@@ -318,6 +318,97 @@ for process in processes:
 
 Note that the prefiller nodes and the decoder nodes may have different configurations. In this example, each prefiller node deployed as master node independently, but all decoder nodes take the first node as the master node. So it leads to difference in 'dp_size_local' and 'dp_rank_start'
 
+## 单机 A2 部署（4 卡 Prefill + 4 卡 Decode）
+
+若只有一台 Atlas 800T A2 服务器（8 张 NPU），可以将 4 张卡作为 Prefill 节点、4 张卡作为 Decode 节点，在同一台机器上部署 DP 分离服务。做法是：
+
+- 使用 **ASCEND_RT_VISIBLE_DEVICES** 将设备划分：Prefill 进程只使用卡 0–3，Decode 进程只使用卡 4–7。
+- Prefill 侧：1 个 DP 引擎，`tensor-parallel-size=4`（4 卡）。
+- Decode 侧：**1 个 DP 引擎，`tensor-parallel-size=4`**（单进程用满 4 卡 4–7），显存更充裕，适合 32B 等大模型。若使用 7B 等小模型且希望多副本，可自行改为 TP=1、dp_size=4（4 个单卡副本）。
+
+### 1. 单机脚本与模板说明
+
+单机 4+4 卡部署已拆分为 **Prefill / Decode 两套脚本**，无需共用一份 `run_dp_template.sh`：
+
+| 角色 | 启动入口 | Shell 模板 |
+|------|----------|------------|
+| Prefill（4 卡） | `launch_prefill_single_node_4cards.py` | `Qwen3-32B/run_prefill_4cards.sh` |
+| Decode（4 卡） | `launch_decode_single_node_4cards.py` | `Qwen3-32B/run_decode_4cards.sh` |
+| Prefill（2 卡） | 直接执行 | `Qwen3-32B/run_prefill_2cards.sh` |
+| Decode（2 卡） | 直接执行 | `Qwen3-32B/run_decode_2cards.sh` |
+| Prefill（1 卡，Qwen3-8B） | 直接执行 | `Qwen3-8B/run_prefill_1card.sh` |
+| Decode（1 卡，Qwen3-8B） | 直接执行 | `Qwen3-8B/run_decode_1card.sh` |
+
+- **Prefill 模板**（`run_prefill_4cards.sh`）：`--tensor-parallel-size 4`，`kv_role: kv_producer`，`--enforce-eager`；`ASCEND_RT_VISIBLE_DEVICES` 由 Python 启动脚本设置，脚本内不写死。
+- **Decode 模板**（`run_decode_4cards.sh`）：`--tensor-parallel-size 4`，`--nnodes 1`，`kv_connector_extra_config` 为 `"prefill": {"dp_size": 1, "tp_size": 4}, "decode": {"dp_size": 1, "tp_size": 4}`；**第 8 个参数 $8** 为 `ASCEND_RT_VISIBLE_DEVICES`（单副本时由启动脚本传入 `"4,5,6,7"`）。
+- **2 卡配置**（仅 4 张卡环境）：使用 `run_prefill_2cards.sh` / `run_decode_2cards.sh`，TP=2，Prefill 用卡 0–1、Decode 用卡 2–3；`kv_connector_extra_config` 中 `tp_size` 均为 2。**直接执行上述 shell 即可**，无 Python 启动脚本。
+- **1 卡 P + 1 卡 D（Qwen3-8B）**：使用 `Qwen3-8B/run_prefill_1card.sh` / `run_decode_1card.sh`，TP=1，Prefill 用卡 0、Decode 用卡 1；`kv_connector_extra_config` 中 `tp_size` 均为 1。**直接执行上述 shell 即可**，无 Python 启动脚本。显存占用小，适合 2 卡机。
+- 使用前在对应 shell 中修改 `nic_name`、`local_ip`、`model_path`。
+
+### 2. 单机 Prefill / Decode 启动脚本
+
+- **Prefill**：直接使用 [launch_prefill_single_node_4cards.py](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/launch_prefill_single_node_4cards.py)，单进程调用 `Qwen3-32B/run_prefill_4cards.sh`。脚本逻辑见仓库该文件。
+- **Decode**：直接使用 [launch_decode_single_node_4cards.py](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/launch_decode_single_node_4cards.py)，单进程调用 `Qwen3-32B/run_decode_4cards.sh`。脚本逻辑见仓库该文件。
+- Shell 模板见 [Qwen3-32B/run_prefill_4cards.sh](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/Qwen3-32B/run_prefill_4cards.sh) 与 [Qwen3-32B/run_decode_4cards.sh](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/Qwen3-32B/run_decode_4cards.sh)。使用前在脚本内修改 `nic_name`、`local_ip`、`model_path`。
+
+### 3. 启动顺序与 Proxy
+
+1. 先在本机启动 **Prefill**：在 `examples/disaggregated_prefill_v1` 下执行 `python launch_prefill_single_node_4cards.py`（会调用 `Qwen3-32B/run_prefill_4cards.sh`）。
+2. 再启动 **Decode**：在同一目录执行 `python launch_decode_single_node_4cards.py`（会调用 `Qwen3-32B/run_decode_4cards.sh`）。
+3. 启动负载均衡代理（示例，单副本 Decode 仅 1 个端口）：
+
+```shell
+python load_balance_proxy_server_example.py \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --prefiller-hosts 127.0.0.1 \
+  --prefiller-ports 9000 \
+  --decoder-hosts 127.0.0.1 \
+  --decoder-ports 9010
+```
+
+请求发往代理的 8000 端口即可。
+
+**其他建议：**（1）先确认 Prefill 日志中出现 “Creating v1 connector … kv_producer” 且无报错后再起 Decode；（2）两进程建议在不同终端或后台运行（如 `nohup ... &`），便于分别查看日志；（3）若更换模型或卡数，需同步修改对应 shell 中的 `model_path`、`--tensor-parallel-size` 及 `kv_connector_extra_config` 中的 dp_size/tp_size。
+
+### 4. 单机配置小结
+
+**4 卡 Prefill + 4 卡 Decode（8 卡机）：**
+
+| 项目           | Prefill（单机 4 卡） | Decode（单机 4 卡） |
+|----------------|----------------------|----------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 0,1,2,3（由启动脚本设置） | 4,5,6,7（单进程 4 卡） |
+| DP 引擎数       | 1                     | 1                     |
+| tensor-parallel-size | 4                 | 4                     |
+| 引擎端口         | 9000                  | 9010                  |
+
+**2 卡 Prefill + 2 卡 Decode（4 卡机）：**
+
+| 项目           | Prefill（单机 2 卡） | Decode（单机 2 卡） |
+|----------------|----------------------|----------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 0,1（由启动脚本设置） | 2,3（单进程 2 卡） |
+| DP 引擎数       | 1                     | 1                     |
+| tensor-parallel-size | 2                 | 2                     |
+| 引擎端口         | 9000                  | 9010                  |
+
+**1 卡 Prefill + 1 卡 Decode（Qwen3-8B，2 卡机）：**
+
+| 项目           | Prefill（单机 1 卡） | Decode（单机 1 卡） |
+|----------------|----------------------|----------------------|
+| ASCEND_RT_VISIBLE_DEVICES | 0（由启动脚本设置） | 1（单卡） |
+| DP 引擎数       | 1                     | 1                     |
+| tensor-parallel-size | 1                 | 1                     |
+| 引擎端口         | 9000                  | 9010                  |
+| 模型/模板       | Qwen3-8B，`Qwen3-8B/run_prefill_1card.sh` | `Qwen3-8B/run_decode_1card.sh` |
+
+:::{note}
+单机部署时 Prefill 与 Decode 共用同一台机器，需保证两个 shell 模板中的 `nic_name`、`local_ip` 一致；Decode 的 `engine_port`（9010）与 Prefill（9000）不重叠；**Decode 的 `dp_port`（13495）必须与 Prefill 的 `dp_port`（13395）不同**，否则会报 `EADDRINUSE`。若模型或显存有压力，可在对应 shell 中调低 `--max-model-len`、`--max-num-batched-tokens` 或 `--gpu-memory-utilization`。
+:::
+
+**32B 模型与显存：** 上述单机 Decode 配置默认 **TP=4、dp_size=1**（1 个副本用满 4 卡），模型分片到 4 张卡后每卡约 16GB 权重，显存更充裕，适合 Qwen3-32B 等 32B 级模型。若使用 7B 等小模型且希望 4 个单卡 Decode 副本，需自行改启动脚本与 `run_decode_4cards.sh`（多进程、TP=1）。
+
+**Decode 仍 OOM 时：** 若 TP=4 仍报 “NPU out of memory”，可在 `run_decode_4cards.sh` 中降低 `--max-model-len`（如 4096）和 `--gpu-memory-utilization`（如 0.85），或评估 `--quantization ascend`（需对应量化权重并确认兼容）。
+
 ## Example proxy for Distributed DP Server
 
 In the PD separation scenario, we need a proxy to distribute requests. Execute the following commands to enable the example proxy:
