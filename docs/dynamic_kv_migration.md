@@ -54,7 +54,7 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **enabled**：是否启用 DynamicKV（默认 `false`）
 - **model_types**：允许启用的 HF `model_type` 列表（默认 `["mistral"]`）
 - **window**：窗口大小 window（默认 `16`）
-- **max_capacity**：每层 KV 最大容量上限（默认 `512`）。通常表示 \(old + window\) 的上限
+- **prompt_kv_len_budget**：每层 KV 长度的预算目标（默认 `512`，通常约等于 \(old + window\_size\) 的目标值）。**不是硬上限**：个别层可能 \(kv\_len > prompt\_kv\_len\_budget\)，硬上限仍为 prompt_len
 - **pooling**：对 token importance 做 1D 平滑（`none|avgpool|maxpool`，默认 `none`）
 - **kernel_size**：pooling 的 kernel（默认 `1`）
 - **radio_max / radio_min**：跨层重分配的上/下限相关系数（默认 `10.0/0.1`，与上游参考实现一致）
@@ -142,7 +142,7 @@ decode 侧生效依赖两件事：
 ### 4.2 Mooncake（PD 传递是否带上分层信息）
 
 - **`[DynamicKV][PD] request_finished per_layer_kv_lens stats`**
-  - `unique/min/max/sum` 用于验收“分层预算非均匀”且总预算符合预期（例如 sum≈num_layers*max_capacity）
+- `unique/min/max/sum` 用于验收“分层预算非均匀”且总预算符合预期（例如 sum≈num_layers*prompt_kv_len_budget）
 - **`[DynamicKV] request_finished per_layer_kv_lens(fallback)`（WARNING）**
   - 出现说明分层结果未成功 attach，PD 退化为均匀 cap（需要排查）
 

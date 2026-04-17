@@ -943,7 +943,8 @@ class MooncakeConnectorScheduler:
         # - how many tokens are considered "externally matched" for remote prefill
         # - how many prompt blocks are transferred to decode node
         self._dynamickv_enabled = bool(getattr(self.ascend_config, "dynamic_kv_enabled", False))
-        self._dynamickv_max_capacity = int(getattr(self.ascend_config, "dynamic_kv_max_capacity", 0) or 0)
+        self._dynamickv_impl = str(getattr(self.ascend_config, "dynamic_kv_impl", "offload"))
+        self._dynamickv_max_capacity = int(getattr(self.ascend_config, "dynamic_kv_prompt_kv_len_budget", 0) or 0)
         self.side_channel_host = get_ip()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -1002,46 +1003,69 @@ class MooncakeConnectorScheduler:
             # `num_new_tokens + num_external_computed_tokens`, and for async KV
             # loads num_new_tokens==0). Therefore, `ext_tokens` MUST match the
             # actual transfer footprint in blocks.
-            total = len(request.prompt_token_ids)
+            # Compute prompt KV footprint in *blocks* (KV transfer is block-based).
+            prompt_len = len(request.prompt_token_ids)
+            total = prompt_len
             try:
                 if isinstance(params, dict):
+                    bs = int(self.block_size)
+                    if bs > 0:
+                        prompt_blocks = int(math.ceil(int(prompt_len) / bs))
+                        total_blocks = prompt_blocks
+                    # DynamicKV offload: compressed KV is packed into the *prefix*
+                    # of the producer paged layout; only the first
+                    # ceil(max(per_layer_kv_lens))/block_size logical blocks need to
+                    # be pulled. `remote_block_ids` / `num_prompt_blocks` from
+                    # prefill are shortened accordingly (see request_finished).
+                    if (
+                        self._dynamickv_enabled
+                        and self._dynamickv_impl == "offload"
+                    ):
+                        dyn = params.get("dynamic_kv")
+                        if isinstance(dyn, dict):
+                            pl = dyn.get("per_layer_kv_lens")
+                            if isinstance(pl, list) and pl:
+                                lens_pos: list[int] = []
+                                for x in pl:
+                                    try:
+                                        xi = int(x)
+                                    except Exception:
+                                        continue
+                                    if xi > 0:
+                                        lens_pos.append(xi)
+                                if lens_pos and bs > 0:
+                                    max_len = max(lens_pos)
+                                    total_blocks = int(
+                                        math.ceil(int(max_len) / bs))
+                                    total = int(total_blocks) * bs
                     # 1) Prefer the exact transfer list length when available.
                     rbi = params.get("remote_block_ids")
                     if isinstance(rbi, list) and rbi:
-                        total = min(total, int(len(rbi)) * int(self.block_size))
+                        if bs > 0:
+                            total_blocks = min(total_blocks, int(len(rbi)))
+                        else:
+                            total = min(total, int(len(rbi)) * int(self.block_size))
                     # 2) Otherwise, use declared prompt blocks.
                     npb = int(params.get("num_prompt_blocks", 0) or 0)
                     if npb > 0:
-                        total = min(total, npb * int(self.block_size))
+                        if bs > 0:
+                            total_blocks = min(total_blocks, int(npb))
+                        else:
+                            total = min(total, npb * int(self.block_size))
+                    if bs > 0:
+                        total = int(total_blocks) * bs
             except Exception:
                 pass
-            # DynamicKV physical-block compression: if producer attached per-layer
-            # prompt blocks, reduce the remote prefill footprint to the maximum
-            # per-layer KV length (in blocks). This makes decode allocate fewer
-            # physical KV blocks and reduces transfer size.
-            try:
-                dyn = (params.get("dynamic_kv") or {}) if isinstance(params, dict) else {}
-                pl_nb = dyn.get("per_layer_num_prompt_blocks")
-                if self._dynamickv_enabled and isinstance(pl_nb, list) and pl_nb:
-                    max_blocks = max(int(x) for x in pl_nb if isinstance(x, (int, float, str)))
-                    if max_blocks > 0:
-                        total = min(total, max_blocks * int(self.block_size))
-                elif self._dynamickv_enabled and self._dynamickv_max_capacity > 0:
-                    # Backward-compatible fallback when per-layer blocks not present.
-                    total = min(total, self._dynamickv_max_capacity)
-            except Exception:
-                if self._dynamickv_enabled and self._dynamickv_max_capacity > 0:
-                    total = min(total, self._dynamickv_max_capacity)
 
-            # Keep the returned external token count block-aligned to avoid
-            # allocating an extra partial block that wouldn't be transferred.
-            try:
-                bs = int(self.block_size)
-                if bs > 0:
-                    total = (int(total) // bs) * bs
-            except Exception:
-                pass
-            count = max(total - num_computed_tokens, 0)
+            # NOTE: `total` is block-aligned above. For non-offload DynamicKV,
+            # keep full prompt transfer; offload uses compressed footprint.
+            #
+            # In practice, `num_computed_tokens` on the consumer side may be
+            # non-zero due to scheduler/runtime bookkeeping, but subtracting it
+            # can cause us to skip transferring the first block(s). That leads
+            # to decode reading incomplete/incorrect prompt KV and producing
+            # severe gibberish.
+            count = max(int(total), 0)
             return count, count > 0
 
         # No remote prefill for this request.
@@ -1138,10 +1162,12 @@ class MooncakeConnectorScheduler:
             return False, None
 
         computed_block_ids = block_ids
-        # Full prompt paged layout on Prefill: block count must match physical
-        # prompt KV, not DynamicKV effective lengths (max_capacity is layer budget).
         prompt_len_blocks = len(request.prompt_token_ids)
         num_prompt_blocks = math.ceil(prompt_len_blocks / self.block_size)
+        # Default: transfer the full prompt footprint. DynamicKV offload may
+        # shrink to prefix blocks only (see below).
+        send_block_ids: list[int] = list(computed_block_ids)
+        send_num_prompt_blocks: int = int(num_prompt_blocks)
         # PD DynamicKV: attach per-layer kv_len so decode can apply
         # layer-wise effective context lengths.
         dynamic_kv_payload: dict[str, Any] | None = None
@@ -1177,46 +1203,55 @@ class MooncakeConnectorScheduler:
                                 }
                                 try:
                                     lens_i = [int(x) for x in per_layer0]
-                                    if lens_i:
+                                    pos = [x for x in lens_i if x > 0]
+                                    if pos:
+                                        mean_pos = float(sum(pos)) / float(len(pos))
                                         logger.info(
                                             "[DynamicKV][PD] request_finished per_layer_kv_lens stats: "
-                                            "request_id=%s unique=%d min=%d max=%d sum=%d",
+                                            "request_id=%s unique=%d min=%d max=%d sum=%d "
+                                            "mean=%.2f (layers_len>0=%d; Li<=prompt_len, "
+                                            "mean budget from dynamic_kv.prompt_kv_len_budget=%d)",
                                             request.request_id,
-                                            len(set(lens_i)),
-                                            min(lens_i),
-                                            max(lens_i),
-                                            sum(lens_i),
+                                            len(set(pos)),
+                                            min(pos),
+                                            max(pos),
+                                            sum(pos),
+                                            mean_pos,
+                                            len(pos),
+                                            self._dynamickv_max_capacity,
                                         )
-                                        # Physical-block compression metadata (v1):
-                                        # - per-layer prompt blocks needed to hold the compressed KV
-                                        # - corresponding per-layer remote block ids to transfer
-                                        #   (prefix of remote_block_ids; relies on compressed KV
-                                        #    being written contiguously from the start of the
-                                        #    paged layout for each layer).
-                                        try:
-                                            bs = int(self.block_size)
-                                            rb = list(computed_block_ids)
-                                            per_layer_num_prompt_blocks = [
-                                                int(math.ceil(int(L) / bs)) if int(L) > 0 else 0
-                                                for L in lens_i
-                                            ]
-                                            per_layer_remote_block_ids = [
-                                                rb[:n] for n in per_layer_num_prompt_blocks
-                                            ]
-                                            dynamic_kv_payload["per_layer_num_prompt_blocks"] = per_layer_num_prompt_blocks
-                                            dynamic_kv_payload["per_layer_remote_block_ids"] = per_layer_remote_block_ids
-                                            # Shrink overall PD transfer footprint to the maximum
-                                            # per-layer blocks. This reduces decode-side physical
-                                            # KV allocation (kv_cache_usage) and transfer volume.
-                                            try:
-                                                max_blocks = max(per_layer_num_prompt_blocks) if per_layer_num_prompt_blocks else 0
-                                                if isinstance(max_blocks, int) and max_blocks > 0:
-                                                    num_prompt_blocks = int(max_blocks)
-                                                    computed_block_ids = list(computed_block_ids)[:num_prompt_blocks]
-                                            except Exception:
-                                                pass
-                                        except Exception:
-                                            pass
+                                    # Physical-block compression metadata (v1):
+                                    # - per-layer prompt blocks needed to hold the compressed KV
+                                    # - corresponding per-layer remote block ids to transfer
+                                    #   (prefix of remote_block_ids; relies on compressed KV
+                                    #    being written contiguously from the start of the
+                                    #    paged layout for each layer).
+                                    try:
+                                        bs = int(self.block_size)
+                                        rb = list(computed_block_ids)
+                                        per_layer_num_prompt_blocks = [
+                                            int(math.ceil(int(L) / bs)) if int(L) > 0 else 0
+                                            for L in lens_i
+                                        ]
+                                        per_layer_remote_block_ids = [
+                                            rb[:n] for n in per_layer_num_prompt_blocks
+                                        ]
+                                        dynamic_kv_payload["per_layer_num_prompt_blocks"] = per_layer_num_prompt_blocks
+                                        dynamic_kv_payload["per_layer_remote_block_ids"] = per_layer_remote_block_ids
+                                        # IMPORTANT: Do NOT shrink `computed_block_ids` /
+                                        # `num_prompt_blocks` here.
+                                        #
+                                        # Taking `remote_block_ids[:N]` assumes the incoming
+                                        # `block_ids` list is ordered by *logical prompt
+                                        # prefix* blocks. This is not guaranteed (it may be
+                                        # allocation order), and shrinking can therefore
+                                        # transfer incorrect blocks and corrupt decode KV.
+                                        #
+                                        # Keep the full prompt transfer footprint for
+                                        # correctness; DynamicKV effectiveness is applied by
+                                        # decode attention via per-layer `kv_lens` / indices.
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     pass
                     except Exception:
@@ -1233,6 +1268,10 @@ class MooncakeConnectorScheduler:
                         )
                         and dynamic_kv_payload["per_layer_kv_lens"]
                     )
+                    # Offload mode: do not attach fallback lens without worker
+                    # results (would misalign decode attention vs full KV).
+                    if self._dynamickv_impl != "attn" and not has_dynkv_from_request:
+                        dynamic_kv_payload = None
                     if (
                         not has_dynkv_from_request
                         and isinstance(last_res, dict)
@@ -1261,32 +1300,91 @@ class MooncakeConnectorScheduler:
                         # incorrectly overwrote a good payload from
                         # ``request.kv_transfer_params`` whenever scheduler-side
                         # ``_DYNKV_STATE`` was empty (always true on scheduler proc).
+                        #
+                        # NOTE: This is NOT the DynamicKV per-layer budget; it repeats
+                        # ``capped=min(prompt_len,prompt_kv_len_budget)`` for every layer so
+                        # PD shrink / decode have *some* bound when worker metadata
+                        # is not merged before request_finished (see log tag below).
                         dynamic_kv_payload = {
-                            # Fallback: uniform capping.
                             "per_layer_kv_lens": [int(capped)] * int(num_layers),
                         }
-                        # Even under fallback (e.g. prefix-cache hit skipped
-                        # worker-side export), shrink PD physical footprint to
-                        # the capped effective length so decode-side KV
-                        # allocation doesn't scale with full prompt length.
-                        try:
-                            bs = int(self.block_size)
-                            max_blocks = int(math.ceil(int(capped) / bs)) if int(capped) > 0 else 0
-                            if max_blocks > 0:
-                                num_prompt_blocks = int(max_blocks)
-                                computed_block_ids = list(computed_block_ids)[:num_prompt_blocks]
-                        except Exception:
-                            pass
                         logger.warning(
-                            "[DynamicKV] request_finished per_layer_kv_lens(fallback): request_id=%s lens=%s",
+                            "[DynamicKV] request_finished per_layer_kv_lens"
+                            "(uniform_fallback, not_worker_budget): request_id=%s "
+                            "capped=%s x %d layers lens=%s",
                             request.request_id,
+                            int(capped),
+                            int(num_layers),
                             dynamic_kv_payload["per_layer_kv_lens"],
                         )
         except Exception:
             dynamic_kv_payload = None
 
-        # Delay-free should match the actual transfer footprint (computed_block_ids),
-        # which may be shrunk under DynamicKV physical-block compression.
+        # DynamicKV offload: shrink PD transfer to the prefix physical blocks that
+        # hold compressed KV (worker packs into slots 0..kv_len-1). Requires
+        # `block_ids` to follow logical prompt block order (vLLM default).
+        if (
+            isinstance(dynamic_kv_payload, dict)
+            and self._dynamickv_enabled
+            and self._dynamickv_impl == "offload"
+            and send_block_ids
+        ):
+            try:
+                pl = dynamic_kv_payload.get("per_layer_kv_lens")
+                if isinstance(pl, list) and pl:
+                    lens_pos: list[int] = []
+                    for x in pl:
+                        try:
+                            xi = int(x)
+                        except Exception:
+                            continue
+                        if xi > 0:
+                            lens_pos.append(xi)
+                    if lens_pos:
+                        bs = int(self.block_size)
+                        max_len = int(max(lens_pos))
+                        n_transfer = (
+                            int(math.ceil(max_len / bs)) if bs > 0 else len(send_block_ids)
+                        )
+                        n_transfer = max(1, min(n_transfer, len(send_block_ids)))
+                        if n_transfer < len(send_block_ids):
+                            send_block_ids = send_block_ids[:n_transfer]
+                            send_num_prompt_blocks = int(n_transfer)
+                            rb = list(send_block_ids)
+                            pl_nb: list[int] = []
+                            pl_rb: list[list[int]] = []
+                            for L in pl:
+                                try:
+                                    Li = int(L)
+                                except Exception:
+                                    Li = -1
+                                if Li <= 0:
+                                    pl_nb.append(0)
+                                    pl_rb.append([])
+                                    continue
+                                nb = (
+                                    int(math.ceil(Li / bs)) if bs > 0 else 0
+                                )
+                                nb = min(nb, len(rb))
+                                pl_nb.append(nb)
+                                pl_rb.append(rb[:nb])
+                            dynamic_kv_payload["per_layer_num_prompt_blocks"] = pl_nb
+                            dynamic_kv_payload["per_layer_remote_block_ids"] = pl_rb
+                            logger.info(
+                                "[DynamicKV][PD] offload shrink transfer: request_id=%s "
+                                "blocks %d -> %d (max_kv_len=%d)",
+                                request.request_id,
+                                len(computed_block_ids),
+                                n_transfer,
+                                max_len,
+                            )
+            except Exception:
+                logger.debug(
+                    "[DynamicKV][PD] offload shrink transfer skipped",
+                    exc_info=True,
+                )
+
+        # Delay-free pins the full prefill allocation until async send completes.
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s",
@@ -1296,7 +1394,7 @@ class MooncakeConnectorScheduler:
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
-            remote_block_ids=computed_block_ids,
+            remote_block_ids=send_block_ids,
             remote_engine_id=self.engine_id,
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
@@ -1305,7 +1403,7 @@ class MooncakeConnectorScheduler:
             remote_dcp_size=self.dcp_size,
             last_token_id=request.output_token_ids[-1],
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
-            num_prompt_blocks=num_prompt_blocks,
+            num_prompt_blocks=send_num_prompt_blocks,
             dynamic_kv=dynamic_kv_payload,
         )
 

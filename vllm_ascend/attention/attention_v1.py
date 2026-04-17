@@ -42,6 +42,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     AscendMetadataForDecode, AscendMetadataForPrefill)
 from vllm_ascend.attention.dynamic_kv import (
     DynamicKVConfig,
+    cap_keep_indices_chronological,
     gather_kv_from_paged_cache,
     gather_kv_from_paged_cache_batched,
     scores_and_indices_old,
@@ -444,9 +445,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # the current vllm_config if needed.
         init_ascend_config(self.vllm_config)
         ascend_cfg = get_ascend_config()
-        self._dynamickv_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
-        self._dynamickv_window = int(getattr(ascend_cfg, "dynamic_kv_window", 16))
-        self._dynamickv_max_capacity = int(getattr(ascend_cfg, "dynamic_kv_max_capacity", 512))
+        # DynamicKV has multiple implementations. Only the legacy "attn" mode
+        # hooks Python attention forward; "offload" keeps the attention
+        # execution path unchanged and rewrites KV after prefill elsewhere.
+        self._dynamickv_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
+        self._dynamickv_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False)) and (self._dynamickv_impl == "attn")
+        self._dynamickv_window_size = int(getattr(ascend_cfg, "dynamic_kv_window_size", 16))
+        self._dynamickv_prompt_kv_len_budget = int(getattr(ascend_cfg, "dynamic_kv_prompt_kv_len_budget", 512))
         self._dynamickv_pooling = getattr(ascend_cfg, "dynamic_kv_pooling", "none")
         self._dynamickv_kernel_size = int(getattr(ascend_cfg, "dynamic_kv_kernel_size", 1))
         self._dynamickv_radio_max = float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0))
@@ -1077,8 +1082,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         try:
                             dynkv_cfg_layer = DynamicKVConfig(
                                 num_hidden_layers=num_layers,
-                                window_size=int(self._dynamickv_window),
-                                max_capacity_prompt=int(self._dynamickv_max_capacity),
+                                window_size=int(self._dynamickv_window_size),
+                                max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
                                 pooling=(
                                     "avgpool"
                                     if self._dynamickv_pooling == "avgpool"
@@ -1180,8 +1185,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                         continue
                                     cfg_sub = DynamicKVConfig(
                                         num_hidden_layers=len(scores_layers),
-                                        window_size=int(self._dynamickv_window),
-                                        max_capacity_prompt=int(self._dynamickv_max_capacity),
+                                        window_size=int(self._dynamickv_window_size),
+                                        max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
                                         pooling="none",
                                         kernel_size=1,
                                         radio_max=float(self._dynamickv_radio_max),
@@ -1278,8 +1283,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
                         dynkv_cfg = DynamicKVConfig(
                             num_hidden_layers=num_layers,
-                            window_size=int(self._dynamickv_window),
-                            max_capacity_prompt=int(self._dynamickv_max_capacity),
+                            window_size=int(self._dynamickv_window_size),
+                            max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
                             pooling=(
                                 "avgpool"
                                 if self._dynamickv_pooling == "avgpool"
@@ -1320,6 +1325,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 continue
                             seq_len_i = int(seq_lens_list_int[ridx])
                             if seq_len_i <= 0:
+                                continue
+                            max_cap_cfg = int(dynkv_cfg.max_capacity_prompt)
+                            if seq_len_i <= max_cap_cfg:
+                                # Full prompt fits in prompt_kv_len_budget: export full prefix;
+                                # do not rewrite cache (same semantics as offload path).
+                                results_by_req[rid] = {
+                                    "per_layer_kv_lens": [seq_len_i] * num_layers,
+                                    "per_layer_keep_indices": [
+                                        list(range(seq_len_i)) for _ in range(num_layers)
+                                    ],
+                                }
                                 continue
                             W = int(dynkv_cfg.window_size)
                             tail_keep_idx_by_req[ridx] = (
@@ -1455,16 +1471,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             # Rewrite each layer for this request.
                             for li in range(num_layers):
                                 old_budget = int(per_layer_old_budget[li])
-                                W = int(dynkv_cfg.window_size)
-                                # Build keep indices in original sequence space for PD transfer.
+                                # Merge old top-k + tail window, unique-sort, cap to prompt_kv_len_budget
+                                # (align with ``impl=offload``).
+                                #
+                                # IMPORTANT: `dynamic_kv.prompt_kv_len_budget` is not treated as a hard kv_len cap.
+                                # Some layers may keep more than `prompt_kv_len_budget` tokens; the real upper bound
+                                # is the prompt length `seq_len_i`.
                                 idx_old = per_layer_indices_old[li]
                                 tail_idx = tail_keep_idx_by_req[ridx].to(idx_old.device)
-                                keep_idx = (
-                                    torch.cat([idx_old[:old_budget].to(torch.long), tail_idx], dim=0)
-                                    if tail_idx.numel() > 0
-                                    else idx_old[:old_budget].to(torch.long)
+                                keep_sorted, _ = cap_keep_indices_chronological(
+                                    idx_old=idx_old,
+                                    old_budget=old_budget,
+                                    tail_idx=tail_idx,
+                                    cap=seq_len_i,
+                                    device=idx_old.device,
                                 )
-                                per_layer_keep_indices.append(keep_idx.tolist())
+                                per_layer_keep_indices.append(
+                                    [int(x) for x in keep_sorted.tolist()]
+                                )
 
                                 # Build compressed KV by gathering from full KV.
                                 packed = gathered_by_layer.get(li)
@@ -1475,8 +1499,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 end = int(cu[ridx])
                                 k_full = k_packed[start:end]
                                 v_full = v_packed[start:end]
-                                k_final = k_full.index_select(0, keep_idx.to(torch.long))
-                                v_final = v_full.index_select(0, keep_idx.to(torch.long))
+                                k_final = k_full.index_select(0, keep_sorted.to(torch.long))
+                                v_final = v_full.index_select(0, keep_sorted.to(torch.long))
 
                                 kv_len_i = int(k_final.shape[0])
                                 per_layer_kv_lens.append(kv_len_i)

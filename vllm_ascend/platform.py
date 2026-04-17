@@ -431,27 +431,13 @@ class NPUPlatform(Platform):
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
-        # NOTE: Ascend previously used an "opaque attention op" path, which
-        # routes AttentionLayer.forward() to torch.ops.vllm.unified_attention*,
-        # bypassing Python AttentionImpl.forward().
+        # Ascend uses an optimized opaque attention operator path for
+        # correctness/performance parity with upstream vLLM kernels.
         #
-        # DynamicKV layered compression currently hooks into the Python forward
-        # path (per-layer KV access + writing results into process state for
-        # PD/Mooncake). If we keep opaque ops enabled, none of the DynamicKV
-        # logs/state updates in attention_v1.py can ever run.
-        #
-        # Force direct-call path on Ascend.
-        try:
-            from vllm.logger import logger
-
-            logger.warning_once(
-                "AscendPlatform: disabling opaque_attention_op to enable "
-                "Python attention forward path (required for DynamicKV).",
-                scope="local",
-            )
-        except Exception:
-            pass
-        return False
+        # NOTE: Some experimental features may want to hook Python attention
+        # forward. Those features must be implemented without globally
+        # disabling opaque ops, otherwise base generation quality can regress.
+        return True
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:

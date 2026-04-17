@@ -156,15 +156,22 @@ class AscendConfig:
         # the attention backend chooses to consume it.
         dyn = additional_config.get("dynamic_kv", {}) or {}
         self.dynamic_kv_enabled = bool(dyn.get("enabled", False))
+        # DynamicKV implementation mode:
+        # - "attn": legacy path that hooks into Python attention forward.
+        # - "offload": (preferred) run a separate post-prefill rewrite pass in
+        #   worker/runner code, keeping attention execution path unchanged.
+        # Default to "offload" to avoid impacting base correctness.
+        self.dynamic_kv_impl = str(dyn.get("impl", "offload"))
         self.dynamic_kv_model_types = dyn.get("model_types", ["mistral"])
-        self.dynamic_kv_window = int(dyn.get("window", 16))
-        self.dynamic_kv_max_capacity = int(dyn.get("max_capacity", 512))
+        self.dynamic_kv_window_size = int(dyn.get("window_size", 16))
+        # DynamicKV budget target (per-layer KV length target).
+        # NOTE: This is NOT a hard upper bound; some layers may keep > target.
+        self.dynamic_kv_prompt_kv_len_budget = int(dyn.get("prompt_kv_len_budget", 512))
         self.dynamic_kv_pooling = dyn.get("pooling", "none")
         self.dynamic_kv_kernel_size = int(dyn.get("kernel_size", 1))
         # DynamicKV knobs (optional; radio_* match upstream reference).
         self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
         self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
-
         # DynamicKV currently rewrites paged KV content on prefill. Prefix caching
         # assumes KV blocks are immutable given the same token prefix. To avoid
         # incorrect reuse/mismatched DynamicKV exports on repeated requests, we

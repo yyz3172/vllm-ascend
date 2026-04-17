@@ -3,7 +3,7 @@ DynamicKV helpers for vLLM-Ascend:
 
 - Paged-cache gather for full-sequence K/V (`gather_kv_from_paged_cache*`).
 - DynamicKV: per-layer scores/indices and cross-layer budget (`DynamicKVConfig`,
-  `scores_and_indices_old`, `update_and_reset_budget`).
+  `scores_and_indices_old`, `update_and_reset_budget`, `cap_keep_indices_chronological`).
 """
 
 import math
@@ -162,7 +162,12 @@ def _compute_token_scores_old(
     scale = 1.0 / math.sqrt(D)
     rep = Hq // Hkv
     qg = query_last.view(W, Hkv, rep, D).permute(1, 2, 0, 3)  # [Hkv, rep, W, D]
-    kg = key_full.permute(1, 2, 0)  # [Hkv, D, L]
+    # NOTE: `torch.matmul` broadcasts batch dims by right-alignment.
+    # qg batch dims are [Hkv, rep], kg batch dims are [Hkv]. Without an extra
+    # singleton dim, kg's [Hkv] would align to rep and can fail when rep != Hkv
+    # (e.g. TP=1 with GQA: Hkv=8, rep=4). Unsqueeze so kg batch dims become
+    # [Hkv, 1] and broadcast correctly to [Hkv, rep].
+    kg = key_full.permute(1, 2, 0).unsqueeze(1)  # [Hkv, 1, D, L]
     attn_logits = torch.matmul(qg, kg).reshape(Hq, W, L) * scale
     attn = torch.nn.functional.softmax(attn_logits, dim=-1, dtype=torch.float32).to(
         query_last.dtype
@@ -196,6 +201,57 @@ def scores_and_indices_old(
         indices_old = torch.topk(scores_old, k=budget_size, dim=0).indices
         indices_old, _ = torch.sort(indices_old)
     return scores_old, indices_old
+
+
+def cap_keep_indices_chronological(
+    *,
+    idx_old: torch.Tensor,
+    old_budget: int,
+    tail_idx: torch.Tensor,
+    cap: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, bool]:
+    """Merge old-segment top-k indices with tail window, unique-sort, then cap.
+
+    If more than ``cap`` distinct positions: **always keep the full tail window**
+    (all indices in ``tail_idx`` that appear in the merge), then fill remaining
+    slots with **old-region** indices **closest to the tail** (largest original
+    indices first). Shared by ``impl=attn`` rewrite and ``impl=offload`` path.
+
+    Returns ``(keep_sorted, truncated)`` where ``truncated`` is True if we had
+    to drop any index that would have been kept in the uncapped merge.
+    """
+    C = int(cap)
+    if C <= 0:
+        return torch.zeros(0, device=device, dtype=torch.long), False
+
+    old_part = idx_old[: int(old_budget)].to(torch.long)
+    if tail_idx.numel() == 0:
+        merged = old_part
+    else:
+        merged = torch.cat([old_part, tail_idx.to(torch.long)], dim=0)
+    keep_sorted = torch.unique(merged, sorted=True)
+    n0 = int(keep_sorted.numel())
+    if n0 <= C:
+        return keep_sorted, False
+
+    tail_set = {int(x) for x in tail_idx.tolist()}
+    ks_list = [int(x) for x in keep_sorted.tolist()]
+    tail_in = [x for x in ks_list if x in tail_set]
+    old_in = [x for x in ks_list if x not in tail_set]
+
+    if len(tail_in) + len(old_in) <= C:
+        return keep_sorted, False
+
+    if len(tail_in) >= C:
+        # Extremely rare (e.g. W > C): keep the last C chronological positions.
+        kept = ks_list[-C:]
+        return torch.tensor(kept, device=device, dtype=torch.long), True
+
+    budget_old = C - len(tail_in)
+    old_kept = old_in[-budget_old:] if budget_old > 0 else []
+    result = sorted(set(tail_in) | set(old_kept))
+    return torch.tensor(result, device=device, dtype=torch.long), True
 
 
 def update_and_reset_budget(
