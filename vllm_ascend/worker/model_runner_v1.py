@@ -746,6 +746,36 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
         base_num_reqs = self.input_batch.num_reqs
         num_reqs = base_num_reqs
+        # DynamicKV: ChunkedPrefill only compresses on the last chunk.
+        # Determine if this step finishes the prompt for all requests.
+        dynamic_kv_is_last_chunk = False
+        dynkv_max_capacity = None
+        try:
+            if self.attn_state in (AscendAttentionState.PrefillNoCache,
+                                   AscendAttentionState.ChunkedPrefill):
+                comp = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                sched = num_scheduled_tokens[:num_reqs]
+                total = num_tokens_np[:num_reqs]
+                # `dynamic_kv.max_capacity` is a per-layer KV budget, not a cap on
+                # how many prompt tokens get chunked prefill. Using
+                # min(prompt_len, max_capacity) here marks the *first* chunk as
+                # "last" for long prompts and breaks DynamicKV + PD metadata.
+                try:
+                    dynkv_cfg = None
+                    add_cfg = getattr(self.vllm_config, "additional_config", None)
+                    if isinstance(add_cfg, dict):
+                        dynkv_cfg = add_cfg.get("dynamic_kv")
+                    if isinstance(dynkv_cfg, dict):
+                        mc = dynkv_cfg.get("max_capacity")
+                        if isinstance(mc, int) and mc > 0:
+                            dynkv_max_capacity = mc
+                except Exception:
+                    dynkv_max_capacity = None
+                total_eff = total
+                dynamic_kv_is_last_chunk = bool(
+                    np.all((comp + sched) >= total_eff))
+        except Exception:
+            dynamic_kv_is_last_chunk = False
         if self.pcp_size > 1:
             # while pcp > 1, we need the original num_scheduled_tokens before split
             # to calculate discard_requests_mask
@@ -767,10 +797,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # _prepare_inputs may reorder the batch, so we must gather
         # multi-modal outputs after that to ensure the correct order
-        if vllm_version_is('0.13.0'):
-            model_kwargs = self._init_model_kwargs(num_input_tokens)
-        else:
-            model_kwargs = self._init_model_kwargs()
+        model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.is_multimodal_model and not self.model_config.is_encoder_decoder:
             self.multimodal_cpu_fields = ["grid_thw"]
             self._prepare_multimodal_fields()
@@ -1029,12 +1056,20 @@ class NPUModelRunner(GPUModelRunner):
                 num_computed_tokens_cpu_tensor[:num_reqs],
                 positions=self.positions.gpu,
                 attn_state=self.attn_state,
+                dynamic_kv_is_last_chunk=dynamic_kv_is_last_chunk,
                 max_query_len=max_num_scheduled_tokens,
                 decode_token_per_req=self.decode_token_per_req,
                 prefill_context_parallel_metadata=self.long_seq_metadata,
                 max_seq_len=0,
                 encoder_seq_lens=encoder_seq_lens,
                 encoder_seq_lens_cpu=encoder_seq_lens_cpu)
+            # DynamicKV: carry request ids through to attention metadata.
+            # AscendCommonAttentionMetadata may not accept this as a ctor kwarg
+            # across versions, so attach it dynamically.
+            try:
+                setattr(common_attn_metadata, "req_ids", list(req_ids))
+            except Exception:
+                pass
 
             if self.speculative_config and self.pcp_size * self.dcp_size > 1:
                 # For pcp + spec decode, we flatten block_table
@@ -1099,9 +1134,35 @@ class NPUModelRunner(GPUModelRunner):
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args)
+                # DynamicKV: propagate gating fields to backend metadata.
+                try:
+                    setattr(attn_metadata_i, "dynamic_kv_is_last_chunk",
+                            getattr(common_attn_metadata,
+                                    "dynamic_kv_is_last_chunk", False))
+                except Exception:
+                    pass
+                try:
+                    if getattr(attn_metadata_i, "req_ids", None) is None:
+                        setattr(attn_metadata_i, "req_ids",
+                                getattr(common_attn_metadata, "req_ids", None))
+                except Exception:
+                    pass
 
                 for layer_name in attn_group.layer_names:
-                    attn_metadata[layer_name] = attn_metadata_i
+                    # vLLM will index attn_metadata by layer_name. We must ensure
+                    # each layer sees its own metadata instance with `layer_name`
+                    # populated, otherwise DynamicKV cannot resolve layer_idx.
+                    try:
+                        import copy as _copy
+
+                        meta_i = _copy.copy(attn_metadata_i)
+                    except Exception:
+                        meta_i = attn_metadata_i
+                    try:
+                        setattr(meta_i, "layer_name", layer_name)
+                    except Exception:
+                        pass
+                    attn_metadata[layer_name] = meta_i
 
         # update global cos, sin
         update_cos_sin(positions)
@@ -1681,6 +1742,32 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # Same step as GPU path's ``_get_kv_connector_output`` finally: drain
+        # worker DynamicKV (etc.) into the output *before* the scheduler runs
+        # ``request_finished``. Ascend splits execute_model/sample_tokens and
+        # does not use that context manager, so without this drain the scheduler
+        # only sees mooncake_connector's uniform ``min(prompt, max_capacity)``
+        # fallback for ``per_layer_kv_lens``.
+        if kv_connector_output is not None and has_kv_transfer_group():
+            try:
+                kc = get_kv_transfer_group()
+                if hasattr(kc, "drain_kv_transfer_params_updates"):
+                    req_ids_set: set[str] = set()
+                    if kv_connector_output.finished_sending:
+                        req_ids_set.update(kv_connector_output.finished_sending)
+                    if kv_connector_output.finished_recving:
+                        req_ids_set.update(kv_connector_output.finished_recving)
+                    if scheduler_output.finished_req_ids:
+                        req_ids_set.update(scheduler_output.finished_req_ids)
+                    if not req_ids_set:
+                        req_ids_set.update(
+                            scheduler_output.num_scheduled_tokens.keys())
+                    upd = kc.drain_kv_transfer_params_updates(list(req_ids_set))
+                    if isinstance(upd, dict) and upd:
+                        kv_connector_output.kv_transfer_params_updates = upd
+            except Exception:
+                pass
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
@@ -2047,11 +2134,20 @@ class NPUModelRunner(GPUModelRunner):
                             common_attn_metadata, attn_state)
                     for layer_name in kv_cache_group_spec.layer_names:
                         if "linear_attn" in layer_name:
-                            attn_metadata[
-                                layer_name] = attn_metadata_gdn_attention
+                            meta_src = attn_metadata_gdn_attention
                         else:
-                            attn_metadata[
-                                layer_name] = attn_metadata_full_attention
+                            meta_src = attn_metadata_full_attention
+                        try:
+                            import copy as _copy
+
+                            meta_i = _copy.copy(meta_src)
+                        except Exception:
+                            meta_i = meta_src
+                        try:
+                            setattr(meta_i, "layer_name", layer_name)
+                        except Exception:
+                            pass
+                        attn_metadata[layer_name] = meta_i
 
         return attn_metadata
 
@@ -2890,7 +2986,8 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config.kv_cache_groups):
             attn_backends = get_attn_backends_for_group(  # type: ignore
                 kv_cache_group_spec)
-            self.attn_groups.append(create_attn_groups(attn_backends[0], i))
+            groups = create_attn_groups(attn_backends[0], i)
+            self.attn_groups.append(groups)
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()

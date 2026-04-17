@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.attention.attention_v1 import _DYNKV_STATE
 from vllm_ascend.distributed.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.utils import get_transfer_timeout_value
 from vllm_ascend.utils import is_vl_model
@@ -75,6 +76,12 @@ class ReqMeta:
     remote_dcp_size: int
     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
     num_prompt_blocks: int
+    # DynamicKV physical-block compression (optional).
+    # When present, these describe per-layer prompt-block transfer layout.
+    # They are only valid when `dynamic_kv.enabled` and producer attaches them.
+    per_layer_num_prompt_blocks: list[int] | None = None
+    per_layer_remote_block_ids: list[list[int]] | None = None
+    per_layer_local_block_ids: list[list[int]] | None = None
 
 
 @dataclass
@@ -783,6 +790,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         num_external_tokens: int,
         kv_transfer_params: dict[str, Any],
     ):
+        dyn = (kv_transfer_params.get("dynamic_kv") or {}) if isinstance(kv_transfer_params, dict) else {}
+        pl_nb = dyn.get("per_layer_num_prompt_blocks")
+        pl_rb = dyn.get("per_layer_remote_block_ids")
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
             num_external_tokens=num_external_tokens,
@@ -795,6 +805,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_multi_nodes_meta_mapping=kv_transfer_params.get(
                 "remote_multi_nodes_meta_mapping", {}),
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
+            per_layer_num_prompt_blocks=pl_nb if isinstance(pl_nb, list) else None,
+            per_layer_remote_block_ids=pl_rb if isinstance(pl_rb, list) else None,
         )
 
 
@@ -863,6 +875,13 @@ class MooncakeConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
 
+    def drain_kv_transfer_params_updates(
+            self, req_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Drain per-request kv_transfer_params updates from worker side."""
+        if self.connector_worker is None:
+            return {}
+        return self.connector_worker.drain_kv_transfer_params_updates(req_ids)
+
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
         assert self.connector_worker is not None
@@ -919,6 +938,12 @@ class MooncakeConnectorScheduler:
         self.local_ip = get_ip()
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
 
+        # DynamicKV: if enabled, limit remote KV transfer size to the compressed
+        # prompt KV length. This affects:
+        # - how many tokens are considered "externally matched" for remote prefill
+        # - how many prompt blocks are transferred to decode node
+        self._dynamickv_enabled = bool(getattr(self.ascend_config, "dynamic_kv_enabled", False))
+        self._dynamickv_max_capacity = int(getattr(self.ascend_config, "dynamic_kv_max_capacity", 0) or 0)
         self.side_channel_host = get_ip()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -970,8 +995,53 @@ class MooncakeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % self.block_size == 0
-            # Note: We use the full token count as transmit data here.
-            count = max(len(request.prompt_token_ids) - num_computed_tokens, 0)
+            # Determine remote prefill footprint in tokens.
+            #
+            # For PD disaggregation, decode-side KV block allocation is driven by
+            # the returned `ext_tokens` (scheduler allocates
+            # `num_new_tokens + num_external_computed_tokens`, and for async KV
+            # loads num_new_tokens==0). Therefore, `ext_tokens` MUST match the
+            # actual transfer footprint in blocks.
+            total = len(request.prompt_token_ids)
+            try:
+                if isinstance(params, dict):
+                    # 1) Prefer the exact transfer list length when available.
+                    rbi = params.get("remote_block_ids")
+                    if isinstance(rbi, list) and rbi:
+                        total = min(total, int(len(rbi)) * int(self.block_size))
+                    # 2) Otherwise, use declared prompt blocks.
+                    npb = int(params.get("num_prompt_blocks", 0) or 0)
+                    if npb > 0:
+                        total = min(total, npb * int(self.block_size))
+            except Exception:
+                pass
+            # DynamicKV physical-block compression: if producer attached per-layer
+            # prompt blocks, reduce the remote prefill footprint to the maximum
+            # per-layer KV length (in blocks). This makes decode allocate fewer
+            # physical KV blocks and reduces transfer size.
+            try:
+                dyn = (params.get("dynamic_kv") or {}) if isinstance(params, dict) else {}
+                pl_nb = dyn.get("per_layer_num_prompt_blocks")
+                if self._dynamickv_enabled and isinstance(pl_nb, list) and pl_nb:
+                    max_blocks = max(int(x) for x in pl_nb if isinstance(x, (int, float, str)))
+                    if max_blocks > 0:
+                        total = min(total, max_blocks * int(self.block_size))
+                elif self._dynamickv_enabled and self._dynamickv_max_capacity > 0:
+                    # Backward-compatible fallback when per-layer blocks not present.
+                    total = min(total, self._dynamickv_max_capacity)
+            except Exception:
+                if self._dynamickv_enabled and self._dynamickv_max_capacity > 0:
+                    total = min(total, self._dynamickv_max_capacity)
+
+            # Keep the returned external token count block-aligned to avoid
+            # allocating an extra partial block that wouldn't be transferred.
+            try:
+                bs = int(self.block_size)
+                if bs > 0:
+                    total = (int(total) // bs) * bs
+            except Exception:
+                pass
+            count = max(total - num_computed_tokens, 0)
             return count, count > 0
 
         # No remote prefill for this request.
@@ -994,8 +1064,19 @@ class MooncakeConnectorScheduler:
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host",
                                              "remote_port")):
-                    local_block_ids = (blocks.get_unhashed_block_ids()
-                                       if num_external_tokens > 0 else [])
+                    if num_external_tokens > 0:
+                        # Prefer group-aware unhashed block ids when available.
+                        # Keep legacy flat list for current transfer path.
+                        try:
+                            if hasattr(blocks, "get_unhashed_block_ids_by_group"):
+                                gb = blocks.get_unhashed_block_ids_by_group()
+                                local_block_ids = [x for g in gb for x in g]
+                            else:
+                                local_block_ids = blocks.get_unhashed_block_ids()
+                        except Exception:
+                            local_block_ids = blocks.get_unhashed_block_ids()
+                    else:
+                        local_block_ids = []
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (
                         request, local_block_ids, num_external_tokens)
@@ -1057,14 +1138,160 @@ class MooncakeConnectorScheduler:
             return False, None
 
         computed_block_ids = block_ids
+        # Full prompt paged layout on Prefill: block count must match physical
+        # prompt KV, not DynamicKV effective lengths (max_capacity is layer budget).
+        prompt_len_blocks = len(request.prompt_token_ids)
+        num_prompt_blocks = math.ceil(prompt_len_blocks / self.block_size)
+        # PD DynamicKV: attach per-layer kv_len so decode can apply
+        # layer-wise effective context lengths.
+        dynamic_kv_payload: dict[str, Any] | None = None
+        try:
+            if self._dynamickv_enabled:
+                prompt_len = len(request.prompt_token_ids)
+                capped = (
+                    min(prompt_len, self._dynamickv_max_capacity)
+                    if self._dynamickv_max_capacity and self._dynamickv_max_capacity > 0
+                    else prompt_len
+                )
+                model_cfg = self.vllm_config.model_config
+                hf_cfg = getattr(model_cfg, "hf_config", None)
+                num_layers = (
+                    getattr(model_cfg, "num_hidden_layers", None)
+                    or getattr(model_cfg, "num_layers", None)
+                    or getattr(hf_cfg, "num_hidden_layers", None)
+                    or getattr(hf_cfg, "num_layers", None)
+                    or 0
+                )
+                if isinstance(num_layers, int) and num_layers > 0:
+                    last_results: Any = _DYNKV_STATE.get("last_results")
+                    # Prefer scheduler-side request.kv_transfer_params if available
+                    # (worker may have sent per-layer results back via KVConnectorOutput).
+                    try:
+                        if isinstance(getattr(request, "kv_transfer_params", None), dict):
+                            dyn0 = request.kv_transfer_params.get("dynamic_kv") or {}
+                            per_layer0 = dyn0.get("per_layer_kv_lens")
+                            if isinstance(per_layer0, list) and per_layer0:
+                                dynamic_kv_payload = {
+                                    "per_layer_kv_lens": per_layer0,
+                                    "per_layer_keep_indices": dyn0.get("per_layer_keep_indices"),
+                                }
+                                try:
+                                    lens_i = [int(x) for x in per_layer0]
+                                    if lens_i:
+                                        logger.info(
+                                            "[DynamicKV][PD] request_finished per_layer_kv_lens stats: "
+                                            "request_id=%s unique=%d min=%d max=%d sum=%d",
+                                            request.request_id,
+                                            len(set(lens_i)),
+                                            min(lens_i),
+                                            max(lens_i),
+                                            sum(lens_i),
+                                        )
+                                        # Physical-block compression metadata (v1):
+                                        # - per-layer prompt blocks needed to hold the compressed KV
+                                        # - corresponding per-layer remote block ids to transfer
+                                        #   (prefix of remote_block_ids; relies on compressed KV
+                                        #    being written contiguously from the start of the
+                                        #    paged layout for each layer).
+                                        try:
+                                            bs = int(self.block_size)
+                                            rb = list(computed_block_ids)
+                                            per_layer_num_prompt_blocks = [
+                                                int(math.ceil(int(L) / bs)) if int(L) > 0 else 0
+                                                for L in lens_i
+                                            ]
+                                            per_layer_remote_block_ids = [
+                                                rb[:n] for n in per_layer_num_prompt_blocks
+                                            ]
+                                            dynamic_kv_payload["per_layer_num_prompt_blocks"] = per_layer_num_prompt_blocks
+                                            dynamic_kv_payload["per_layer_remote_block_ids"] = per_layer_remote_block_ids
+                                            # Shrink overall PD transfer footprint to the maximum
+                                            # per-layer blocks. This reduces decode-side physical
+                                            # KV allocation (kv_cache_usage) and transfer volume.
+                                            try:
+                                                max_blocks = max(per_layer_num_prompt_blocks) if per_layer_num_prompt_blocks else 0
+                                                if isinstance(max_blocks, int) and max_blocks > 0:
+                                                    num_prompt_blocks = int(max_blocks)
+                                                    computed_block_ids = list(computed_block_ids)[:num_prompt_blocks]
+                                            except Exception:
+                                                pass
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    last_res = (
+                        last_results.get(request.request_id)
+                        if isinstance(last_results, dict)
+                        else None
+                    )
+                    has_dynkv_from_request = (
+                        isinstance(dynamic_kv_payload, dict)
+                        and isinstance(
+                            dynamic_kv_payload.get("per_layer_kv_lens"), list
+                        )
+                        and dynamic_kv_payload["per_layer_kv_lens"]
+                    )
+                    if (
+                        not has_dynkv_from_request
+                        and isinstance(last_res, dict)
+                        and isinstance(last_res.get("per_layer_kv_lens"), list)
+                    ):
+                        dynamic_kv_payload = {
+                            "per_layer_kv_lens": last_res["per_layer_kv_lens"],
+                            "per_layer_keep_indices": last_res.get("per_layer_keep_indices"),
+                        }
+                        # Once attached to kv_transfer_params, we can drop the cached result.
+                        try:
+                            if isinstance(last_results, dict):
+                                last_results.pop(request.request_id, None)
+                        except Exception:
+                            pass
+                    elif not (
+                        isinstance(dynamic_kv_payload, dict)
+                        and isinstance(
+                            dynamic_kv_payload.get("per_layer_kv_lens"), list
+                        )
+                        and dynamic_kv_payload["per_layer_kv_lens"]
+                    ):
+                        # Only uniform-cap when neither worker last_results nor
+                        # request.kv_transfer_params (merged from KVConnectorOutput)
+                        # already supplied per-layer lens.  A bare ``else`` here
+                        # incorrectly overwrote a good payload from
+                        # ``request.kv_transfer_params`` whenever scheduler-side
+                        # ``_DYNKV_STATE`` was empty (always true on scheduler proc).
+                        dynamic_kv_payload = {
+                            # Fallback: uniform capping.
+                            "per_layer_kv_lens": [int(capped)] * int(num_layers),
+                        }
+                        # Even under fallback (e.g. prefix-cache hit skipped
+                        # worker-side export), shrink PD physical footprint to
+                        # the capped effective length so decode-side KV
+                        # allocation doesn't scale with full prompt length.
+                        try:
+                            bs = int(self.block_size)
+                            max_blocks = int(math.ceil(int(capped) / bs)) if int(capped) > 0 else 0
+                            if max_blocks > 0:
+                                num_prompt_blocks = int(max_blocks)
+                                computed_block_ids = list(computed_block_ids)[:num_prompt_blocks]
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "[DynamicKV] request_finished per_layer_kv_lens(fallback): request_id=%s lens=%s",
+                            request.request_id,
+                            dynamic_kv_payload["per_layer_kv_lens"],
+                        )
+        except Exception:
+            dynamic_kv_payload = None
+
+        # Delay-free should match the actual transfer footprint (computed_block_ids),
+        # which may be shrunk under DynamicKV physical-block compression.
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s",
                         len(computed_block_ids), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
-
-        num_prompt_blocks = math.ceil(
-            len(request.prompt_token_ids) / self.block_size)
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -1073,11 +1300,13 @@ class MooncakeConnectorScheduler:
             remote_engine_id=self.engine_id,
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
+            block_size=int(self.block_size),
             remote_pcp_size=self.pcp_size,
             remote_dcp_size=self.dcp_size,
             last_token_id=request.output_token_ids[-1],
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
+            dynamic_kv=dynamic_kv_payload,
         )
 
     def set_xfer_handshake_metadata(
@@ -1336,6 +1565,44 @@ class MooncakeConnectorWorker:
                 "Number of completed KV cache send requests: %d, receive "
                 "requests: %d", len(done_sending), len(done_recving))
         return done_sending, done_recving
+
+    def drain_kv_transfer_params_updates(
+            self, req_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Drain worker-side DynamicKV results for finished requests.
+
+        Runs in the worker process. The scheduler process receives these updates
+        via KVConnectorOutput and merges into Request.kv_transfer_params.
+        """
+        updates: dict[str, dict[str, Any]] = {}
+        if not req_ids:
+            return updates
+        try:
+            from vllm_ascend.attention.attention_v1 import _DYNKV_STATE  # local import
+
+            last_results = _DYNKV_STATE.get("last_results")
+            if not isinstance(last_results, dict):
+                return updates
+            for rid in req_ids:
+                item = last_results.get(rid)
+                if not isinstance(item, dict):
+                    continue
+                per_layer_kv_lens = item.get("per_layer_kv_lens")
+                per_layer_keep_indices = item.get("per_layer_keep_indices")
+                if not isinstance(per_layer_kv_lens, list):
+                    continue
+                updates[rid] = {
+                    "dynamic_kv": {
+                        "per_layer_kv_lens": per_layer_kv_lens,
+                        "per_layer_keep_indices": per_layer_keep_indices,
+                    }
+                }
+                try:
+                    last_results.pop(rid, None)
+                except Exception:
+                    pass
+        except Exception:
+            return updates
+        return updates
 
     def _get_kv_split_metadata(
         self,

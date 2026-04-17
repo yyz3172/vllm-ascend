@@ -151,6 +151,53 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can "
                     "only be used in D node.")
 
+        # DynamicKV: additional_config["dynamic_kv"] (prefill compression; PD hooks).
+        # This is intentionally scoped to Ascend, and is a no-op unless
+        # the attention backend chooses to consume it.
+        dyn = additional_config.get("dynamic_kv", {}) or {}
+        self.dynamic_kv_enabled = bool(dyn.get("enabled", False))
+        self.dynamic_kv_model_types = dyn.get("model_types", ["mistral"])
+        self.dynamic_kv_window = int(dyn.get("window", 16))
+        self.dynamic_kv_max_capacity = int(dyn.get("max_capacity", 512))
+        self.dynamic_kv_pooling = dyn.get("pooling", "none")
+        self.dynamic_kv_kernel_size = int(dyn.get("kernel_size", 1))
+        # DynamicKV knobs (optional; radio_* match upstream reference).
+        self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
+        self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
+
+        # DynamicKV currently rewrites paged KV content on prefill. Prefix caching
+        # assumes KV blocks are immutable given the same token prefix. To avoid
+        # incorrect reuse/mismatched DynamicKV exports on repeated requests, we
+        # force-disable prefix caching when DynamicKV is enabled.
+        try:
+            if self.dynamic_kv_enabled and getattr(vllm_config, "cache_config", None) is not None:
+                try:
+                    logger.info_once(
+                        "CacheConfig (before DynamicKV override): block_size=%s num_gpu_blocks=%s enable_prefix_caching=%s",
+                        getattr(vllm_config.cache_config, "block_size", None),
+                        getattr(vllm_config.cache_config, "num_gpu_blocks", None),
+                        getattr(vllm_config.cache_config, "enable_prefix_caching", None),
+                    )
+                except Exception:
+                    pass
+                if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+                    logger.warning_once(
+                        "DynamicKV is enabled; forcing prefix caching off for correctness.",
+                        scope="local",
+                    )
+                vllm_config.cache_config.enable_prefix_caching = False
+                try:
+                    logger.info_once(
+                        "CacheConfig (after DynamicKV override): block_size=%s num_gpu_blocks=%s enable_prefix_caching=%s",
+                        getattr(vllm_config.cache_config, "block_size", None),
+                        getattr(vllm_config.cache_config, "num_gpu_blocks", None),
+                        getattr(vllm_config.cache_config, "enable_prefix_caching", None),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def refresh_eplb_config(self, config):
         self.expert_map_path = config.get("expert_map_path", None)
         self.eplb_policy_type = config.get("eplb_policy_type", 1)
@@ -293,6 +340,7 @@ class WeightPrefetchConfig:
 
 
 _ASCEND_CONFIG: Optional[AscendConfig] = None
+_DYNAMIC_KV_ENABLED: bool = False
 
 
 def init_ascend_config(vllm_config):
@@ -303,12 +351,26 @@ def init_ascend_config(vllm_config):
     if _ASCEND_CONFIG is not None and not refresh:
         return _ASCEND_CONFIG
     _ASCEND_CONFIG = AscendConfig(vllm_config)
+    # Expose a safe, early-readable flag for platform-level dispatch.
+    # This avoids depending on get_ascend_config() initialization timing.
+    global _DYNAMIC_KV_ENABLED
+    try:
+        _DYNAMIC_KV_ENABLED = bool(getattr(_ASCEND_CONFIG, "dynamic_kv_enabled", False))
+    except Exception:
+        _DYNAMIC_KV_ENABLED = False
     return _ASCEND_CONFIG
 
 
 def clear_ascend_config():
     global _ASCEND_CONFIG
     _ASCEND_CONFIG = None
+    global _DYNAMIC_KV_ENABLED
+    _DYNAMIC_KV_ENABLED = False
+
+
+def dynamic_kv_enabled_safe() -> bool:
+    """Return whether DynamicKV is enabled without requiring init order."""
+    return bool(_DYNAMIC_KV_ENABLED)
 
 
 def get_ascend_config():

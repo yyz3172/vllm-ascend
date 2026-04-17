@@ -18,6 +18,7 @@
 #
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -26,6 +27,7 @@ from vllm.config import VllmConfig
 from vllm.config.model import ModelDType
 from vllm.v1.attention.backends.utils import AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, KVCacheConfig
+from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -47,6 +49,8 @@ def build_attn_metadata(
     attn_metadata_builders: list[AttentionMetadataBuilder],
     num_reqs: int,
     num_tokens: int,
+    req_ids: list[str] | None = None,
+    kv_transfer_params_list: list[dict[str, Any] | None] | None = None,
     query_start_loc_gpu: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -68,6 +72,18 @@ def build_attn_metadata(
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
     max_query_len = int(query_start_loc_cpu.max())
     max_seq_len = int(seq_lens_cpu.max())
+
+    # DynamicKV: ChunkedPrefill 仅在最后一块压缩；PrefillNoCache 在 attention 内始终走压缩路径。
+    dynamic_kv_is_last_chunk = False
+    try:
+        if attn_state == AscendAttentionState.ChunkedPrefill:
+            q_lens = (query_start_loc_cpu[1:num_reqs + 1] -
+                      query_start_loc_cpu[:num_reqs]).to(torch.int64)
+            seq_l = seq_lens_cpu[:num_reqs].to(torch.int64)
+            comp = num_computed_tokens_cpu[:num_reqs].to(torch.int64)
+            dynamic_kv_is_last_chunk = bool(torch.all((comp + q_lens) >= seq_l).item())
+    except Exception:
+        dynamic_kv_is_last_chunk = False
 
     attn_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
@@ -93,6 +109,7 @@ def build_attn_metadata(
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
             prefill_context_parallel_metadata=prefill_context_parallel_metadata,
+            dynamic_kv_is_last_chunk=dynamic_kv_is_last_chunk,
             max_seq_len=max_seq_len)
 
         attn_metadata_builder = attn_metadata_builders[i]
@@ -101,7 +118,60 @@ def build_attn_metadata(
             common_attn_metadata=common_attn_metadata,  # type: ignore
         )
         for layer_name in kv_cache_spec.layer_names:
-            attn_metadata[layer_name] = metadata
+            dynamic_kv_seq_lens_list: list[int] | None = None
+            dynamic_kv_keep_indices_list: list[list[int]] | None = None
+            if req_ids and kv_transfer_params_list and len(kv_transfer_params_list) == len(req_ids):
+                try:
+                    layer_idx = int(extract_layer_index(layer_name, num_attn_module=1))
+                except Exception:
+                    layer_idx = -1
+                if layer_idx >= 0:
+                    tmp: list[int] = []
+                    idx_tmp: list[list[int]] = []
+                    for kvp in kv_transfer_params_list:
+                        if not kvp:
+                            tmp.append(-1)
+                            idx_tmp.append([])
+                            continue
+                        dyn = kvp.get("dynamic_kv") or {}
+                        per_layer = dyn.get("per_layer_kv_lens")
+                        per_layer_indices = dyn.get("per_layer_keep_indices")
+                        # Prefer kv_len derived from indices when available.
+                        if isinstance(per_layer_indices, list) and layer_idx < len(per_layer_indices):
+                            try:
+                                idxs = per_layer_indices[layer_idx]
+                                if isinstance(idxs, list):
+                                    idx_tmp.append([int(x) for x in idxs])
+                                    tmp.append(len(idxs))
+                                    continue
+                            except Exception:
+                                idx_tmp.append([])
+                                tmp.append(-1)
+                                continue
+                        if isinstance(per_layer, list) and layer_idx < len(per_layer):
+                            try:
+                                tmp.append(int(per_layer[layer_idx]))
+                            except Exception:
+                                tmp.append(-1)
+                        else:
+                            tmp.append(-1)
+                        idx_tmp.append([])
+                    if tmp and not all(v < 0 for v in tmp):
+                        dynamic_kv_seq_lens_list = tmp
+                    if idx_tmp and any(len(x) > 0 for x in idx_tmp):
+                        dynamic_kv_keep_indices_list = idx_tmp
+
+            # vLLM expects a metadata dict keyed by layer name. We create a
+            # per-layer copy so attention backends can branch on layer_name.
+            attn_metadata[layer_name] = replace(
+                metadata,
+                layer_name=layer_name,
+                # Propagate request ids so attention backends can export
+                # per-request DynamicKV results for PD transfer.
+                req_ids=req_ids or [],
+                dynamic_kv_seq_lens_list=dynamic_kv_seq_lens_list,
+                dynamic_kv_keep_indices_list=dynamic_kv_keep_indices_list,
+            )
     return attn_metadata
 
 

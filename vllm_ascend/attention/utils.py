@@ -100,6 +100,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: Optional[
         AscendPrefillContextParallelMetadata] = None
 
+    # DynamicKV: whether this ChunkedPrefill step is the last chunk.
+    # This is computed in the attn metadata builder and used by attention backend
+    # to avoid compressing KV cache on every chunk.
+    dynamic_kv_is_last_chunk: bool = False
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int,
                  num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -128,6 +133,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.
             prefill_context_parallel_metadata,
+            dynamic_kv_is_last_chunk=self.dynamic_kv_is_last_chunk,
             max_seq_len=self.max_seq_len)
 
 
