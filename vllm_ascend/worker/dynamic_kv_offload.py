@@ -393,13 +393,13 @@ def run_offload_rewrite_and_build_updates(
         )
         if len(per_layer_old_budget) != num_layers:
             # Fallback: uniform.
-            per_layer_old_budget = [budget_size] * num_layers
+            per_layer_old_budget = [cand_old] * num_layers
 
         per_layer_keep_indices: list[list[int]] = []
         per_layer_kv_lens: list[int] = []
         cap_trunc_any = False
 
-        # Rewrite each layer into prefix slots.
+        # Rewrite each layer.
         for local_i, (li, _k_cache, _v_cache) in enumerate(layer_items):
             old_budget = int(per_layer_old_budget[li])
             idx_old = per_layer_indices_old[local_i]
@@ -427,17 +427,15 @@ def run_offload_rewrite_and_build_updates(
             k_full = per_layer_k_full[local_i]
             v_full = per_layer_v_full[local_i]
             slots_full = per_layer_slots_full[local_i]
-            k_chrono = k_full.index_select(0, keep_sorted)
-            v_chrono = v_full.index_select(0, keep_sorted)
             kv_len = int(keep_sorted.shape[0])
-            per_layer_kv_lens.append(kv_len)
-
-            # Write chronologically ordered retained K/V into the first kv_len
-            # *sequential prompt* slots (``slots_full[:kv_len]``).
-            slots_keep = slots_full[:kv_len]
             # Flatten paged cache to [num_blocks*block_size, H, D]
             k_flat = _k_cache.reshape(-1, _k_cache.shape[-2], _k_cache.shape[-1])
             v_flat = _v_cache.reshape(-1, _v_cache.shape[-2], _v_cache.shape[-1])
+            # Pack kept KV into prefix slots for transfer/decode.
+            k_chrono = k_full.index_select(0, keep_sorted)
+            v_chrono = v_full.index_select(0, keep_sorted)
+            per_layer_kv_lens.append(kv_len)
+            slots_keep = slots_full[:kv_len]
             k_flat.index_copy_(0, slots_keep.to(k_flat.device), k_chrono)
             v_flat.index_copy_(0, slots_keep.to(v_flat.device), v_chrono)
 
@@ -473,7 +471,6 @@ def run_offload_rewrite_and_build_updates(
                     float(sum(pos_lens)) / float(len(pos_lens)),
                     cap_trunc_any,
                 )
-
         updates[rid] = {
             "dynamic_kv": {
                 "per_layer_kv_lens": full_lens,
