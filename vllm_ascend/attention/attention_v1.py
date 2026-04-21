@@ -765,9 +765,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         forward_context: ForwardContext = get_forward_context()
         if forward_context.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+        # Default (full prompt) context lengths.
         context_lens = attn_metadata.seq_lens
+        full_context_lens = attn_metadata.seq_lens
         dyn_keep = getattr(attn_metadata, "dynamic_kv_keep_indices_list", None)
         dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+        dyn_extra = getattr(attn_metadata, "dynamic_kv_extra", None)
+        rebuild_full = False
+        rebuild_full_prompt_len = None
+        try:
+            if isinstance(dyn_extra, dict):
+                rebuild_full = bool(dyn_extra.get("rebuild_full", False))
+                rebuild_full_prompt_len = dyn_extra.get("rebuild_full_prompt_len")
+        except Exception:
+            rebuild_full = False
+            rebuild_full_prompt_len = None
 
         # If keep indices exist, prefer to derive kv_len from indices.
         if dyn_keep is not None and isinstance(dyn_keep, list) and dyn_keep:
@@ -775,6 +787,81 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 dyn_lens_list = [len(x) for x in dyn_keep]
             except Exception:
                 pass
+
+        # Step2 validation path: pack -> rebuild full layout on Decode.
+        # This sacrifices compute-side savings but allows correctness checks while
+        # keeping prompt length unchanged.
+        if (
+            rebuild_full
+            and dyn_keep is not None
+            and isinstance(dyn_keep, list)
+            and dyn_keep
+            and not getattr(attn_metadata, "_dynamic_kv_rebuilt_full", False)
+            and hasattr(attn_metadata, "block_tables")
+        ):
+            try:
+                block_tables = attn_metadata.block_tables
+                bs = int(getattr(attn_metadata, "block_size", 0) or 0)
+                if bs <= 0:
+                    # AscendMetadata may not carry block_size; fall back to cache_config block size.
+                    bs = int(getattr(self, "block_size", 0) or 0)
+                if bs <= 0:
+                    bs = 128  # safe fallback; should match cache_config.block_size
+
+                k_flat = self.key_cache.reshape(-1, self.key_cache.shape[-2], self.key_cache.shape[-1])
+                v_flat = self.value_cache.reshape(-1, self.value_cache.shape[-2], self.value_cache.shape[-1])
+
+                B = int(block_tables.shape[0])
+                for ridx in range(B):
+                    keep_list = dyn_keep[ridx]
+                    if not isinstance(keep_list, list) or not keep_list:
+                        continue
+                    keep = torch.tensor(keep_list, device=block_tables.device, dtype=torch.long)
+
+                    # Target full prompt length.
+                    if rebuild_full_prompt_len is not None:
+                        L = int(rebuild_full_prompt_len)
+                    else:
+                        L = int(full_context_lens[ridx].item())
+                    if L <= 0:
+                        continue
+
+                    kv_len = int(keep.shape[0])
+                    # Packed KV resides in positions 0..kv_len-1.
+                    packed_pos = torch.arange(0, kv_len, device=block_tables.device, dtype=torch.long)
+
+                    # Map logical positions -> physical slot ids.
+                    bt = block_tables[ridx].to(torch.long)
+                    packed_slots = bt.index_select(0, packed_pos // bs) * bs + (packed_pos % bs)
+                    keep_slots = bt.index_select(0, keep // bs) * bs + (keep % bs)
+
+                    # Gather packed KV, then scatter into original positions.
+                    k_packed = k_flat.index_select(0, packed_slots.to(k_flat.device))
+                    v_packed = v_flat.index_select(0, packed_slots.to(v_flat.device))
+
+                    # Zero full prompt region [0..L-1] first.
+                    full_pos = torch.arange(0, L, device=block_tables.device, dtype=torch.long)
+                    full_slots = bt.index_select(0, full_pos // bs) * bs + (full_pos % bs)
+                    zeros_k = torch.zeros(
+                        (int(full_slots.shape[0]),) + tuple(k_flat.shape[1:]),
+                        device=k_flat.device,
+                        dtype=k_flat.dtype,
+                    )
+                    zeros_v = torch.zeros(
+                        (int(full_slots.shape[0]),) + tuple(v_flat.shape[1:]),
+                        device=v_flat.device,
+                        dtype=v_flat.dtype,
+                    )
+                    k_flat.index_copy_(0, full_slots.to(k_flat.device), zeros_k)
+                    v_flat.index_copy_(0, full_slots.to(v_flat.device), zeros_v)
+
+                    # Scatter kept KV.
+                    k_flat.index_copy_(0, keep_slots.to(k_flat.device), k_packed)
+                    v_flat.index_copy_(0, keep_slots.to(v_flat.device), v_packed)
+
+                setattr(attn_metadata, "_dynamic_kv_rebuilt_full", True)
+            except Exception:
+                logger.exception("[DynamicKV][Decode] rebuild_full failed; continue with packed KV")
 
         if dyn_lens_list is not None:
             if not getattr(attn_metadata, "_dynamic_kv_decode_logged", False):
@@ -809,13 +896,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             len(dyn_lens_list),
                         )
                 setattr(attn_metadata, "_dynamic_kv_decode_logged", True)
-            # Per-layer kv_len override for PD DynamicKV.
-            # Expect dyn_lens_list to be ordered by request order in the batch.
-            context_lens = torch.tensor(
-                dyn_lens_list,
-                device=attn_metadata.seq_lens.device,
-                dtype=attn_metadata.seq_lens.dtype,
-            )
+            # Per-layer kv_len override for PD DynamicKV unless we rebuilt to full.
+            if rebuild_full and getattr(attn_metadata, "_dynamic_kv_rebuilt_full", False):
+                context_lens = full_context_lens
+            else:
+                # Expect dyn_lens_list to be ordered by request order in the batch.
+                context_lens = torch.tensor(
+                    dyn_lens_list,
+                    device=attn_metadata.seq_lens.device,
+                    dtype=attn_metadata.seq_lens.dtype,
+                )
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,

@@ -28,6 +28,32 @@ from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
                                               scores_and_indices_old,
                                               update_and_reset_budget)
 
+_DYNKV_REWRITE_STRATEGY_ENV = "VLLM_ASCEND_DYNKV_REWRITE_STRATEGY"
+
+
+def _get_dynkv_rewrite_strategy() -> str:
+    """
+    DynamicKV KV-rewrite strategy (offload impl).
+
+    - "pack" (default): pack kept tokens into prefix slots 0..kv_len-1.
+    - "zero_inplace": keep layout unchanged; dropped tokens' KV set to 0;
+      per-layer kv_lens exported as full prompt length (no compute-side gain).
+    - "pack_rebuild_full": pack for transfer compatibility, but instruct Decode
+      to rebuild a full-length KV layout using keep_indices + zero-fill.
+    """
+    v = os.environ.get(_DYNKV_REWRITE_STRATEGY_ENV, "").strip().lower()
+    if not v:
+        return "pack"
+    if v in ("pack", "zero_inplace", "pack_rebuild_full"):
+        return v
+    logger.warning(
+        "[DynamicKV][offload] unknown %s=%r; falling back to 'pack'",
+        _DYNKV_REWRITE_STRATEGY_ENV,
+        v,
+    )
+    return "pack"
+
+
 
 @dataclass
 class OffloadCaptureContext:
@@ -287,6 +313,7 @@ def run_offload_rewrite_and_build_updates(
         L = int(seq_lens[ridx])
         if L <= 0:
             continue
+        strategy = _get_dynkv_rewrite_strategy()
 
         # Entire prompt fits in ``prompt_kv_len_budget``: no cross-layer budget / lift.
         if L <= C:
@@ -393,13 +420,14 @@ def run_offload_rewrite_and_build_updates(
         )
         if len(per_layer_old_budget) != num_layers:
             # Fallback: uniform.
-            per_layer_old_budget = [budget_size] * num_layers
+            per_layer_old_budget = [cand_old] * num_layers
 
         per_layer_keep_indices: list[list[int]] = []
         per_layer_kv_lens: list[int] = []
+        per_layer_keep_lens: list[int] = []
         cap_trunc_any = False
 
-        # Rewrite each layer into prefix slots.
+        # Rewrite each layer.
         for local_i, (li, _k_cache, _v_cache) in enumerate(layer_items):
             old_budget = int(per_layer_old_budget[li])
             idx_old = per_layer_indices_old[local_i]
@@ -423,23 +451,44 @@ def run_offload_rewrite_and_build_updates(
             # time order: ``keep_sorted`` is ascending original token indices.
             keep_list = [int(x) for x in keep_sorted.tolist()]
             per_layer_keep_indices.append(keep_list)
+            per_layer_keep_lens.append(int(keep_sorted.numel()))
 
             k_full = per_layer_k_full[local_i]
             v_full = per_layer_v_full[local_i]
             slots_full = per_layer_slots_full[local_i]
-            k_chrono = k_full.index_select(0, keep_sorted)
-            v_chrono = v_full.index_select(0, keep_sorted)
             kv_len = int(keep_sorted.shape[0])
-            per_layer_kv_lens.append(kv_len)
-
-            # Write chronologically ordered retained K/V into the first kv_len
-            # *sequential prompt* slots (``slots_full[:kv_len]``).
-            slots_keep = slots_full[:kv_len]
             # Flatten paged cache to [num_blocks*block_size, H, D]
             k_flat = _k_cache.reshape(-1, _k_cache.shape[-2], _k_cache.shape[-1])
             v_flat = _v_cache.reshape(-1, _v_cache.shape[-2], _v_cache.shape[-1])
-            k_flat.index_copy_(0, slots_keep.to(k_flat.device), k_chrono)
-            v_flat.index_copy_(0, slots_keep.to(v_flat.device), v_chrono)
+
+            if strategy == "zero_inplace":
+                # Keep the original KV layout (positions 0..L-1). Zero out dropped tokens.
+                keep_mask = torch.zeros((L,), device=keep_sorted.device, dtype=torch.bool)
+                keep_mask.index_fill_(0, keep_sorted, True)
+                drop_pos = torch.nonzero(~keep_mask, as_tuple=False).flatten()
+                if drop_pos.numel() > 0:
+                    slots_drop = slots_full.index_select(0, drop_pos).to(torch.long)
+                    zeros_k = torch.zeros(
+                        (int(slots_drop.shape[0]),) + tuple(k_flat.shape[1:]),
+                        device=k_flat.device,
+                        dtype=k_flat.dtype,
+                    )
+                    zeros_v = torch.zeros(
+                        (int(slots_drop.shape[0]),) + tuple(v_flat.shape[1:]),
+                        device=v_flat.device,
+                        dtype=v_flat.dtype,
+                    )
+                    k_flat.index_copy_(0, slots_drop.to(k_flat.device), zeros_k)
+                    v_flat.index_copy_(0, slots_drop.to(v_flat.device), zeros_v)
+                per_layer_kv_lens.append(int(L))
+            else:
+                # "pack" / "pack_rebuild_full": pack kept KV into prefix slots for transfer.
+                k_chrono = k_full.index_select(0, keep_sorted)
+                v_chrono = v_full.index_select(0, keep_sorted)
+                per_layer_kv_lens.append(kv_len)
+                slots_keep = slots_full[:kv_len]
+                k_flat.index_copy_(0, slots_keep.to(k_flat.device), k_chrono)
+                v_flat.index_copy_(0, slots_keep.to(v_flat.device), v_chrono)
 
         # Expand to full num_layers: for layers not present in kv_caches (rare),
         # fill with -1/[] so decode can ignore.
@@ -473,13 +522,62 @@ def run_offload_rewrite_and_build_updates(
                     float(sum(pos_lens)) / float(len(pos_lens)),
                     cap_trunc_any,
                 )
+                # More intuitive stats: "effective" (kept) prompt tokens per layer.
+                if per_layer_keep_lens:
+                    try:
+                        keep_pos = [int(x) for x in per_layer_keep_lens if int(x) > 0]
+                        if keep_pos:
+                            uniq = len(set(keep_pos))
+                            mn = min(keep_pos)
+                            mx = max(keep_pos)
+                            sm = sum(keep_pos)
+                            mean = float(sm) / float(len(keep_pos))
+                            logger.info(
+                                "[DynamicKV][offload] per_layer_keep_lens stats: request_id=%s strategy=%s "
+                                "unique=%d min=%d max=%d sum=%d mean=%.2f (layers_len>0=%d; L=%d; C=%d; W=%d)",
+                                rid,
+                                strategy,
+                                uniq,
+                                mn,
+                                mx,
+                                sm,
+                                mean,
+                                len(keep_pos),
+                                L,
+                                C,
+                                W,
+                            )
+                            # Also report implied dropped count for Step1 readability.
+                            drop_pos = [int(L - x) for x in keep_pos]
+                            logger.info(
+                                "[DynamicKV][offload] per_layer_drop_lens(implied) stats: request_id=%s strategy=%s "
+                                "unique=%d min=%d max=%d sum=%d mean=%.2f (layers_len>0=%d; L=%d)",
+                                rid,
+                                strategy,
+                                len(set(drop_pos)),
+                                min(drop_pos),
+                                max(drop_pos),
+                                sum(drop_pos),
+                                float(sum(drop_pos)) / float(len(drop_pos)),
+                                len(drop_pos),
+                                L,
+                            )
+                    except Exception:
+                        pass
 
-        updates[rid] = {
-            "dynamic_kv": {
-                "per_layer_kv_lens": full_lens,
-                "per_layer_keep_indices": full_idx,
-            }
-        }
+        dyn_payload: dict[str, Any] = {"per_layer_kv_lens": full_lens}
+        if strategy == "pack":
+            dyn_payload["per_layer_keep_indices"] = full_idx
+        elif strategy == "pack_rebuild_full":
+            dyn_payload["per_layer_keep_indices"] = full_idx
+            dyn_payload["rebuild_full"] = True
+            dyn_payload["rebuild_full_prompt_len"] = int(L)
+        elif strategy == "zero_inplace":
+            # Intentionally omit keep_indices so Decode won't derive a shorter kv_len.
+            dyn_payload["zero_inplace"] = True
+            dyn_payload["original_prompt_len"] = int(L)
+
+        updates[rid] = {"dynamic_kv": dyn_payload}
 
     return updates
 

@@ -1225,12 +1225,20 @@ class NPUModelRunner(GPUModelRunner):
                                 kv_list.append(kvp if isinstance(kvp, dict) else {})
                             if kv_list and len(kv_list) == len(rid_list):
                                 tmp_lens: list[int] = []
+                                tmp_keep: list[list[int] | None] = []
+                                any_rebuild_full = False
+                                extra_payload: dict[str, Any] | None = None
                                 for req_idx, kvp in enumerate(kv_list):
                                     if not kvp:
                                         tmp_lens.append(-1)
+                                        tmp_keep.append(None)
                                         continue
                                     dyn = kvp.get("dynamic_kv") or {}
                                     per_layer = dyn.get("per_layer_kv_lens")
+                                    per_layer_keep = dyn.get("per_layer_keep_indices")
+                                    rebuild_full = bool(
+                                        dyn.get("rebuild_full", False)
+                                    ) if isinstance(dyn, dict) else False
                                     try:
                                         npt = int(
                                             self.input_batch.num_prompt_tokens[
@@ -1260,6 +1268,27 @@ class NPUModelRunner(GPUModelRunner):
                                             tmp_lens.append(-1)
                                     else:
                                         tmp_lens.append(-1)
+                                    if rebuild_full:
+                                        any_rebuild_full = True
+                                        try:
+                                            if (
+                                                isinstance(per_layer_keep, list)
+                                                and layer_idx < len(per_layer_keep)
+                                                and isinstance(per_layer_keep[layer_idx], list)
+                                            ):
+                                                tmp_keep.append(per_layer_keep[layer_idx])
+                                            else:
+                                                tmp_keep.append([])
+                                        except Exception:
+                                            tmp_keep.append([])
+                                        if extra_payload is None:
+                                            extra_payload = {"rebuild_full": True}
+                                            if isinstance(dyn, dict) and "rebuild_full_prompt_len" in dyn:
+                                                extra_payload["rebuild_full_prompt_len"] = dyn.get(
+                                                    "rebuild_full_prompt_len"
+                                                )
+                                    else:
+                                        tmp_keep.append(None)
                                 # TP decode: rank-0 builds from ``kv_transfer_params``;
                                 # other ranks may miss the dict — broadcast lens list.
                                 tg = get_tp_group()
@@ -1270,9 +1299,29 @@ class NPUModelRunner(GPUModelRunner):
                                         else None,
                                         src=0,
                                     )
+                                    tmp_keep = tg.broadcast_object(
+                                        tmp_keep
+                                        if get_tensor_model_parallel_rank() == 0
+                                        else None,
+                                        src=0,
+                                    )
+                                    extra_payload = tg.broadcast_object(
+                                        extra_payload
+                                        if get_tensor_model_parallel_rank() == 0
+                                        else None,
+                                        src=0,
+                                    )
                                 if tmp_lens and not all(v < 0 for v in tmp_lens):
                                     setattr(meta_i, "dynamic_kv_seq_lens_list",
                                             tmp_lens)
+                                if any_rebuild_full and isinstance(tmp_keep, list):
+                                    # Replace None with [] to keep list shape.
+                                    keep_out: list[list[int]] = [
+                                        (x if isinstance(x, list) else []) for x in tmp_keep
+                                    ]
+                                    setattr(meta_i, "dynamic_kv_keep_indices_list", keep_out)
+                                    if isinstance(extra_payload, dict):
+                                        setattr(meta_i, "dynamic_kv_extra", extra_payload)
                     attn_metadata[layer_name] = meta_i
 
         # update global cos, sin
