@@ -169,11 +169,178 @@ def _compute_token_scores_old(
     # [Hkv, 1] and broadcast correctly to [Hkv, rep].
     kg = key_full.permute(1, 2, 0).unsqueeze(1)  # [Hkv, 1, D, L]
     attn_logits = torch.matmul(qg, kg).reshape(Hq, W, L) * scale
+    # Apply causal mask within the tail window (align with open-source DynamicKV).
+    # Only affects attention from the last W queries to the last W keys.
+    if W > 0 and L >= W:
+        # mask[i, j] = -inf when j > i (future), else 0
+        mask = torch.full((W, W),
+                          torch.finfo(attn_logits.dtype).min,
+                          device=attn_logits.device,
+                          dtype=attn_logits.dtype)
+        mask = torch.triu(mask, diagonal=1)
+        attn_logits[:, :, L - W:L] = attn_logits[:, :, L - W:L] + mask[None, :, :]
     attn = torch.nn.functional.softmax(attn_logits, dim=-1, dtype=torch.float32).to(
         query_last.dtype
     )
     token_scores = attn.sum(dim=1).sum(dim=0)  # [L]
     return token_scores[: L - W]
+
+
+def _compute_token_scores_old_per_kv_head(
+    query_last: torch.Tensor,  # [W, Hq, D]
+    key_full: torch.Tensor,  # [L, Hkv, D]
+    window_size: int,
+) -> torch.Tensor:
+    """Return token importance scores for old tokens per KV head: [Hkv, old_len]."""
+    assert query_last.dim() == 3 and key_full.dim() == 3
+    W = int(window_size)
+    L = int(key_full.shape[0])
+    if W <= 0 or L <= W:
+        return key_full.new_zeros((int(key_full.shape[1]), 0))
+
+    Hq = int(query_last.shape[1])
+    Hkv = int(key_full.shape[1])
+    D = int(query_last.shape[2])
+    assert key_full.shape[2] == D
+    assert Hq % Hkv == 0
+
+    scale = 1.0 / math.sqrt(D)
+    rep = Hq // Hkv
+    # q: [Hkv, rep, W, D]
+    qg = query_last.view(W, Hkv, rep, D).permute(1, 2, 0, 3)
+    # k: [Hkv, 1, D, L] (broadcast across rep)
+    kg = key_full.permute(1, 2, 0).unsqueeze(1)
+    attn_logits = torch.matmul(qg, kg) * scale  # [Hkv, rep, W, L]
+    # Apply causal mask within the tail window (align with open-source DynamicKV).
+    if W > 0 and L >= W:
+        mask = torch.full((W, W),
+                          torch.finfo(attn_logits.dtype).min,
+                          device=attn_logits.device,
+                          dtype=attn_logits.dtype)
+        mask = torch.triu(mask, diagonal=1)
+        attn_logits[:, :, :, L - W:L] = attn_logits[:, :, :, L - W:L] + mask[None, None, :, :]
+    attn = torch.nn.functional.softmax(attn_logits, dim=-1, dtype=torch.float32).to(
+        query_last.dtype
+    )
+    # Sum over rep and W -> [Hkv, L]
+    token_scores = attn.sum(dim=1).sum(dim=1)
+    return token_scores[:, : L - W]
+
+
+def scores_and_indices_old_per_kv_head(
+    *,
+    query_last: torch.Tensor,  # [W, Hq, D]
+    key_full: torch.Tensor,  # [L, Hkv, D]
+    cfg: DynamicKVConfig,
+    budget_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-layer step (open-source style): per-head scores + per-head top-k indices.
+
+    Returns:
+      - scores_old: [Hkv, old_len]
+      - indices_old: [Hkv, k] (NOT sorted chronologically; matches upstream behavior)
+    """
+    W = int(cfg.window_size)
+    L = int(key_full.shape[0])
+    Hkv = int(key_full.shape[1])
+    if W <= 0 or L <= W or query_last.numel() == 0:
+        return (
+            key_full.new_zeros((Hkv, 0)),
+            key_full.new_zeros((Hkv, 0), dtype=torch.long),
+        )
+
+    old_len = L - W
+    k = int(min(int(budget_size), old_len))
+    scores_old = _compute_token_scores_old_per_kv_head(query_last, key_full, W)  # [Hkv, old_len]
+    if cfg.pooling != "none" and int(cfg.kernel_size) > 1 and old_len > 0:
+        pooled: list[torch.Tensor] = []
+        for h in range(Hkv):
+            pooled.append(_pool_1d(scores_old[h], cfg.pooling, int(cfg.kernel_size)))
+        scores_old = torch.stack(pooled, dim=0)
+    if k <= 0:
+        indices_old = key_full.new_zeros((Hkv, 0), dtype=torch.long)
+    else:
+        indices_old = torch.topk(scores_old, k=k, dim=-1).indices  # [Hkv, k]
+    return scores_old, indices_old
+
+
+def update_and_reset_budget_per_kv_head(
+    *,
+    per_layer_scores_old: List[torch.Tensor],  # each [Hkv, old_len]
+    per_layer_k_budget: List[torch.Tensor],
+    per_layer_v_budget: List[torch.Tensor],
+    cfg: DynamicKVConfig,
+    budget_size: int,
+) -> List[int]:
+    """Cross-layer budget reallocation (open-source density) for per-head scores.
+
+    Matches upstream `tk = base * head_num * num_layers` behavior by flattening
+    `[layer, head, token]` volume.
+    Returns per-layer old-token counts (excluding window tokens).
+    """
+    num_layers = int(cfg.num_hidden_layers)
+    base = int(cfg.base)
+    if num_layers <= 0 or base <= 0:
+        return [0] * max(num_layers, 0)
+
+    need_fill_kv = base * num_layers
+    min_budget = int(cfg.radio_min * base)
+
+    valid_scores = [s for s in per_layer_scores_old if isinstance(s, torch.Tensor)]
+    if len(valid_scores) != num_layers:
+        return [base] * num_layers
+
+    # Align old_len across layers by min.
+    old_lens = [int(s.shape[-1]) for s in per_layer_scores_old]
+    min_old_len = min(old_lens) if old_lens else 0
+    if min_old_len <= 0:
+        return [0] * num_layers
+
+    # Align head count by min (defensive; should be constant).
+    head_lens = [int(s.shape[0]) for s in per_layer_scores_old]
+    H = min(head_lens) if head_lens else 0
+    if H <= 0:
+        return [base] * num_layers
+
+    gather_attn = torch.stack(
+        [s[:H, :min_old_len].to(torch.float32) for s in per_layer_scores_old], dim=0
+    )  # [L, H, old_len]
+
+    flat = gather_attn.reshape(-1)
+    flat_n = int(flat.numel())
+    tk = max(1, min(int(base) * int(H) * int(num_layers), flat_n))
+    if tk <= 0:
+        return [base] * num_layers
+
+    topk_indices = torch.topk(flat, k=tk, dim=0).indices
+    dim1 = H * min_old_len
+    indices_0 = torch.div(topk_indices, dim1, rounding_mode="floor")  # layer ids
+    counts = torch.bincount(indices_0, minlength=num_layers).to(torch.float32)
+    if float(counts.sum().item()) <= 0:
+        counts = torch.ones((num_layers,), device=counts.device, dtype=counts.dtype)
+
+    norm = counts / counts.sum()
+    budget_length_fix = [int((budget_size * t).item()) for t in norm]
+
+    ss_radio = (sum(budget_length_fix) / need_fill_kv) if need_fill_kv > 0 else 1.0
+    if ss_radio <= 0:
+        ss_radio = 1.0
+    budget_length_fix = [int(kv // ss_radio) for kv in budget_length_fix]
+
+    diff = need_fill_kv - sum(budget_length_fix)
+    budget_length_fix[-1] += diff
+
+    budget_length_fix = [max(min_budget, int(x)) for x in budget_length_fix]
+    diff = need_fill_kv - sum(budget_length_fix)
+    budget_length_fix[-1] += diff
+
+    out: List[int] = []
+    for i in range(num_layers):
+        max_old = max(int(per_layer_k_budget[i].shape[0]) - int(cfg.window_size), 0)
+        out.append(int(min(budget_length_fix[i], max_old)))
+    diff = need_fill_kv - sum(out)
+    out[-1] = int(max(0, out[-1] + diff))
+    return out
 
 
 def scores_and_indices_old(
