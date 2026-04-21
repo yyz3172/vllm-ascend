@@ -236,6 +236,59 @@ def run_offload_rewrite_and_build_updates(
     C = int(max_capacity)
     if C <= 0:
         return {}
+    # Skip rewrite when compression delta is too small; this avoids triggering
+    # potentially fragile packed-prefix semantics for negligible memory/transfer wins.
+    # NOTE: 128 matches vLLM-Ascend supported paged-attn block size.
+    min_rewrite_delta = 1
+
+    def _full_prefix_update(rid: str, L: int) -> None:
+        updates[rid] = {
+            "dynamic_kv": _dynamic_kv_payload_full_prefix(
+                num_layers=num_layers,
+                layer_indices=layer_indices_all,
+                L=L,
+            )
+        }
+
+    def _validate_payload_or_fallback(
+        *,
+        rid: str,
+        L: int,
+        full_lens: list[int],
+        full_idx: list[list[int]],
+    ) -> bool:
+        """Return True if payload is consistent; otherwise overwrite as full prefix."""
+        try:
+            if len(full_lens) != num_layers or len(full_idx) != num_layers:
+                _full_prefix_update(rid, L)
+                return False
+            for li in layer_indices_all:
+                kv_len = int(full_lens[li])
+                idx = full_idx[li]
+                if not isinstance(idx, list):
+                    _full_prefix_update(rid, L)
+                    return False
+                if kv_len != len(idx):
+                    _full_prefix_update(rid, L)
+                    return False
+                if kv_len <= 0:
+                    _full_prefix_update(rid, L)
+                    return False
+                if kv_len > L:
+                    _full_prefix_update(rid, L)
+                    return False
+                # Must be strictly increasing and within [0, L).
+                last = -1
+                for x in idx:
+                    xi = int(x)
+                    if xi < 0 or xi >= L or xi <= last:
+                        _full_prefix_update(rid, L)
+                        return False
+                    last = xi
+            return True
+        except Exception:
+            _full_prefix_update(rid, L)
+            return False
 
     cfg = DynamicKVConfig(
         num_hidden_layers=int(num_layers),
@@ -289,14 +342,8 @@ def run_offload_rewrite_and_build_updates(
             continue
 
         # Entire prompt fits in ``prompt_kv_len_budget``: no cross-layer budget / lift.
-        if L <= C:
-            updates[rid] = {
-                "dynamic_kv": _dynamic_kv_payload_full_prefix(
-                    num_layers=num_layers,
-                    layer_indices=layer_indices_all,
-                    L=L,
-                )
-            }
+        if L <= C or (L - C) < min_rewrite_delta:
+            _full_prefix_update(rid, L)
             continue
 
         per_layer_q = q_last_store.get(rid) or {}
@@ -312,13 +359,7 @@ def run_offload_rewrite_and_build_updates(
                 "yes",
             ):
                 raise RuntimeError(msg)
-            updates[rid] = {
-                "dynamic_kv": _dynamic_kv_payload_full_prefix(
-                    num_layers=num_layers,
-                    layer_indices=layer_indices_all,
-                    L=L,
-                )
-            }
+            _full_prefix_update(rid, L)
             continue
 
         # Tail indices are always kept.
@@ -477,6 +518,7 @@ def run_offload_rewrite_and_build_updates(
                 "per_layer_keep_indices": full_idx,
             }
         }
+        _validate_payload_or_fallback(rid=rid, L=L, full_lens=full_lens, full_idx=full_idx)
 
     return updates
 

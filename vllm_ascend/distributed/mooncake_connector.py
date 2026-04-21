@@ -1201,6 +1201,14 @@ class MooncakeConnectorScheduler:
                                     "per_layer_kv_lens": per_layer0,
                                     "per_layer_keep_indices": dyn0.get("per_layer_keep_indices"),
                                 }
+                                # Offload impl: worker may attach block_table-ordered prefix blocks.
+                                # Preserve it so PD shrink can avoid allocator-order slicing.
+                                try:
+                                    prb = dyn0.get("prefix_remote_block_ids")
+                                    if isinstance(prb, list) and prb:
+                                        dynamic_kv_payload["prefix_remote_block_ids"] = prb
+                                except Exception:
+                                    pass
                                 try:
                                     lens_i = [int(x) for x in per_layer0]
                                     pos = [x for x in lens_i if x > 0]
@@ -1322,7 +1330,12 @@ class MooncakeConnectorScheduler:
 
         # DynamicKV offload: shrink PD transfer to the prefix physical blocks that
         # hold compressed KV (worker packs into slots 0..kv_len-1). Requires
-        # `block_ids` to follow logical prompt block order (vLLM default).
+        # `block_ids` to follow logical prompt block order (NOT guaranteed).
+        #
+        # IMPORTANT: The only reliable logical-prefix order is `block_table`
+        # (per-request page table). Worker offload attaches a block_table-ordered
+        # prefix list as `dynamic_kv.prefix_remote_block_ids`; prefer it to avoid
+        # sending wrong blocks and producing gibberish.
         if (
             isinstance(dynamic_kv_payload, dict)
             and self._dynamickv_enabled
@@ -1331,25 +1344,15 @@ class MooncakeConnectorScheduler:
         ):
             try:
                 pl = dynamic_kv_payload.get("per_layer_kv_lens")
-                if isinstance(pl, list) and pl:
-                    lens_pos: list[int] = []
-                    for x in pl:
-                        try:
-                            xi = int(x)
-                        except Exception:
-                            continue
-                        if xi > 0:
-                            lens_pos.append(xi)
-                    if lens_pos:
+                prefix_rb = dynamic_kv_payload.get("prefix_remote_block_ids")
+                if isinstance(prefix_rb, list) and prefix_rb:
+                    # Use worker-provided, block_table-ordered prefix blocks.
+                    prefix_rb_int = [int(x) for x in prefix_rb if int(x) >= 0]
+                    if prefix_rb_int:
+                        send_block_ids = prefix_rb_int
+                        send_num_prompt_blocks = int(len(send_block_ids))
                         bs = int(self.block_size)
-                        max_len = int(max(lens_pos))
-                        n_transfer = (
-                            int(math.ceil(max_len / bs)) if bs > 0 else len(send_block_ids)
-                        )
-                        n_transfer = max(1, min(n_transfer, len(send_block_ids)))
-                        if n_transfer < len(send_block_ids):
-                            send_block_ids = send_block_ids[:n_transfer]
-                            send_num_prompt_blocks = int(n_transfer)
+                        if isinstance(pl, list) and pl:
                             rb = list(send_block_ids)
                             pl_nb: list[int] = []
                             pl_rb: list[list[int]] = []
@@ -1362,16 +1365,69 @@ class MooncakeConnectorScheduler:
                                     pl_nb.append(0)
                                     pl_rb.append([])
                                     continue
-                                nb = (
-                                    int(math.ceil(Li / bs)) if bs > 0 else 0
-                                )
+                                nb = int(math.ceil(Li / bs)) if bs > 0 else 0
                                 nb = min(nb, len(rb))
                                 pl_nb.append(nb)
                                 pl_rb.append(rb[:nb])
                             dynamic_kv_payload["per_layer_num_prompt_blocks"] = pl_nb
                             dynamic_kv_payload["per_layer_remote_block_ids"] = pl_rb
+                        # Log at info only when transfer footprint shrinks.
+                        if len(send_block_ids) < len(computed_block_ids):
                             logger.info(
-                                "[DynamicKV][PD] offload shrink transfer: request_id=%s "
+                                "[DynamicKV][PD] offload shrink transfer(block_table): request_id=%s "
+                                "blocks %d -> %d",
+                                request.request_id,
+                                len(computed_block_ids),
+                                len(send_block_ids),
+                            )
+                        else:
+                            logger.debug(
+                                "[DynamicKV][PD] offload shrink transfer(block_table,no_shrink): request_id=%s "
+                                "blocks %d -> %d",
+                                request.request_id,
+                                len(computed_block_ids),
+                                len(send_block_ids),
+                            )
+                elif isinstance(pl, list) and pl:
+                    # Fallback (legacy): shrink by slicing allocator-ordered block_ids.
+                    # This can be incorrect; keep it only when worker did not attach
+                    # block_table-ordered prefix blocks.
+                    lens_pos: list[int] = []
+                    for x in pl:
+                        try:
+                            xi = int(x)
+                        except Exception:
+                            continue
+                        if xi > 0:
+                            lens_pos.append(xi)
+                    if lens_pos:
+                        bs = int(self.block_size)
+                        max_len = int(max(lens_pos))
+                        n_transfer = int(math.ceil(max_len / bs)) if bs > 0 else len(send_block_ids)
+                        n_transfer = max(1, min(n_transfer, len(send_block_ids)))
+                        if n_transfer < len(send_block_ids):
+                            send_block_ids = send_block_ids[:n_transfer]
+                            send_num_prompt_blocks = int(n_transfer)
+                            rb = list(send_block_ids)
+                            pl_nb = []
+                            pl_rb = []
+                            for L in pl:
+                                try:
+                                    Li = int(L)
+                                except Exception:
+                                    Li = -1
+                                if Li <= 0:
+                                    pl_nb.append(0)
+                                    pl_rb.append([])
+                                    continue
+                                nb = int(math.ceil(Li / bs)) if bs > 0 else 0
+                                nb = min(nb, len(rb))
+                                pl_nb.append(nb)
+                                pl_rb.append(rb[:nb])
+                            dynamic_kv_payload["per_layer_num_prompt_blocks"] = pl_nb
+                            dynamic_kv_payload["per_layer_remote_block_ids"] = pl_rb
+                            logger.warning(
+                                "[DynamicKV][PD] offload shrink transfer(allocator_fallback): request_id=%s "
                                 "blocks %d -> %d (max_kv_len=%d)",
                                 request.request_id,
                                 len(computed_block_ids),

@@ -1838,6 +1838,52 @@ class NPUModelRunner(GPUModelRunner):
                                     radio_min=float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1)),
                                     num_layers=num_layers,
                                 )
+                                # Attach block_table-ordered prefix physical blocks for PD shrink.
+                                # NOTE: Do NOT use allocator-ordered `block_ids[:n]` to shrink:
+                                # only `block_tables` represents logical prefix order.
+                                try:
+                                    bs = int(getattr(self.vllm_config.cache_config, "block_size", 0) or 0)
+                                    if bs > 0 and isinstance(dynkv_updates, dict) and dynkv_updates:
+                                        # Normalize block_tables to CPU list-of-lists.
+                                        bt = block_tables
+                                        if isinstance(bt, torch.Tensor):
+                                            bt_cpu = bt.detach().to("cpu")
+                                            bt_rows = bt_cpu.tolist()
+                                        else:
+                                            bt_rows = None
+                                        if isinstance(bt_rows, list) and bt_rows:
+                                            for ridx, rid in enumerate(ctx.req_ids):
+                                                upd = dynkv_updates.get(rid)
+                                                if not isinstance(upd, dict):
+                                                    continue
+                                                dyn = upd.get("dynamic_kv")
+                                                if not isinstance(dyn, dict):
+                                                    continue
+                                                pl = dyn.get("per_layer_kv_lens")
+                                                if not isinstance(pl, list) or not pl:
+                                                    continue
+                                                try:
+                                                    lens_pos = [int(x) for x in pl if int(x) > 0]
+                                                except Exception:
+                                                    lens_pos = []
+                                                if not lens_pos:
+                                                    continue
+                                                max_len = int(max(lens_pos))
+                                                n_transfer = int(math.ceil(max_len / bs)) if max_len > 0 else 0
+                                                if n_transfer <= 0:
+                                                    continue
+                                                if ridx >= len(bt_rows) or not isinstance(bt_rows[ridx], list):
+                                                    continue
+                                                row = [int(x) for x in bt_rows[ridx] if int(x) >= 0]
+                                                prefix = row[:n_transfer]
+                                                if not prefix:
+                                                    continue
+                                                dyn["prefix_remote_block_ids"] = prefix
+                                except Exception:
+                                    logger.info(
+                                        "[DynamicKV][offload] attach prefix_remote_block_ids skipped",
+                                        exc_info=True,
+                                    )
             except Exception:
                 logger.exception("[DynamicKV][offload] post-prefill rewrite failed")
             finally:
