@@ -24,14 +24,14 @@ DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对�
 
 ### 1.2 压缩策略：怎么决定“重要 token”？
 
-以“最后的 window 个 query”（最近 token）为查询，计算它们对历史 keys 的注意力权重；把历史 token 按“被注意力关注的总量”排序，取 top-k：
+以“最后的 window_size 个 query”（最近 token）为查询，计算它们对历史 keys 的注意力权重；把历史 token 按“被注意力关注的总量”排序，取 top-k：
 
 - **旧 token（old）**：按重要性保留 top-k
-- **新 token（cur/window）**：最近 window 全保留
+- **新 token（cur/window）**：最近 window_size 全保留
 
 最终每层保留的 token 数量为：
 
-- \(kv\_len\_layer = old\_budget\_layer + window\)
+- \(kv\_len\_layer = old\_budget\_layer + window_size\)
 
 ### 1.3 分层的关键：跨层预算 + 周期重分配
 
@@ -53,7 +53,7 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 
 - **enabled**：是否启用 DynamicKV（默认 `false`）
 - **model_types**：允许启用的 HF `model_type` 列表（默认 `["mistral"]`）
-- **window**：窗口大小 window（默认 `16`）
+- **window_size**：窗口大小 window（默认 `16`）
 - **prompt_kv_len_budget**：每层 KV 长度的预算目标（默认 `512`，通常约等于 \(old + window\_size\) 的目标值）。**不是硬上限**：个别层可能 \(kv\_len > prompt\_kv\_len\_budget\)，硬上限仍为 prompt_len
 - **pooling**：对 token importance 做 1D 平滑（`none|avgpool|maxpool`，默认 `none`）
 - **kernel_size**：pooling 的 kernel（默认 `1`）

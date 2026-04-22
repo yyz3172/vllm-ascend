@@ -26,9 +26,7 @@ from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
                                               cap_keep_indices_chronological,
                                               gather_kv_from_paged_cache_batched,
                                               scores_and_indices_old,
-                                              scores_and_indices_old_per_kv_head,
                                               update_and_reset_budget)
-from vllm_ascend.attention.dynamic_kv import update_and_reset_budget_per_kv_head
 
 
 @dataclass
@@ -272,8 +270,7 @@ def run_offload_rewrite_and_build_updates(
                     return False
                 # `per_layer_keep_indices` is optional in offload mode: decode uses
                 # packed-prefix layout and only needs `per_layer_kv_lens`.
-                # When per-head selection is enabled, there is no single
-                # chronological keep list in original prompt space, so idx can be [].
+                # Keep-indices may be omitted (empty) to reduce payload size.
                 if idx and kv_len != len(idx):
                     _full_prefix_update(rid, L)
                     return False
@@ -381,7 +378,8 @@ def run_offload_rewrite_and_build_updates(
         cand_old = min(int(cfg.radio_max * cfg.base), int(old_len))
 
         per_layer_scores_old: list[torch.Tensor] = []
-        per_layer_indices_old: list[torch.Tensor] = []  # each [Hkv, cand_old]
+        # Shared (open-source style): each [cand_old]
+        per_layer_indices_old: list[torch.Tensor] = []
         per_layer_k_full: list[torch.Tensor] = []
         per_layer_v_full: list[torch.Tensor] = []
         per_layer_slots_full: list[torch.Tensor] = []
@@ -406,8 +404,8 @@ def run_offload_rewrite_and_build_updates(
             v_full = v_packed[start:end]
             slots_full = slots_packed[start:end].to(torch.long)
 
-            # Per-KV-head scores over old tokens + per-head topk indices.
-            scores_old, idx_old = scores_and_indices_old_per_kv_head(
+            # Shared (open-source style): head-aggregated scores and one index list.
+            scores_old, idx_old = scores_and_indices_old(
                 query_last=q_last,
                 key_full=k_full,
                 cfg=cfg,
@@ -428,15 +426,13 @@ def run_offload_rewrite_and_build_updates(
             continue
 
         # Reallocate budgets across layers for this request.
-        # Allocate per-layer budgets via per-head cross-layer density (upstream style).
         # Dummy shapes only used to cap max_old.
         dummy = []
         for s in per_layer_scores_old:
             old_len_i = int(s.shape[-1]) if isinstance(s, torch.Tensor) and s.dim() == 2 else int(s.numel())
-            dummy.append(
-                torch.empty((old_len_i + int(W), 1, 1), device=s.device, dtype=torch.float16)
-            )
-        per_layer_old_budget = update_and_reset_budget_per_kv_head(
+            dummy.append(torch.empty((old_len_i + int(W), 1, 1), device=s.device, dtype=torch.float16))
+        # Shared mode: allocate budgets from aggregated scores (open-source style).
+        per_layer_old_budget = update_and_reset_budget(
             per_layer_scores_old=per_layer_scores_old,
             per_layer_k_budget=dummy,
             per_layer_v_budget=dummy,
@@ -456,58 +452,42 @@ def run_offload_rewrite_and_build_updates(
         kv_len_by_layer: dict[int, int] = {}
         for local_i, (li, _k_cache, _v_cache) in enumerate(layer_items):
             old_budget = int(per_layer_old_budget[li])
-            idx_old_h = per_layer_indices_old[local_i]  # [Hkv, cand_old]
+            idx_old = per_layer_indices_old[local_i]  # [cand_old]
             k_full = per_layer_k_full[local_i]
             v_full = per_layer_v_full[local_i]
             slots_full = per_layer_slots_full[local_i]
             Hkv = int(k_full.shape[1])
             W_eff = int(tail_idx.numel())
-            old_budget_eff = max(0, min(int(old_budget), int(idx_old_h.shape[1])))
+            old_budget_eff = max(0, min(int(old_budget), int(idx_old.shape[0])))
             kv_len = int(old_budget_eff + W_eff)
             if kv_len <= 0 or Hkv <= 0:
                 per_layer_keep_indices.append([])
                 per_layer_kv_lens.append(0)
                 continue
             # Flatten paged cache to [num_blocks*block_size, H, D]
-            # NOTE: Some kernels may read within the last block beyond `context_lens`
-            # due to block-granularity; we zero-pad the remainder of the last block
-            # to prevent stale KV from leaking into attention.
-            block_size = int(_k_cache.shape[1])
             k_flat = _k_cache.reshape(-1, _k_cache.shape[-2], _k_cache.shape[-1])
             v_flat = _v_cache.reshape(-1, _v_cache.shape[-2], _v_cache.shape[-1])
-            # Build packed KV tensor per KV head:
-            # - old part: per-head top-k indices (order within old part does not matter)
-            # - tail part: chronological tail window (shared across heads)
-            # Final packed tensor has shape [kv_len, Hkv, D].
-            idx_old_keep = idx_old_h[:, :old_budget_eff].to(torch.long) if old_budget_eff > 0 else idx_old_h[:, :0].to(torch.long)
+
+            # Shared packed-prefix (open-source style).
             tail_keep = tail_idx.to(torch.long)
-            k_heads: list[torch.Tensor] = []
-            v_heads: list[torch.Tensor] = []
-            for h in range(Hkv):
-                if old_budget_eff > 0:
-                    k_old = k_full.index_select(0, idx_old_keep[h])[:, h, :]
-                    v_old = v_full.index_select(0, idx_old_keep[h])[:, h, :]
-                else:
-                    k_old = k_full[:0, h, :]
-                    v_old = v_full[:0, h, :]
-                if W_eff > 0:
-                    k_tail = k_full.index_select(0, tail_keep)[:, h, :]
-                    v_tail = v_full.index_select(0, tail_keep)[:, h, :]
-                else:
-                    k_tail = k_full[:0, h, :]
-                    v_tail = v_full[:0, h, :]
-                k_heads.append(torch.cat([k_old, k_tail], dim=0))
-                v_heads.append(torch.cat([v_old, v_tail], dim=0))
-            k_packed = torch.stack(k_heads, dim=0).transpose(0, 1).contiguous()
-            v_packed = torch.stack(v_heads, dim=0).transpose(0, 1).contiguous()
-            per_layer_kv_lens.append(kv_len)
-            kv_len_by_layer[int(li)] = int(kv_len)
-            slots_keep = slots_full[:kv_len]
+            idx_old_keep = idx_old[:old_budget_eff].to(torch.long) if old_budget_eff > 0 else idx_old[:0].to(torch.long)
+            keep_sorted, _ = cap_keep_indices_chronological(
+                idx_old=idx_old_keep,
+                old_budget=old_budget_eff,
+                tail_idx=tail_keep,
+                cap=L,
+                device=idx_old.device if isinstance(idx_old, torch.Tensor) else k_full.device,
+            )
+            k_packed = k_full.index_select(0, keep_sorted)
+            v_packed = v_full.index_select(0, keep_sorted)
+            kv_len_i = int(k_packed.shape[0])
+            per_layer_kv_lens.append(kv_len_i)
+            kv_len_by_layer[int(li)] = int(kv_len_i)
+            slots_keep = slots_full[:kv_len_i]
             k_flat.index_copy_(0, slots_keep.to(k_flat.device), k_packed)
             v_flat.index_copy_(0, slots_keep.to(v_flat.device), v_packed)
-            # For debugging/PD export: keep_indices in original prompt space is
-            # no longer a single chronological list under per-head selection.
-            # Keep it empty to avoid misinterpretation; decode uses kv_len only.
+            # For debugging/PD export: keep_indices in original prompt space is optional.
+            # We keep it empty to avoid misinterpretation; decode uses kv_len only.
             per_layer_keep_indices.append([])
 
         # Zero-pad within PD transfer upper bound.
