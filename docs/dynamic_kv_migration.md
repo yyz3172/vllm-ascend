@@ -43,8 +43,12 @@ DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对�
 
 ```
 combined_score = token_被选中的head数 × token_聚合importance
-indices = combined_score.topk(budget_size)
+indices = combined_score.topk(budget_size)  # 保持重要性顺序
 ```
+
+**indices 顺序**：
+- 中间态按**重要性顺序**存储（与开源一致），截断 `indices[:budget]` 保留最重要的
+- 最终输出通过 `cap_keep_indices_chronological` 恢复**时间顺序**，用于 KV 写回
 
 这样既保持了开源的跨层预算分配密度，又兼容 vLLM 的 Paged KV Cache 语义。
 

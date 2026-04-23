@@ -370,7 +370,8 @@ def scores_and_indices_old(
         indices_old = key_full.new_zeros((0,), dtype=torch.long)
     else:
         indices_old = torch.topk(scores_old, k=budget_size, dim=0).indices
-        indices_old, _ = torch.sort(indices_old)
+        # Keep importance order (no sort): truncation idx[:budget] keeps most important.
+        # Final chronological order is restored by cap_keep_indices_chronological.
     return scores_old, indices_old
 
 
@@ -390,7 +391,7 @@ def scores_and_indices_old_perhead_aggregated(
 
     Returns:
       - scores_old: [Hkv, old_len] (per-head, for cross-layer topk)
-      - indices_old: [k] (aggregated across heads, sorted chronologically)
+      - indices_old: [k] (aggregated across heads, importance order for truncation)
     """
     W = int(cfg.window_size)
     L = int(key_full.shape[0])
@@ -442,8 +443,8 @@ def scores_and_indices_old_perhead_aggregated(
     # Select top-k tokens by combined score
     k_final = min(budget_size, old_len)
     indices_aggregated = torch.topk(combined_score, k=k_final, dim=0).indices
-    # Sort chronologically for consistent KV layout
-    indices_aggregated, _ = torch.sort(indices_aggregated)
+    # Keep importance order (no sort): truncation idx[:budget] keeps most important.
+    # Final chronological order is restored by cap_keep_indices_chronological.
 
     return scores_old, indices_aggregated.to(torch.long)
 
