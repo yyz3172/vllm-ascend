@@ -172,6 +172,14 @@ class AscendConfig:
         # DynamicKV knobs (optional; radio_* match upstream reference).
         self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
         self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
+        # DynamicKV validation mode for verifying token selection effectiveness.
+        # - "none": normal compression (default)
+        # - "mask": decode uses full KV + attention mask (npu_fusion_attention)
+        # - "zero": prefill zeros unimportant K/V in paged cache; PD transfers that
+        #   cache; decode uses normal paged attention (no fusion mask path).
+        # Support both "validation_mode" and "dynamickv_validation_mode" keys.
+        _vm = dyn.get("validation_mode", dyn.get("dynamickv_validation_mode", "none"))
+        self.dynamic_kv_validation_mode = str(_vm if _vm is not None else "none")
         # DynamicKV currently rewrites paged KV content on prefill. Prefix caching
         # assumes KV blocks are immutable given the same token prefix. To avoid
         # incorrect reuse/mismatched DynamicKV exports on repeated requests, we

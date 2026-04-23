@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
                                               cap_keep_indices_chronological,
                                               gather_kv_from_paged_cache_batched,
+                                              save_validation_mask,
                                               scores_and_indices_old,
                                               scores_and_indices_old_perhead_aggregated,
                                               update_and_reset_budget,
@@ -224,6 +225,7 @@ def run_offload_rewrite_and_build_updates(
     radio_max: float,
     radio_min: float,
     num_layers: int,
+    validation_mode: str = "none",
 ) -> dict[str, dict[str, Any]]:
     """
     Returns kv_transfer_params_updates payload:
@@ -444,6 +446,110 @@ def run_offload_rewrite_and_build_updates(
         if len(per_layer_old_budget) != num_layers:
             # Fallback: uniform.
             per_layer_old_budget = [cand_old] * num_layers
+
+        # ``mask``: full KV + sparse indices for decode ``npu_fusion_attention`` mask.
+        # ``zero``: physically zero unimportant K/V in paged cache on this worker; decode
+        # uses normal paged attention (no side-channel mask).
+        if str(validation_mode) in ("mask", "zero"):
+            is_mask = str(validation_mode) == "mask"
+            important_indices_by_layer: list[list[int]] = [[] for _ in range(num_layers)]
+            important_n_by_layer: list[int] = []
+            layer_idx_for_n: list[int] = []
+            for local_i, (li, _k_cache, _v_cache) in enumerate(layer_items):
+                old_budget = int(per_layer_old_budget[li])
+                idx_old = per_layer_indices_old[local_i]
+                k_full = per_layer_k_full[local_i]
+                slots_full = per_layer_slots_full[local_i]
+                Hkv = int(k_full.shape[1])
+                W_eff = int(tail_idx.numel())
+                old_budget_eff = max(0, min(int(old_budget), int(idx_old.shape[0])))
+                if Hkv <= 0 or W_eff <= 0:
+                    continue
+                tail_keep = tail_idx.to(torch.long)
+                idx_old_keep = (
+                    idx_old[:old_budget_eff].to(torch.long)
+                    if old_budget_eff > 0
+                    else idx_old[:0].to(torch.long)
+                )
+                keep_sorted, _ = cap_keep_indices_chronological(
+                    idx_old=idx_old_keep,
+                    old_budget=old_budget_eff,
+                    tail_idx=tail_keep,
+                    cap=L,
+                    device=idx_old.device
+                    if isinstance(idx_old, torch.Tensor)
+                    else k_full.device,
+                )
+                important_mask = torch.zeros(L, dtype=torch.bool, device=k_full.device)
+                if keep_sorted.numel() > 0:
+                    important_mask[keep_sorted.to(torch.long)] = True
+                if is_mask:
+                    save_validation_mask(rid, int(li), important_mask)
+                    nz = torch.where(important_mask)[0]
+                    important_indices_by_layer[int(li)] = [int(x) for x in nz.tolist()]
+                else:
+                    k_flat = _k_cache.reshape(
+                        -1, _k_cache.shape[-2], _k_cache.shape[-1]
+                    )
+                    v_flat = _v_cache.reshape(
+                        -1, _v_cache.shape[-2], _v_cache.shape[-1]
+                    )
+                    unimportant = ~important_mask
+                    if unimportant.any():
+                        sb = slots_full[unimportant].to(torch.long).flatten()
+                        sb = torch.unique(sb)
+                        if sb.numel() > 0:
+                            zblk = k_flat.new_zeros(
+                                (int(sb.numel()), int(k_flat.shape[-2]), int(k_flat.shape[-1]))
+                            )
+                            k_flat.index_copy_(0, sb.to(k_flat.device), zblk)
+                            v_flat.index_copy_(0, sb.to(v_flat.device), zblk)
+                important_n_by_layer.append(int(important_mask.sum().item()))
+                layer_idx_for_n.append(int(li))
+            if is_mask:
+                for li in range(num_layers):
+                    if li in layer_indices_all and not important_indices_by_layer[li]:
+                        important_indices_by_layer[li] = list(range(int(L)))
+            _full_prefix_update(rid, L)
+            _val_log = True
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+
+                _val_log = int(get_tensor_model_parallel_rank()) == 0
+            except Exception:
+                pass
+            if _val_log and important_n_by_layer:
+                pairs = ", ".join(
+                    f"L{lj}={nj}" for lj, nj in zip(layer_idx_for_n, important_n_by_layer)
+                )
+                extra = (
+                    "PD mask indices attached"
+                    if is_mask
+                    else "unimportant slots zeroed in paged KV (prefill)"
+                )
+                logger.info(
+                    "[DynamicKV][offload] validation_mode=%s: skip KV pack, "
+                    "full_prefix metadata L=%d request_id=%s important_tokens_per_layer: %s (%s)",
+                    str(validation_mode),
+                    L,
+                    rid,
+                    pairs,
+                    extra,
+                )
+            if is_mask:
+                try:
+                    upd = updates.get(rid)
+                    if isinstance(upd, dict):
+                        dynu = upd.get("dynamic_kv")
+                        if isinstance(dynu, dict):
+                            dynu["per_layer_important_indices"] = (
+                                important_indices_by_layer
+                            )
+                except Exception:
+                    pass
+            continue
 
         per_layer_keep_indices: list[list[int]] = []
         per_layer_kv_lens: list[int] = []

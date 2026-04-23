@@ -81,6 +81,10 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **pooling**：对 token importance 做 1D 平滑（`none|avgpool|maxpool`，默认 `avgpool`）
 - **kernel_size**：pooling 的 kernel（默认 `7`）
 - **radio_max / radio_min**：跨层重分配的上/下限相关系数（默认 `10.0/0.1`，与上游参考实现一致）
+- **validation_mode**：验证模式，用于验证 token 选择策略的有效性（默认 `none`）；可与配置键 `dynamickv_validation_mode` 二选一
+  - `none`：正常压缩模式
+  - `mask`：prefill 不落盘压缩；decode 用完整 KV + `atten_mask`（`npu_fusion_attention`），被掩蔽位置不参与注意力
+  - `zero`：在 **prefill 节点**对 paged KV 中不重要 token 的 **K/V 物理置零**，PD 传输置零后的 KV；decode 走 **常规 `_npu_paged_attention`**，不依赖 `per_layer_important_indices` / `_VALIDATION_MASKS`
 
 ### 2.2 与 PD（Mooncake）的关系
 
@@ -88,6 +92,7 @@ PD 场景下，prefill 完成后会通过 `kv_transfer_params` 把 DynamicKV 的
 
 - **per_layer_kv_lens**：长度为 num_layers 的列表，每层一个 kv_len
 - **per_layer_keep_indices**：长度为 num_layers 的列表，每层一个 indices 列表（可 JSON 序列化）
+- **per_layer_important_indices**（可选）：`validation_mode` 为 **`mask`** 时由 prefill 写入，每层为「重要 token」的下标列表（稀疏）；decode 据此恢复 attention mask（PD 下 decode 与 prefill 不同进程，不能共享 `_VALIDATION_MASKS`）。**`zero`** 不写入该字段（KV 已在 prefill 置零）
 
 为支持 **少传 + 少占物理块**，在 `kv_transfer_params.dynamic_kv` 下新增可选字段（DynamicKV 关闭时不会出现）：
 

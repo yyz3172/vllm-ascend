@@ -1201,6 +1201,11 @@ class MooncakeConnectorScheduler:
                                     "per_layer_kv_lens": per_layer0,
                                     "per_layer_keep_indices": dyn0.get("per_layer_keep_indices"),
                                 }
+                                pii0 = dyn0.get("per_layer_important_indices")
+                                if isinstance(pii0, list) and pii0:
+                                    dynamic_kv_payload["per_layer_important_indices"] = (
+                                        pii0
+                                    )
                                 # Offload impl: worker may attach block_table-ordered prefix blocks.
                                 # Preserve it so PD shrink can avoid allocator-order slicing.
                                 try:
@@ -1289,6 +1294,9 @@ class MooncakeConnectorScheduler:
                             "per_layer_kv_lens": last_res["per_layer_kv_lens"],
                             "per_layer_keep_indices": last_res.get("per_layer_keep_indices"),
                         }
+                        pli_last = last_res.get("per_layer_important_indices")
+                        if isinstance(pli_last, list) and pli_last:
+                            dynamic_kv_payload["per_layer_important_indices"] = pli_last
                         # Once attached to kv_transfer_params, we can drop the cached result.
                         try:
                             if isinstance(last_results, dict):
@@ -1742,14 +1750,16 @@ class MooncakeConnectorWorker:
                     continue
                 per_layer_kv_lens = item.get("per_layer_kv_lens")
                 per_layer_keep_indices = item.get("per_layer_keep_indices")
+                per_layer_important_indices = item.get("per_layer_important_indices")
                 if not isinstance(per_layer_kv_lens, list):
                     continue
-                updates[rid] = {
-                    "dynamic_kv": {
-                        "per_layer_kv_lens": per_layer_kv_lens,
-                        "per_layer_keep_indices": per_layer_keep_indices,
-                    }
+                dyn_out: dict[str, Any] = {
+                    "per_layer_kv_lens": per_layer_kv_lens,
+                    "per_layer_keep_indices": per_layer_keep_indices,
                 }
+                if isinstance(per_layer_important_indices, list):
+                    dyn_out["per_layer_important_indices"] = per_layer_important_indices
+                updates[rid] = {"dynamic_kv": dyn_out}
                 try:
                     last_results.pop(rid, None)
                 except Exception:

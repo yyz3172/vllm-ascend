@@ -42,9 +42,13 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     AscendMetadataForDecode, AscendMetadataForPrefill)
 from vllm_ascend.attention.dynamic_kv import (
     DynamicKVConfig,
+    build_attention_mask_from_important_mask,
     cap_keep_indices_chronological,
+    clear_validation_masks,
     gather_kv_from_paged_cache,
     gather_kv_from_paged_cache_batched,
+    get_validation_mask,
+    save_validation_mask,
     scores_and_indices_old,
     scores_and_indices_old_perhead_aggregated,
     update_and_reset_budget,
@@ -458,6 +462,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._dynamickv_kernel_size = int(getattr(ascend_cfg, "dynamic_kv_kernel_size", 1))
         self._dynamickv_radio_max = float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0))
         self._dynamickv_radio_min = float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1))
+        self._dynamickv_validation_mode = str(getattr(ascend_cfg, "dynamic_kv_validation_mode", "none"))
         self._dynamickv_model_types = set(getattr(ascend_cfg, "dynamic_kv_model_types", ["mistral"]) or [])
         try:
             model_type = getattr(self.vllm_config.model_config.hf_config, "model_type", "")
@@ -724,6 +729,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
+        # Validation mode: decode with mask when using FIA (eager mode).
+        if (attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and self._dynamickv_validation_mode == "mask"
+                and attn_metadata.seq_lens.shape[0] == query.size(0)):
+            dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+            if dyn_lens_list is not None:
+                context_lens = torch.tensor(
+                    dyn_lens_list,
+                    device=attn_metadata.seq_lens.device,
+                    dtype=attn_metadata.seq_lens.dtype,
+                )
+                return self._forward_decode_with_mask_validation(
+                    query=query,
+                    attn_metadata=attn_metadata,
+                    context_lens=context_lens,
+                    output=output,
+                )
         if (attn_metadata.attn_state == AscendAttentionState.DecodeOnly
                 and self.sliding_window is not None
                 and attn_metadata.seq_lens.shape[0] == query.size(0)):
@@ -818,6 +840,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 device=attn_metadata.seq_lens.device,
                 dtype=attn_metadata.seq_lens.dtype,
             )
+        # ``mask`` validation: decode uses full KV + ``npu_fusion_attention`` mask
+        # (indices from PD). ``zero`` validation: KV already zeroed on prefill; decode
+        # uses normal paged attention.
+        if self._dynamickv_validation_mode == "mask":
+            return self._forward_decode_with_mask_validation(
+                query=query,
+                attn_metadata=attn_metadata,
+                context_lens=context_lens,
+                output=output,
+            )
+        
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -829,6 +862,135 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=context_lens,
             out=output,
         )
+        return output
+
+    def _forward_decode_with_mask_validation(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        context_lens: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode ``validation_mode=mask``: full KV + attention mask (fusion)."""
+        mode = "mask"
+        try:
+            layer_idx = int(extract_layer_index(attn_metadata.layer_name, num_attn_module=1))
+        except Exception:
+            layer_idx = 0
+
+        num_reqs = int(attn_metadata.block_tables.shape[0])
+        num_tokens = int(query.shape[0])
+
+        output_list = []
+        token_offset = 0
+
+        if not hasattr(self, "_dynkv_decode_validation_logged"):
+            self._dynkv_decode_validation_logged = set()
+        _log_set = self._dynkv_decode_validation_logged
+        if len(_log_set) > 4096:
+            _log_set.clear()
+
+        for ridx in range(num_reqs):
+            rid = (
+                attn_metadata.req_ids[ridx]
+                if hasattr(attn_metadata, "req_ids")
+                and attn_metadata.req_ids
+                and ridx < len(attn_metadata.req_ids)
+                else None
+            )
+
+            full_seq_len = (
+                int(attn_metadata.seq_lens[ridx].item())
+                if hasattr(attn_metadata, "seq_lens")
+                else int(context_lens[ridx].item())
+            )
+
+            block_table_row = attn_metadata.block_tables[ridx]
+            k_full, v_full = gather_kv_from_paged_cache(
+                self.key_cache,
+                self.value_cache,
+                block_table_row,
+                full_seq_len,
+            )
+
+            important_mask = get_validation_mask(rid, layer_idx) if rid else None
+            if important_mask is not None:
+                important_mask = important_mask.to(device=k_full.device)
+                ml = int(important_mask.shape[0])
+                if ml < full_seq_len:
+                    pad_n = full_seq_len - ml
+                    important_mask = torch.cat(
+                        (
+                            important_mask,
+                            torch.ones(
+                                pad_n,
+                                dtype=torch.bool,
+                                device=k_full.device,
+                            ),
+                        ),
+                        dim=0,
+                    )
+                elif ml > full_seq_len:
+                    important_mask = important_mask[:full_seq_len]
+
+            n_imp = -1
+            if important_mask is not None and important_mask.shape[0] == full_seq_len:
+                n_imp = int(important_mask.sum().item())
+
+            log_key = (str(rid or ""), int(layer_idx), mode)
+            if log_key not in _log_set:
+                _log_set.add(log_key)
+                try:
+                    from vllm.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank,
+                    )
+
+                    _do = int(get_tensor_model_parallel_rank()) == 0
+                except Exception:
+                    _do = True
+                if _do:
+                    logger.info(
+                        "[DynamicKV][Decode][validation] mode=%s layer_idx=%d "
+                        "request_id=%s important_tokens=%d seq_len=%d",
+                        mode,
+                        layer_idx,
+                        rid,
+                        n_imp,
+                        full_seq_len,
+                    )
+
+            if important_mask is not None and important_mask.shape[0] == full_seq_len:
+                attn_mask = build_attention_mask_from_important_mask(
+                    important_mask,
+                    query_len=1,
+                )
+            else:
+                attn_mask = torch.zeros(
+                    1, full_seq_len, device=query.device, dtype=torch.uint8
+                )
+
+            q = query[token_offset : token_offset + 1]
+
+            fa_result = torch_npu.npu_fusion_attention(
+                query=q,
+                key=k_full,
+                value=v_full,
+                head_num=self.num_heads,
+                input_layout="TND",
+                scale=self.scale,
+                atten_mask=attn_mask,
+                actual_seq_qlen=[1],
+                actual_seq_kvlen=[full_seq_len],
+            )
+            attn_out = fa_result[0] if isinstance(fa_result, (list, tuple)) else fa_result
+
+            output_list.append(attn_out)
+            token_offset += 1
+
+        if output_list:
+            combined = torch.cat(output_list, dim=0)
+            output[:num_tokens] = combined[:num_tokens]
+
         return output
 
     def _forward_encoder_attention(self, query: torch.Tensor,
@@ -1138,6 +1300,43 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 )
                                 scores_old_list.append(s_old)
                                 indices_old_list.append(idx_old)
+                                
+                                # ``mask`` validation: save important_mask for decode (PD).
+                                if self._dynamickv_validation_mode == "mask":
+                                    rid = (
+                                        attn_metadata.req_ids[ridx]
+                                        if attn_metadata.req_ids and ridx < len(attn_metadata.req_ids)
+                                        else None
+                                    )
+                                    if rid:
+                                        window_size = int(dynkv_cfg_layer.window_size)
+                                        # Build important_mask: True for important tokens (selected + window)
+                                        important_mask = torch.zeros(seq_len_i, dtype=torch.bool, device=k_full.device)
+                                        if idx_old.numel() > 0:
+                                            important_mask[idx_old.to(torch.long)] = True
+                                        # Window tokens (tail) are always important
+                                        if window_size > 0:
+                                            important_mask[-window_size:] = True
+                                        save_validation_mask(rid, layer_idx, important_mask)
+                                        _n_imp = int(important_mask.sum().item())
+                                        try:
+                                            from vllm.distributed.parallel_state import (
+                                                get_tensor_model_parallel_rank,
+                                            )
+
+                                            _plog = int(get_tensor_model_parallel_rank()) == 0
+                                        except Exception:
+                                            _plog = True
+                                        if _plog:
+                                            logger.info(
+                                                "[DynamicKV][Prefill][validation] mode=%s layer_idx=%d "
+                                                "request_id=%s important_tokens=%d prompt_len=%d",
+                                                self._dynamickv_validation_mode,
+                                                layer_idx,
+                                                rid,
+                                                _n_imp,
+                                                seq_len_i,
+                                            )
                             per_layer[layer_idx]["scores_old_list"] = scores_old_list
                             per_layer[layer_idx]["indices_old_list"] = indices_old_list
                         except Exception as e:
@@ -1482,6 +1681,116 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
                             per_layer_kv_lens: list[int] = []
                             per_layer_keep_indices: list[list[int]] = []
+
+                            # Validation: skip KV pack; ``mask`` exports indices for decode;
+                            # ``zero`` zeros unimportant slots in paged KV on this worker.
+                            if self._dynamickv_validation_mode == "mask":
+                                full_indices = list(range(seq_len_i))
+                                for li in range(num_layers):
+                                    per_layer_kv_lens.append(seq_len_i)
+                                    per_layer_keep_indices.append(full_indices)
+                                plii: list[list[int]] = []
+                                for li in range(num_layers):
+                                    vm = (
+                                        get_validation_mask(rid, li)
+                                        if rid
+                                        else None
+                                    )
+                                    if vm is not None and int(vm.numel()) == int(
+                                        seq_len_i
+                                    ):
+                                        plii.append(
+                                            [
+                                                int(x)
+                                                for x in torch.where(vm)[0].tolist()
+                                            ]
+                                        )
+                                    else:
+                                        plii.append(list(range(int(seq_len_i))))
+                                results_by_req[rid] = {
+                                    "per_layer_kv_lens": per_layer_kv_lens,
+                                    "per_layer_keep_indices": per_layer_keep_indices,
+                                    "per_layer_important_indices": plii,
+                                }
+                                continue  # Skip KV rewrite for this request
+                            if self._dynamickv_validation_mode == "zero":
+                                full_indices = list(range(seq_len_i))
+                                for li in range(num_layers):
+                                    per_layer_kv_lens.append(seq_len_i)
+                                    per_layer_keep_indices.append(full_indices)
+                                for li in range(num_layers):
+                                    old_budget = int(per_layer_old_budget[li])
+                                    idx_old = per_layer_indices_old[li]
+                                    tail_idx_z = tail_keep_idx_by_req[ridx].to(
+                                        idx_old.device
+                                    )
+                                    old_budget_eff = max(
+                                        0,
+                                        min(int(old_budget), int(idx_old.shape[0])),
+                                    )
+                                    idx_old_keep = (
+                                        idx_old[:old_budget_eff].to(torch.long)
+                                        if old_budget_eff > 0
+                                        else idx_old[:0].to(torch.long)
+                                    )
+                                    keep_sorted, _ = cap_keep_indices_chronological(
+                                        idx_old=idx_old_keep,
+                                        old_budget=old_budget_eff,
+                                        tail_idx=tail_idx_z,
+                                        cap=seq_len_i,
+                                        device=idx_old.device,
+                                    )
+                                    important_mask = torch.zeros(
+                                        seq_len_i,
+                                        dtype=torch.bool,
+                                        device=idx_old.device,
+                                    )
+                                    if keep_sorted.numel() > 0:
+                                        important_mask[
+                                            keep_sorted.to(torch.long)
+                                        ] = True
+                                    layer_name_z = layer_idx_to_name.get(li)
+                                    if not layer_name_z:
+                                        continue
+                                    impl_z, _ = _ASCEND_DYNKV_LAYER_REGISTRY[
+                                        layer_name_z
+                                    ]
+                                    kc = impl_z.key_cache
+                                    vc = impl_z.value_cache
+                                    if kc is None or vc is None:
+                                        continue
+                                    slots_full = per_layer_slots_full[li]
+                                    k_fl = kc.reshape(
+                                        -1, kc.shape[-2], kc.shape[-1]
+                                    )
+                                    v_fl = vc.reshape(
+                                        -1, vc.shape[-2], vc.shape[-1]
+                                    )
+                                    unimportant = ~important_mask
+                                    if unimportant.any():
+                                        sb = slots_full[unimportant].to(
+                                            torch.long
+                                        ).flatten()
+                                        sb = torch.unique(sb)
+                                        if sb.numel() > 0:
+                                            zblk = k_fl.new_zeros(
+                                                (
+                                                    int(sb.numel()),
+                                                    int(k_fl.shape[-2]),
+                                                    int(k_fl.shape[-1]),
+                                                )
+                                            )
+                                            k_fl.index_copy_(
+                                                0, sb.to(k_fl.device), zblk
+                                            )
+                                            v_fl.index_copy_(
+                                                0, sb.to(v_fl.device), zblk
+                                            )
+                                results_by_req[rid] = {
+                                    "per_layer_kv_lens": per_layer_kv_lens,
+                                    "per_layer_keep_indices": per_layer_keep_indices,
+                                }
+                                continue
 
                             # Rewrite each layer for this request.
                             for li in range(num_layers):

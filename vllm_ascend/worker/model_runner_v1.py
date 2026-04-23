@@ -83,7 +83,10 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.attention_v1 import _DYNKV_STATE
-from vllm_ascend.attention.dynamic_kv import gather_kv_from_paged_cache_batched
+from vllm_ascend.attention.dynamic_kv import (
+    gather_kv_from_paged_cache_batched,
+    save_validation_mask,
+)
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          using_paged_attention)
 from vllm_ascend.worker.dynamic_kv_offload import (
@@ -1231,6 +1234,7 @@ class NPUModelRunner(GPUModelRunner):
                                         continue
                                     dyn = kvp.get("dynamic_kv") or {}
                                     per_layer = dyn.get("per_layer_kv_lens")
+                                    pii = dyn.get("per_layer_important_indices")
                                     try:
                                         npt = int(
                                             self.input_batch.num_prompt_tokens[
@@ -1256,6 +1260,37 @@ class NPUModelRunner(GPUModelRunner):
                                             Li = -1
                                         if Li > 0:
                                             tmp_lens.append(Li + decode_extra)
+                                            # PD validation: restore important-token mask on decode worker.
+                                            try:
+                                                rid_here = (
+                                                    rid_list[req_idx]
+                                                    if req_idx < len(rid_list)
+                                                    else None
+                                                )
+                                                if (
+                                                    rid_here
+                                                    and isinstance(pii, list)
+                                                    and layer_idx < len(pii)
+                                                ):
+                                                    idxs_layer = pii[layer_idx]
+                                                    if isinstance(idxs_layer, list):
+                                                        li_tot = int(Li) + int(decode_extra)
+                                                        mcpu = torch.zeros(
+                                                            li_tot, dtype=torch.bool
+                                                        )
+                                                        for t in idxs_layer:
+                                                            ti = int(t)
+                                                            if 0 <= ti < int(Li):
+                                                                mcpu[ti] = True
+                                                        if decode_extra > 0 and li_tot > int(Li):
+                                                            mcpu[int(Li) : li_tot] = True
+                                                        save_validation_mask(
+                                                            str(rid_here),
+                                                            int(layer_idx),
+                                                            mcpu,
+                                                        )
+                                            except Exception:
+                                                pass
                                         else:
                                             tmp_lens.append(-1)
                                     else:
@@ -1837,6 +1872,9 @@ class NPUModelRunner(GPUModelRunner):
                                     radio_max=float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0)),
                                     radio_min=float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1)),
                                     num_layers=num_layers,
+                                    validation_mode=str(
+                                        getattr(ascend_cfg, "dynamic_kv_validation_mode", "none")
+                                    ),
                                 )
                                 # Attach block_table-ordered prefix physical blocks for PD shrink.
                                 # NOTE: Do NOT use allocator-ordered `block_ids[:n]` to shrink:

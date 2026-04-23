@@ -4,13 +4,94 @@ DynamicKV helpers for vLLM-Ascend:
 - Paged-cache gather for full-sequence K/V (`gather_kv_from_paged_cache*`).
 - DynamicKV: per-layer scores/indices and cross-layer budget (`DynamicKVConfig`,
   `scores_and_indices_old`, `update_and_reset_budget`, `cap_keep_indices_chronological`).
+- Validation mode: save/retrieve important_mask for verifying token selection.
 """
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# Validation mode: per-request per-layer important_mask storage.
+# Used for verifying token selection effectiveness without compression.
+# ---------------------------------------------------------------------------
+
+# Structure: {request_id: {layer_idx: important_mask}}
+_VALIDATION_MASKS: Dict[str, Dict[int, torch.Tensor]] = {}
+
+
+def save_validation_mask(
+    request_id: str,
+    layer_idx: int,
+    important_mask: torch.Tensor,
+) -> None:
+    """Save important_mask for validation mode.
+    
+    Args:
+        request_id: Unique request identifier.
+        layer_idx: Layer index.
+        important_mask: [seq_len] bool tensor, True = important token.
+    """
+    if request_id not in _VALIDATION_MASKS:
+        _VALIDATION_MASKS[request_id] = {}
+    _VALIDATION_MASKS[request_id][layer_idx] = important_mask
+
+
+def get_validation_mask(
+    request_id: str,
+    layer_idx: int,
+) -> Optional[torch.Tensor]:
+    """Retrieve important_mask for validation mode.
+    
+    Returns:
+        important_mask tensor or None if not found.
+    """
+    req_masks = _VALIDATION_MASKS.get(request_id)
+    if req_masks is None:
+        return None
+    return req_masks.get(layer_idx)
+
+
+def clear_validation_masks(request_id: Optional[str] = None) -> None:
+    """Clear validation masks.
+    
+    Args:
+        request_id: If provided, only clear masks for this request.
+                   If None, clear all masks.
+    """
+    global _VALIDATION_MASKS
+    if request_id is None:
+        _VALIDATION_MASKS = {}
+    elif request_id in _VALIDATION_MASKS:
+        del _VALIDATION_MASKS[request_id]
+
+
+def build_attention_mask_from_important_mask(
+    important_mask: torch.Tensor,
+    query_len: int = 1,
+) -> torch.Tensor:
+    """Convert 1D important_mask to 2D attention mask (uint8/bool).
+    
+    Args:
+        important_mask: [seq_len] bool tensor, True = important token.
+        query_len: Number of query tokens (1 for decode).
+    
+    Returns:
+        attn_mask: [query_len, seq_len] uint8 tensor.
+            0 for important tokens (keep), 1 for unimportant tokens (mask out).
+    """
+    seq_len = important_mask.shape[0]
+    if important_mask.dtype != torch.bool:
+        important_mask = important_mask.to(torch.bool)
+    # FlashAttention kernels on Ascend expect atten_mask to be bool/uint8.
+    # Use uint8: 1 = masked (unimportant), 0 = keep (important).
+    key_mask = (~important_mask).to(torch.uint8)
+    # Broadcast to [query_len, seq_len]
+    attn_mask = key_mask.unsqueeze(0).expand(query_len, seq_len)
+    return attn_mask.contiguous()
 
 
 def _pool_1d(scores: torch.Tensor, pooling: str, kernel_size: int) -> torch.Tensor:
