@@ -70,8 +70,8 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **model_types**：允许启用的 HF `model_type` 列表（默认 `["mistral"]`）
 - **window_size**：窗口大小 window（默认 `16`）
 - **prompt_kv_len_budget**：每层 KV 长度的预算目标（默认 `512`，通常约等于 \(old + window\_size\) 的目标值）。**不是硬上限**：个别层可能 \(kv\_len > prompt\_kv\_len\_budget\)，硬上限仍为 prompt_len
-- **pooling**：对 token importance 做 1D 平滑（`none|avgpool|maxpool`，默认 `none`）
-- **kernel_size**：pooling 的 kernel（默认 `1`）
+- **pooling**：对 token importance 做 1D 平滑（`none|avgpool|maxpool`，默认 `avgpool`）
+- **kernel_size**：pooling 的 kernel（默认 `7`）
 - **radio_max / radio_min**：跨层重分配的上/下限相关系数（默认 `10.0/0.1`，与上游参考实现一致）
 
 ### 2.2 与 PD（Mooncake）的关系

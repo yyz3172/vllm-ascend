@@ -167,8 +167,8 @@ class AscendConfig:
         # DynamicKV budget target (per-layer KV length target).
         # NOTE: This is NOT a hard upper bound; some layers may keep > target.
         self.dynamic_kv_prompt_kv_len_budget = int(dyn.get("prompt_kv_len_budget", 512))
-        self.dynamic_kv_pooling = dyn.get("pooling", "none")
-        self.dynamic_kv_kernel_size = int(dyn.get("kernel_size", 1))
+        self.dynamic_kv_pooling = dyn.get("pooling", "avgpool")
+        self.dynamic_kv_kernel_size = int(dyn.get("kernel_size", 7))
         # DynamicKV knobs (optional; radio_* match upstream reference).
         self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
         self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
