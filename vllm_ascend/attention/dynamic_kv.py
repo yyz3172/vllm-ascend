@@ -383,15 +383,17 @@ def scores_and_indices_old_perhead_aggregated(
     budget_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Per-layer step with per-head scores + aggregated indices.
+    Per-layer step with per-head scores + aggregated indices (union strategy).
 
-    Matches open-source DynamicKV density semantics:
+    To preserve all tokens that ANY head considers important (matching the semantic
+    of open-source per-head compression under vLLM's token-level Paged KV Cache):
     - Compute per-head scores [Hkv, old_len] for cross-layer budget allocation
-    - Aggregate indices across heads for token-level KV compression
+    - Each head selects its top-k tokens
+    - Return the UNION of all heads' selections (sorted by importance for truncation)
 
     Returns:
       - scores_old: [Hkv, old_len] (per-head, for cross-layer topk)
-      - indices_old: [k] (aggregated across heads, importance order for truncation)
+      - indices_old: [union_size] (union of all heads' top-k, importance order)
     """
     W = int(cfg.window_size)
     L = int(key_full.shape[0])
@@ -421,32 +423,28 @@ def scores_and_indices_old_perhead_aggregated(
     # Step 3: Per-head top-k indices [Hkv, k]
     indices_per_head = torch.topk(scores_old, k=budget_size, dim=-1).indices
 
-    # Step 4: Aggregate indices across heads
-    # Strategy: count how many heads selected each token, then pick top tokens
-    # by selection frequency (weighted by per-head importance)
+    # Step 4: Union of all heads' selections
+    # This ensures no head loses tokens it considers important.
     flat_indices = indices_per_head.flatten()  # [Hkv * k]
+    union_indices = torch.unique(flat_indices)  # unique tokens selected by any head
 
-    # Count selection frequency per token
+    # Sort union by combined importance score (for truncation: idx[:budget] keeps best)
+    # Combined score = selection frequency × aggregated importance
     token_counts = torch.zeros(old_len, device=key_full.device, dtype=torch.float32)
     token_counts.scatter_add_(
         0,
         flat_indices.to(torch.long),
         torch.ones_like(flat_indices, dtype=torch.float32),
     )
-
-    # Additionally weight by aggregated importance score
-    # (sum of per-head scores for each token)
     token_importance = scores_old.sum(dim=0)  # [old_len]
-    # Combine: tokens selected by more heads AND with higher importance win
     combined_score = token_counts * token_importance.to(torch.float32)
 
-    # Select top-k tokens by combined score
-    k_final = min(budget_size, old_len)
-    indices_aggregated = torch.topk(combined_score, k=k_final, dim=0).indices
-    # Keep importance order (no sort): truncation idx[:budget] keeps most important.
-    # Final chronological order is restored by cap_keep_indices_chronological.
+    # Get scores for union tokens and sort by importance (descending)
+    union_scores = combined_score[union_indices.to(torch.long)]
+    sorted_order = torch.argsort(union_scores, descending=True)
+    indices_sorted_by_importance = union_indices[sorted_order]
 
-    return scores_old, indices_aggregated.to(torch.long)
+    return scores_old, indices_sorted_by_importance.to(torch.long)
 
 
 def cap_keep_indices_chronological(

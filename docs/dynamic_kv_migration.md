@@ -31,26 +31,30 @@ DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对�
 
 - \(kv\_len\_layer = old\_budget\_layer + window\_size\)
 
-#### 1.2.1 Per-Head Scores + 聚合 Indices（与开源对齐）
+#### 1.2.1 Per-Head Scores + 并集 Indices（保留所有 head 的选择）
 
-为与开源 DynamicKV 的跨层密度语义对齐，本实现采用：
+由于 vLLM 的 Paged KV Cache 是 token-level 布局（同一 slot 的所有 head 来自同一 token），无法实现开源的 per-head 压缩（每个 head 保留不同的 token 集合）。
+
+为确保不丢失任何 head 认为重要的 token，本实现采用**并集策略**：
 
 1. **Per-head scores**：每个 KV head 独立计算 token importance，得到 `[Hkv, old_len]` 的 scores
-2. **跨层 top-k**：使用 `tk = base × Hkv × num_layers`（与开源一致），在 `[layer, head, token]` 三维空间做全局 top-k
-3. **聚合 indices**：由于 Paged KV Cache 是 token-level 布局（同一 slot 的所有 head 来自同一 token），最终 indices 需聚合为 token-level
-
-聚合策略：
+2. **Per-head top-k**：每个 head 独立选出 `budget_size` 个最重要的 token
+3. **并集 indices**：取所有 head 选择的 token **并集**，确保任意 head 认为重要的 token 都被保留
 
 ```
-combined_score = token_被选中的head数 × token_聚合importance
-indices = combined_score.topk(budget_size)  # 保持重要性顺序
+indices_per_head = scores_old.topk(budget_size, dim=-1).indices  # [Hkv, budget_size]
+union_indices = torch.unique(indices_per_head.flatten())         # 并集
+# 按重要性排序，用于后续跨层截断
+indices = sort_by_combined_importance(union_indices)
 ```
+
+**与开源的对比**：
+- 开源：每个 head 各保留 `budget_size` 个（可以不同），总 token 数 = `budget_size`/head
+- 本实现：所有 head 共享并集，总 token 数 = `|union|`（介于 `budget_size` 和 `budget_size × Hkv` 之间）
 
 **indices 顺序**：
-- 中间态按**重要性顺序**存储（与开源一致），截断 `indices[:budget]` 保留最重要的
+- 中间态按**重要性顺序**存储，截断 `indices[:budget]` 保留最重要的
 - 最终输出通过 `cap_keep_indices_chronological` 恢复**时间顺序**，用于 KV 写回
-
-这样既保持了开源的跨层预算分配密度，又兼容 vLLM 的 Paged KV Cache 语义。
 
 ### 1.3 分层的关键：跨层预算 + 周期重分配
 
