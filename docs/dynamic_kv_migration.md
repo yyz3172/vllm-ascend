@@ -1,8 +1,6 @@
 ## DynamicKV（vLLM / vLLM-Ascend，PD 场景）说明
 
-本文是一份面向工程落地的 **DynamicKV** 说明；算法与开源仓库 `code/DynamicKV/` 中跨层预算、周期重分配等思路对齐。实现入口为 `DynamicKVConfig`、`scores_and_indices_old`、`update_and_reset_budget`（见 `vllm_ascend/attention/dynamic_kv.py`）。
-
-当前适配目标模型：Mistral-7B-Instruct-v0.2。
+本文是一份面向工程落地的 **DynamicKV** 说明；算法与开源仓库 `code/DynamicKV/` 中跨层预算、周期重分配等思路对齐。当前适配目标模型：Mistral-7B-Instruct-v0.2。
 
 ---
 
@@ -15,31 +13,48 @@
 - **Prefill → Decode 的 KV 传输代价**（传多少 blocks、耗时多少）
 - **Decode 侧每步 attention 读取 KV 的代价**
 
-DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对较旧 token 做“保留重要的少量 token”，并始终保留最近一段窗口（window）以维持局部一致性。
+DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对较旧 token 做"保留重要的少量 token"，并始终保留最近一段窗口（window）以维持局部一致性。
 
-补充：在 PD 场景里，“压缩”有两层含义：
+补充：在 PD 场景里，"压缩"有两层含义：
 
 - **少算（compute-side）**：decode 每层用自己的 `kv_len`（更短的 `context_lens`）做 attention，减少算力/带宽。
 - **少传 + 少占物理块（memory/transfer-side）**：prefill → decode 只传输压缩后需要的 KV blocks，并让 decode 侧只分配这些 blocks（`kv_cache_usage` 随之下降）。
 
-### 1.2 压缩策略：怎么决定“重要 token”？
+### 1.2 压缩策略：怎么决定"重要 token"？
 
-以“最后的 window_size 个 query”（最近 token）为查询，计算它们对历史 keys 的注意力权重；把历史 token 按“被注意力关注的总量”排序，取 top-k：
+以"最后的 window_size 个 query"（最近 token）为查询，计算它们对历史 keys 的注意力权重；把历史 token 按"被注意力关注的总量"排序，取 top-k：
 
 - **旧 token（old）**：按重要性保留 top-k
 - **新 token（cur/window）**：最近 window_size 全保留
 
 最终每层保留的 token 数量为：
 
-- \(kv\_len\_layer = old\_budget\_layer + window_size\)
+- \(kv\_len\_layer = old\_budget\_layer + window\_size\)
+
+#### 1.2.1 Per-Head Scores + 聚合 Indices（与开源对齐）
+
+为与开源 DynamicKV 的跨层密度语义对齐，本实现采用：
+
+1. **Per-head scores**：每个 KV head 独立计算 token importance，得到 `[Hkv, old_len]` 的 scores
+2. **跨层 top-k**：使用 `tk = base × Hkv × num_layers`（与开源一致），在 `[layer, head, token]` 三维空间做全局 top-k
+3. **聚合 indices**：由于 Paged KV Cache 是 token-level 布局（同一 slot 的所有 head 来自同一 token），最终 indices 需聚合为 token-level
+
+聚合策略：
+
+```
+combined_score = token_被选中的head数 × token_聚合importance
+indices = combined_score.topk(budget_size)
+```
+
+这样既保持了开源的跨层预算分配密度，又兼容 vLLM 的 Paged KV Cache 语义。
 
 ### 1.3 分层的关键：跨层预算 + 周期重分配
 
 分层策略不要求每层保留相同的 old token 数量，而是：
 
 - 每层先得到一份候选的重要性分布（scores/indices）
-- 每隔若干层（参考实现为 **每 4 层**）进行一次跨层预算重分配（`update_and_reset_budget`）
-- 最终在最后一层将“各层的压缩 KV”写回 cache，使得后续 decode 按层读取到的 KV 内容真实不同
+- 每隔若干层（参考实现为 **每 4 层**）进行一次跨层预算重分配（`update_and_reset_budget_per_kv_head`）
+- 最终在最后一层将"各层的压缩 KV"写回 cache，使得后续 decode 按层读取到的 KV 内容真实不同
 
 ---
 
@@ -68,7 +83,7 @@ PD 场景下，prefill 完成后会通过 `kv_transfer_params` 把 DynamicKV 的
 
 为支持 **少传 + 少占物理块**，在 `kv_transfer_params.dynamic_kv` 下新增可选字段（DynamicKV 关闭时不会出现）：
 
-- **per_layer_num_prompt_blocks**：长度为 num_layers 的列表，每层压缩 KV 需要的 blocks 数（\(ceil(kv\\_len / block\\_size)\)）
+- **per_layer_num_prompt_blocks**：长度为 num_layers 的列表，每层压缩 KV 需要的 blocks 数（\(ceil(kv\_len / block\_size)\)）
 - **per_layer_remote_block_ids**：长度为 num_layers 的二维列表，每层要传输的远端 block id 序列（当前实现为远端 `remote_block_ids` 的前缀切片，依赖压缩 KV 写入连续前缀 slots）
 
 此外，Mooncake 会把 **整体 `num_prompt_blocks` / `remote_block_ids`** 收缩到 `max(per_layer_num_prompt_blocks)`，用于驱动 decode 侧的 **物理 blocks 分配与传输规模**。
@@ -79,7 +94,7 @@ PD 场景下，prefill 完成后会通过 `kv_transfer_params` 把 DynamicKV 的
 
 ## 3. 算法/流程（人话版）
 
-本节按“真实推理路径”描述，不逐行翻译代码。
+本节按"真实推理路径"描述，不逐行翻译代码。
 
 ### 3.1 PrefillNoCache（非 chunked）
 
@@ -96,18 +111,21 @@ PD 场景下，prefill 完成后会通过 `kv_transfer_params` 把 DynamicKV 的
 流程：
 
 1. 先把本 chunk 的 KV 正常写入 paged cache（保证 cache 完整）
-2. 从每层的 paged cache 中 gather 出“全 prompt 的 K/V”（按 request）
-3. 对每层、每个 request：计算旧 token 的 scores/indices（top-k 候选）
+2. 从每层的 paged cache 中 gather 出"全 prompt 的 K/V"（按 request）
+3. 对每层、每个 request：计算旧 token 的 per-head scores/indices（top-k 候选）
 4. **每 4 层**触发一次跨层预算重分配（对每个 request 独立）：
-   - 计算每层应该保留多少 old tokens（old_budget_layer）
+   - 使用 `update_and_reset_budget_per_kv_head` 计算每层应该保留多少 old tokens
    - 立即对已算过层的 indices 做截断（预算沿途更新生效）
 5. 最后一层：按最终预算为每层构造 keep_idx（old_budget + window），从 full KV 中 gather 出压缩后的 KV，并写回该层 paged cache 的前缀 slots
 6. 输出 per-layer kv_lens 与 per-layer keep indices（供 PD 传递与 decode 生效）
 
 关键实现位置：
 
-- 评分/indices 与跨层预算：`code/vllm-ascend/vllm_ascend/attention/dynamic_kv.py`（`DynamicKVConfig`、`scores_and_indices_old`、`update_and_reset_budget` 等）
+- 评分/indices 与跨层预算：`code/vllm-ascend/vllm_ascend/attention/dynamic_kv.py`
+  - `scores_and_indices_old_perhead_aggregated`：per-head scores + 聚合 indices
+  - `update_and_reset_budget_per_kv_head`：跨层预算重分配（`tk = base × Hkv × layers`）
 - last_chunk / PrefillNoCache 主流程：`code/vllm-ascend/vllm_ascend/attention/attention_v1.py`
+- offload 模式实现：`code/vllm-ascend/vllm_ascend/worker/dynamic_kv_offload.py`
 
 ### 3.3 Decode 如何按层生效（关键点：kv_len 与内容一致）
 
@@ -131,7 +149,7 @@ decode 侧生效依赖两件事：
 
 ---
 
-## 4. 关键日志说明（如何验收“真的生效”）
+## 4. 关键日志说明（如何验收"真的生效"）
 
 日志前缀以 **`[DynamicKV]`** 为主；Decode / PD 子阶段见下。
 
@@ -142,7 +160,7 @@ decode 侧生效依赖两件事：
 ### 4.2 Mooncake（PD 传递是否带上分层信息）
 
 - **`[DynamicKV][PD] request_finished per_layer_kv_lens stats`**
-- `unique/min/max/sum` 用于验收“分层预算非均匀”且总预算符合预期（例如 sum≈num_layers*prompt_kv_len_budget）
+- `unique/min/max/sum` 用于验收"分层预算非均匀"且总预算符合预期（例如 sum≈num_layers*prompt_kv_len_budget）
 - **`[DynamicKV] request_finished per_layer_kv_lens(fallback)`（WARNING）**
   - 出现说明分层结果未成功 attach，PD 退化为均匀 cap（需要排查）
 
@@ -150,7 +168,7 @@ decode 侧生效依赖两件事：
 
 验收点：
 
-- decode `GPU KV cache usage` 应从“full prompt blocks”级别下降到“`max(per_layer_kv_len)` 对应 blocks”级别。
+- decode `GPU KV cache usage` 应从"full prompt blocks"级别下降到"`max(per_layer_kv_len)` 对应 blocks"级别。
 - 直观上，对于 20k prompt（160 blocks@128），若 `max(per_layer_kv_len)` 约 3.5k（约 27 blocks），decode `kv_cache_usage` 应接近原来的 \(27/160\) 倍（再乘以全局 block pool 分母的影响）。
 
 ### 4.3 Decode（按层 kv_len 是否被 kernel 使用）
@@ -163,12 +181,42 @@ decode 侧生效依赖两件事：
 ## 5. 已知约束与注意事项
 
 - **这是 PD 场景优先实现**：prefill 本地仍先完整写入 KV，再在 **同一轮 prefill 的最后一层**做分层压缩写回（`PrefillNoCache` 整段或 ChunkedPrefill 最后一块）
-- **Paged KV 的写回策略**：压缩后的 KV 写回到每层 cache 的“前缀 slots”，保证 decode 按 kv_len 读的是连续有效前缀
+- **Paged KV 的写回策略**：压缩后的 KV 写回到每层 cache 的"前缀 slots"，保证 decode 按 kv_len 读的是连续有效前缀
 - **并发安全**：per-request 结果按 `request_id` 存放并在 Mooncake attach 后 pop，同时有 TTL/容量清理
 - **图捕获（graph capture）**：录制图期间不做分层压缩，只做普通 `reshape_and_cache`，避免动态形状破坏捕获
 
 ---
 
-## 6. 参考（开源 DynamicKV）
+## 6. 与开源 DynamicKV 的差异
+
+本实现针对 vLLM-Ascend PD 场景做了以下适配：
+
+### 6.1 架构差异（必要适配）
+
+| 方面 | 开源实现 | 本实现 |
+|------|----------|--------|
+| **应用场景** | HuggingFace Transformers 单机推理 | vLLM-Ascend PD 分布式分离 |
+| **KV Cache** | `DynamicCache` 连续内存 | Paged KV Cache（block_table 映射） |
+| **集成方式** | Monkey-patch forward | vLLM Attention Backend + offload 模式 |
+
+### 6.2 算法对齐（已完成）
+
+| 方面 | 开源实现 | 本实现 |
+|------|----------|--------|
+| **scores 形状** | `[bsz, num_heads, old_len]` | `[Hkv, old_len]`（per-head） |
+| **跨层 tk** | `base × heads × layers` | `base × Hkv × layers`（一致） |
+| **indices 聚合** | per-head gather | per-head scores + token-level 聚合（兼容 Paged KV） |
+
+### 6.3 本实现扩展功能
+
+这些是开源实现没有的 PD 场景增值功能：
+
+- **物理块压缩传输**：`per_layer_num_prompt_blocks` / `per_layer_remote_block_ids`
+- **kv_transfer_params 跨进程传递**：prefill → proxy → decode
+- **offload 模式**：Hook Q-proj 延迟计算，不修改 attention 执行路径
+
+---
+
+## 7. 参考（开源 DynamicKV）
 
 对照 `code/DynamicKV/kv_compression/token_drop/` 下分层相关 **methods** 与 **mistral_model_impl** 源码（与本文算法同思路）。

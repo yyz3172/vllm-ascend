@@ -46,7 +46,9 @@ from vllm_ascend.attention.dynamic_kv import (
     gather_kv_from_paged_cache,
     gather_kv_from_paged_cache_batched,
     scores_and_indices_old,
+    scores_and_indices_old_perhead_aggregated,
     update_and_reset_budget,
+    update_and_reset_budget_per_kv_head,
 )
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          enable_cp, split_decodes_and_prefills,
@@ -1127,7 +1129,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     int(dynkv_cfg_layer.radio_max * dynkv_cfg_layer.base),
                                     max(seq_len_i - dynkv_cfg_layer.window_size, 0),
                                 )
-                                s_old, idx_old = scores_and_indices_old(
+                                # Per-head scores + aggregated indices (open-source density style).
+                                s_old, idx_old = scores_and_indices_old_perhead_aggregated(
                                     query_last=q_last_list[ridx],
                                     key_full=k_full,
                                     cfg=dynkv_cfg_layer,
@@ -1192,9 +1195,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                         radio_max=float(self._dynamickv_radio_max),
                                         radio_min=float(self._dynamickv_radio_min),
                                     )
+                                    # Dummy shapes: scores are now [Hkv, old_len], use last dim for old_len.
                                     dummy = [
                                         torch.empty(
-                                            (int(s.numel()) + int(cfg_sub.window_size), 1, 1),
+                                            (int(s.shape[-1]) + int(cfg_sub.window_size), 1, 1),
                                             device=s.device,
                                             dtype=torch.float16,
                                         )
@@ -1205,13 +1209,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                         int(cfg_sub.radio_max * cfg_sub.base),
                                         max(seq_len_i - cfg_sub.window_size, 0),
                                     )
-                                    budgets_sub = update_and_reset_budget(
+                                    # Per-head mode: tk = base * H * layers (open-source style).
+                                    budgets_sub = update_and_reset_budget_per_kv_head(
                                         per_layer_scores_old=scores_layers,
                                         per_layer_k_budget=dummy,
                                         per_layer_v_budget=dummy,
                                         cfg=cfg_sub,
                                         budget_size=budget_size,
-                                        head_factor=int(q_last_list[ridx].shape[1]) if q_last_list[ridx].numel() else 1,
                                     )
                                     # Expand budgets to full num_layers length so the final writeback
                                     # can directly consume it.
@@ -1247,7 +1251,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                                 keep_old = 0
                                             idx_kept = idx_old2[:keep_old]
                                             idx_list2[ridx] = idx_kept
-                                            # Sync scores: keep same [old_len] shape but zero out
+                                            # Sync scores: keep same [Hkv, old_len] shape but zero out
                                             # mass outside the kept index set so later realloc matches indices.
                                             scores_list2 = li_item.get("scores_old_list")
                                             if isinstance(scores_list2, list) and ridx < len(
@@ -1257,14 +1261,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                                 ) > 0:
                                                     new_s = torch.zeros_like(s_old2)
                                                     if idx_kept.numel() > 0:
-                                                        idx_clamped = idx_kept.clamp(
-                                                            0, s_old2.numel() - 1).to(
-                                                                torch.long)
-                                                        new_s.scatter_(
-                                                            0,
-                                                            idx_clamped,
-                                                            s_old2.index_select(0, idx_clamped),
-                                                        )
+                                                        # s_old2 is [Hkv, old_len], apply mask per head.
+                                                        if s_old2.dim() == 2:
+                                                            old_len_s = int(s_old2.shape[-1])
+                                                            idx_clamped = idx_kept.clamp(0, old_len_s - 1).to(torch.long)
+                                                            for h in range(s_old2.shape[0]):
+                                                                new_s[h].scatter_(
+                                                                    0,
+                                                                    idx_clamped,
+                                                                    s_old2[h].index_select(0, idx_clamped),
+                                                                )
+                                                        else:
+                                                            # Fallback for 1D scores (backward compat).
+                                                            idx_clamped = idx_kept.clamp(0, s_old2.numel() - 1).to(torch.long)
+                                                            new_s.scatter_(
+                                                                0,
+                                                                idx_clamped,
+                                                                s_old2.index_select(0, idx_clamped),
+                                                            )
                                                     scores_list2[ridx] = new_s
                                     except Exception:
                                         pass
@@ -1437,9 +1451,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 per_layer_slots_full.append(slots_full)
                                 per_layer_indices_old.append(indices_list[ridx])
 
+                            # Dummy shapes: scores are now [Hkv, old_len], use last dim for old_len.
                             dummy = [
                                 torch.empty(
-                                    (int(s.numel()) + int(dynkv_cfg.window_size), 1, 1),
+                                    (int(s.shape[-1]) + int(dynkv_cfg.window_size), 1, 1),
                                     device=s.device,
                                     dtype=torch.float16,
                                 )
@@ -1456,13 +1471,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             except Exception:
                                 per_layer_old_budget = None
                             if per_layer_old_budget is None or len(per_layer_old_budget) != num_layers:
-                                per_layer_old_budget = update_and_reset_budget(
+                                # Per-head mode: tk = base * H * layers (open-source style).
+                                per_layer_old_budget = update_and_reset_budget_per_kv_head(
                                     per_layer_scores_old=per_layer_scores,
                                     per_layer_k_budget=dummy,
                                     per_layer_v_budget=dummy,
                                     cfg=dynkv_cfg,
                                     budget_size=budget_size,
-                                    head_factor=int(q_last_list[ridx].shape[1]) if q_last_list[ridx].numel() else 1,
                                 )
 
                             per_layer_kv_lens: list[int] = []

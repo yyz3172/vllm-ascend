@@ -352,6 +352,10 @@ def scores_and_indices_old(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Lighter per-layer step: scores over old tokens + top-k indices (sorted).
+
+    NOTE: This version uses head-aggregated scores. For per-head scores with
+    aggregated indices (matching open-source DynamicKV density), use
+    ``scores_and_indices_old_perhead_aggregated`` instead.
     """
     W = int(cfg.window_size)
     L = int(key_full.shape[0])
@@ -368,6 +372,80 @@ def scores_and_indices_old(
         indices_old = torch.topk(scores_old, k=budget_size, dim=0).indices
         indices_old, _ = torch.sort(indices_old)
     return scores_old, indices_old
+
+
+def scores_and_indices_old_perhead_aggregated(
+    *,
+    query_last: torch.Tensor,  # [W, Hq, D]
+    key_full: torch.Tensor,  # [L, Hkv, D]
+    cfg: DynamicKVConfig,
+    budget_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Per-layer step with per-head scores + aggregated indices.
+
+    Matches open-source DynamicKV density semantics:
+    - Compute per-head scores [Hkv, old_len] for cross-layer budget allocation
+    - Aggregate indices across heads for token-level KV compression
+
+    Returns:
+      - scores_old: [Hkv, old_len] (per-head, for cross-layer topk)
+      - indices_old: [k] (aggregated across heads, sorted chronologically)
+    """
+    W = int(cfg.window_size)
+    L = int(key_full.shape[0])
+    Hkv = int(key_full.shape[1])
+    if W <= 0 or L <= W or query_last.numel() == 0:
+        return (
+            key_full.new_zeros((Hkv, 0)),
+            key_full.new_zeros((0,), dtype=torch.long),
+        )
+
+    old_len = L - W
+    budget_size = int(min(int(budget_size), old_len))
+
+    # Step 1: Compute per-head scores [Hkv, old_len]
+    scores_old = _compute_token_scores_old_per_kv_head(query_last, key_full, W)
+
+    # Step 2: Apply pooling per head
+    if cfg.pooling != "none" and int(cfg.kernel_size) > 1 and old_len > 0:
+        pooled: list[torch.Tensor] = []
+        for h in range(Hkv):
+            pooled.append(_pool_1d(scores_old[h], cfg.pooling, int(cfg.kernel_size)))
+        scores_old = torch.stack(pooled, dim=0)
+
+    if budget_size <= 0:
+        return scores_old, key_full.new_zeros((0,), dtype=torch.long)
+
+    # Step 3: Per-head top-k indices [Hkv, k]
+    indices_per_head = torch.topk(scores_old, k=budget_size, dim=-1).indices
+
+    # Step 4: Aggregate indices across heads
+    # Strategy: count how many heads selected each token, then pick top tokens
+    # by selection frequency (weighted by per-head importance)
+    flat_indices = indices_per_head.flatten()  # [Hkv * k]
+
+    # Count selection frequency per token
+    token_counts = torch.zeros(old_len, device=key_full.device, dtype=torch.float32)
+    token_counts.scatter_add_(
+        0,
+        flat_indices.to(torch.long),
+        torch.ones_like(flat_indices, dtype=torch.float32),
+    )
+
+    # Additionally weight by aggregated importance score
+    # (sum of per-head scores for each token)
+    token_importance = scores_old.sum(dim=0)  # [old_len]
+    # Combine: tokens selected by more heads AND with higher importance win
+    combined_score = token_counts * token_importance.to(torch.float32)
+
+    # Select top-k tokens by combined score
+    k_final = min(budget_size, old_len)
+    indices_aggregated = torch.topk(combined_score, k=k_final, dim=0).indices
+    # Sort chronologically for consistent KV layout
+    indices_aggregated, _ = torch.sort(indices_aggregated)
+
+    return scores_old, indices_aggregated.to(torch.long)
 
 
 def cap_keep_indices_chronological(

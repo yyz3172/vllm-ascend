@@ -26,7 +26,9 @@ from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
                                               cap_keep_indices_chronological,
                                               gather_kv_from_paged_cache_batched,
                                               scores_and_indices_old,
-                                              update_and_reset_budget)
+                                              scores_and_indices_old_perhead_aggregated,
+                                              update_and_reset_budget,
+                                              update_and_reset_budget_per_kv_head)
 
 
 @dataclass
@@ -378,7 +380,7 @@ def run_offload_rewrite_and_build_updates(
         cand_old = min(int(cfg.radio_max * cfg.base), int(old_len))
 
         per_layer_scores_old: list[torch.Tensor] = []
-        # Shared (open-source style): each [cand_old]
+        # Per-head scores [Hkv, old_len] for cross-layer budget (open-source style).
         per_layer_indices_old: list[torch.Tensor] = []
         per_layer_k_full: list[torch.Tensor] = []
         per_layer_v_full: list[torch.Tensor] = []
@@ -404,8 +406,8 @@ def run_offload_rewrite_and_build_updates(
             v_full = v_packed[start:end]
             slots_full = slots_packed[start:end].to(torch.long)
 
-            # Shared (open-source style): head-aggregated scores and one index list.
-            scores_old, idx_old = scores_and_indices_old(
+            # Per-head scores + aggregated indices (open-source density style).
+            scores_old, idx_old = scores_and_indices_old_perhead_aggregated(
                 query_last=q_last,
                 key_full=k_full,
                 cfg=cfg,
@@ -429,10 +431,10 @@ def run_offload_rewrite_and_build_updates(
         # Dummy shapes only used to cap max_old.
         dummy = []
         for s in per_layer_scores_old:
-            old_len_i = int(s.shape[-1]) if isinstance(s, torch.Tensor) and s.dim() == 2 else int(s.numel())
+            old_len_i = int(s.shape[-1]) if isinstance(s, torch.Tensor) and s.dim() >= 1 else int(s.numel())
             dummy.append(torch.empty((old_len_i + int(W), 1, 1), device=s.device, dtype=torch.float16))
-        # Shared mode: allocate budgets from aggregated scores (open-source style).
-        per_layer_old_budget = update_and_reset_budget(
+        # Per-head mode: allocate budgets using tk = base * H * layers (open-source style).
+        per_layer_old_budget = update_and_reset_budget_per_kv_head(
             per_layer_scores_old=per_layer_scores_old,
             per_layer_k_budget=dummy,
             per_layer_v_budget=dummy,
