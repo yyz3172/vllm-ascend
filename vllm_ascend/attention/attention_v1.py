@@ -29,7 +29,7 @@ from vllm.attention.backends.registry import (AttentionBackendEnum,
                                               register_backend)
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.v1.worker.utils import extract_layer_index
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
@@ -67,8 +67,6 @@ from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
-
-logger = init_logger(__name__)
 
 # PD DynamicKV：prefill 内按层累计，最后一层做跨层预算并写回各层 KV。
 # 算法与开源 DynamicKV 参考实现（code/DynamicKV）对齐。
@@ -1227,7 +1225,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         for i in range(len(attn_metadata.seq_lens_list)):
                             q0, q1 = int(qsl_cpu[i]), int(qsl_cpu[i + 1])
                             qi = query[q0:q1]
-                            qi_last = qi[-min(int(qi.shape[0]), int(self._dynamickv_window)) :] if qi.numel() else qi
+                            qi_last = qi[-min(int(qi.shape[0]), int(self._dynamickv_window_size)) :] if qi.numel() else qi
                             q_last_list.append(qi_last)
 
                         state = _DYNKV_STATE.setdefault("prefill_batch", {})
@@ -1301,42 +1299,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 scores_old_list.append(s_old)
                                 indices_old_list.append(idx_old)
                                 
-                                # ``mask`` validation: save important_mask for decode (PD).
-                                if self._dynamickv_validation_mode == "mask":
-                                    rid = (
-                                        attn_metadata.req_ids[ridx]
-                                        if attn_metadata.req_ids and ridx < len(attn_metadata.req_ids)
-                                        else None
-                                    )
-                                    if rid:
-                                        window_size = int(dynkv_cfg_layer.window_size)
-                                        # Build important_mask: True for important tokens (selected + window)
-                                        important_mask = torch.zeros(seq_len_i, dtype=torch.bool, device=k_full.device)
-                                        if idx_old.numel() > 0:
-                                            important_mask[idx_old.to(torch.long)] = True
-                                        # Window tokens (tail) are always important
-                                        if window_size > 0:
-                                            important_mask[-window_size:] = True
-                                        save_validation_mask(rid, layer_idx, important_mask)
-                                        _n_imp = int(important_mask.sum().item())
-                                        try:
-                                            from vllm.distributed.parallel_state import (
-                                                get_tensor_model_parallel_rank,
-                                            )
-
-                                            _plog = int(get_tensor_model_parallel_rank()) == 0
-                                        except Exception:
-                                            _plog = True
-                                        if _plog:
-                                            logger.info(
-                                                "[DynamicKV][Prefill][validation] mode=%s layer_idx=%d "
-                                                "request_id=%s important_tokens=%d prompt_len=%d",
-                                                self._dynamickv_validation_mode,
-                                                layer_idx,
-                                                rid,
-                                                _n_imp,
-                                                seq_len_i,
-                                            )
+                                # NOTE: For ``validation_mode=mask``, we build the final per-layer
+                                # important_mask after cross-layer budgets are determined (last layer),
+                                # so that the mask reflects the *effective* keep set rather than the
+                                # pre-reallocation candidate pool.
                             per_layer[layer_idx]["scores_old_list"] = scores_old_list
                             per_layer[layer_idx]["indices_old_list"] = indices_old_list
                         except Exception as e:
@@ -1691,27 +1657,68 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     per_layer_keep_indices.append(full_indices)
                                 plii: list[list[int]] = []
                                 for li in range(num_layers):
-                                    vm = (
-                                        get_validation_mask(rid, li)
-                                        if rid
-                                        else None
+                                    old_budget = int(per_layer_old_budget[li])
+                                    idx_old = per_layer_indices_old[li]
+                                    tail_idx_m = tail_keep_idx_by_req[ridx].to(idx_old.device)
+                                    old_budget_eff = max(
+                                        0,
+                                        min(int(old_budget), int(idx_old.shape[0])),
                                     )
-                                    if vm is not None and int(vm.numel()) == int(
-                                        seq_len_i
-                                    ):
-                                        plii.append(
-                                            [
-                                                int(x)
-                                                for x in torch.where(vm)[0].tolist()
-                                            ]
+                                    idx_old_keep = (
+                                        idx_old[:old_budget_eff].to(torch.long)
+                                        if old_budget_eff > 0
+                                        else idx_old[:0].to(torch.long)
+                                    )
+                                    keep_sorted, _ = cap_keep_indices_chronological(
+                                        idx_old=idx_old_keep,
+                                        old_budget=old_budget_eff,
+                                        tail_idx=tail_idx_m,
+                                        cap=seq_len_i,
+                                        device=idx_old.device,
+                                    )
+                                    # Save per-layer important_mask for in-proc decode validation,
+                                    # and export sparse important indices for PD decode.
+                                    if rid:
+                                        important_mask = torch.zeros(
+                                            seq_len_i,
+                                            dtype=torch.bool,
+                                            device=idx_old.device,
                                         )
-                                    else:
-                                        plii.append(list(range(int(seq_len_i))))
+                                        if keep_sorted.numel() > 0:
+                                            important_mask[keep_sorted.to(torch.long)] = True
+                                        save_validation_mask(rid, li, important_mask)
+                                    plii.append([int(x) for x in keep_sorted.tolist()])
                                 results_by_req[rid] = {
                                     "per_layer_kv_lens": per_layer_kv_lens,
                                     "per_layer_keep_indices": per_layer_keep_indices,
                                     "per_layer_important_indices": plii,
                                 }
+                                _val_log = True
+                                try:
+                                    from vllm.distributed.parallel_state import (
+                                        get_tensor_model_parallel_rank,
+                                    )
+
+                                    _val_log = int(get_tensor_model_parallel_rank()) == 0
+                                except Exception:
+                                    pass
+                                if _val_log:
+                                    # Debug-level verbose log (full per-layer counts).
+                                    # Enable DEBUG logging when needed; avoid spamming prefill.log by default.
+                                    important_n_by_layer = [len(x) for x in plii] if plii else []
+                                    pairs = ", ".join(
+                                        f"L{lj}={nj}" for lj, nj in enumerate(important_n_by_layer)
+                                    ) if important_n_by_layer else "<empty>"
+                                    logger.debug(
+                                        "[DynamicKV][attn] validation_mode=%s: skip KV pack, "
+                                        "full_prefix metadata L=%d request_id=%s "
+                                        "important_tokens_per_layer: %s (%s)",
+                                        str(self._dynamickv_validation_mode),
+                                        int(seq_len_i),
+                                        rid,
+                                        pairs,
+                                        "PD mask indices attached",
+                                    )
                                 continue  # Skip KV rewrite for this request
                             if self._dynamickv_validation_mode == "zero":
                                 full_indices = list(range(seq_len_i))

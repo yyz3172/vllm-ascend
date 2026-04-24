@@ -1206,6 +1206,26 @@ class MooncakeConnectorScheduler:
                                     dynamic_kv_payload["per_layer_important_indices"] = (
                                         pii0
                                     )
+                                    # Validation-mode convenience log: per-layer important token counts.
+                                    try:
+                                        cnts = [
+                                            len(x) if isinstance(x, list) else -1
+                                            for x in pii0
+                                        ]
+                                        if cnts:
+                                            pairs = ", ".join(
+                                                f"L{li}={c}"
+                                                for li, c in enumerate(cnts)
+                                                if int(c) >= 0
+                                            )
+                                            logger.info(
+                                                "[DynamicKV][PD][mask] request_finished important_tokens_per_layer: "
+                                                "request_id=%s %s",
+                                                request.request_id,
+                                                pairs if pairs else "<empty>",
+                                            )
+                                    except Exception:
+                                        pass
                                 # Offload impl: worker may attach block_table-ordered prefix blocks.
                                 # Preserve it so PD shrink can avoid allocator-order slicing.
                                 try:
