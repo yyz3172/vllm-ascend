@@ -4,7 +4,7 @@
 
 ---
 
-## 1. 功能目的与总体策略（通俗版）
+## 1. 功能目的与总体策略
 
 ### 1.1 目的：压缩的是什么？为什么要压缩？
 
@@ -75,13 +75,20 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 ### 2.1 配置项
 
 - **enabled**：是否启用 DynamicKV（默认 `false`）
+- **impl**：在 vLLM-Ascend 里 **把压缩算法挂在哪里执行**（默认 **`offload`**）
+  - **`offload`（默认）**：prefill 时 attention 仍走常规路径（`reshape_and_cache` 等）把 KV 写满；**该步结束后**在 worker / `model_runner` 里做一次后处理：通过 Q 相关模块的 forward hook 捕获各层 `q_last`，再调用 `run_offload_rewrite_and_build_updates` 做选 token、跨层预算、前缀写回与 PD 元数据组装。**不经过** `attention_v1.py` 里那套「prefill forward 内逐层累积 + 每 4 层重分配」分支。启动后日志里若出现 **`[DynamicKV][offload] installed ...`**，即表示当前为 offload。
+  - **`attn`**：压缩逻辑挂在 **`attention_v1.py` 的 Python attention forward** 中：在 `PrefillNoCache` 或 ChunkedPrefill **最后一块**内逐层累计各层 `q_last`/scores/indices，并在 forward 内触发跨层预算与写回。文档 **§3.2** 里描述的「每 4 层」跨层重分配与沿途截断 indices，**当前主要对应此路径**。适合与开源「在模型前向里直接操作 KV」的读法对齐；与默认 offload 相比，对图捕获、eager 等环境更敏感。
 - **model_types**：允许启用的 HF `model_type` 列表（默认 `["mistral"]`）
 - **window_size**：窗口大小 window（默认 `16`）
 - **prompt_kv_len_budget**：每层 KV 长度的预算目标（默认 `512`，通常约等于 \(old + window\_size\) 的目标值）。**不是硬上限**：个别层可能 \(kv\_len > prompt\_kv\_len\_budget\)，硬上限仍为 prompt_len
-- **pooling**：对 token importance 做 1D 平滑（`none|avgpool|maxpool`，默认 `avgpool`）
-- **kernel_size**：pooling 的 kernel（默认 `7`）
+- **pooling**：对 **旧 token 段**上的一维 importance 分数做空间平滑（沿 token 下标轴，步长 1，两侧对称 padding 为 `kernel_size // 2`）。取值含义：
+  - **`none`**：不平滑，各位置的分数直接进入后续 top-k / 并集逻辑。
+  - **`avgpool`**（默认）：`avg_pool1d`，邻域内取平均，可抑制单 token 尖峰、让局部区间的重要性更平滑。
+  - **`maxpool`**：`max_pool1d`，邻域内取最大，更偏向「只要邻域里有一处高响应就抬高该位置」。
+  - 当 `pooling == "none"` 或 `kernel_size <= 1` 时，实现上等价于不做 pooling。
+- **kernel_size**：pooling 的卷积核长度（默认 `7`）；仅在 `pooling` 为 `avgpool` / `maxpool` 且 `kernel_size > 1` 时生效。
 - **radio_max / radio_min**：跨层重分配的上/下限相关系数（默认 `10.0/0.1`，与上游参考实现一致）
-- **validation_mode**：验证模式，用于验证 token 选择策略的有效性（默认 `none`）；可与配置键 `dynamickv_validation_mode` 二选一
+- **validation_mode**：验证模式，用于验证 token 选择策略的有效性（默认 `none`）
   - `none`：正常压缩模式
   - `mask`：prefill 不落盘压缩；decode 用完整 KV + `atten_mask`（`npu_fusion_attention`），被掩蔽位置不参与注意力
   - `zero`：在 **prefill 节点**对 paged KV 中不重要 token 的 **K/V 物理置零**，PD 传输置零后的 KV；decode 走 **常规 `_npu_paged_attention`**，不依赖 `per_layer_important_indices` / `_VALIDATION_MASKS`
@@ -195,6 +202,7 @@ decode 侧生效依赖两件事：
 
 - **这是 PD 场景优先实现**：prefill 本地仍先完整写入 KV，再在 **同一轮 prefill 的最后一层**做分层压缩写回（`PrefillNoCache` 整段或 ChunkedPrefill 最后一块）
 - **Paged KV 的写回策略**：压缩后的 KV 写回到每层 cache 的"前缀 slots"，保证 decode 按 kv_len 读的是连续有效前缀
+- **Prefix caching 与 DynamicKV 互斥**：启用 DynamicKV 时，vLLM-Ascend 会在初始化配置阶段 **强制关闭** `enable_prefix_caching`。原因是 DynamicKV 会在 prefill 上 **改写** paged KV 内容；而前缀缓存假设「相同 token 前缀对应可复用的稳定 KV」。若同时开启，可能导致错误复用或与 DynamicKV 导出的 per-layer 元数据不一致。若用户在 YAML/CLI 中打开了 prefix caching，实际运行仍会被置为关闭（日志中有 `forcing prefix caching off` 提示）。
 - **并发安全**：per-request 结果按 `request_id` 存放并在 Mooncake attach 后 pop，同时有 TTL/容量清理
 - **图捕获（graph capture）**：录制图期间不做分层压缩，只做普通 `reshape_and_cache`，避免动态形状破坏捕获
 
@@ -210,7 +218,7 @@ decode 侧生效依赖两件事：
 |------|----------|--------|
 | **应用场景** | HuggingFace Transformers 单机推理 | vLLM-Ascend PD 分布式分离 |
 | **KV Cache** | `DynamicCache` 连续内存 | Paged KV Cache（block_table 映射） |
-| **集成方式** | Monkey-patch forward | vLLM Attention Backend + offload 模式 |
+| **集成方式** | 在模型 **forward 内** 替换/包裹注意力与 cache（Monkey-patch），推理过程中逐层读写压缩后的 KV | **默认 `impl=offload`**：forward 不内嵌压缩，prefill 后再 **后处理** 改写 Paged KV；可选 **`impl=attn`**：在 **Attention 后端 forward** 内嵌压缩流程，与开源「前向内」形态 **更接近**（但并非同一套代码仓库） |
 
 ### 6.2 算法对齐（已完成）
 
@@ -226,7 +234,7 @@ decode 侧生效依赖两件事：
 
 - **物理块压缩传输**：`per_layer_num_prompt_blocks` / `per_layer_remote_block_ids`
 - **kv_transfer_params 跨进程传递**：prefill → proxy → decode
-- **offload 模式**：Hook Q-proj 延迟计算，不修改 attention 执行路径
+- **`impl=offload`（默认）**：Q 捕获 hook + prefill 后改写，**不**改 attention 算子主路径，便于与 PD、Mooncake 组合；开源参考实现 **没有** 与此一一对应的同名模式，仅可类比为「把压缩从 forward 挪到步后」的工程折中。
 
 ---
 
