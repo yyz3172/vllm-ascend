@@ -947,7 +947,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 except Exception:
                     _do = True
                 if _do:
-                    logger.info(
+                    logger.debug(
                         "[DynamicKV][Decode][validation] mode=%s layer_idx=%d "
                         "request_id=%s important_tokens=%d seq_len=%d",
                         mode,
