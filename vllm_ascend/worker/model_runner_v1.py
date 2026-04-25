@@ -645,6 +645,58 @@ class NPUModelRunner(GPUModelRunner):
                 position_pcp[:total_num_scheduled_tokens],
                 out=positions_np,
             )
+        # Keep a raw (cache-space) position snapshot for token-id lookup.
+        # Slot-mapping and token indexing must remain in compressed cache space.
+        token_positions_np = positions_np.copy()
+
+        # DynamicKV PD decode: RoPE positions should stay in original prompt space
+        # while slot mapping/token lookup stays in compressed cache space.
+        if (not self.uses_mrope and self.uses_xdrope_dim == 0
+                and getattr(self, "is_kv_consumer", False)):
+            try:
+                ascend_cfg = get_ascend_config()
+                dyn_enabled = bool(
+                    getattr(ascend_cfg, "dynamic_kv_enabled", False))
+                if dyn_enabled:
+                    offset_by_req_idx: dict[int, int] = {}
+                    for req_idx in range(num_reqs):
+                        req_id = req_ids[req_idx]
+                        req = self.requests.get(req_id)
+                        kvp = getattr(req, "kv_transfer_params",
+                                      None) if req is not None else None
+                        if not isinstance(kvp, dict):
+                            continue
+                        dyn = kvp.get("dynamic_kv") if isinstance(
+                            kvp.get("dynamic_kv"), dict) else {}
+                        # Backward-compatible: prefer explicit field, else derive.
+                        offset = dyn.get("decode_position_offset")
+                        if not isinstance(offset, int):
+                            opl = dyn.get("original_prompt_len")
+                            transferred = dyn.get("transferred_tokens")
+                            if (isinstance(opl, int) and opl > 0
+                                    and isinstance(transferred, int)
+                                    and transferred > 0):
+                                # first decode query position should be `opl`
+                                # when raw position starts at transferred-1.
+                                offset = int(opl) - int(transferred) + 1
+                        if isinstance(offset, int) and offset != 0:
+                            offset_by_req_idx[req_idx] = int(offset)
+                    if offset_by_req_idx:
+                        for req_idx, offset in offset_by_req_idx.items():
+                            mask = (req_indices == req_idx)
+                            positions_np[mask] += offset
+                        prev_offsets = getattr(self, "_dynkv_last_rope_offsets",
+                                               None)
+                        if prev_offsets != offset_by_req_idx:
+                            setattr(self, "_dynkv_last_rope_offsets",
+                                    dict(offset_by_req_idx))
+                            logger.info(
+                                "[DynamicKV][decode] applied RoPE offsets: %s",
+                                offset_by_req_idx,
+                            )
+            except Exception as e:
+                logger.warning(
+                    "[DynamicKV][decode] RoPE offset apply failed: %s", e)
         max_num_scheduled_tokens = max(tokens)
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
             and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
@@ -704,7 +756,7 @@ class NPUModelRunner(GPUModelRunner):
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
-        token_indices = (positions_np +
+        token_indices = (token_positions_np +
                          req_indices * self.input_batch.token_ids_cpu.shape[1])
         token_indices_tensor = torch.from_numpy(token_indices)
         # Prepare input_ids.
@@ -1228,6 +1280,19 @@ class NPUModelRunner(GPUModelRunner):
                                 kv_list.append(kvp if isinstance(kvp, dict) else {})
                             if kv_list and len(kv_list) == len(rid_list):
                                 tmp_lens: list[int] = []
+                                dyn_slot_mapping_np = None
+                                try:
+                                    dyn_slot_mapping_np = (
+                                        meta_i.slot_mapping.detach().cpu().numpy().copy()
+                                    )
+                                    block_tables_np = (
+                                        meta_i.block_tables.detach().cpu().numpy()
+                                    )
+                                    bs_dyn = int(self.block_size)
+                                except Exception:
+                                    dyn_slot_mapping_np = None
+                                    block_tables_np = None
+                                    bs_dyn = 0
                                 for req_idx, kvp in enumerate(kv_list):
                                     if not kvp:
                                         tmp_lens.append(-1)
@@ -1244,7 +1309,36 @@ class NPUModelRunner(GPUModelRunner):
                                             num_computed_tokens_cpu[req_idx])
                                     except Exception:
                                         npt, ncomp = 0, 0
-                                    decode_extra = max(0, ncomp - npt)
+                                    # PD+DynamicKV: scheduler's `num_computed_tokens`
+                                    # starts at `transferred_tokens` (< num_prompt_tokens
+                                    # because of compression). Use that as the base for
+                                    # decode_extra so per-layer kv_len grows as new
+                                    # decode KVs are written into cache.
+                                    base_tokens = npt
+                                    transferred = dyn.get("transferred_tokens")
+                                    use_dyn_base = isinstance(
+                                        transferred, int) and transferred > 0
+                                    if use_dyn_base:
+                                        base_tokens = int(transferred)
+                                    # `num_computed_tokens` points to the position of
+                                    # current decode query token. For PD remote prefill,
+                                    # scheduler initializes it at `base_tokens - 1`.
+                                    # Context length must include the current token, so
+                                    # the first decode step contributes one token.
+                                    decode_extra = max(
+                                        0, ncomp - base_tokens + 2)
+                                    if layer_idx == 0:
+                                        logger.debug(
+                                            "[DynamicKV][decode_extra] req_idx=%d "
+                                            "npt=%d ncomp=%d transferred=%s base=%d decode_extra=%d dyn_base=%s",
+                                            req_idx,
+                                            npt,
+                                            ncomp,
+                                            transferred,
+                                            base_tokens,
+                                            decode_extra,
+                                            use_dyn_base,
+                                        )
                                     # Do not pass ``per_layer_keep_indices`` into
                                     # paged decode: indices live in *original*
                                     # prompt coordinates while offload packs KV
@@ -1260,6 +1354,33 @@ class NPUModelRunner(GPUModelRunner):
                                             Li = -1
                                         if Li > 0:
                                             tmp_lens.append(Li + decode_extra)
+                                            # PD+DynamicKV offload uses per-layer
+                                            # packed prompt lengths. Decode KV must be
+                                            # written immediately after each layer's
+                                            # packed prefix (`Li + step`), not at the
+                                            # global transferred-token position.
+                                            if (use_dyn_base
+                                                    and dyn_slot_mapping_np is not None
+                                                    and block_tables_np is not None
+                                                    and bs_dyn > 0):
+                                                try:
+                                                    mask = (req_indices == req_idx)
+                                                    if mask.any():
+                                                        rel = (
+                                                            token_positions_np[mask]
+                                                            - (int(base_tokens) - 1)
+                                                        )
+                                                        tgt_pos = int(Li) + rel
+                                                        bt_row = block_tables_np[req_idx]
+                                                        block_ids = bt_row[
+                                                            tgt_pos // bs_dyn
+                                                        ]
+                                                        dyn_slot_mapping_np[mask] = (
+                                                            block_ids * bs_dyn
+                                                            + (tgt_pos % bs_dyn)
+                                                        )
+                                                except Exception:
+                                                    dyn_slot_mapping_np = None
                                             # PD validation: restore important-token mask on decode worker.
                                             try:
                                                 rid_here = (
@@ -1308,6 +1429,19 @@ class NPUModelRunner(GPUModelRunner):
                                 if tmp_lens and not all(v < 0 for v in tmp_lens):
                                     setattr(meta_i, "dynamic_kv_seq_lens_list",
                                             tmp_lens)
+                                    if dyn_slot_mapping_np is not None:
+                                        try:
+                                            meta_i.slot_mapping = torch.as_tensor(
+                                                dyn_slot_mapping_np,
+                                                device=meta_i.slot_mapping.device,
+                                                dtype=meta_i.slot_mapping.dtype,
+                                            )
+                                            if layer_idx == 0:
+                                                logger.debug(
+                                                    "[DynamicKV][decode] applied per-layer slot_mapping override"
+                                                )
+                                        except Exception:
+                                            pass
                     attn_metadata[layer_name] = meta_i
 
         # update global cos, sin

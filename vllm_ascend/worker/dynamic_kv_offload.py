@@ -69,6 +69,7 @@ def _dynamic_kv_payload_full_prefix(
     return {
         "per_layer_kv_lens": full_lens,
         "per_layer_keep_indices": full_idx,
+        "original_prompt_len": int(L),
     }
 
 
@@ -674,6 +675,7 @@ def run_offload_rewrite_and_build_updates(
             "dynamic_kv": {
                 "per_layer_kv_lens": full_lens,
                 "per_layer_keep_indices": full_idx,
+                "original_prompt_len": int(L),
             }
         }
         _validate_payload_or_fallback(rid=rid, L=L, full_lens=full_lens, full_idx=full_idx)

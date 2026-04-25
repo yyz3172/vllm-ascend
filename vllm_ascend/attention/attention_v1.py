@@ -1590,21 +1590,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 v_full = v_packed[start:end]
                                 slots_full = slots_packed[start:end]
 
-                                # Use cached indices/scores computed in earlier per-layer pass.
                                 cached = per_layer.get(li)
                                 if not cached or "scores_old_list" not in cached or "indices_old_list" not in cached:
-                                    try:
-                                        key = (rid, "missing_scores_indices", int(li))
-                                        dbgfail = _DYNKV_STATE.setdefault("debug_fail", set())
-                                        if isinstance(dbgfail, set) and key not in dbgfail:
-                                            dbgfail.add(key)
-                                            logger.warning(
-                                                "[DynamicKV] prefill_fail: stage=final_rewrite request_id=%s reason=missing_scores_indices layer_idx=%d",
-                                                rid,
-                                                int(li),
-                                            )
-                                    except Exception:
-                                        pass
                                     return output
                                 scores_list = cached["scores_old_list"]
                                 indices_list = cached["indices_old_list"]

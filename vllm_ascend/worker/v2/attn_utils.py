@@ -128,7 +128,7 @@ def build_attn_metadata(
                 if layer_idx >= 0:
                     tmp: list[int] = []
                     idx_tmp: list[list[int]] = []
-                    for kvp in kv_transfer_params_list:
+                    for ridx, kvp in enumerate(kv_transfer_params_list):
                         if not kvp:
                             tmp.append(-1)
                             idx_tmp.append([])
@@ -136,13 +136,33 @@ def build_attn_metadata(
                         dyn = kvp.get("dynamic_kv") or {}
                         per_layer = dyn.get("per_layer_kv_lens")
                         per_layer_indices = dyn.get("per_layer_keep_indices")
+                        # PD+DynamicKV: per-layer kv_len must grow with decode tokens.
+                        # decode_extra = num_computed_tokens - transferred_tokens.
+                        try:
+                            ncomp = int(num_computed_tokens_cpu[ridx])
+                        except Exception:
+                            ncomp = 0
+                        transferred = dyn.get("transferred_tokens")
+                        use_shared_len = isinstance(
+                            transferred, int) and transferred > 0
+                        if use_shared_len:
+                            # Scheduler starts at `transferred - 1`; include
+                            # current decode token.
+                            decode_extra = max(0, ncomp - int(transferred) + 2)
+                        else:
+                            decode_extra = 0
                         # Prefer kv_len derived from indices when available.
+                        # NOTE: offload+none mode sets per_layer_keep_indices to empty []
+                        # for all layers (packed-prefix layout). Only use indices if non-empty.
                         if isinstance(per_layer_indices, list) and layer_idx < len(per_layer_indices):
                             try:
                                 idxs = per_layer_indices[layer_idx]
-                                if isinstance(idxs, list):
+                                if isinstance(idxs, list) and idxs:  # Check non-empty
                                     idx_tmp.append([int(x) for x in idxs])
-                                    tmp.append(len(idxs))
+                                    if use_shared_len:
+                                        tmp.append(int(transferred) + decode_extra)
+                                    else:
+                                        tmp.append(len(idxs) + decode_extra)
                                     continue
                             except Exception:
                                 idx_tmp.append([])
@@ -150,7 +170,14 @@ def build_attn_metadata(
                                 continue
                         if isinstance(per_layer, list) and layer_idx < len(per_layer):
                             try:
-                                tmp.append(int(per_layer[layer_idx]))
+                                Li = int(per_layer[layer_idx])
+                                if Li > 0:
+                                    if use_shared_len:
+                                        tmp.append(int(transferred) + decode_extra)
+                                    else:
+                                        tmp.append(Li + decode_extra)
+                                else:
+                                    tmp.append(-1)
                             except Exception:
                                 tmp.append(-1)
                         else:

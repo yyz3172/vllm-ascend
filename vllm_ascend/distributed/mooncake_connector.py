@@ -1200,6 +1200,7 @@ class MooncakeConnectorScheduler:
                                 dynamic_kv_payload = {
                                     "per_layer_kv_lens": per_layer0,
                                     "per_layer_keep_indices": dyn0.get("per_layer_keep_indices"),
+                                    "original_prompt_len": dyn0.get("original_prompt_len") or int(prompt_len),
                                 }
                                 pii0 = dyn0.get("per_layer_important_indices")
                                 if isinstance(pii0, list) and pii0:
@@ -1313,6 +1314,7 @@ class MooncakeConnectorScheduler:
                         dynamic_kv_payload = {
                             "per_layer_kv_lens": last_res["per_layer_kv_lens"],
                             "per_layer_keep_indices": last_res.get("per_layer_keep_indices"),
+                            "original_prompt_len": last_res.get("original_prompt_len") or int(prompt_len),
                         }
                         pli_last = last_res.get("per_layer_important_indices")
                         if isinstance(pli_last, list) and pli_last:
@@ -1343,6 +1345,7 @@ class MooncakeConnectorScheduler:
                         # is not merged before request_finished (see log tag below).
                         dynamic_kv_payload = {
                             "per_layer_kv_lens": [int(capped)] * int(num_layers),
+                            "original_prompt_len": int(prompt_len),
                         }
                         logger.warning(
                             "[DynamicKV] request_finished per_layer_kv_lens"
@@ -1467,6 +1470,23 @@ class MooncakeConnectorScheduler:
                     "[DynamicKV][PD] offload shrink transfer skipped",
                     exc_info=True,
                 )
+
+        # NOTE(DynamicKV): record `transferred_tokens` so decode side can compute
+        # `decode_extra = num_computed_tokens - transferred_tokens` correctly.
+        # Without this, decode_extra would use `num_prompt_tokens` as the base,
+        # which is wrong in PD+DynamicKV (transferred_tokens < num_prompt_tokens),
+        # making `decode_extra` always 0 and keeping decoded KV out of the
+        # per-layer `context_lens` window.
+        if isinstance(dynamic_kv_payload, dict):
+            transferred_tokens = len(send_block_ids) * int(self.block_size)
+            dynamic_kv_payload["transferred_tokens"] = int(transferred_tokens)
+            logger.info(
+                "[DynamicKV][PD] transferred_tokens recorded: request_id=%s "
+                "original_prompt_len=%s transferred_tokens=%d",
+                request.request_id,
+                dynamic_kv_payload.get("original_prompt_len"),
+                transferred_tokens,
+            )
 
         # Delay-free pins the full prefill allocation until async send completes.
         delay_free_blocks = len(computed_block_ids) > 0

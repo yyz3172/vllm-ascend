@@ -224,6 +224,96 @@ decode 侧生效依赖两件事：
 - kernel 使用：`code/vllm-ascend/vllm_ascend/attention/attention_v1.py::forward_paged_attention`
 - decode 侧长度与注释：`code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py`（DynamicKV + `decode_extra`）
 
+### 3.4 PD + DynamicKV 关键修复：`transferred_tokens` 与 `decode_extra`
+
+**问题背景**：在 PD + DynamicKV 物理压缩场景下，prefill 把压缩后 KV 通过 `transferred_tokens = num_blocks * block_size` 个 token 的容量传给 decode。Decode 端 scheduler 据此初始化 `num_computed_tokens ≈ transferred_tokens - 1`（< `num_prompt_tokens`，因为压缩）。
+
+`model_runner_v1.py` 在为 paged attention 注入 `dynamic_kv_seq_lens_list` 时，需要把 prefill 端的每层 `Li`（`per_layer_kv_lens[layer]`）按 decode 已生成的 token 数 grow：
+
+```python
+decode_extra = max(0, num_computed_tokens - base_tokens)
+context_lens[layer] = Li + decode_extra
+```
+
+**Bug**：旧实现 `base_tokens = num_prompt_tokens`：
+- 普通 PD 场景：`num_computed_tokens` 一开始就 `>= num_prompt_tokens`，差值就是 decode 步数 ✓
+- **PD + DynamicKV 场景**：`num_computed_tokens` 始终 < `num_prompt_tokens`（前者是 transferred_tokens，后者是原 prompt 长度），导致 `decode_extra = 0`，每层 `kv_len` 不会随 decode 增长，**新生成的 decode KV 永远落在 paged attention 的 `context_lens` 窗口之外**，被 attention kernel 忽略。结果就是 decode 输出乱码。
+
+**修复**：prefill 端在 `kv_transfer_params.dynamic_kv` 中带上 `transferred_tokens`，decode 端用它替换 `num_prompt_tokens` 作为 `decode_extra` 的 base：
+
+```python
+base_tokens = dyn.get("transferred_tokens") or num_prompt_tokens
+decode_extra = max(0, num_computed_tokens - base_tokens)
+context_lens[layer] = Li + decode_extra
+```
+
+数据流：
+1. **Prefill** (`mooncake_connector.py`)：计算 `transferred_tokens = len(send_block_ids) * block_size`，写入 `dynamic_kv_payload["transferred_tokens"]`。
+2. **PD 传输**：随 `kv_transfer_params` 一并送达 decode 端。
+3. **Decode** (`model_runner_v1.py` 与 `worker/v2/attn_utils.py`)：在生成 `dynamic_kv_seq_lens_list` 时，每层 kv_len = `Li + (num_computed_tokens - transferred_tokens)`。
+
+**示例**（L=20455, blocks=153, block_size=128）：
+- `transferred_tokens = 19584`
+- 第 1 步 decode：`ncomp=19583`, `decode_extra=0`, 第 i 层 `kv_len = Li + 0`
+- 第 2 步 decode：`ncomp=19584`, `decode_extra=0` (=19584-19584), 第 i 层 `kv_len = Li + 0`
+
+**注**：第 N 步 decode 时 `ncomp ≈ transferred_tokens + N - 1`，所以 `decode_extra = N - 1`。新写入的 decode KV 才能被 attention kernel 正确读到。
+
+> 关于 RoPE position：因为 keys 在 cache 中保留**原始 RoPE**，而 query 的 RoPE 由模型按 `positions` tensor（首步 = `num_computed_tokens` ≈ transferred_tokens-1）计算，二者**绝对位置不一致**。但 attention 用相对位置，q·k 的 RoPE 角度差是 `query_pos - key_pos`，仍然反映 token 在压缩前的相对距离。除首步会有轻微 RoPE 偏差外，整体 attention 仍然正确。
+
+### 3.4.X（已弃用）`decode_position_offset` 实验性方案
+
+**问题背景**：DynamicKV 物理压缩后，KV cache 中的 keys 仍保留其**原始 prompt 位置**的 RoPE 编码（如原位置 100 的 key 仍带 RoPE(100)）。Decode 端的 scheduler 基于**传输的 block 数量**设置 `num_computed_tokens`，而非原始 prompt 长度。若直接使用 `num_computed_tokens` 作为 query position，会导致相对位置编码错误，产生错误的 attention 结果。
+
+**解决方案**：Prefill 端在 PD 传输时计算 **`decode_position_offset`**：
+
+```
+transferred_tokens = num_blocks_transferred × block_size
+decode_position_offset = original_prompt_len - transferred_tokens + 1
+```
+
+**注**：+1 是因为 decode scheduler 初始化 `num_computed_tokens = transferred_tokens - 1`（而非 `transferred_tokens`）。
+
+Decode 端在计算 query position 时加上此 offset：
+
+```
+position = num_computed_tokens + decode_position_offset
+```
+
+**数据流**：
+
+1. **Prefill 端**（`dynamic_kv_offload.py`）：导出 `original_prompt_len: int(L)`
+2. **PD 传输**（`mooncake_connector.py`）：
+   - 计算 `decode_position_offset = original_prompt_len - len(send_block_ids) * block_size + 1`
+   - 添加到 `dynamic_kv_payload`
+3. **Decode 端**（`model_runner_v1.py::_prepare_inputs`）：
+   - 从 `request.kv_transfer_params.dynamic_kv.decode_position_offset` 获取 offset
+   - `position_base = num_computed_tokens + decode_position_offset`
+
+**示例**：
+- 原始 prompt 长度：`L = 20455`
+- 传输 block 数量：`153`，block_size = `128`
+- 传输 token 数：`153 × 128 = 19584`
+- `decode_position_offset = 20455 - 19584 + 1 = 872`
+- Decode scheduler 初始化 `num_computed_tokens = 19583`（= transferred_tokens - 1）
+- 首次 decode：`position = 19583 + 872 = 20455` ✓
+- 第二次 decode：`position = 19584 + 872 = 20456` ✓
+
+**字段说明**（`kv_transfer_params.dynamic_kv`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `original_prompt_len` | `int` | 原始 prompt token 数 |
+| `decode_position_offset` | `int` | Decode query position 调整值 |
+| `per_layer_kv_lens` | `list[int]` | 各层压缩后 KV 有效长度，用于 attention kernel context_lens |
+| `per_layer_keep_indices` | `list[list[int]]` | 各层保留 token indices（offload 压缩后常为空列表） |
+
+关键实现位置：
+
+- prefill 导出：`code/vllm-ascend/vllm_ascend/worker/dynamic_kv_offload.py`
+- offset 计算与 PD 传递：`code/vllm-ascend/vllm_ascend/distributed/mooncake_connector.py`
+- decode position 调整：`code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py::_prepare_inputs`
+
 ---
 
 ## 4. 关键日志说明（如何验收"真的生效"）
