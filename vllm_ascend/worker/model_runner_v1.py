@@ -1875,6 +1875,9 @@ class NPUModelRunner(GPUModelRunner):
                                     validation_mode=str(
                                         getattr(ascend_cfg, "dynamic_kv_validation_mode", "none")
                                     ),
+                                    min_rewrite_delta=int(
+                                        getattr(ascend_cfg, "dynamic_kv_min_rewrite_delta", 128)
+                                    ),
                                 )
                                 # Attach block_table-ordered prefix physical blocks for PD shrink.
                                 # NOTE: Do NOT use allocator-ordered `block_ids[:n]` to shrink:

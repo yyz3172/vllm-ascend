@@ -172,6 +172,9 @@ class AscendConfig:
         # DynamicKV knobs (optional; radio_* match upstream reference).
         self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
         self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
+        # Offload only: skip packed-prefix rewrite when (prompt_len - budget) is
+        # below this many tokens (avoids fragile pack for tiny over-budget deltas).
+        self.dynamic_kv_min_rewrite_delta = max(0, int(dyn.get("min_rewrite_delta", 128)))
         # DynamicKV validation mode for verifying token selection effectiveness.
         # - "none": normal compression (default)
         # - "mask": decode uses full KV + attention mask (npu_fusion_attention)

@@ -90,6 +90,7 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **model_types**：允许启用的 HF `model_type` 列表（默认 `["mistral"]`）
 - **window_size**：窗口大小 window（默认 `16`）
 - **prompt_kv_len_budget**：每层 KV 长度的预算目标（默认 `512`，通常约等于 \(old + window\_size\) 的目标值）。**不是硬上限**：个别层可能 \(kv\_len > prompt\_kv\_len\_budget\)，硬上限仍为 prompt_len
+- **min_rewrite_delta**（默认 `128`，YAML：`min_rewrite_delta`）：**仅 `impl=offload`**。当 **`L > prompt_kv_len_budget`** 且 **`L - prompt_kv_len_budget < min_rewrite_delta`**（按 **prompt token 数**计）时，**不执行** packed-prefix 改写，仍下发 **全长前缀**元数据（见 §2.1.1）。用于避免「仅略超预算」时走 pack 的收益小、语义更脆。默认值常与 **`block_size`（如 128）** 同级；可按业务调小（例如 `1` 表示只要 `L>C` 即允许尝试压缩）或调大。
 - **pooling**：对 **旧 token 段**上的一维 importance 分数做空间平滑（沿 token 下标轴，步长 1，两侧对称 padding 为 `kernel_size // 2`）。取值含义：
   - **`none`**：不平滑，各位置的分数直接进入后续 top-k / 并集逻辑。
   - **`avgpool`**（默认）：`avg_pool1d`，邻域内取平均，可抑制单 token 尖峰、让局部区间的重要性更平滑。
@@ -115,7 +116,7 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 **单 request：全长前缀元数据（`_full_prefix_update`，不 pack 物理 KV）**
 
 - **`L <= C`**：整段 prompt 不超过预算，不做跨层压缩（与模块 docstring 一致）。
-- **`(L - C) < min_rewrite_delta`**：实现里 **`min_rewrite_delta` 写死为 `1`**（**非 YAML**，当前不改）。对 **整数 `L,C`**，在 **`L > C`** 时 **`L - C >= 1`**，故该条件与 **`L <= C`** 叠加后 **实际等价于仅 `L <= C` 触发**；源码注释提到「增量过小跳过」及 **128 与 block_size**，与 **当前常数 `1`** 不一致，以代码为准；后续对齐见待办 **dynkv-min-rewrite-delta**。
+- **`(L - C) < min_rewrite_delta`**：**`min_rewrite_delta`** 来自配置 **`dynamic_kv_min_rewrite_delta`**（YAML：`additional_config["dynamic_kv"]["min_rewrite_delta"]`，**默认 `128`**）。仅当 **`L > C`** 且 **`L - C ≥ min_rewrite_delta`** 时才进入后续打分与 pack；否则与 **`L ≤ C`** 一样走 **full prefix**。设为 **`1`** 时，在整数 prompt 下等价于「只要 **`L > C`** 就允许尝试压缩」。
 - **无任何 `q_last` 捕获**（`q_last_store[rid]` 为空）且 **`L > C`**：打 **WARNING**，写入 **full prefix**；若环境变量 **`VLLM_ASCEND_DYNKV_STRICT`** 为 `1` / `true` / `yes`，则 **抛 `RuntimeError`**（见同文件模块 docstring）。
 - **`validation_mode` 为 `mask` / `zero`**：仍算预算与重要位置，但 **不做** `none` 下的前缀 pack；对 **mask** 写 **`per_layer_important_indices`** 等，对 **zero** 在 paged KV 上置零不重要 slot；随后 **`_full_prefix_update(rid, L)`**（全长 `per_layer_kv_lens` / keep 语义），再 **`continue`**。
 - **`_validate_payload_or_fallback` 校验失败**（已写入的 `per_layer_kv_lens` / `per_layer_keep_indices` 与 `L` 或非空 indices 规则不一致）：覆盖为该 request 的 **full prefix**，保证元数据自洽。

@@ -226,10 +226,14 @@ def run_offload_rewrite_and_build_updates(
     radio_min: float,
     num_layers: int,
     validation_mode: str = "none",
+    min_rewrite_delta: int = 128,
 ) -> dict[str, dict[str, Any]]:
     """
     Returns kv_transfer_params_updates payload:
-      { req_id: { "dynamic_kv": { per_layer_kv_lens, per_layer_keep_indices } } }
+      { req_id: { "dynamic_kv": { per_layer_kv_lens, per_layer_keep_indices } } } }
+
+    ``min_rewrite_delta``: when ``L > max_capacity`` but ``L - max_capacity`` is
+    below this (tokens), skip packed-prefix rewrite and emit full-prefix metadata.
     """
     if not req_ids or num_layers <= 0:
         return {}
@@ -240,10 +244,9 @@ def run_offload_rewrite_and_build_updates(
     C = int(max_capacity)
     if C <= 0:
         return {}
-    # Skip rewrite when compression delta is too small; this avoids triggering
-    # potentially fragile packed-prefix semantics for negligible memory/transfer wins.
-    # NOTE: 128 matches vLLM-Ascend supported paged-attn block size.
-    min_rewrite_delta = 1
+    # Skip rewrite when (L - C) < min_rewrite_delta; avoids fragile packed-prefix
+    # semantics for negligible over-budget deltas. Default matches common block_size.
+    mrd = max(0, int(min_rewrite_delta))
 
     def _full_prefix_update(rid: str, L: int) -> None:
         updates[rid] = {
@@ -351,7 +354,7 @@ def run_offload_rewrite_and_build_updates(
             continue
 
         # Entire prompt fits in ``prompt_kv_len_budget``: no cross-layer budget / lift.
-        if L <= C or (L - C) < min_rewrite_delta:
+        if L <= C or (L - C) < mrd:
             _full_prefix_update(rid, L)
             continue
 
