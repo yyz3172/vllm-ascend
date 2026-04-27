@@ -1,153 +1,121 @@
 ## DynamicKV（vLLM / vLLM-Ascend，PD 场景）说明
-
-本文是一份面向工程落地的 **DynamicKV** 说明；算法与开源仓库 `code/DynamicKV/` 中 **跨层预算**（`update_and_reset_budget_per_kv_head` 一类）及 **per-head 打分 / 并集 indices** 等思路对齐。需区分：`impl=attn` 下还存在与参考实现相近的 **「前向内、每隔若干层刷新预算」** 的节奏；**默认 `impl=offload`** 则在 prefill 步后 **一次性** 对全层做跨层预算，**没有**「每 4 层」的前向周期。当前适配目标模型：Mistral-7B-Instruct-v0.2。
-
----
-
 ## 1. 功能目的与总体策略
-
 ### 1.1 目的：压缩的是什么？为什么要压缩？
-
-大模型推理时，注意力需要读写 **KV Cache（Key/Value）**。当 prompt 很长（例如 20K tokens），KV Cache 会占用大量显存/显存带宽，并且在 PD 场景下还会带来：
+大模型推理时，注意力需要读写 **KV Cache（Key/Value）**。当 prompt 很长（例如 20K tokens），KV Cache 会占用大量显存，并且在 PD 场景下还会带来：
 
 - **Prefill → Decode 的 KV 传输代价**（传多少 blocks、耗时多少）
-- **Decode 侧每步 attention 读取 KV 的代价**
+- **Decode 侧每步 attention 读取、计算代价**
 
-DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对较旧 token 做"保留重要的少量 token"，并始终保留最近一段窗口（window）以维持局部一致性。
+DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对较旧 token 做"保留重要的少量 token"，并始终保留最近一段窗口以维持局部一致性。
 
 补充：在 PD 场景里，"压缩"有两层含义：
-
 - **少算（compute-side）**：decode 每层用自己的 `kv_len`（更短的 `context_lens`）做 attention，减少算力/带宽。
 - **少传 + 少占物理块（memory/transfer-side）**：prefill → decode 只传输压缩后需要的 KV blocks，并让 decode 侧只分配这些 blocks（`kv_cache_usage` 随之下降）。
 
 ### 1.2 压缩策略：怎么决定"重要 token"？
+压缩是**按层独立**进行的：对第 \(L\) 层来说，会从该层 KV cache 取出完整的序列 \(K_L\)，再用「最后 `window_size` 个 query」去计算它们对**旧段 keys**的注意力权重，从而得到旧 token 的重要性分数。
+基于分数，每层会先选出一份 **top-k 候选**；随后再通过跨层预算，确定该层最终保留的旧 token 数 **`old_budget_L`**
 
-以"最后的 window_size 个 query"（最近 token）为查询，计算它们对历史 keys 的注意力权重；把历史 token 按"被注意力关注的总量"排序，取 top-k：
+- **旧 token（old）**：在第 \(L\) 层按重要性从候选里保留 **`old_budget_L`** 个（与全层预算约束一致）
+- **新 token（cur/window）**：最近 `window_size` 个 token， 在 **每一层** 都全保留
 
-- **旧 token（old）**：按重要性保留 top-k
-- **新 token（cur/window）**：最近 window_size 全保留
+第 \(L\) 层逻辑 KV 长度（该层参与注意的有效 prompt token 数）为：`kv_len_L = old_budget_L + window_size`
+#### 1.2.1 Per-Head打分 + 并集保留
+先说明一个实现约束：vLLM 的 Paged KV Cache 是 **token-level** 的布局——每个 token 在 KV cache 里对应一个“槽位”（slot，可以理解为“这个 token 的 KV 记录位置”），并且同一个 token 的所有 KV heads 都共用这一条记录。因此，不能像开源参考那样做到“**每个 head 保留一套不同的 token 集合**”并在物理上分别压缩；一旦某个 token 被丢弃，就意味着该 token 的所有 heads 都一起丢弃。
 
-最终每层保留的 token 数量为：
-
-- \(kv\_len\_layer = old\_budget\_layer + window\_size\)
-
-#### 1.2.1 Per-Head Scores + 并集 Indices（保留所有 head 的选择）
-
-由于 vLLM 的 Paged KV Cache 是 token-level 布局（同一 slot 的所有 head 来自同一 token），无法实现开源的 per-head 压缩（每个 head 保留不同的 token 集合）。
-
-为确保不丢失任何 head 认为重要的 token，本实现采用**并集策略**：
-
-1. **Per-head scores**：每个 KV head 独立计算 token importance，得到 `[Hkv, old_len]` 的 scores
-2. **Per-head top-k**：每个 head 独立选出 `budget_size` 个最重要的 token
-3. **并集 indices**：取所有 head 选择的 token **并集**，确保任意 head 认为重要的 token 都被保留
-
-```
-indices_per_head = scores_old.topk(budget_size, dim=-1).indices  # [Hkv, budget_size]
-union_indices = torch.unique(indices_per_head.flatten())         # 并集
-# 按重要性排序，用于后续跨层截断
-indices = sort_by_combined_importance(union_indices)
-```
+为尽量贴近开源语义（不丢掉任何 head 认为重要的 token），这里采用 **per-head 打分 + 并集保留**：
+1. **每个 head 各自“打分”**：把旧段里的每个 token 都看作一个候选，让每个 KV head 分别算一遍“它有多重要”。
+2. **每个 head 先各自“挑一份”**：每个 head 从旧段里先挑出自己最认可的 top-k 个 token。
+3. **把大家挑的合在一起**：把所有 head 选中的 token 取并集，得到最终要保留的 token 集合（保证任何一个 head 觉得重要的 token 都不会被丢掉）。
 
 **与开源的对比**：
-- 开源：每个 head 各保留 `budget_size` 个（可以不同），总 token 数 = `budget_size`/head
-- 本实现：所有 head 共享并集，总 token 数 = `|union|`（介于 `budget_size` 和 `budget_size × Hkv` 之间）
+- 开源（按 head 压缩）：每个 head 各保留 `budget_size` 个（各 head 的集合可不同）。
+- 本实现（token-level 并集）：每个 head 先各自选出一份 top-k，再把所有 head 的结果取并集，形成最终的 token 保留集合。直观上：不同 head 选中的 token 越重合，并集越小、压缩越强；不同 head 的选择越分散，并集越大、压缩越弱。
 
-**indices 顺序**：
-- 中间态按**重要性顺序**存储，截断 `indices[:budget]` 保留最重要的
-- 最终输出通过 `cap_keep_indices_chronological` 恢复**时间顺序**，用于 KV 写回
+**保留位置（keep indices）的两种顺序**：
+- **重要性顺序（中间态）**：在算法内部，会把“要保留的旧 token 位置”按重要性从高到低排好（可理解为一个 `keep_indices` 列表）。这样当预算从 `budget_size` 收敛到 `old_budget_L` 时，只需要取前 `old_budget_L` 个即可。
+- **时间顺序（最终态）**：在真正写回 KV / 导出元数据前，会调整为按 token 时间先后递增的顺序，保证写回后的 KV 是连续前缀，便于 paged attention 只用 `kv_len` 就能正确生效。
 
-### 1.3 分层的关键：跨层预算；周期重分配仅 `impl=attn`
+### 1.3 分层的关键：跨层预算
+分层的意思是：**不同层可以保留不同数量的旧 token**。但在“全局预算”约束下（由参数`prompt_kv_len_budget`决定，平均每层保留的Token数），需要决定每一层最终保留多少旧 token（`old_budget_L`）。
 
-分层策略不要求每层保留相同的 old token 数量。两种 **`impl`** 的**事实**如下。
+这里有两类共同点，以及两种实现路径（`impl`）的差异。
 
-**共性（两种 impl 一致）**
+**共同点（不论 `impl` 取值）**
 
-- 每层先得到一份候选的重要性分布（scores / indices，见 §1.2.1）。
-- 跨层「每层保留多少 old token」由 **`update_and_reset_budget_per_kv_head`**（及同一套 `radio_max` / `radio_min`、`prompt_kv_len_budget` 等配置）决定；最终在 prefill 侧得到各层的 `old_budget`（再结合 window 做 keep / 写回或导出元数据）。
+- 每层先得到一份候选的重要性分布
+- 然后把所有层的分数放在一起做一次“跨层分配”：由**跨层预算分配逻辑**决定各层的 `old_budget_L`（会受 `radio_max` / `radio_min` / `prompt_kv_len_budget` 等配置影响），再结合 `window_size` 得到每层最终 `kv_len_L`，并据此写回 KV 或导出元数据。
 
-**差异（必须按配置区分阅读）**
+**差异（取决于 `impl`）**
 
 | 项目 | **`impl=attn`**（`attention_v1.py`） | **`impl=offload`（默认）**（`dynamic_kv_offload.py` + `model_runner_v1.py`） |
 |------|--------------------------------------|--------------------------------------------------------------------------|
-| 跨层预算调用时机 | 在 **attention 前向**内：除最后一层外，每当 **`layer_idx % 4 == 3`** 时，用 **当前已累积的若干层** scores 调一次 `update_and_reset_budget_per_kv_head`，并可能对 **已算层** 的 indices 做截断；**最后一层**再基于全层 scores 做预算（或沿用周期阶段写入的缓存，以代码为准）。 | **prefill 整段 forward 结束之后**：各层 `q_last` 与 KV 已由 hook 与普通 attention 写满，再 **对全层 `num_layers` 只调一次** `update_and_reset_budget_per_kv_head`。 |
-| 「每 4 层」周期重分配 | **有**（仅该路径）。 | **无**。 |
-| 与开源「前向里逐层改 KV」的类比 | 更接近（仍在步内、随层推进）。 | 不等价：压缩发生在 **步后**，跨层预算只有 **一轮**。 |
+| 跨层预算什么时候算 | 在 **prefill 的 attention 前向里**边算边积累：除最后一层外，大约 **每 4 层**会用“目前已累积的层”先算一次临时预算，并可能立即截断已算层的候选；到 **最后一层**再用全层信息收尾。 | 在 **prefill 整段 forward 结束后**再统一处理：先通过 hook 拿到各层 `q_last`，再对 **所有层一次性**计算跨层预算并完成改写/导出。 |
+| 是否存在“每 4 层一次”的周期 | **有**（仅该路径）。 | **无**（只有一次性全层预算）。 |
+| 直觉类比 | 更像“把压缩逻辑嵌进模型前向，随层推进逐步调整”。 | 更像“prefill 先正常写满 KV，结束后再做一次后处理压缩”。 |
 
 ---
 
 ## 2. 接口与配置参数说明（无新 API，新增配置）
-
 DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-Ascend 解析）。
-
 配置入口：`code/vllm-ascend/vllm_ascend/ascend_config.py`
-
 ### 2.1 配置项
+下面按“你会怎么用”来介绍各参数（从必选到进阶）。
 
-- **enabled**：是否启用 DynamicKV（默认 `false`）
-- **impl**：在 vLLM-Ascend 里 **把压缩算法挂在哪里执行**（默认 **`offload`**）
-  - **`offload`（默认）**：prefill 时 attention 仍走常规路径（`reshape_and_cache` 等）把 KV 写满；**该步结束后**在 worker / `model_runner` 里做一次后处理：通过 Q 相关模块的 forward hook 捕获各层 `q_last`，再调用 `run_offload_rewrite_and_build_updates` 做选 token、跨层预算、前缀写回与 PD 元数据组装。**不经过** `attention_v1.py` 里那套「prefill forward 内逐层累积 + 每 4 层重分配」分支。启动后日志里若出现 **`[DynamicKV][offload] installed ...`**，即表示当前为 offload。
-  - **`attn`**：压缩逻辑挂在 **`attention_v1.py` 的 Python attention forward** 中：在 `PrefillNoCache` 或 ChunkedPrefill **最后一块**内逐层累计各层 `q_last`/scores/indices，并在 forward 内触发跨层预算与写回。文档 **§3.2** 里描述的「每 4 层」跨层重分配与沿途截断 indices，**当前主要对应此路径**。适合与开源「在模型前向里直接操作 KV」的读法对齐；与默认 offload 相比，对图捕获、eager 等环境更敏感。
-- **model_types**：允许启用的 HF `model_type` 列表（默认 `["mistral"]`）
-- **window_size**：窗口大小 window（默认 `16`）
-- **prompt_kv_len_budget**：每层 KV 长度的预算目标（默认 `512`，通常约等于 \(old + window\_size\) 的目标值）。**不是硬上限**：个别层可能 \(kv\_len > prompt\_kv\_len\_budget\)，硬上限仍为 prompt_len
-- **min_rewrite_delta**（默认 `128`，YAML：`min_rewrite_delta`）：**仅 `impl=offload`**。当 **`L > prompt_kv_len_budget`** 且 **`L - prompt_kv_len_budget < min_rewrite_delta`**（按 **prompt token 数**计）时，**不执行** packed-prefix 改写，仍下发 **全长前缀**元数据（见 §2.1.1）。用于避免「仅略超预算」时走 pack 的收益小、语义更脆。默认值常与 **`block_size`（如 128）** 同级；可按业务调小（例如 `1` 表示只要 `L>C` 即允许尝试压缩）或调大。
-- **pooling**：对 **旧 token 段**上的一维 importance 分数做空间平滑（沿 token 下标轴，步长 1，两侧对称 padding 为 `kernel_size // 2`）。取值含义：
-  - **`none`**：不平滑，各位置的分数直接进入后续 top-k / 并集逻辑。
-  - **`avgpool`**（默认）：`avg_pool1d`，邻域内取平均，可抑制单 token 尖峰、让局部区间的重要性更平滑。
-  - **`maxpool`**：`max_pool1d`，邻域内取最大，更偏向「只要邻域里有一处高响应就抬高该位置」。
-  - 当 `pooling == "none"` 或 `kernel_size <= 1` 时，实现上等价于不做 pooling。
-- **kernel_size**：pooling 的卷积核长度（默认 `7`）；仅在 `pooling` 为 `avgpool` / `maxpool` 且 `kernel_size > 1` 时生效。
-- **radio_max**（默认 `10.0`）：与实现内部 **`base = max(prompt_kv_len_budget - window_size, 0)`**（`DynamicKVConfig.base`，非单独 YAML 键）相乘，得到 **`cand_old = min(int(radio_max × base), old_len)`**，其中 **`old_len`** 为当前 prompt 下旧段长度 **`prompt_len - window_size`**。该值在 **`impl=offload`**（`dynamic_kv_offload.py`）与 **`impl=attn`**（`attention_v1.py`）中均用作：**(1)** per-head 对旧段打分时 **`topk` 的候选规模上界**（及并集路径上的候选池）；**(2)** 传入 **`update_and_reset_budget_per_kv_head`** 的 **`budget_size`**，参与跨层比例与归一化。**不宜**把 `radio_max` 理解成「每层最终最多保留 `radio_max×base` 个 old token」：全层 old 总量仍由跨层函数里 **`need_fill_kv = base × num_layers`** 等与 `dynamic_kv.py` 实现一致的逻辑收束；较大 `radio_max` 主要是 **扩大候选集**，使跨层分配基于更密的分数（offload 源码注释：允许候选池大于 `prompt_kv_len_budget` 对应量级，**最终每层预算仍由 `update_and_reset_budget*` 给出**）。YAML：`additional_config["dynamic_kv"]["radio_max"]` → `dynamic_kv_radio_max`。
-- **radio_min**（默认 `0.1`）：在 **`update_and_reset_budget`** / **`update_and_reset_budget_per_kv_head`**（`dynamic_kv.py`）中定义 **`min_budget = int(radio_min × base)`**，对跨层比例分配得到的每层 old 预算做 **下界**（`max(min_budget, …)`），避免某层被压到过低；再通过最后一层加减 **`diff`** 等对全层总和纠偏。更贴近「**跨层重分配后、每层 old 预算的下限系数**」。YAML 中为 `additional_config["dynamic_kv"]["radio_min"]`（与 `radio_max` 同理），由 `ascend_config.py` 读入为 `dynamic_kv_radio_min`。
-- **validation_mode**：验证模式，用于验证 token 选择策略的有效性（默认 `none`）
-  - `none`：正常压缩模式
-  - `mask`：prefill 不落盘压缩；decode 用完整 KV + `atten_mask`（`npu_fusion_attention`），被掩蔽位置不参与注意力
-  - `zero`：在 **prefill 节点**对 paged KV 中不重要 token 的 **K/V 物理置零**，PD 传输置零后的 KV；decode 走 **常规 `_npu_paged_attention`**，不依赖 `per_layer_important_indices` / `_VALIDATION_MASKS`
+- **enabled**：是否启用 DynamicKV（默认 `false`）。
 
-#### 2.1.1 `impl=offload`：何时不做 pack、何时全长元数据、何时整 request 跳过
+- **impl**：选择压缩逻辑的执行方式（默认 **`offload`**）。
+  - **`offload`（默认，推荐先用）**：prefill 正常写满 KV，prefill 结束后再做压缩。
+  - **`attn`**：在 prefill 的 attention 前向内部完成压缩/导出（只在 `PrefillNoCache` 或 ChunkedPrefill 的最后一块触发，见 §3）。更接近“前向内压缩”的形态，但对图捕获/执行路径更敏感。
 
-以下均指 **`run_offload_rewrite_and_build_updates`**（`vllm_ascend/worker/dynamic_kv_offload.py`）。**`C`** 即传入的 **`prompt_kv_len_budget`**，**`L`** 为该 request 的 prompt 长度（`seq_lens` 项）。
+- **model_types**：允许启用的模型 `model_type` 白名单（默认 `["mistral"]`）。如果你的模型不在列表里，DynamicKV 不会生效。
 
-**整批无更新（返回 `{}`）**
+- **prompt_kv_len_budget**：你希望“**每层保留的 prompt KV 长度**”大致控制在多少（默认 `512`）。它是**目标/预算量级**，不是硬上限（上限仍是 prompt_len）。
+  - 直觉：值越小，压缩越激进、越省显存/传输/算力；但质量风险更高。
 
-- `req_ids` 为空、`num_layers <= 0`，或 **`C <= 0`**（预算无效）。
-- 从 **`kv_caches`** 解析不到任何合法 4D K/V（**`layer_items` 为空**）。
+- **window_size**：每层**无条件保留**的尾部窗口长度（默认 `16`）。同时，它也是“用来打分旧段 token”的 query 窗口长度。
+  - 旧段长度：`old_len = max(prompt_len - window_size, 0)`
+  - 每层逻辑 KV 长度：`kv_len_L = old_budget_L + window_size`
+  - 直觉：`window_size` 越大，越稳但压缩空间越小；越小，越省但更依赖打分/预算分配。
 
-**单 request：全长前缀元数据（`_full_prefix_update`，不 pack 物理 KV）**
+- **radio_max**：旧段 top-k 的**候选池放大系数**（默认 `10.0`）。它主要影响“候选池够不够大”，而不是最终每层一定保留多少。
+  - 直觉：`radio_max` 越大，候选池越大（更不容易漏掉重要 token），但计算/并集可能更大。
 
-- **`L <= C`**：整段 prompt 不超过预算，不做跨层压缩（与模块 docstring 一致）。
-- **`(L - C) < min_rewrite_delta`**：**`min_rewrite_delta`** 来自配置 **`dynamic_kv_min_rewrite_delta`**（YAML：`additional_config["dynamic_kv"]["min_rewrite_delta"]`，**默认 `128`**）。仅当 **`L > C`** 且 **`L - C ≥ min_rewrite_delta`** 时才进入后续打分与 pack；否则与 **`L ≤ C`** 一样走 **full prefix**。设为 **`1`** 时，在整数 prompt 下等价于「只要 **`L > C`** 就允许尝试压缩」。
-- **无任何 `q_last` 捕获**（`q_last_store[rid]` 为空）且 **`L > C`**：打 **WARNING**，写入 **full prefix**；若环境变量 **`VLLM_ASCEND_DYNKV_STRICT`** 为 `1` / `true` / `yes`，则 **抛 `RuntimeError`**（见同文件模块 docstring）。
-- **`validation_mode` 为 `mask` / `zero`**：仍算预算与重要位置，但 **不做** `none` 下的前缀 pack；对 **mask** 写 **`per_layer_important_indices`** 等，对 **zero** 在 paged KV 上置零不重要 slot；随后 **`_full_prefix_update(rid, L)`**（全长 `per_layer_kv_lens` / keep 语义），再 **`continue`**。
-- **`_validate_payload_or_fallback` 校验失败**（已写入的 `per_layer_kv_lens` / `per_layer_keep_indices` 与 `L` 或非空 indices 规则不一致）：覆盖为该 request 的 **full prefix**，保证元数据自洽。
+- **radio_min**：跨层预算分配时给每层 old budget 的**下限系数**（默认 `0.1`）。用于避免某些层被分到过少的旧 token。
 
-**单 request：不写 `updates[rid]`（`continue`，与「无 Q 仍 full prefix」不同）**
+- **pooling / kernel_size**：对旧段重要性分数做平滑（默认 `avgpool` + `kernel_size=7`）。
+  - `avgpool`：让分数更平滑，减少“单点尖峰”。
+  - `maxpool`：更偏向“邻域内只要有高响应就抬高”。
+  - `none`：不做平滑。
 
-- **`L <= 0`**：无效长度，直接跳过。
-- **某层缺少 `q_last`** 导致 **`per_layer_scores_old` 不完整**：打 WARNING「**incomplete Q capture**」，**本 request 不进入 `updates`**（非 `_full_prefix_update`）。与「整包无 Q」仍给全长 PD 元数据的行为 **不一致**，排查 PD 缺 `dynamic_kv` 时需注意。
+- **validation_mode**：验证/对照模式（默认 `none`）。
+  - `none`：正常压缩（可能改写/pack KV，并导出 `per_layer_kv_lens` 等）。
+  - `mask`：不做物理压缩，decode 通过 attention mask 仅关注“重要 token”（便于验证选 token 是否合理）。
+  - `zero`：不做物理压缩，但把不重要的 K/V 置零，让 decode 在常规 paged attention 下对比效果。
+
+- **min_rewrite_delta**（仅 `impl=offload`时有效）：当 prompt 只“略微”超过 `prompt_kv_len_budget` 时，是否跳过物理 pack（默认 `128`）。
+  - 直觉：设大一些更保守（更少触发 pack），设小一些更激进（更容易触发 pack）。
+  - **offload 什么时候会真的做物理 pack（压缩写回 KV）**：仅当 `prompt_len > prompt_kv_len_budget` 且 `prompt_len - prompt_kv_len_budget >= min_rewrite_delta`，并且各层 `q_last` 捕获完整，同时 `validation_mode=none`。
 
 ### 2.2 与 PD（Mooncake）的关系
 
-PD 场景下，prefill 完成后会通过 `kv_transfer_params` 把 DynamicKV 的结果带给 decode：
+一句话：PD 场景下，prefill 会把“**每层该看多少 KV**”以及（可选）“**要传哪些 KV blocks**”打包到 `kv_transfer_params.dynamic_kv`，随请求传给 decode。
 
-- **per_layer_kv_lens**：长度为 num_layers 的列表，每层一个 kv_len；**PD decode 侧按层有效长度应以此为准**（尤其 **`impl=offload`** 物理 pack 之后，见 §3.3）。
-- **per_layer_keep_indices**：长度为 num_layers 的列表，每层在 **原始 prompt token 下标空间** 中的保留下标列表（可 JSON 序列化）。**`impl=offload`** 在 **`validation_mode=none`** 且完成 **packed 前缀写回** 后，实现上常 **每层为 `[]`**：KV 已按时间序压入 cache 前缀 slot `0..kv_len-1`，再传原始坐标易与 pack 语义冲突，故省略 indices、**仅依赖 `per_layer_kv_lens`**。未压缩回退（全长前缀）或 **`impl=attn`** 导出时可为 **`0..L-1`** 等非空列表，便于与 `kv_len` 交叉校验。
-- **per_layer_important_indices**（可选）：`validation_mode` 为 **`mask`** 时由 prefill 写入，每层为「重要 token」的下标列表（稀疏）；decode 据此恢复 attention mask（PD 下 decode 与 prefill 不同进程，不能共享 `_VALIDATION_MASKS`）。**`zero`** 不写入该字段（KV 已在 prefill 置零）
+#### 2.2.1 decode 侧最关心的 3 个字段（看懂就够用）
+- **`per_layer_kv_lens`（核心）**：长度为 `num_layers` 的列表。第 \(L\) 个值表示“decode 在第 \(L\) 层 attention 里，prompt 部分最多只看这么多 token 的 KV”。  
+  - 这是 **PD decode 按层生效** 的主要依据（尤其 `impl=offload` 物理 pack 后，只靠它就能工作）。
+- **`per_layer_keep_indices`（可选）**：每层在“原始 prompt 下标空间”里保留了哪些 token。  
+  - **`impl=offload` + `validation_mode=none` + 已 pack** 时通常为 `[]`：因为 KV 已经被按时间顺序 pack 到 cache 的连续前缀 `0..kv_len-1`，这时再传原始下标反而容易被误用，所以只依赖 `per_layer_kv_lens`。  
+  - `impl=attn` 或未 pack 回退（全长前缀）时，可能会是非空列表，用于对照/校验。
+- **`per_layer_important_indices`（仅验证用，可选）**：只在 `validation_mode=mask` 时出现。每层给出“重要 token 的下标”，decode 用它来构造 attention mask 做对照验证。
 
-为支持 **少传 + 少占物理块**，在 `kv_transfer_params.dynamic_kv` 下新增可选字段（DynamicKV 关闭时不会出现）：
+#### 2.2.2 为了“少传 blocks / 少占物理块”，额外携带哪些字段
 
-- **per_layer_num_prompt_blocks**：长度为 num_layers 的列表，每层压缩 KV 需要的 blocks 数（\(ceil(kv\_len / block\_size)\)）
-- **per_layer_remote_block_ids**：长度为 num_layers 的二维列表；第 \(L\) 层为「该层要参与 PD 的远端 block id 序列」。实现上常由 **同一组「按逻辑 prompt 前缀排列的物理块 id 列表」** 再按每层 `per_layer_num_prompt_blocks[L]` 取 **前若干个 id** 得到（各层共享前缀，尾部层块数可更少）。**前提**：底层 id 列表的顺序必须是 **逻辑上的 prompt 从前到后**（见下节「块序」），而不能默认等于调度器里任意 `computed_block_ids` 的枚举顺序。
-- **prefix_remote_block_ids**（可选，**当前仅 `impl=offload`** 由 worker 写入）：长度 `n_transfer = ceil(max(L for L in per_layer_kv_lens if L > 0) / block_size)` 的一维列表（与 `model_runner_v1.py` 中计算一致），元素为 **该 request 的 `block_table` 行** 中 **前 `n_transfer` 个槽位**对应的物理 block id（与 paged KV 中「压缩 KV 写在连续前缀 slots」一致）。用于纠正「分配器给出的 block id 列表顺序 ≠ 逻辑前缀序」时，对 `remote_block_ids` 盲目取前缀会 **拉错块、decode KV 损坏** 的问题。
+当开启“物理块收缩传输”时，会额外出现下面字段（DynamicKV 关闭时不会出现）：
 
-#### 2.2.1 块序为何重要；offload 下如何收缩传输
-
-DynamicKV 将每层有效 KV 写回 **各层 paged 布局的连续前缀**（从 slot 0 起长度 `kv_len`）。PD 要传的应是 **覆盖这些前缀槽位** 的物理块，且 **block id 在列表中的顺序须与逻辑 token 序一致**。
-
-- **可靠顺序**：每个 request 的 **`block_table` 一行**（page table）按 slot 下标排列，对应 **prompt 从首 token 往后的块映射**；取该行前 \(n_{transfer}\) 个非负 id，即得到与压缩前缀对齐的 **`prefix_remote_block_ids`**。实现：`vllm_ascend/worker/model_runner_v1.py`（offload 后处理挂载 `kv_transfer_params_updates` 时写入 `dynamic_kv.prefix_remote_block_ids`；注释说明勿用分配器序的 `block_ids[:n]`）。
-- **连接器侧（Mooncake）**：`vllm_ascend/distributed/mooncake_connector.py` 在合并 `request_finished` 时 **保留** worker 带来的 `prefix_remote_block_ids`。随后在 **`impl=offload`** 且即将发起传输时：**若存在 `prefix_remote_block_ids`**，则以其作为本次 **`remote_block_ids`（`send_block_ids`）** 并据此重算 `num_prompt_blocks` 与 **`per_layer_num_prompt_blocks` / `per_layer_remote_block_ids`**（每层对同一前缀列表再截前 `nb` 个块）。日志标签含 **`[DynamicKV][PD] offload shrink transfer(block_table)`**。**若无**该字段，则退化为对当前 `send_block_ids` 做 **`[:n_transfer]`** 的 legacy 收缩并打 **WARNING**（`allocator_fallback`）——块序可能与逻辑前缀不一致，存在风险。
-- **调度侧一段实现注意**：在仅根据 `computed_block_ids` 构造一版 `per_layer_remote_block_ids` 时，**不会**在此处改短顶层 `computed_block_ids` 本身，以避免误用非逻辑序列表的前缀（见 `mooncake_connector.py` 内注释）。
-- **`impl=attn`**：当前代码路径 **不写入** `prefix_remote_block_ids`；PD 元数据与顶层 `remote_block_ids` 的组合行为与 offload **不完全相同**，排查传输与对齐问题时需按 **`impl`** 区分。
+- **`per_layer_num_prompt_blocks`**：每层压缩后的 prompt KV 需要多少 blocks（近似 \(ceil(kv\_len / block\_size)\)）。
+- **`per_layer_remote_block_ids`**：每层要传的远端 block id 列表（通常是“同一份前缀 block 列表”的不同截断）。
+- **`prefix_remote_block_ids`（offload 专用，强烈推荐有）**：一份“**按逻辑 prompt 顺序排列的前缀 block id 列表**”。Mooncake 会优先用它来 shrink 传输，避免误用 allocator 顺序导致拉错块、decode 乱码（见下一节）。
 
 代理（proxy）会把 prefill 返回的 `kv_transfer_params` 原样传给 decode 请求。
 
@@ -155,225 +123,119 @@ DynamicKV 将每层有效 KV 写回 **各层 paged 布局的连续前缀**（从
 
 ## 3. 算法/流程（人话版）
 **阅读约定（重要）**
+- **`impl=attn`**：压缩逻辑在 prefill 的 attention 前向里完成（见 §3.1、§3.2）。
+- **`impl=offload`（默认）**：压缩逻辑在 prefill 结束后一次性完成（见 §2.1 的 `impl` 说明），因此不展开在 §3.1–3.2。
 
-- **§3.1、§3.2 仅描述 `impl=attn`**：代码在 `attention_v1.py` 的 Ascend attention forward 内，与 **ChunkedPrefill 的最后一块** 或 **PrefillNoCache** 共用同一套「逐层累积 →（可选）每 4 层周期预算 → 最后一层写回/导出」分支。
-- **`impl=offload`（默认）**：不在 §3.1–3.2 展开；其事实流程为：prefill 内常规写 KV → 步后 `run_offload_rewrite_and_build_updates`（见 §2.1、`dynamic_kv_offload.py`、`model_runner_v1.py`），**无 §3.2 步骤 4 的「每 4 层 + 沿途截断 indices」**。
+**名词说明（通用，不是 DynamicKV 专有）**
+- **PrefillNoCache / ChunkedPrefill**：是 vLLM（及 vLLM-Ascend）里对“prefill 计算阶段”的两种常见形态描述：前者是一次性 prefill（没有历史 cache 命中），后者是把长 prompt 拆成多块分段 prefill；DynamicKV 的 `impl=attn` 只在 **ChunkedPrefill 的最后一块** 或 **PrefillNoCache** 的末尾阶段触发压缩/导出，以保证拿到完整 prompt 的 KV 视图。
+  - **如何通过参数控制是否启用 ChunkedPrefill**：这是 vLLM 调度侧的开关，而不是 DynamicKV 的参数。
+    - 启用：`--enable-chunked-prefill`（`scheduler_config.enable_chunked_prefill=true`）
+    - 关闭：`--no-enable-chunked-prefill`（`scheduler_config.enable_chunked_prefill=false`）
 
-### 3.1 PrefillNoCache（非 chunked）— 仅 `impl=attn`
+### 3.1 PrefillNoCache（一次性 prefill）— 仅 `impl=attn`适用
 
-触发条件：**`impl=attn`**，且 Prefill、此前没有 cache（`PrefillNoCache`），DynamicKV 开启、模型类型允许。
+这一节只想说明一件事：**在一次性 prefill 的末尾，DynamicKV 会对整段 prompt 做一次“按层压缩/导出”。**
 
-流程与 **§3.2 ChunkedPrefill 的最后一块** 在 **attention 内嵌分支** 上相同：每层先 `reshape_and_cache`，在最后一层前累积各层 `q_last`/scores/indices，最后一层对全 prompt 做 gather、跨层预算与按层写回或导出（与 `validation_mode` 有关）。
+触发条件：`impl=attn`并且本次是一次性 prefill（无历史 cache 命中）
 
-实现位置：`attention_v1.py` 中与 ChunkedPrefill **最后一块** 共用同一套逻辑（非 chunked 时不再要求 `dynamic_kv_is_last_chunk`）。
+流程上与 **§3.2（ChunkedPrefill 最后一块）** 完全一致，只是这里没有“分块/最后一块”的概念。你可以直接按 §3.2 的步骤理解：在 prefill 末尾计算每层重要性 → 跨层分配预算 → 按层写回/导出。
 
-**`impl=offload` 时**：本小节不适用；PrefillNoCache 下 KV 仍由常规 attention 写满，压缩与跨层预算发生在 **该 prefill 步结束后的 offload 后处理**。
+### 3.2 ChunkedPrefill 最后一块 — 仅 `impl=attn`适用
+触发条件：**`impl=attn`**，chunked prefill 且最后一块（以及 DynamicKV、模型类型等前置条件满足）。
 
-### 3.2 ChunkedPrefill 最后一块 — 仅 `impl=attn`（含「每 4 层」与沿途截断）
+这一节只想说明一件事：**chunked prefill 只有在“最后一块”才会触发压缩/导出**，前面的块只是在把 KV 写完整。
 
-本节描述 **`impl=attn`** 下，`attention_v1.py` 在 **chunked prefill 且最后一块**（`dynamic_kv_is_last_chunk=True`）时的行为。
-
-触发条件：**`impl=attn`**，chunked prefill 且 `dynamic_kv_is_last_chunk=True`（以及 DynamicKV、模型类型等前置条件满足）。
-
-流程：
+流程（只抓关键动作）：
 
 1. 先把本 chunk 的 KV 正常写入 paged cache（保证 cache 完整）
-2. 从每层的 paged cache 中 gather 出「全 prompt」的 K/V（按 request）
-3. 对每层、每个 request：计算旧 token 段的 per-head scores / indices（top-k 候选）
-4. **仅本 impl**：在 forward 内，当层索引满足 **每 4 层一次**（实现上为 `layer_idx % 4 == 3` 且尚未到最后一层）时，对 **当前已出现的层集合** 调用一次 **`update_and_reset_budget_per_kv_head`**，并 **可能对已累积层的 indices 做截断**，使周期阶段的预算变更作用到中间态。（**`impl=offload` 无此步骤。**）
-5. **最后一层**：按 **最终** 各层 `old_budget` 为每层构造 keep（old 段 + window），从 full KV 中 gather 出压缩后的 KV 写回各层 paged cache 前缀 slots，或按 `validation_mode` 仅导出 mask/元数据而不改 KV
-6. 输出 `per_layer_kv_lens`、`per_layer_keep_indices` 等（供 PD 与 decode 使用；`mask` 时还可能带 `per_layer_important_indices`，见 §2.2）
-
-关键实现位置（按职责拆分）：
-
-- **共用算法库**：`code/vllm-ascend/vllm_ascend/attention/dynamic_kv.py`
-  - `scores_and_indices_old_perhead_aggregated`：per-head scores + 聚合 indices
-  - `update_and_reset_budget_per_kv_head`：跨层预算（`tk` 等与实现注释一致）
-- **`impl=attn` 前向编排（含每 4 层周期）**：`code/vllm-ascend/vllm_ascend/attention/attention_v1.py`
-- **`impl=offload` 步后一轮预算 + 写回/导出**：`code/vllm-ascend/vllm_ascend/worker/dynamic_kv_offload.py`；调度入口见 `model_runner_v1.py`
+2. （最后一块才做）每层计算旧段 token 重要性，得到候选 keep set（每个 head 先挑 top-k，再做并集）
+3. （可选）大约每 4 层先做一次临时跨层分配，并把候选截断到“当前预算”大小
+4. 到最后一层：得到最终每层 `old_budget_L`，对每层把 KV 写回到连续前缀 slots（或验证模式仅导出信息）
+5. 导出给 PD/decode 使用的结果：`per_layer_kv_lens`（核心），以及（可选）`per_layer_keep_indices` / `per_layer_important_indices`
 
 ### 3.3 Decode 如何按层生效（关键点：kv_len 与内容一致）
 
+这一节只想说明一件事：**decode 侧要同时满足“KV 内容对”+“每层长度对”，按层的压缩才会真正生效。**
+
 decode 侧生效依赖两件事：
 
-1. **内容**：在 **`validation_mode=none`**（及物理压缩路径）下，依赖 prefill 侧把各层压缩后的 KV 写回各层 paged cache；**`mask` / `zero`** 等验证路径下可能仍持全量物理 KV，通过 mask 或置零表达「有效注意力」，以代码与 §2.1 为准。
+1. **内容**：在 **`validation_mode=none`**（及物理压缩路径）下，依赖 prefill 侧把各层压缩后的 KV 写回各层 paged cache；**`mask` / `zero`** 等验证路径下可能仍持全量物理 KV，通过 mask 或置零表达「有效注意力」。
 2. **长度**：decode attention kernel 在每层使用该层自己的 **`kv_len`**（经 metadata 注入后以 **`context_lens`** 等形式进入 kernel）。
 
 #### 3.3.1 `per_layer_kv_lens` 与 `per_layer_keep_indices`（offload 常为「长度有、indices 空」）
 
-- **`per_layer_kv_lens`**：每层逻辑上的 KV 有效 token 数；**凡是 PD decode 需要 per-layer 长度的，均应以此字段为真源**（含 **`impl=offload`** pack 之后）。
-- **`per_layer_keep_indices`**：
-  - **`impl=attn`** 或 **offload 未压缩回退**（如全长前缀 `_dynamic_kv_payload_full_prefix`）：可为 **非空** 列表（通常为原始 prompt 下标），可与 `kv_len` 做 `len(indices) == kv_len` 一类一致性检查。
-  - **`impl=offload` + `validation_mode=none` + 已 pack 写回**：`dynamic_kv_offload.py` **故意** 每层 `append([])`，注释写明 decode **仅用 `kv_len`**；校验逻辑亦规定 **仅当 indices 非空** 时才要求 `kv_len == len(indices)`。**全空 `[]` 不是丢字段，而是与连续前缀布局一致的设计。**
+把它当作两条规则就够了：
 
-**Metadata 注入（`vllm_ascend/worker/v2/attn_utils.py`）**：对每个 request、每层，若 **`per_layer_keep_indices[layer]` 为非空 list**，则该 request 该项长度取 **`len(indices)`** 并记入 `dynamic_kv_keep_indices_list`；**否则** 回退到 **`per_layer_kv_lens[layer]`**。**仅当本 batch 至少一个 request 在该层 indices 非空时**，才会挂上 **`dynamic_kv_keep_indices_list`**；若全部为空，则 **`dynamic_kv_keep_indices_list` 为 `None`**，仅 **`dynamic_kv_seq_lens_list`**（来自各层 `per_layer_kv_lens`）驱动长度。
+- **`per_layer_kv_lens`（核心）**：每层 prompt KV 的有效长度。decode 侧“按层生效”主要就靠它。
+- **`per_layer_keep_indices`（可选）**：只有在需要“告诉你具体保留了哪些 prompt 下标”时才有用。
+  - `impl=attn` 或全长回退时可能是非空列表（便于对照/校验）。
+  - **`impl=offload` + `validation_mode=none` + 已 pack** 时常见为 `[]`：这是正常设计，因为 KV 已被 pack 到连续前缀 `0..kv_len-1`，这时只用 `per_layer_kv_lens` 更安全。
 
-**PD + `transferred_tokens` 的 v2 实际行为（重要，易误读）**：当 `kv_transfer_params.dynamic_kv.transferred_tokens` 为正整数（PD 场景常见）时，v2 注入逻辑会启用 **shared-len** 分支：该层的 `dynamic_kv_seq_lens_list` 会被设置为 **`transferred_tokens + decode_extra`（全层同长）**，而不是严格的 **`per_layer_kv_lens[layer] + decode_extra`（按层不同）**。该策略用于在 PD 场景下以“已传输 token 容量”作为统一可读上界，配合 `impl=offload` 的 **prefix padding 置零**（见 `dynamic_kv_offload.py` 尾部补零逻辑）保证不会读到脏 KV。需要注意：这会削弱“decode 按层不同 kv_len 降算力”的收益，按层差异主要体现在 **PD 传输 shrink（按 `max(per_layer_kv_lens)`）** 与 **各层 pack 后的真实有效内容**。
+你只需要记住：`per_layer_kv_lens` 会一路从 prefill 传到 decode，并最终影响每层 attention 的 `context_lens`。
 
-**Kernel 路径（`attention_v1.py::forward_paged_attention`）**：若 **`dynamic_kv_keep_indices_list` 存在且非空**（实现上为 truthy 列表），则用 **`[len(x) for x in dyn_keep]`** 覆盖内部长度列表；否则使用已注入的 **`dynamic_kv_seq_lens_list`**（即主要来自 **`per_layer_kv_lens`**）。因此 offload 压缩后 **不会** 因「全空 indices」误把 `kv_len` 推成 0。
+### 3.4 PD + DynamicKV 关键机制：`transferred_tokens` 与 `decode_extra`
 
-**Decode 组 batch（`model_runner_v1.py`）**：注释明确 **勿把 `per_layer_keep_indices` 再当作 paged decode 的 gather 坐标**：indices 在 **原始 prompt** 空间，而 offload 已将 KV **pack 到 slot `0..Li-1`**；按层长度用 **`Li`（来自 `per_layer_kv_lens`）+ decode 步增量** 与 **`context_lens`** 对齐。
+这一节只想说明一件事：**PD 场景下，decode 侧必须知道“prefill 实际传过来的 prompt 容量”，才能让新生成的 KV 被纳入注意力范围。**
 
-落地方式（数据流）：
+- prefill 会把“本次实际传输的 prompt token 容量”记录成 `transferred_tokens`（本质是 `num_blocks * block_size`）。
+- decode 会用它推导 `decode_extra`（已经 decode 生成了多少新 token），从而让每层 `context_lens` 随 decode 步数增长：
+  - 直觉公式：`context_lens_L ≈ per_layer_kv_lens[L] + decode_extra`
 
-- `kv_transfer_params.dynamic_kv` 中 **`per_layer_kv_lens`**（必选语义）与 **`per_layer_keep_indices`**（offload 压缩后常全空）经 prefill → proxy → decode。
-- 按 `layer_name` 注入 **`dynamic_kv_seq_lens_list`**；**仅当存在非空 keep 列表时** 才附加 **`dynamic_kv_keep_indices_list`**。
-- NPU paged attention 以 **`context_lens`** 接收 per-layer `kv_len`（由上述 metadata 推导）。
-
-关键实现位置：
-
-- metadata 注入（v2 runner）：`code/vllm-ascend/vllm_ascend/worker/v2/attn_utils.py`
-- kernel 使用：`code/vllm-ascend/vllm_ascend/attention/attention_v1.py::forward_paged_attention`
-- decode 侧长度与注释：`code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py`（DynamicKV + `decode_extra`）
-
-### 3.4 PD + DynamicKV 关键修复：`transferred_tokens` 与 `decode_extra`
-
-**问题背景**：在 PD + DynamicKV 物理压缩场景下，prefill 把压缩后 KV 通过 `transferred_tokens = num_blocks * block_size` 个 token 的容量传给 decode。Decode 端 scheduler 据此初始化 `num_computed_tokens ≈ transferred_tokens - 1`（< `num_prompt_tokens`，因为压缩）。
-
-`model_runner_v1.py` 在为 paged attention 注入 `dynamic_kv_seq_lens_list` 时，需要把 prefill 端的每层 `Li`（`per_layer_kv_lens[layer]`）按 decode 已生成的 token 数 grow：
-
-```python
-decode_extra = max(0, num_computed_tokens - base_tokens)
-context_lens[layer] = Li + decode_extra
-```
-
-**Bug**：旧实现 `base_tokens = num_prompt_tokens`：
-- 普通 PD 场景：`num_computed_tokens` 一开始就 `>= num_prompt_tokens`，差值就是 decode 步数 ✓
-- **PD + DynamicKV 场景**：`num_computed_tokens` 始终 < `num_prompt_tokens`（前者是 transferred_tokens，后者是原 prompt 长度），导致 `decode_extra = 0`，每层 `kv_len` 不会随 decode 增长，**新生成的 decode KV 永远落在 paged attention 的 `context_lens` 窗口之外**，被 attention kernel 忽略。结果就是 decode 输出乱码。
-
-**修复**：prefill 端在 `kv_transfer_params.dynamic_kv` 中带上 `transferred_tokens`，decode 端用它替换 `num_prompt_tokens` 作为 `decode_extra` 的 base：
-
-```python
-base_tokens = dyn.get("transferred_tokens") or num_prompt_tokens
-decode_extra = max(0, num_computed_tokens - base_tokens)
-context_lens[layer] = Li + decode_extra
-```
-
-数据流：
-1. **Prefill** (`mooncake_connector.py`)：计算 `transferred_tokens = len(send_block_ids) * block_size`，写入 `dynamic_kv_payload["transferred_tokens"]`。
-2. **PD 传输**：随 `kv_transfer_params` 一并送达 decode 端。
-3. **Decode** (`model_runner_v1.py` 与 `worker/v2/attn_utils.py`)：在生成 `dynamic_kv_seq_lens_list` 时，每层 kv_len = `Li + (num_computed_tokens - transferred_tokens)`。
-
-**示例**（L=20455, blocks=153, block_size=128）：
-- `transferred_tokens = 19584`
-- 第 1 步 decode：`ncomp=19583`, `decode_extra=0`, 第 i 层 `kv_len = Li + 0`
-- 第 2 步 decode：`ncomp=19584`, `decode_extra=0` (=19584-19584), 第 i 层 `kv_len = Li + 0`
-
-**注**：第 N 步 decode 时 `ncomp ≈ transferred_tokens + N - 1`，所以 `decode_extra = N - 1`。新写入的 decode KV 才能被 attention kernel 正确读到。
-
-> 关于 RoPE position：因为 keys 在 cache 中保留**原始 RoPE**，而 query 的 RoPE 由模型按 `positions` tensor（首步 = `num_computed_tokens` ≈ transferred_tokens-1）计算，二者**绝对位置不一致**。但 attention 用相对位置，q·k 的 RoPE 角度差是 `query_pos - key_pos`，仍然反映 token 在压缩前的相对距离。除首步会有轻微 RoPE 偏差外，整体 attention 仍然正确。
-
-### 3.4.X（已弃用）`decode_position_offset` 实验性方案
-
-**问题背景**：DynamicKV 物理压缩后，KV cache 中的 keys 仍保留其**原始 prompt 位置**的 RoPE 编码（如原位置 100 的 key 仍带 RoPE(100)）。Decode 端的 scheduler 基于**传输的 block 数量**设置 `num_computed_tokens`，而非原始 prompt 长度。若直接使用 `num_computed_tokens` 作为 query position，会导致相对位置编码错误，产生错误的 attention 结果。
-
-**解决方案**：Prefill 端在 PD 传输时计算 **`decode_position_offset`**：
-
-```
-transferred_tokens = num_blocks_transferred × block_size
-decode_position_offset = original_prompt_len - transferred_tokens + 1
-```
-
-**注**：+1 是因为 decode scheduler 初始化 `num_computed_tokens = transferred_tokens - 1`（而非 `transferred_tokens`）。
-
-Decode 端在计算 query position 时加上此 offset：
-
-```
-position = num_computed_tokens + decode_position_offset
-```
-
-**数据流**：
-
-1. **Prefill 端**（`dynamic_kv_offload.py`）：导出 `original_prompt_len: int(L)`
-2. **PD 传输**（`mooncake_connector.py`）：
-   - 计算 `decode_position_offset = original_prompt_len - len(send_block_ids) * block_size + 1`
-   - 添加到 `dynamic_kv_payload`
-3. **Decode 端**（`model_runner_v1.py::_prepare_inputs`）：
-   - 从 `request.kv_transfer_params.dynamic_kv.decode_position_offset` 获取 offset
-   - `position_base = num_computed_tokens + decode_position_offset`
-
-**示例**：
-- 原始 prompt 长度：`L = 20455`
-- 传输 block 数量：`153`，block_size = `128`
-- 传输 token 数：`153 × 128 = 19584`
-- `decode_position_offset = 20455 - 19584 + 1 = 872`
-- Decode scheduler 初始化 `num_computed_tokens = 19583`（= transferred_tokens - 1）
-- 首次 decode：`position = 19583 + 872 = 20455` ✓
-- 第二次 decode：`position = 19584 + 872 = 20456` ✓
-
-**字段说明**（`kv_transfer_params.dynamic_kv`）：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `original_prompt_len` | `int` | 原始 prompt token 数 |
-| `decode_position_offset` | `int` | Decode query position 调整值 |
-| `per_layer_kv_lens` | `list[int]` | 各层压缩后 KV 有效长度，用于 attention kernel context_lens |
-| `per_layer_keep_indices` | `list[list[int]]` | 各层保留 token indices（offload 压缩后常为空列表） |
-
-关键实现位置：
-
-- prefill 导出：`code/vllm-ascend/vllm_ascend/worker/dynamic_kv_offload.py`
-- offset 计算与 PD 传递：`code/vllm-ascend/vllm_ascend/distributed/mooncake_connector.py`
-- decode position 调整：`code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py::_prepare_inputs`
+只要这个机制成立，decode 每步新写入的 KV 就能被下一步 attention 正确读取。
 
 ---
 
-## 4. 关键日志说明（如何验收"真的生效"）
+## 4. 关键日志说明
 
 日志前缀以 **`[DynamicKV]`** 为主；Decode / PD 子阶段见下。
 
-### 4.1 Prefill（预算/导出）
+### 4.1 `impl=offload`（Prefill 后处理）相关日志
 
-- **`[DynamicKV] exported results`**：本轮 prefill（`PrefillNoCache` 或 ChunkedPrefill 最后一块）已对 batch 导出 per-request 的分层结果
+- **是否已启用 offload 路径**：启动后若出现 **`[DynamicKV][offload] installed ...`**，表示已安装 Q 捕获 hook。
 
-### 4.2 Mooncake（PD 传递是否带上分层信息）
+按 `validation_mode` 分：
+
+- **`validation_mode=none`（正常压缩）**：
+  - **`[DynamicKV][offload] rewrite ... kv_len min/max/mean ...`**：确认本次确实做了压缩写回，以及 `per_layer_kv_lens` 的量级。
+- **`validation_mode=mask` / `zero`（验证模式）**：
+  - **`[DynamicKV][offload] validation_mode=...: skip KV pack, full_prefix metadata ...`**：确认本轮不做物理 pack；其中 `mask` 会附带重要位置用于构造 attention mask，`zero` 会把不重要的 K/V 置零。
+
+### 4.2 `impl=attn`（Prefill 前向内）相关日志
+
+按 `validation_mode` 分：
+
+- **`validation_mode=mask`**：
+  - **`[DynamicKV][attn] validation_mode=mask: skip KV pack ...`**：确认本轮不做物理 pack、仅导出验证信息（重要位置/掩码）。
+- **`validation_mode=none/zero`**：
+  - 该路径下日志不一定稳定出现；若配置为 `attn` 但一直没有任何 `[DynamicKV]` 相关输出，优先检查是否处于 ChunkedPrefill 的非最后一块或是否命中图捕获。
+
+### 4.3 Mooncake（PD 传递是否带上分层信息）
 
 - **`[DynamicKV][PD] request_finished per_layer_kv_lens stats`**（及同类汇总日志）
-- **`unique` / `min` / `max` / `sum` 的读法**：在 **`validation_mode=none`** 且已做 **物理压缩写回** 时，`per_layer_kv_lens` 常反映各层压缩后长度，可用于观察「分层非均匀」与总量级是否接近 `num_layers × prompt_kv_len_budget` 的量级（允许实现细节导致的偏差）。在 **`validation_mode=mask`** 等路径下，实现可能仍向 PD 携带 **全长** `per_layer_kv_lens`，而真实「每层参与注意的有效长度」由 **`per_layer_important_indices` / mask** 等体现；此时 **不宜** 仅用 `sum(per_layer_kv_lens)` 等同于「已压缩掉的 token 数」。详见 §2.2 与实现代码。
-- **`[DynamicKV] request_finished per_layer_kv_lens(fallback)`（WARNING）**
-  - 出现说明分层结果未成功 attach，PD 退化为均匀 cap（需要排查）
-
-### 4.2.1 物理块是否真的下降（decode kv_cache_usage）
-
-验收点：
-
-- decode `GPU KV cache usage` 应从"full prompt blocks"级别下降到"`max(per_layer_kv_len)` 对应 blocks"级别。
-- 直观上，对于 20k prompt（160 blocks@128），若 `max(per_layer_kv_len)` 约 3.5k（约 27 blocks），decode `kv_cache_usage` 应接近原来的 \(27/160\) 倍（再乘以全局 block pool 分母的影响）。
-
-### 4.3 Decode（按层 kv_len 是否被 kernel 使用）
-
-- **`[DynamicKV][Decode] ... kv_lens(...)`**
-  - 每层只打印一次，用于确认该层拿到了 per-layer kv_len（由 indices 推导或直接来自 per_layer_kv_lens）
+- **`unique` / `min` / `max` / `sum` 的读法**：在 `validation_mode=none` 且已做物理压缩写回时，`per_layer_kv_lens` 常反映各层压缩后长度，可用于观察「分层非均匀」与总量级是否接近 `num_layers × prompt_kv_len_budget` 的量级（允许实现细节导致的偏差）。
+- **uniform_fallback（WARNING）**：若看到 **`[DynamicKV] request_finished per_layer_kv_lens(uniform_fallback, not_worker_budget)`**，表示本次未拿到 worker 下发的分层结果，PD 只能用“均匀长度上界”兜底；此时 DynamicKV 的分层收益可能不完整。
 
 ---
-
-## 5. 已知约束与注意事项
-
-- **`impl=attn` 与 `impl=offload` 的时序不同**：前者在 **attention 前向最后一阶段**（整段 PrefillNoCache 或 chunked 最后一块）内嵌压缩与（可选）每 4 层周期预算；后者在 **prefill 步后** 做一轮全层预算与改写。二者共用 `dynamic_kv.py` 中的核心函数，但 **编排与是否「每 4 层」不一致**（见 §1.3）。
-- **这是 PD 场景优先实现**：prefill 本地仍先完整写入 KV；**`impl=attn`** 再在 **同一轮 prefill 的最后一层** 所在的前向路径内做分层压缩写回（`PrefillNoCache` 整段或 ChunkedPrefill 最后一块）；**`impl=offload`** 则在 **该步 forward 完成之后** 在 worker 内改写。
-- **Paged KV 的写回策略**：压缩后的 KV 写回到每层 cache 的"前缀 slots"，保证 decode 按 kv_len 读的是连续有效前缀
-- **PD + v2 shared-len（见 §3.3）**：在 PD 场景携带 `transferred_tokens` 时，v2 metadata 注入会使用 **`transferred_tokens + decode_extra`** 作为统一长度上界（全层同长），以“已传输容量”保证可读范围；按层差异长度在该分支下不会完全体现到 decode kernel 的长度输入。
+## 5. 注意事项和待办事项
 - **Prefix caching 与 DynamicKV 互斥**：启用 DynamicKV 时，vLLM-Ascend 会在初始化配置阶段 **强制关闭** `enable_prefix_caching`。原因是 DynamicKV 会在 prefill 上 **改写** paged KV 内容；而前缀缓存假设「相同 token 前缀对应可复用的稳定 KV」。若同时开启，可能导致错误复用或与 DynamicKV 导出的 per-layer 元数据不一致。若用户在 YAML/CLI 中打开了 prefix caching，实际运行仍会被置为关闭（日志中有 `forcing prefix caching off` 提示）。
-- **并发安全**：per-request 结果按 `request_id` 存放并在 Mooncake attach 后 pop，同时有 TTL/容量清理
-- **图捕获（graph capture）**：录制图期间不做分层压缩，只做普通 `reshape_and_cache`，避免动态形状破坏捕获
-- **`impl=offload` 与 Q 捕获**：若 **`L > prompt_kv_len_budget`** 但拿不到 tail query，见 **§2.1.1**；可通过 **`VLLM_ASCEND_DYNKV_STRICT=1`** 在「无 Q」时强制失败以便暴露配置/钩子问题。
+- impl=attn模式下，推理效果不可行，还存在乱码，需要进一步优化
 
 ---
 
 ## 6. 与开源 DynamicKV 的差异
 
-本实现针对 vLLM-Ascend PD 场景做了以下适配：
+这一节只想说明一件事：**开源实现的核心思路我们沿用了，但因为 vLLM 的 KV cache 形态与 PD（prefill/decode 分离）架构不同，落地方式会有一些“不得不这样做”的差异。**
 
 ### 6.1 架构差异（必要适配）
 
 | 方面　　　　　　　　 | 开源实现　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 | 本实现　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　|
 | ----------------------| ----------------------------------------------------------------------------------------------| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **应用场景**　　　　 | HuggingFace Transformers 单机推理　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　| vLLM-Ascend PD 分布式分离　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 |
-| **KV Cache**　　　　 | `DynamicCache` 连续内存　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　| Paged KV Cache（block_table 映射）　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　|
-| **集成方式**　　　　 | 在模型 **forward 内** 替换/包裹注意力与 cache（Monkey-patch），推理过程中逐层读写压缩后的 KV | **默认 `impl=offload`**：forward 不内嵌压缩，prefill 后再 **后处理** 改写 Paged KV；可选 **`impl=attn`**：在 **Attention 后端 forward** 内嵌压缩流程，与开源「前向内」形态 **更接近**（但并非同一套代码仓库） |
-| **跨层预算调用节奏** | 与具体开源挂载方式相关；常见为前向内随层推进　　　　　　　　　　　　　　　　　　　　　　　　 | **`impl=attn`**：`attention_v1.py` 内 **每 4 层** 一次周期预算（子集层）+ **最后一层**全层收尾；**`impl=offload`**：**步后单轮**全层 `update_and_reset_budget_per_kv_head`，**无**每 4 层周期　　　　　　　　 |
+| **应用场景**　　　　 | HF/Transformers 单机推理　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　| vLLM-Ascend 的 PD（prefill/decode 分离）推理　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　																 |
+| **KV Cache 形态**　　 | 连续 KV（更像“一整条序列”的缓存）　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 | Paged KV Cache（按 block/slot 管理，需要通过 block_table 映射）　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　　 |
+| **集成方式**　　　　 | 通常在模型 forward 内直接改写 cache / 注意力逻辑　　　　　　　　　　　　　　　　　　　　　　　 | 两种方式：默认 `impl=offload`（prefill 结束后再压缩并写回）；可选 `impl=attn`（prefill 前向内压缩，更接近开源形态） |
+| **跨层预算触发时机**　 | 取决于开源挂载方式，常见为前向内随层推进　　　　　　　　　　　　　　　　　　　　　　　　　　　 | `impl=attn`：前向内可选“每 4 层一次”的临时分配 + 最后一层收尾；`impl=offload`：prefill 结束后一次性全层分配 |
 
-### 6.2 算法对齐（已完成）
+### 6.2 算法对齐
 
 | 方面　　　　　　 | 开源实现　　　　　　　　　　| 本实现　　　　　　　　　　　　　　　　　　　　　　　|
 | ------------------| -----------------------------| -----------------------------------------------------|
@@ -381,26 +243,14 @@ position = num_computed_tokens + decode_position_offset
 | **跨层 tk**　　　| `base × heads × layers`　　 | `base × Hkv × layers`（一致）　　　　　　　　　　　 |
 | **indices 聚合** | per-head gather　　　　　　 | per-head scores + token-level 聚合（兼容 Paged KV） |
 
-**补充说明（结构性差异，非 bug）**：vLLM 的 Paged KV Cache 是 **token-level slot** 布局：同一 token 的所有 KV heads 共用同一 slot（管理与迁移的最小粒度是 token/slot，而不是 head）。因此无法像开源参考实现那样真正做到“每个 head 保留不同的 token 集合并独立压缩”；本实现采用 **per-head 打分 + 各 head top-k 并集** 来保证“任意 head 认为重要的 token 都被保留”。直接后果是：同样的 `budget_size` 配置下，最终保留 token 数量落在 \([k, k \times H_{kv}]\) 之间，压缩率与层间分配不可能与开源一一对应，需要按该约束解释日志与效果。
+**补充说明（结构性差异，非 bug）**：
+vLLM 的 Paged KV Cache 以 **token** 为最小管理粒度（一个 token 对应一个 slot，slot 内包含该 token 的所有 KV heads）。
+因此无法像开源参考那样做到“每个 head 保留不同的 token 集合并物理压缩”；这里采用 **per-head 打分 + 并集保留** 来保证“只要某个 head 认为重要，这个 token 就不会被丢掉”。
+带来的直观影响是：同样的 `budget_size` 下，最终保留的 token 数量落在 \([k, k \times H_{kv}]\) 之间，压缩率不可能与开源逐 head 的实现一一对应。
 
-### 6.3 本实现扩展功能
+### 6.3 PD 场景下的工程化扩展
 
-这些是开源实现没有的 PD 场景增值功能：
-
-- **物理块压缩传输**：`per_layer_num_prompt_blocks` / `per_layer_remote_block_ids`
-- **kv_transfer_params 跨进程传递**：prefill → proxy → decode
-- **`impl=offload`（默认）**：Q 捕获 hook + prefill 后改写，**不**改 attention 算子主路径，便于与 PD、Mooncake 组合；开源参考实现 **没有** 与此一一对应的同名模式，仅可类比为「把压缩从 forward 挪到步后」的工程折中。
-
-### 6.4 vLLM 主仓（`code/vllm`）的 PD + DynamicKV 配套改动（系统级补充）
-
-以下改动位于 vLLM 主仓（非 vLLM-Ascend），用于让“PD + 物理块 shrink（DynamicKV offload）”在 decode 侧可运行；它们会影响端到端行为，排查问题需知晓：
-
-- **Decode 侧 prompt_token_ids 截断与尾 token 覆写**：当 `kv_transfer_params.do_remote_prefill=true` 且携带 `block_size` / `num_prompt_blocks`（传输 footprint 被 shrink）时，decode 侧会将本地 `prompt_token_ids` 截断到 `eff = block_size × num_prompt_blocks`，并把 `prompt_token_ids[eff-1]` 覆写为 `kv_transfer_params.last_token_id`（否则首个 decode step 读取的 `input_id` 可能落在“中间 prompt token”，导致语义错误）。实现：`code/vllm/vllm/v1/request.py`。
-- **Worker 回传 kv_transfer_params 的浅合并**：worker 侧可通过 `KVConnectorOutput.kv_transfer_params_updates` 回传（例如 `dynamic_kv.per_layer_kv_lens` 等），scheduler 侧对 `request.kv_transfer_params` 做 **顶层 `dict.update()` 浅合并**。因此不要依赖“深层字段 merge”语义；若同一 key 被覆盖，以后到更新为准。实现：`code/vllm/vllm/v1/core/sched/scheduler.py`、`code/vllm/vllm/v1/outputs.py`。
-- **vLLM 核心 attention metadata**：`code/vllm/vllm/v1/worker/gpu_model_runner.py` 仅对每层注入 **`layer_name`**（同 KV cache group 内复用 metadata 时区分层），**不向** attention metadata 写入 `dynamic_kv_seq_lens_list`（该路径在 CUDA/通用后端中未被消费，已移除以免误导）。Decode 侧 DynamicKV 的 `dynamic_kv_seq_lens_list` / `dynamic_kv_keep_indices_list` 仍由 **vLLM-Ascend** 的 `worker/v2/attn_utils.py`（及 v1 `model_runner_v1.py` 等）从 `kv_transfer_params.dynamic_kv` 注入。
+- **分层结果需要跨进程传递**：prefill 侧算出的 `per_layer_kv_lens` 等，需要通过 `kv_transfer_params` 传给 decode 侧才能生效。
+- **物理传输/显存收缩（可选）**：在 offload + PD 场景下，可以进一步只传输/只占用“压缩后前缀”所需的 blocks，以降低 decode 侧 KV 占用。
 
 ---
-
-## 7. 参考（开源 DynamicKV）
-
-对照 `code/DynamicKV/kv_compression/token_drop/` 下分层相关 **methods** 与 **mistral_model_impl** 源码（与本文算法同思路）。
