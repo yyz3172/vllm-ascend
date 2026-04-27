@@ -208,6 +208,8 @@ decode 侧生效依赖两件事：
 
 **Metadata 注入（`vllm_ascend/worker/v2/attn_utils.py`）**：对每个 request、每层，若 **`per_layer_keep_indices[layer]` 为非空 list**，则该 request 该项长度取 **`len(indices)`** 并记入 `dynamic_kv_keep_indices_list`；**否则** 回退到 **`per_layer_kv_lens[layer]`**。**仅当本 batch 至少一个 request 在该层 indices 非空时**，才会挂上 **`dynamic_kv_keep_indices_list`**；若全部为空，则 **`dynamic_kv_keep_indices_list` 为 `None`**，仅 **`dynamic_kv_seq_lens_list`**（来自各层 `per_layer_kv_lens`）驱动长度。
 
+**PD + `transferred_tokens` 的 v2 实际行为（重要，易误读）**：当 `kv_transfer_params.dynamic_kv.transferred_tokens` 为正整数（PD 场景常见）时，v2 注入逻辑会启用 **shared-len** 分支：该层的 `dynamic_kv_seq_lens_list` 会被设置为 **`transferred_tokens + decode_extra`（全层同长）**，而不是严格的 **`per_layer_kv_lens[layer] + decode_extra`（按层不同）**。该策略用于在 PD 场景下以“已传输 token 容量”作为统一可读上界，配合 `impl=offload` 的 **prefix padding 置零**（见 `dynamic_kv_offload.py` 尾部补零逻辑）保证不会读到脏 KV。需要注意：这会削弱“decode 按层不同 kv_len 降算力”的收益，按层差异主要体现在 **PD 传输 shrink（按 `max(per_layer_kv_lens)`）** 与 **各层 pack 后的真实有效内容**。
+
 **Kernel 路径（`attention_v1.py::forward_paged_attention`）**：若 **`dynamic_kv_keep_indices_list` 存在且非空**（实现上为 truthy 列表），则用 **`[len(x) for x in dyn_keep]`** 覆盖内部长度列表；否则使用已注入的 **`dynamic_kv_seq_lens_list`**（即主要来自 **`per_layer_kv_lens`**）。因此 offload 压缩后 **不会** 因「全空 indices」误把 `kv_len` 推成 0。
 
 **Decode 组 batch（`model_runner_v1.py`）**：注释明确 **勿把 `per_layer_keep_indices` 再当作 paged decode 的 gather 坐标**：indices 在 **原始 prompt** 空间，而 offload 已将 KV **pack 到 slot `0..Li-1`**；按层长度用 **`Li`（来自 `per_layer_kv_lens`）+ decode 步增量** 与 **`context_lens`** 对齐。
@@ -350,6 +352,7 @@ position = num_computed_tokens + decode_position_offset
 - **`impl=attn` 与 `impl=offload` 的时序不同**：前者在 **attention 前向最后一阶段**（整段 PrefillNoCache 或 chunked 最后一块）内嵌压缩与（可选）每 4 层周期预算；后者在 **prefill 步后** 做一轮全层预算与改写。二者共用 `dynamic_kv.py` 中的核心函数，但 **编排与是否「每 4 层」不一致**（见 §1.3）。
 - **这是 PD 场景优先实现**：prefill 本地仍先完整写入 KV；**`impl=attn`** 再在 **同一轮 prefill 的最后一层** 所在的前向路径内做分层压缩写回（`PrefillNoCache` 整段或 ChunkedPrefill 最后一块）；**`impl=offload`** 则在 **该步 forward 完成之后** 在 worker 内改写。
 - **Paged KV 的写回策略**：压缩后的 KV 写回到每层 cache 的"前缀 slots"，保证 decode 按 kv_len 读的是连续有效前缀
+- **PD + v2 shared-len（见 §3.3）**：在 PD 场景携带 `transferred_tokens` 时，v2 metadata 注入会使用 **`transferred_tokens + decode_extra`** 作为统一长度上界（全层同长），以“已传输容量”保证可读范围；按层差异长度在该分支下不会完全体现到 decode kernel 的长度输入。
 - **Prefix caching 与 DynamicKV 互斥**：启用 DynamicKV 时，vLLM-Ascend 会在初始化配置阶段 **强制关闭** `enable_prefix_caching`。原因是 DynamicKV 会在 prefill 上 **改写** paged KV 内容；而前缀缓存假设「相同 token 前缀对应可复用的稳定 KV」。若同时开启，可能导致错误复用或与 DynamicKV 导出的 per-layer 元数据不一致。若用户在 YAML/CLI 中打开了 prefix caching，实际运行仍会被置为关闭（日志中有 `forcing prefix caching off` 提示）。
 - **并发安全**：per-request 结果按 `request_id` 存放并在 Mooncake attach 后 pop，同时有 TTL/容量清理
 - **图捕获（graph capture）**：录制图期间不做分层压缩，只做普通 `reshape_and_cache`，避免动态形状破坏捕获
@@ -378,6 +381,8 @@ position = num_computed_tokens + decode_position_offset
 | **跨层 tk**　　　| `base × heads × layers`　　 | `base × Hkv × layers`（一致）　　　　　　　　　　　 |
 | **indices 聚合** | per-head gather　　　　　　 | per-head scores + token-level 聚合（兼容 Paged KV） |
 
+**补充说明（结构性差异，非 bug）**：vLLM 的 Paged KV Cache 是 **token-level slot** 布局：同一 token 的所有 KV heads 共用同一 slot（管理与迁移的最小粒度是 token/slot，而不是 head）。因此无法像开源参考实现那样真正做到“每个 head 保留不同的 token 集合并独立压缩”；本实现采用 **per-head 打分 + 各 head top-k 并集** 来保证“任意 head 认为重要的 token 都被保留”。直接后果是：同样的 `budget_size` 配置下，最终保留 token 数量落在 \([k, k \times H_{kv}]\) 之间，压缩率与层间分配不可能与开源一一对应，需要按该约束解释日志与效果。
+
 ### 6.3 本实现扩展功能
 
 这些是开源实现没有的 PD 场景增值功能：
@@ -385,6 +390,14 @@ position = num_computed_tokens + decode_position_offset
 - **物理块压缩传输**：`per_layer_num_prompt_blocks` / `per_layer_remote_block_ids`
 - **kv_transfer_params 跨进程传递**：prefill → proxy → decode
 - **`impl=offload`（默认）**：Q 捕获 hook + prefill 后改写，**不**改 attention 算子主路径，便于与 PD、Mooncake 组合；开源参考实现 **没有** 与此一一对应的同名模式，仅可类比为「把压缩从 forward 挪到步后」的工程折中。
+
+### 6.4 vLLM 主仓（`code/vllm`）的 PD + DynamicKV 配套改动（系统级补充）
+
+以下改动位于 vLLM 主仓（非 vLLM-Ascend），用于让“PD + 物理块 shrink（DynamicKV offload）”在 decode 侧可运行；它们会影响端到端行为，排查问题需知晓：
+
+- **Decode 侧 prompt_token_ids 截断与尾 token 覆写**：当 `kv_transfer_params.do_remote_prefill=true` 且携带 `block_size` / `num_prompt_blocks`（传输 footprint 被 shrink）时，decode 侧会将本地 `prompt_token_ids` 截断到 `eff = block_size × num_prompt_blocks`，并把 `prompt_token_ids[eff-1]` 覆写为 `kv_transfer_params.last_token_id`（否则首个 decode step 读取的 `input_id` 可能落在“中间 prompt token”，导致语义错误）。实现：`code/vllm/vllm/v1/request.py`。
+- **Worker 回传 kv_transfer_params 的浅合并**：worker 侧可通过 `KVConnectorOutput.kv_transfer_params_updates` 回传（例如 `dynamic_kv.per_layer_kv_lens` 等），scheduler 侧对 `request.kv_transfer_params` 做 **顶层 `dict.update()` 浅合并**。因此不要依赖“深层字段 merge”语义；若同一 key 被覆盖，以后到更新为准。实现：`code/vllm/vllm/v1/core/sched/scheduler.py`、`code/vllm/vllm/v1/outputs.py`。
+- **vLLM 核心 attention metadata**：`code/vllm/vllm/v1/worker/gpu_model_runner.py` 仅对每层注入 **`layer_name`**（同 KV cache group 内复用 metadata 时区分层），**不向** attention metadata 写入 `dynamic_kv_seq_lens_list`（该路径在 CUDA/通用后端中未被消费，已移除以免误导）。Decode 侧 DynamicKV 的 `dynamic_kv_seq_lens_list` / `dynamic_kv_keep_indices_list` 仍由 **vLLM-Ascend** 的 `worker/v2/attn_utils.py`（及 v1 `model_runner_v1.py` 等）从 `kv_transfer_params.dynamic_kv` 注入。
 
 ---
 
