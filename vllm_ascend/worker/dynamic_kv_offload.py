@@ -42,8 +42,9 @@ class OffloadCaptureContext:
     q_end: list[int]
     # Total prompt length (seq len) per request.
     seq_lens: list[int]
-    # True when this step completes prompt (last chunk).
-    is_last_chunk: bool
+    # Requests that complete prefill in this step (indices into req_ids/seq_lens).
+    # DynamicKV offload rewrite should run for these requests after the forward.
+    finished_idx: list[int]
 
 
 def try_extract_layer_idx_from_name(name: str) -> int | None:

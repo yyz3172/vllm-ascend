@@ -1929,15 +1929,18 @@ class NPUModelRunner(GPUModelRunner):
                         nst = scheduler_output.num_scheduled_tokens
                         sched = [int(nst.get(r, 0)) if isinstance(nst, dict) else 0 for r in req_ids]
                         active_idx = [i for i in range(num_reqs) if seq_lens[i] > 0]
-                        is_last = bool(active_idx) and all(
-                            (comp[i] + sched[i]) >= seq_lens[i] for i in active_idx
-                        )
+                        # Per-request completion: in a multi-request batch, some requests
+                        # may finish prefill earlier than others. We must trigger the
+                        # DynamicKV rewrite for each request when it completes.
+                        finished_idx = [
+                            i for i in active_idx if (comp[i] + sched[i]) >= seq_lens[i]
+                        ]
                         _DYNKV_STATE["offload_ctx"] = OffloadCaptureContext(
                             req_ids=req_ids,
                             q_start=q_start,
                             q_end=q_end,
                             seq_lens=seq_lens,
-                            is_last_chunk=bool(is_last),
+                            finished_idx=finished_idx,
                         )
                 except Exception:
                     _DYNKV_STATE["offload_ctx"] = None
@@ -1959,7 +1962,7 @@ class NPUModelRunner(GPUModelRunner):
                     if kv_cfg is not None and getattr(kv_cfg, "is_kv_producer", False):
                         ctx = _DYNKV_STATE.get("offload_ctx")
                         kv_by_layer = getattr(self, "_kv_caches_by_layer_name", None)
-                        if (isinstance(ctx, OffloadCaptureContext) and ctx.is_last_chunk
+                        if (isinstance(ctx, OffloadCaptureContext) and ctx.finished_idx
                                 and isinstance(kv_by_layer, dict) and kv_by_layer):
                             # Block table is shared; some layers' metadata may omit it—scan.
                             block_tables = None
@@ -1986,10 +1989,20 @@ class NPUModelRunner(GPUModelRunner):
                                 q_last_store = _DYNKV_STATE.get("offload_q_last") or {}
                                 if not isinstance(q_last_store, dict):
                                     q_last_store = {}
+                                done_idx = [int(i) for i in ctx.finished_idx if int(i) >= 0]
+                                # Subselect to only finished requests.
+                                idx_one = torch.tensor(
+                                    done_idx,
+                                    device=block_tables.device,
+                                    dtype=torch.long,
+                                )
+                                block_tables_done = block_tables.index_select(0, idx_one)
+                                req_ids_done = [ctx.req_ids[i] for i in done_idx]
+                                seq_lens_done = [ctx.seq_lens[i] for i in done_idx]
                                 dynkv_updates = run_offload_rewrite_and_build_updates(
-                                    req_ids=ctx.req_ids,
-                                    seq_lens=ctx.seq_lens,
-                                    block_tables=block_tables,
+                                    req_ids=req_ids_done,
+                                    seq_lens=seq_lens_done,
+                                    block_tables=block_tables_done,
                                     kv_caches=kv_by_layer,
                                     q_last_store=q_last_store,
                                     max_capacity=int(getattr(ascend_cfg, "dynamic_kv_prompt_kv_len_budget", 0) or 0),
@@ -2013,14 +2026,14 @@ class NPUModelRunner(GPUModelRunner):
                                     bs = int(getattr(self.vllm_config.cache_config, "block_size", 0) or 0)
                                     if bs > 0 and isinstance(dynkv_updates, dict) and dynkv_updates:
                                         # Normalize block_tables to CPU list-of-lists.
-                                        bt = block_tables
+                                        bt = block_tables_done
                                         if isinstance(bt, torch.Tensor):
                                             bt_cpu = bt.detach().to("cpu")
                                             bt_rows = bt_cpu.tolist()
                                         else:
                                             bt_rows = None
                                         if isinstance(bt_rows, list) and bt_rows:
-                                            for ridx, rid in enumerate(ctx.req_ids):
+                                            for ridx, rid in enumerate(req_ids_done):
                                                 upd = dynkv_updates.get(rid)
                                                 if not isinstance(upd, dict):
                                                     continue
