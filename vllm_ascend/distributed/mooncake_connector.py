@@ -1332,29 +1332,33 @@ class MooncakeConnectorScheduler:
                         )
                         and dynamic_kv_payload["per_layer_kv_lens"]
                     ):
-                        # Only uniform-cap when neither worker last_results nor
+                        # When neither worker last_results nor
                         # request.kv_transfer_params (merged from KVConnectorOutput)
                         # already supplied per-layer lens.  A bare ``else`` here
                         # incorrectly overwrote a good payload from
                         # ``request.kv_transfer_params`` whenever scheduler-side
                         # ``_DYNKV_STATE`` was empty (always true on scheduler proc).
                         #
-                        # NOTE: This is NOT the DynamicKV per-layer budget; it repeats
-                        # ``capped=min(prompt_len,prompt_kv_len_budget)`` for every layer so
-                        # PD shrink / decode have *some* bound when worker metadata
-                        # is not merged before request_finished (see log tag below).
+                        # IMPORTANT: If worker rewrite did not provide per-layer lens,
+                        # we must NOT pretend KV was compressed to `capped` (e.g. 2048).
+                        # That would cause PD transfer shrink (esp. allocator_fallback)
+                        # to send fewer blocks than the worker actually packed, leading
+                        # to incorrect remote prefill/decode.
+                        #
+                        # Instead, fall back to "no compression": per-layer lens uses
+                        # the full prompt_len, which keeps the original behavior and
+                        # disables shrink.
                         dynamic_kv_payload = {
-                            "per_layer_kv_lens": [int(capped)] * int(num_layers),
+                            "per_layer_kv_lens": [int(prompt_len)] * int(num_layers),
                             "original_prompt_len": int(prompt_len),
                         }
                         logger.warning(
                             "[DynamicKV] request_finished per_layer_kv_lens"
-                            "(uniform_fallback, not_worker_budget): request_id=%s "
-                            "capped=%s x %d layers lens=%s",
+                            "(no_compress_fallback, missing_worker_budget): request_id=%s "
+                            "prompt_len=%s x %d layers",
                             request.request_id,
-                            int(capped),
+                            int(prompt_len),
                             int(num_layers),
-                            dynamic_kv_payload["per_layer_kv_lens"],
                         )
         except Exception:
             dynamic_kv_payload = None

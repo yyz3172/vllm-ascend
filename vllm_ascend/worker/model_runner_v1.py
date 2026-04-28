@@ -2009,6 +2009,7 @@ class NPUModelRunner(GPUModelRunner):
                                     window_size=int(getattr(ascend_cfg, "dynamic_kv_window_size", 16) or 16),
                                     pooling=str(getattr(ascend_cfg, "dynamic_kv_pooling", "none")),
                                     kernel_size=int(getattr(ascend_cfg, "dynamic_kv_kernel_size", 1) or 1),
+                                    softmax_chunk_size=int(getattr(ascend_cfg, "dynamic_kv_softmax_chunk_size", 1024) or 1024),
                                     radio_max=float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0)),
                                     radio_min=float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1)),
                                     num_layers=num_layers,

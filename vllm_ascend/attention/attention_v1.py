@@ -458,6 +458,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._dynamickv_prompt_kv_len_budget = int(getattr(ascend_cfg, "dynamic_kv_prompt_kv_len_budget", 512))
         self._dynamickv_pooling = getattr(ascend_cfg, "dynamic_kv_pooling", "none")
         self._dynamickv_kernel_size = int(getattr(ascend_cfg, "dynamic_kv_kernel_size", 1))
+        self._dynamickv_softmax_chunk_size = int(getattr(ascend_cfg, "dynamic_kv_softmax_chunk_size", 1024) or 1024)
         self._dynamickv_radio_max = float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0))
         self._dynamickv_radio_min = float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1))
         self._dynamickv_validation_mode = str(getattr(ascend_cfg, "dynamic_kv_validation_mode", "none"))
@@ -1253,6 +1254,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 ),
                                 kernel_size=int(self._dynamickv_kernel_size)
                                 if int(self._dynamickv_kernel_size) > 1 else 7,
+                                softmax_chunk_size=int(self._dynamickv_softmax_chunk_size),
                                 radio_max=float(self._dynamickv_radio_max),
                                 radio_min=float(self._dynamickv_radio_min),
                             )
@@ -1357,6 +1359,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                         max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
                                         pooling="none",
                                         kernel_size=1,
+                                        softmax_chunk_size=int(self._dynamickv_softmax_chunk_size),
                                         radio_max=float(self._dynamickv_radio_max),
                                         radio_min=float(self._dynamickv_radio_min),
                                     )
@@ -1471,6 +1474,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             ),
                             kernel_size=int(self._dynamickv_kernel_size)
                             if int(self._dynamickv_kernel_size) > 1 else 7,
+                            softmax_chunk_size=int(self._dynamickv_softmax_chunk_size),
                             radio_max=float(self._dynamickv_radio_max),
                             radio_min=float(self._dynamickv_radio_min),
                         )

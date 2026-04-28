@@ -24,10 +24,12 @@ from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
                                               cap_keep_indices_chronological,
+                                              clear_dynkv_softmax_scratch,
                                               gather_kv_from_paged_cache_batched,
                                               save_validation_mask,
                                               scores_and_indices_old,
                                               scores_and_indices_old_perhead_aggregated,
+                                              scores_and_indices_old_perhead_aggregated_paged_cache,
                                               update_and_reset_budget,
                                               update_and_reset_budget_per_kv_head)
 
@@ -234,6 +236,7 @@ def run_offload_rewrite_and_build_updates(
     window_size: int,
     pooling: str,
     kernel_size: int,
+    softmax_chunk_size: int = 1024,
     radio_max: float,
     radio_min: float,
     num_layers: int,
@@ -320,6 +323,7 @@ def run_offload_rewrite_and_build_updates(
         max_capacity_prompt=int(C),
         pooling=str(pooling),
         kernel_size=int(kernel_size),
+        softmax_chunk_size=int(softmax_chunk_size),
         radio_max=float(radio_max),
         radio_min=float(radio_min),
     )
@@ -399,11 +403,8 @@ def run_offload_rewrite_and_build_updates(
         per_layer_scores_old: list[torch.Tensor] = []
         # Per-head scores [Hkv, old_len] for cross-layer budget (open-source style).
         per_layer_indices_old: list[torch.Tensor] = []
-        per_layer_k_full: list[torch.Tensor] = []
-        per_layer_v_full: list[torch.Tensor] = []
-        per_layer_slots_full: list[torch.Tensor] = []
 
-        # Gather full KV once per layer (batched gather returns packed; slice by ridx).
+        # Stream K directly from paged cache (avoid allocating full k_packed/v_packed).
         for li, k_cache, v_cache in layer_items:
             q_last = per_layer_q.get(li)
             if q_last is None or not isinstance(q_last, torch.Tensor):
@@ -411,30 +412,17 @@ def run_offload_rewrite_and_build_updates(
                 per_layer_scores_old = []
                 break
 
-            k_packed, v_packed, slots_packed, cu = gather_kv_from_paged_cache_batched(
-                k_cache,
-                v_cache,
-                block_tables.to(device=k_cache.device),
-                seq_lens,
-            )
-            start = 0 if ridx == 0 else int(cu[ridx - 1])
-            end = int(cu[ridx])
-            k_full = k_packed[start:end]
-            v_full = v_packed[start:end]
-            slots_full = slots_packed[start:end].to(torch.long)
-
-            # Per-head scores + aggregated indices (open-source density style).
-            scores_old, idx_old = scores_and_indices_old_perhead_aggregated(
+            bt_row = block_tables[ridx].to(device=k_cache.device)
+            scores_old, idx_old = scores_and_indices_old_perhead_aggregated_paged_cache(
                 query_last=q_last,
-                key_full=k_full,
+                key_cache=k_cache,
+                block_table_row=bt_row,
+                seq_len=L,
                 cfg=cfg,
                 budget_size=cand_old,
             )
             per_layer_scores_old.append(scores_old)
             per_layer_indices_old.append(idx_old)
-            per_layer_k_full.append(k_full)
-            per_layer_v_full.append(v_full)
-            per_layer_slots_full.append(slots_full)
 
         if not per_layer_scores_old or len(per_layer_scores_old) != len(layer_items):
             logger.warning(
@@ -473,9 +461,7 @@ def run_offload_rewrite_and_build_updates(
             for local_i, (li, _k_cache, _v_cache) in enumerate(layer_items):
                 old_budget = int(per_layer_old_budget[li])
                 idx_old = per_layer_indices_old[local_i]
-                k_full = per_layer_k_full[local_i]
-                slots_full = per_layer_slots_full[local_i]
-                Hkv = int(k_full.shape[1])
+                Hkv = int(_k_cache.shape[2])
                 W_eff = int(tail_idx.numel())
                 old_budget_eff = max(0, min(int(old_budget), int(idx_old.shape[0])))
                 if Hkv <= 0 or W_eff <= 0:
@@ -493,9 +479,9 @@ def run_offload_rewrite_and_build_updates(
                     cap=L,
                     device=idx_old.device
                     if isinstance(idx_old, torch.Tensor)
-                    else k_full.device,
+                    else _k_cache.device,
                 )
-                important_mask = torch.zeros(L, dtype=torch.bool, device=k_full.device)
+                important_mask = torch.zeros(L, dtype=torch.bool, device=_k_cache.device)
                 if keep_sorted.numel() > 0:
                     important_mask[keep_sorted.to(torch.long)] = True
                 if is_mask:
@@ -511,8 +497,13 @@ def run_offload_rewrite_and_build_updates(
                     )
                     unimportant = ~important_mask
                     if unimportant.any():
-                        sb = slots_full[unimportant].to(torch.long).flatten()
-                        sb = torch.unique(sb)
+                        unimp_idx = torch.where(unimportant)[0].to(torch.long)
+                        block_size = int(_k_cache.shape[1])
+                        bt_row = block_tables[ridx].to(device=_k_cache.device)
+                        block_idx = torch.div(unimp_idx, block_size, rounding_mode="floor")
+                        off = unimp_idx - block_idx * block_size
+                        phys = bt_row.index_select(0, block_idx).to(torch.long)
+                        sb = torch.unique(phys * block_size + off)
                         if sb.numel() > 0:
                             zblk = k_flat.new_zeros(
                                 (int(sb.numel()), int(k_flat.shape[-2]), int(k_flat.shape[-1]))
@@ -576,10 +567,7 @@ def run_offload_rewrite_and_build_updates(
         for local_i, (li, _k_cache, _v_cache) in enumerate(layer_items):
             old_budget = int(per_layer_old_budget[li])
             idx_old = per_layer_indices_old[local_i]  # [cand_old]
-            k_full = per_layer_k_full[local_i]
-            v_full = per_layer_v_full[local_i]
-            slots_full = per_layer_slots_full[local_i]
-            Hkv = int(k_full.shape[1])
+            Hkv = int(_k_cache.shape[2])
             W_eff = int(tail_idx.numel())
             old_budget_eff = max(0, min(int(old_budget), int(idx_old.shape[0])))
             kv_len = int(old_budget_eff + W_eff)
@@ -590,6 +578,8 @@ def run_offload_rewrite_and_build_updates(
             # Flatten paged cache to [num_blocks*block_size, H, D]
             k_flat = _k_cache.reshape(-1, _k_cache.shape[-2], _k_cache.shape[-1])
             v_flat = _v_cache.reshape(-1, _v_cache.shape[-2], _v_cache.shape[-1])
+            block_size = int(_k_cache.shape[1])
+            bt_row = block_tables[ridx].to(device=_k_cache.device)
 
             # Shared packed-prefix (open-source style).
             tail_keep = tail_idx.to(torch.long)
@@ -599,19 +589,42 @@ def run_offload_rewrite_and_build_updates(
                 old_budget=old_budget_eff,
                 tail_idx=tail_keep,
                 cap=L,
-                device=idx_old.device if isinstance(idx_old, torch.Tensor) else k_full.device,
+                device=idx_old.device if isinstance(idx_old, torch.Tensor) else _k_cache.device,
             )
-            k_packed = k_full.index_select(0, keep_sorted)
-            v_packed = v_full.index_select(0, keep_sorted)
-            kv_len_i = int(k_packed.shape[0])
+            kv_len_i = int(keep_sorted.numel())
+            # Source slots: kept tokens in original prompt space.
+            if kv_len_i > 0:
+                keep_sorted_l = keep_sorted.to(torch.long)
+                block_idx_src = torch.div(keep_sorted_l, block_size, rounding_mode="floor")
+                off_src = keep_sorted_l - block_idx_src * block_size
+                phys_src = bt_row.index_select(0, block_idx_src).to(torch.long)
+                slots_src = phys_src * block_size + off_src
+                k_packed = k_flat.index_select(0, slots_src)
+                v_packed = v_flat.index_select(0, slots_src)
+            else:
+                k_packed = k_flat[:0]
+                v_packed = v_flat[:0]
             per_layer_kv_lens.append(kv_len_i)
             kv_len_by_layer[int(li)] = int(kv_len_i)
-            slots_keep = slots_full[:kv_len_i]
-            k_flat.index_copy_(0, slots_keep.to(k_flat.device), k_packed)
-            v_flat.index_copy_(0, slots_keep.to(v_flat.device), v_packed)
+            # Destination slots: leading prefix positions [0, kv_len_i).
+            if kv_len_i > 0:
+                dst_idx = torch.arange(kv_len_i, device=_k_cache.device, dtype=torch.long)
+                block_idx_dst = torch.div(dst_idx, block_size, rounding_mode="floor")
+                off_dst = dst_idx - block_idx_dst * block_size
+                phys_dst = bt_row.index_select(0, block_idx_dst).to(torch.long)
+                slots_dst = phys_dst * block_size + off_dst
+                k_flat.index_copy_(0, slots_dst.to(k_flat.device), k_packed)
+                v_flat.index_copy_(0, slots_dst.to(v_flat.device), v_packed)
             # For debugging/PD export: keep_indices in original prompt space is optional.
             # We keep it empty to avoid misinterpretation; decode uses kv_len only.
             per_layer_keep_indices.append([])
+
+        # Best-effort: release large persistent scratch to reduce fragmentation
+        # and reserved-memory growth under concurrency.
+        try:
+            clear_dynkv_softmax_scratch(device=layer_items[0][1].device)
+        except Exception:
+            pass
 
         # Zero-pad within PD transfer upper bound.
         #
@@ -637,8 +650,21 @@ def run_offload_rewrite_and_build_updates(
                             kv_len_i = int(kv_len_by_layer.get(int(li), 0))
                             if kv_len_i <= 0 or kv_len_i >= pad_to_global:
                                 continue
-                            slots_full = per_layer_slots_full[local_i]
-                            slots_pad = slots_full[kv_len_i:pad_to_global]
+                            # Pad slots are the *destination prefix* slots in paged cache,
+                            # i.e. logical positions [kv_len_i, pad_to_global).
+                            bt_row = block_tables[ridx].to(device=_k_cache.device)
+                            dst_idx = torch.arange(
+                                kv_len_i,
+                                pad_to_global,
+                                device=_k_cache.device,
+                                dtype=torch.long,
+                            )
+                            block_idx_dst = torch.div(
+                                dst_idx, block_size, rounding_mode="floor"
+                            )
+                            off_dst = dst_idx - block_idx_dst * block_size
+                            phys_dst = bt_row.index_select(0, block_idx_dst).to(torch.long)
+                            slots_pad = (phys_dst * block_size + off_dst).to(torch.long)
                             if slots_pad.numel() <= 0:
                                 continue
                             k_flat = _k_cache.reshape(-1, _k_cache.shape[-2], _k_cache.shape[-1])
