@@ -107,8 +107,18 @@ def install_qproj_hooks(
             q_req = q[s:e]
             if q_req.numel() == 0:
                 continue
-            q_last = q_req[-min(W, int(q_req.shape[0])):].contiguous()
             per_req = q_last_store.setdefault(rid, {})
+            # Maintain a rolling tail window across *all* prefill chunks.
+            # Hooks fire on every chunk, so we append and keep only the last W tokens.
+            if W <= 0:
+                continue
+            prev = per_req.get(layer_idx)
+            if isinstance(prev, torch.Tensor) and prev.numel() > 0:
+                # Both prev and q_req are [t, Hq, D] on the same device/dtype.
+                cat = torch.cat([prev, q_req], dim=0)
+                q_last = cat[-min(W, int(cat.shape[0])):].contiguous()
+            else:
+                q_last = q_req[-min(W, int(q_req.shape[0])):].contiguous()
             per_req[layer_idx] = q_last
 
     def _hook_q_proj(module, inputs, output, *, module_name: str):

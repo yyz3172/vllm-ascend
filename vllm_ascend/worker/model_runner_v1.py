@@ -1932,13 +1932,6 @@ class NPUModelRunner(GPUModelRunner):
                         is_last = bool(active_idx) and all(
                             (comp[i] + sched[i]) >= seq_lens[i] for i in active_idx
                         )
-                        # Hooks run on every chunk; clear stale captures before the
-                        # final prefill forward so ``offload_q_last`` matches the tail.
-                        if is_last:
-                            st = _DYNKV_STATE.get("offload_q_last")
-                            if isinstance(st, dict):
-                                for r in req_ids:
-                                    st.pop(r, None)
                         _DYNKV_STATE["offload_ctx"] = OffloadCaptureContext(
                             req_ids=req_ids,
                             q_start=q_start,
