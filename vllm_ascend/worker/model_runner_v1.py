@@ -1952,6 +1952,7 @@ class NPUModelRunner(GPUModelRunner):
             # DynamicKV (offload impl): run a post-prefill KV rewrite pass in
             # the worker process. This keeps the attention execution path
             # unchanged while allowing PD to receive per-layer kv_lens/indices.
+            _dynkv_offload_q_cleanup_rids: list[str] = []
             try:
                 ascend_cfg = get_ascend_config()
                 dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
@@ -1998,6 +1999,7 @@ class NPUModelRunner(GPUModelRunner):
                                 )
                                 block_tables_done = block_tables.index_select(0, idx_one)
                                 req_ids_done = [ctx.req_ids[i] for i in done_idx]
+                                _dynkv_offload_q_cleanup_rids = list(req_ids_done)
                                 seq_lens_done = [ctx.seq_lens[i] for i in done_idx]
                                 dynkv_updates = run_offload_rewrite_and_build_updates(
                                     req_ids=req_ids_done,
@@ -2071,6 +2073,13 @@ class NPUModelRunner(GPUModelRunner):
             finally:
                 # Clear capture context to avoid accidental reuse.
                 _DYNKV_STATE["offload_ctx"] = None
+                # Captured q_last tensors are only for rewrite; drop them so
+                # offload_q_last does not retain NPU memory across requests.
+                if _dynkv_offload_q_cleanup_rids:
+                    _store = _DYNKV_STATE.get("offload_q_last")
+                    if isinstance(_store, dict):
+                        for _rid in _dynkv_offload_q_cleanup_rids:
+                            _store.pop(_rid, None)
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(
