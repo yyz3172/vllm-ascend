@@ -1905,11 +1905,17 @@ class NPUModelRunner(GPUModelRunner):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 # DynamicKV offload: publish capture context for q_proj hooks.
+                # Only the KV producer (prefill) needs Q capture + post-prefill rewrite.
+                # On the decode worker, ``should_enable()`` must stay false: otherwise hooks
+                # keep writing ``offload_q_last`` every step while cleanup only runs on the
+                # producer after ``run_offload_rewrite_and_build_updates``, leaking NPU
+                # memory across finished requests (OOM after many requests).
                 try:
                     ascend_cfg = get_ascend_config()
                     dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
                     dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
-                    if dyn_enabled and dyn_impl == "offload":
+                    if dyn_enabled and dyn_impl == "offload" and getattr(
+                            self, "is_kv_producer", False):
                         num_reqs = int(self.input_batch.num_reqs)
                         req_ids = list(self.input_batch.req_ids)
                         # query_start_loc is cumulative starts for each req in this step.
@@ -1942,6 +1948,8 @@ class NPUModelRunner(GPUModelRunner):
                             seq_lens=seq_lens,
                             finished_idx=finished_idx,
                         )
+                    elif dyn_enabled and dyn_impl == "offload":
+                        _DYNKV_STATE["offload_ctx"] = None
                 except Exception:
                     _DYNKV_STATE["offload_ctx"] = None
 
