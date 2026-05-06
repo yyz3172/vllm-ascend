@@ -30,6 +30,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import threading
 from vllm.attention.backends.abstract import AttentionBackend, AttentionType
 from vllm.attention.layer import Attention, MLAAttention
 from vllm.attention.selector import get_attn_backend
@@ -42,10 +43,12 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import (get_dcp_group, get_dp_group,
                                              get_pcp_group, get_pp_group,
+                                             get_tensor_model_parallel_rank,
                                              get_tp_group)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
@@ -79,8 +82,18 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import _DYNKV_STATE
+from vllm_ascend.attention.dynamic_kv import (
+    gather_kv_from_paged_cache_batched,
+    save_validation_mask,
+)
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          using_paged_attention)
+from vllm_ascend.worker.dynamic_kv_offload import (
+    OffloadCaptureContext,
+    install_qproj_hooks,
+    run_offload_rewrite_and_build_updates,
+)
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
@@ -130,6 +143,37 @@ if get_ascend_device_type() == AscendDeviceType._310P:
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+
+def _merge_kv_xfer_updates_drain(
+    existing: dict[str, dict[str, Any]] | None,
+    drain: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]] | None:
+    """Merge ``drain_kv_transfer_params_updates`` into execute_model updates.
+
+    Worker offload attaches ``kv_transfer_params_updates`` in ``execute_model``;
+    draining the KV connector in ``sample_tokens`` must not replace those entries
+    with scheduler-side fallbacks for the same keys.
+    """
+    if not drain:
+        return existing
+    merged: dict[str, dict[str, Any]] = dict(existing or {})
+    for rid, d_req in drain.items():
+        if rid not in merged:
+            merged[rid] = dict(d_req)
+            continue
+        e_req = dict(merged[rid])
+        u_req = dict(d_req)
+        out_req = {**u_req, **e_req}
+        dk_e = e_req.get("dynamic_kv")
+        dk_u = u_req.get("dynamic_kv")
+        if isinstance(dk_e, dict) or isinstance(dk_u, dict):
+            out_req["dynamic_kv"] = {
+                **(dk_u if isinstance(dk_u, dict) else {}),
+                **(dk_e if isinstance(dk_e, dict) else {}),
+            }
+        merged[rid] = out_req
+    return merged
 
 
 @dataclass
@@ -601,6 +645,58 @@ class NPUModelRunner(GPUModelRunner):
                 position_pcp[:total_num_scheduled_tokens],
                 out=positions_np,
             )
+        # Keep a raw (cache-space) position snapshot for token-id lookup.
+        # Slot-mapping and token indexing must remain in compressed cache space.
+        token_positions_np = positions_np.copy()
+
+        # DynamicKV PD decode: RoPE positions should stay in original prompt space
+        # while slot mapping/token lookup stays in compressed cache space.
+        if (not self.uses_mrope and self.uses_xdrope_dim == 0
+                and getattr(self, "is_kv_consumer", False)):
+            try:
+                ascend_cfg = get_ascend_config()
+                dyn_enabled = bool(
+                    getattr(ascend_cfg, "dynamic_kv_enabled", False))
+                if dyn_enabled:
+                    offset_by_req_idx: dict[int, int] = {}
+                    for req_idx in range(num_reqs):
+                        req_id = req_ids[req_idx]
+                        req = self.requests.get(req_id)
+                        kvp = getattr(req, "kv_transfer_params",
+                                      None) if req is not None else None
+                        if not isinstance(kvp, dict):
+                            continue
+                        dyn = kvp.get("dynamic_kv") if isinstance(
+                            kvp.get("dynamic_kv"), dict) else {}
+                        # Backward-compatible: prefer explicit field, else derive.
+                        offset = dyn.get("decode_position_offset")
+                        if not isinstance(offset, int):
+                            opl = dyn.get("original_prompt_len")
+                            transferred = dyn.get("transferred_tokens")
+                            if (isinstance(opl, int) and opl > 0
+                                    and isinstance(transferred, int)
+                                    and transferred > 0):
+                                # first decode query position should be `opl`
+                                # when raw position starts at transferred-1.
+                                offset = int(opl) - int(transferred) + 1
+                        if isinstance(offset, int) and offset != 0:
+                            offset_by_req_idx[req_idx] = int(offset)
+                    if offset_by_req_idx:
+                        for req_idx, offset in offset_by_req_idx.items():
+                            mask = (req_indices == req_idx)
+                            positions_np[mask] += offset
+                        prev_offsets = getattr(self, "_dynkv_last_rope_offsets",
+                                               None)
+                        if prev_offsets != offset_by_req_idx:
+                            setattr(self, "_dynkv_last_rope_offsets",
+                                    dict(offset_by_req_idx))
+                            logger.info(
+                                "[DynamicKV][decode] applied RoPE offsets: %s",
+                                offset_by_req_idx,
+                            )
+            except Exception as e:
+                logger.warning(
+                    "[DynamicKV][decode] RoPE offset apply failed: %s", e)
         max_num_scheduled_tokens = max(tokens)
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
             and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
@@ -660,7 +756,7 @@ class NPUModelRunner(GPUModelRunner):
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
-        token_indices = (positions_np +
+        token_indices = (token_positions_np +
                          req_indices * self.input_batch.token_ids_cpu.shape[1])
         token_indices_tensor = torch.from_numpy(token_indices)
         # Prepare input_ids.
@@ -746,6 +842,36 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
         base_num_reqs = self.input_batch.num_reqs
         num_reqs = base_num_reqs
+        # DynamicKV: ChunkedPrefill only compresses on the last chunk.
+        # Determine if this step finishes the prompt for all requests.
+        dynamic_kv_is_last_chunk = False
+        dynkv_max_capacity = None
+        try:
+            if self.attn_state in (AscendAttentionState.PrefillNoCache,
+                                   AscendAttentionState.ChunkedPrefill):
+                comp = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                sched = num_scheduled_tokens[:num_reqs]
+                total = num_tokens_np[:num_reqs]
+                # `dynamic_kv.prompt_kv_len_budget` is a per-layer KV budget target, not a hard cap on
+                # how many prompt tokens get chunked prefill. Using
+                # min(prompt_len, max_capacity) here marks the *first* chunk as
+                # "last" for long prompts and breaks DynamicKV + PD metadata.
+                try:
+                    dynkv_cfg = None
+                    add_cfg = getattr(self.vllm_config, "additional_config", None)
+                    if isinstance(add_cfg, dict):
+                        dynkv_cfg = add_cfg.get("dynamic_kv")
+                    if isinstance(dynkv_cfg, dict):
+                        mc = dynkv_cfg.get("prompt_kv_len_budget")
+                        if isinstance(mc, int) and mc > 0:
+                            dynkv_max_capacity = mc
+                except Exception:
+                    dynkv_max_capacity = None
+                total_eff = total
+                dynamic_kv_is_last_chunk = bool(
+                    np.all((comp + sched) >= total_eff))
+        except Exception:
+            dynamic_kv_is_last_chunk = False
         if self.pcp_size > 1:
             # while pcp > 1, we need the original num_scheduled_tokens before split
             # to calculate discard_requests_mask
@@ -767,10 +893,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # _prepare_inputs may reorder the batch, so we must gather
         # multi-modal outputs after that to ensure the correct order
-        if vllm_version_is('0.13.0'):
-            model_kwargs = self._init_model_kwargs(num_input_tokens)
-        else:
-            model_kwargs = self._init_model_kwargs()
+        model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.is_multimodal_model and not self.model_config.is_encoder_decoder:
             self.multimodal_cpu_fields = ["grid_thw"]
             self._prepare_multimodal_fields()
@@ -1029,12 +1152,20 @@ class NPUModelRunner(GPUModelRunner):
                 num_computed_tokens_cpu_tensor[:num_reqs],
                 positions=self.positions.gpu,
                 attn_state=self.attn_state,
+                dynamic_kv_is_last_chunk=dynamic_kv_is_last_chunk,
                 max_query_len=max_num_scheduled_tokens,
                 decode_token_per_req=self.decode_token_per_req,
                 prefill_context_parallel_metadata=self.long_seq_metadata,
                 max_seq_len=0,
                 encoder_seq_lens=encoder_seq_lens,
                 encoder_seq_lens_cpu=encoder_seq_lens_cpu)
+            # DynamicKV: carry request ids through to attention metadata.
+            # AscendCommonAttentionMetadata may not accept this as a ctor kwarg
+            # across versions, so attach it dynamically.
+            try:
+                setattr(common_attn_metadata, "req_ids", list(req_ids))
+            except Exception:
+                pass
 
             if self.speculative_config and self.pcp_size * self.dcp_size > 1:
                 # For pcp + spec decode, we flatten block_table
@@ -1099,9 +1230,219 @@ class NPUModelRunner(GPUModelRunner):
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args)
+                # DynamicKV: propagate gating fields to backend metadata.
+                try:
+                    setattr(attn_metadata_i, "dynamic_kv_is_last_chunk",
+                            getattr(common_attn_metadata,
+                                    "dynamic_kv_is_last_chunk", False))
+                except Exception:
+                    pass
+                try:
+                    if getattr(attn_metadata_i, "req_ids", None) is None:
+                        setattr(attn_metadata_i, "req_ids",
+                                getattr(common_attn_metadata, "req_ids", None))
+                except Exception:
+                    pass
 
                 for layer_name in attn_group.layer_names:
-                    attn_metadata[layer_name] = attn_metadata_i
+                    # vLLM will index attn_metadata by layer_name. We must ensure
+                    # each layer sees its own metadata instance with `layer_name`
+                    # populated, otherwise DynamicKV cannot resolve layer_idx.
+                    try:
+                        import copy as _copy
+
+                        meta_i = _copy.copy(attn_metadata_i)
+                    except Exception:
+                        meta_i = attn_metadata_i
+                    try:
+                        setattr(meta_i, "layer_name", layer_name)
+                    except Exception:
+                        pass
+                    # PD DynamicKV (decode consumer): mirror v2 ``attn_utils`` so
+                    # paged attention uses per-layer ``kv_len`` from
+                    # ``request.kv_transfer_params`` instead of full logical
+                    # ``seq_lens`` (which would read past compressed KV).
+                    if getattr(self, "is_kv_consumer", False):
+                        try:
+                            layer_idx = int(
+                                extract_layer_index(layer_name,
+                                                    num_attn_module=1))
+                        except Exception:
+                            layer_idx = -1
+                        if layer_idx >= 0:
+                            n_r = int(num_reqs)
+                            rid_list = list(req_ids[:n_r])
+                            kv_list: list[dict[str, Any]] = []
+                            for rid in rid_list:
+                                req = self.requests.get(rid)
+                                kvp = getattr(req, "kv_transfer_params",
+                                              None) if req is not None else None
+                                kv_list.append(kvp if isinstance(kvp, dict) else {})
+                            if kv_list and len(kv_list) == len(rid_list):
+                                tmp_lens: list[int] = []
+                                dyn_slot_mapping_np = None
+                                try:
+                                    dyn_slot_mapping_np = (
+                                        meta_i.slot_mapping.detach().cpu().numpy().copy()
+                                    )
+                                    block_tables_np = (
+                                        meta_i.block_tables.detach().cpu().numpy()
+                                    )
+                                    bs_dyn = int(self.block_size)
+                                except Exception:
+                                    dyn_slot_mapping_np = None
+                                    block_tables_np = None
+                                    bs_dyn = 0
+                                for req_idx, kvp in enumerate(kv_list):
+                                    if not kvp:
+                                        tmp_lens.append(-1)
+                                        continue
+                                    dyn = kvp.get("dynamic_kv") or {}
+                                    per_layer = dyn.get("per_layer_kv_lens")
+                                    pii = dyn.get("per_layer_important_indices")
+                                    try:
+                                        npt = int(
+                                            self.input_batch.num_prompt_tokens[
+                                                req_idx])
+                                        ncomp = int(
+                                            self.input_batch.
+                                            num_computed_tokens_cpu[req_idx])
+                                    except Exception:
+                                        npt, ncomp = 0, 0
+                                    # PD+DynamicKV: scheduler's `num_computed_tokens`
+                                    # starts at `transferred_tokens` (< num_prompt_tokens
+                                    # because of compression). Use that as the base for
+                                    # decode_extra so per-layer kv_len grows as new
+                                    # decode KVs are written into cache.
+                                    base_tokens = npt
+                                    transferred = dyn.get("transferred_tokens")
+                                    use_dyn_base = isinstance(
+                                        transferred, int) and transferred > 0
+                                    if use_dyn_base:
+                                        base_tokens = int(transferred)
+                                    # `num_computed_tokens` points to the position of
+                                    # current decode query token. For PD remote prefill,
+                                    # scheduler initializes it at `base_tokens - 1`.
+                                    # Context length must include the current token, so
+                                    # the first decode step contributes one token.
+                                    decode_extra = max(
+                                        0, ncomp - base_tokens + 2)
+                                    if layer_idx == 0:
+                                        logger.debug(
+                                            "[DynamicKV][decode_extra] req_idx=%d "
+                                            "npt=%d ncomp=%d transferred=%s base=%d decode_extra=%d dyn_base=%s",
+                                            req_idx,
+                                            npt,
+                                            ncomp,
+                                            transferred,
+                                            base_tokens,
+                                            decode_extra,
+                                            use_dyn_base,
+                                        )
+                                    # Do not pass ``per_layer_keep_indices`` into
+                                    # paged decode: indices live in *original*
+                                    # prompt coordinates while offload packs KV
+                                    # contiguously in cache slots ``0..Li-1``.
+                                    # Length-only ``context_lens`` matches the
+                                    # packed layout; grow with decode tokens via
+                                    # ``decode_extra``.
+                                    if (isinstance(per_layer, list)
+                                            and layer_idx < len(per_layer)):
+                                        try:
+                                            Li = int(per_layer[layer_idx])
+                                        except Exception:
+                                            Li = -1
+                                        if Li > 0:
+                                            tmp_lens.append(Li + decode_extra)
+                                            # PD+DynamicKV offload uses per-layer
+                                            # packed prompt lengths. Decode KV must be
+                                            # written immediately after each layer's
+                                            # packed prefix (`Li + step`), not at the
+                                            # global transferred-token position.
+                                            if (use_dyn_base
+                                                    and dyn_slot_mapping_np is not None
+                                                    and block_tables_np is not None
+                                                    and bs_dyn > 0):
+                                                try:
+                                                    mask = (req_indices == req_idx)
+                                                    if mask.any():
+                                                        rel = (
+                                                            token_positions_np[mask]
+                                                            - (int(base_tokens) - 1)
+                                                        )
+                                                        tgt_pos = int(Li) + rel
+                                                        bt_row = block_tables_np[req_idx]
+                                                        block_ids = bt_row[
+                                                            tgt_pos // bs_dyn
+                                                        ]
+                                                        dyn_slot_mapping_np[mask] = (
+                                                            block_ids * bs_dyn
+                                                            + (tgt_pos % bs_dyn)
+                                                        )
+                                                except Exception:
+                                                    dyn_slot_mapping_np = None
+                                            # PD validation: restore important-token mask on decode worker.
+                                            try:
+                                                rid_here = (
+                                                    rid_list[req_idx]
+                                                    if req_idx < len(rid_list)
+                                                    else None
+                                                )
+                                                if (
+                                                    rid_here
+                                                    and isinstance(pii, list)
+                                                    and layer_idx < len(pii)
+                                                ):
+                                                    idxs_layer = pii[layer_idx]
+                                                    if isinstance(idxs_layer, list):
+                                                        li_tot = int(Li) + int(decode_extra)
+                                                        mcpu = torch.zeros(
+                                                            li_tot, dtype=torch.bool
+                                                        )
+                                                        for t in idxs_layer:
+                                                            ti = int(t)
+                                                            if 0 <= ti < int(Li):
+                                                                mcpu[ti] = True
+                                                        if decode_extra > 0 and li_tot > int(Li):
+                                                            mcpu[int(Li) : li_tot] = True
+                                                        save_validation_mask(
+                                                            str(rid_here),
+                                                            int(layer_idx),
+                                                            mcpu,
+                                                        )
+                                            except Exception:
+                                                pass
+                                        else:
+                                            tmp_lens.append(-1)
+                                    else:
+                                        tmp_lens.append(-1)
+                                # TP decode: rank-0 builds from ``kv_transfer_params``;
+                                # other ranks may miss the dict — broadcast lens list.
+                                tg = get_tp_group()
+                                if tg.world_size > 1:
+                                    tmp_lens = tg.broadcast_object(
+                                        tmp_lens
+                                        if get_tensor_model_parallel_rank() == 0
+                                        else None,
+                                        src=0,
+                                    )
+                                if tmp_lens and not all(v < 0 for v in tmp_lens):
+                                    setattr(meta_i, "dynamic_kv_seq_lens_list",
+                                            tmp_lens)
+                                    if dyn_slot_mapping_np is not None:
+                                        try:
+                                            meta_i.slot_mapping = torch.as_tensor(
+                                                dyn_slot_mapping_np,
+                                                device=meta_i.slot_mapping.device,
+                                                dtype=meta_i.slot_mapping.dtype,
+                                            )
+                                            if layer_idx == 0:
+                                                logger.debug(
+                                                    "[DynamicKV][decode] applied per-layer slot_mapping override"
+                                                )
+                                        except Exception:
+                                            pass
+                    attn_metadata[layer_name] = meta_i
 
         # update global cos, sin
         update_cos_sin(positions)
@@ -1546,6 +1887,8 @@ class NPUModelRunner(GPUModelRunner):
                 head_dim=self.model_config.get_vocab_size(),
                 generators=self.input_batch.sampling_metadata.generators)
 
+        dynkv_updates: dict[str, dict[str, Any]] = {}
+
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
@@ -1561,9 +1904,190 @@ class NPUModelRunner(GPUModelRunner):
                     is_multimodal_model=self.is_multimodal_model):
                 self.maybe_setup_kv_connector(scheduler_output)
 
+                # DynamicKV offload: publish capture context for q_proj hooks.
+                # Only the KV producer (prefill) needs Q capture + post-prefill rewrite.
+                # On the decode worker, ``should_enable()`` must stay false: otherwise hooks
+                # keep writing ``offload_q_last`` every step while cleanup only runs on the
+                # producer after ``run_offload_rewrite_and_build_updates``, leaking NPU
+                # memory across finished requests (OOM after many requests).
+                try:
+                    ascend_cfg = get_ascend_config()
+                    dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
+                    dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
+                    if dyn_enabled and dyn_impl == "offload" and getattr(
+                            self, "is_kv_producer", False):
+                        num_reqs = int(self.input_batch.num_reqs)
+                        req_ids = list(self.input_batch.req_ids)
+                        # query_start_loc is cumulative starts for each req in this step.
+                        qsl = self.query_start_loc.np[:num_reqs + 1].astype(int).tolist()
+                        q_start = qsl[:-1]
+                        q_end = qsl[1:]
+                        # Use prompt length for prefill completion; ``num_tokens`` can
+                        # diverge once outputs/spec tokens are appended.
+                        seq_lens: list[int] = []
+                        for r in req_ids:
+                            req = self.requests[r]
+                            nprompt = int(getattr(req, "num_prompt_tokens", 0) or 0)
+                            if nprompt <= 0:
+                                nprompt = int(req.num_tokens)
+                            seq_lens.append(nprompt)
+                        comp = [int(x) for x in self.input_batch.num_computed_tokens_cpu[:num_reqs]]
+                        nst = scheduler_output.num_scheduled_tokens
+                        sched = [int(nst.get(r, 0)) if isinstance(nst, dict) else 0 for r in req_ids]
+                        active_idx = [i for i in range(num_reqs) if seq_lens[i] > 0]
+                        # Per-request completion: in a multi-request batch, some requests
+                        # may finish prefill earlier than others. We must trigger the
+                        # DynamicKV rewrite for each request when it completes.
+                        finished_idx = [
+                            i for i in active_idx if (comp[i] + sched[i]) >= seq_lens[i]
+                        ]
+                        _DYNKV_STATE["offload_ctx"] = OffloadCaptureContext(
+                            req_ids=req_ids,
+                            q_start=q_start,
+                            q_end=q_end,
+                            seq_lens=seq_lens,
+                            finished_idx=finished_idx,
+                        )
+                    elif dyn_enabled and dyn_impl == "offload":
+                        _DYNKV_STATE["offload_ctx"] = None
+                except Exception:
+                    _DYNKV_STATE["offload_ctx"] = None
+
                 hidden_states = self._generate_process_reqs_hidden_states(
                     maybe_padded_num_tokens, input_ids, positions,
                     intermediate_tensors, inputs_embeds, model_kwargs)
+
+            # DynamicKV (offload impl): run a post-prefill KV rewrite pass in
+            # the worker process. This keeps the attention execution path
+            # unchanged while allowing PD to receive per-layer kv_lens/indices.
+            _dynkv_offload_q_cleanup_rids: list[str] = []
+            try:
+                ascend_cfg = get_ascend_config()
+                dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
+                dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
+                if dyn_enabled and dyn_impl == "offload" and has_kv_transfer_group():
+                    # Only meaningful on KV producer (prefill) side.
+                    kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
+                    if kv_cfg is not None and getattr(kv_cfg, "is_kv_producer", False):
+                        ctx = _DYNKV_STATE.get("offload_ctx")
+                        kv_by_layer = getattr(self, "_kv_caches_by_layer_name", None)
+                        if (isinstance(ctx, OffloadCaptureContext) and ctx.finished_idx
+                                and isinstance(kv_by_layer, dict) and kv_by_layer):
+                            # Block table is shared; some layers' metadata may omit it—scan.
+                            block_tables = None
+                            if isinstance(attn_metadata, dict) and attn_metadata:
+                                for _m in attn_metadata.values():
+                                    if _m is None:
+                                        continue
+                                    bt = getattr(_m, "block_tables", None)
+                                    if bt is None:
+                                        bt = getattr(_m, "block_table_tensor", None)
+                                    if bt is not None:
+                                        block_tables = bt
+                                        break
+                            if block_tables is not None:
+                                model_cfg = self.vllm_config.model_config
+                                hf_text_cfg = getattr(model_cfg, "hf_text_config", None)
+                                hf_cfg = getattr(model_cfg, "hf_config", None)
+                                num_layers = int(
+                                    getattr(hf_text_cfg, "num_hidden_layers", None)
+                                    or getattr(model_cfg, "num_hidden_layers", None)
+                                    or getattr(hf_cfg, "num_hidden_layers", None)
+                                    or 0
+                                )
+                                q_last_store = _DYNKV_STATE.get("offload_q_last") or {}
+                                if not isinstance(q_last_store, dict):
+                                    q_last_store = {}
+                                done_idx = [int(i) for i in ctx.finished_idx if int(i) >= 0]
+                                # Subselect to only finished requests.
+                                idx_one = torch.tensor(
+                                    done_idx,
+                                    device=block_tables.device,
+                                    dtype=torch.long,
+                                )
+                                block_tables_done = block_tables.index_select(0, idx_one)
+                                req_ids_done = [ctx.req_ids[i] for i in done_idx]
+                                _dynkv_offload_q_cleanup_rids = list(req_ids_done)
+                                seq_lens_done = [ctx.seq_lens[i] for i in done_idx]
+                                dynkv_updates = run_offload_rewrite_and_build_updates(
+                                    req_ids=req_ids_done,
+                                    seq_lens=seq_lens_done,
+                                    block_tables=block_tables_done,
+                                    kv_caches=kv_by_layer,
+                                    q_last_store=q_last_store,
+                                    max_capacity=int(getattr(ascend_cfg, "dynamic_kv_prompt_kv_len_budget", 0) or 0),
+                                    window_size=int(getattr(ascend_cfg, "dynamic_kv_window_size", 16) or 16),
+                                    pooling=str(getattr(ascend_cfg, "dynamic_kv_pooling", "none")),
+                                    kernel_size=int(getattr(ascend_cfg, "dynamic_kv_kernel_size", 1) or 1),
+                                    softmax_chunk_size=int(getattr(ascend_cfg, "dynamic_kv_softmax_chunk_size", 1024) or 1024),
+                                    radio_max=float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0)),
+                                    radio_min=float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1)),
+                                    num_layers=num_layers,
+                                    validation_mode=str(
+                                        getattr(ascend_cfg, "dynamic_kv_validation_mode", "none")
+                                    ),
+                                    min_rewrite_delta=int(
+                                        getattr(ascend_cfg, "dynamic_kv_min_rewrite_delta", 128)
+                                    ),
+                                )
+                                # Attach block_table-ordered prefix physical blocks for PD shrink.
+                                # NOTE: Do NOT use allocator-ordered `block_ids[:n]` to shrink:
+                                # only `block_tables` represents logical prefix order.
+                                try:
+                                    bs = int(getattr(self.vllm_config.cache_config, "block_size", 0) or 0)
+                                    if bs > 0 and isinstance(dynkv_updates, dict) and dynkv_updates:
+                                        # Normalize block_tables to CPU list-of-lists.
+                                        bt = block_tables_done
+                                        if isinstance(bt, torch.Tensor):
+                                            bt_cpu = bt.detach().to("cpu")
+                                            bt_rows = bt_cpu.tolist()
+                                        else:
+                                            bt_rows = None
+                                        if isinstance(bt_rows, list) and bt_rows:
+                                            for ridx, rid in enumerate(req_ids_done):
+                                                upd = dynkv_updates.get(rid)
+                                                if not isinstance(upd, dict):
+                                                    continue
+                                                dyn = upd.get("dynamic_kv")
+                                                if not isinstance(dyn, dict):
+                                                    continue
+                                                pl = dyn.get("per_layer_kv_lens")
+                                                if not isinstance(pl, list) or not pl:
+                                                    continue
+                                                try:
+                                                    lens_pos = [int(x) for x in pl if int(x) > 0]
+                                                except Exception:
+                                                    lens_pos = []
+                                                if not lens_pos:
+                                                    continue
+                                                max_len = int(max(lens_pos))
+                                                n_transfer = int(math.ceil(max_len / bs)) if max_len > 0 else 0
+                                                if n_transfer <= 0:
+                                                    continue
+                                                if ridx >= len(bt_rows) or not isinstance(bt_rows[ridx], list):
+                                                    continue
+                                                row = [int(x) for x in bt_rows[ridx] if int(x) >= 0]
+                                                prefix = row[:n_transfer]
+                                                if not prefix:
+                                                    continue
+                                                dyn["prefix_remote_block_ids"] = prefix
+                                except Exception:
+                                    logger.info(
+                                        "[DynamicKV][offload] attach prefix_remote_block_ids skipped",
+                                        exc_info=True,
+                                    )
+            except Exception:
+                logger.exception("[DynamicKV][offload] post-prefill rewrite failed")
+            finally:
+                # Clear capture context to avoid accidental reuse.
+                _DYNKV_STATE["offload_ctx"] = None
+                # Captured q_last tensors are only for rewrite; drop them so
+                # offload_q_last does not retain NPU memory across requests.
+                if _dynkv_offload_q_cleanup_rids:
+                    _store = _DYNKV_STATE.get("offload_q_last")
+                    if isinstance(_store, dict):
+                        for _rid in _dynkv_offload_q_cleanup_rids:
+                            _store.pop(_rid, None)
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(
@@ -1576,6 +2100,11 @@ class NPUModelRunner(GPUModelRunner):
         kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving)
+        if dynkv_updates:
+            try:
+                kv_connector_output.kv_transfer_params_updates = dynkv_updates
+            except Exception:
+                pass
         finished_sending = None
         finished_recving = None
         with ProfileExecuteDuration().capture_async("post process"):
@@ -1680,6 +2209,38 @@ class NPUModelRunner(GPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        # Same step as GPU path's ``_get_kv_connector_output`` finally: drain
+        # worker DynamicKV (etc.) into the output *before* the scheduler runs
+        # ``request_finished``. Ascend splits execute_model/sample_tokens and
+        # does not use that context manager, so without this drain the scheduler
+        # only sees mooncake_connector's uniform ``min(prompt, max_capacity)``
+        # fallback for ``per_layer_kv_lens``.
+        if kv_connector_output is not None and has_kv_transfer_group():
+            try:
+                kc = get_kv_transfer_group()
+                if hasattr(kc, "drain_kv_transfer_params_updates"):
+                    req_ids_set: set[str] = set()
+                    if kv_connector_output.finished_sending:
+                        req_ids_set.update(kv_connector_output.finished_sending)
+                    if kv_connector_output.finished_recving:
+                        req_ids_set.update(kv_connector_output.finished_recving)
+                    if scheduler_output.finished_req_ids:
+                        req_ids_set.update(scheduler_output.finished_req_ids)
+                    if not req_ids_set:
+                        req_ids_set.update(
+                            scheduler_output.num_scheduled_tokens.keys())
+                    upd = kc.drain_kv_transfer_params_updates(list(req_ids_set))
+                    if isinstance(upd, dict) and upd:
+                        prev = getattr(
+                            kv_connector_output,
+                            "kv_transfer_params_updates",
+                            None,
+                        )
+                        kv_connector_output.kv_transfer_params_updates = (
+                            _merge_kv_xfer_updates_drain(prev, upd))
+            except Exception:
+                pass
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2047,11 +2608,20 @@ class NPUModelRunner(GPUModelRunner):
                             common_attn_metadata, attn_state)
                     for layer_name in kv_cache_group_spec.layer_names:
                         if "linear_attn" in layer_name:
-                            attn_metadata[
-                                layer_name] = attn_metadata_gdn_attention
+                            meta_src = attn_metadata_gdn_attention
                         else:
-                            attn_metadata[
-                                layer_name] = attn_metadata_full_attention
+                            meta_src = attn_metadata_full_attention
+                        try:
+                            import copy as _copy
+
+                            meta_i = _copy.copy(meta_src)
+                        except Exception:
+                            meta_i = meta_src
+                        try:
+                            setattr(meta_i, "layer_name", layer_name)
+                        except Exception:
+                            pass
+                        attn_metadata[layer_name] = meta_i
 
         return attn_metadata
 
@@ -2387,11 +2957,74 @@ class NPUModelRunner(GPUModelRunner):
                     m.consumed_memory / float(2**30))
 
         # wrap the model with full graph wrapper if needed.
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        use_full_aclgraph = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        # FULL-graph replay bypasses submodule ``forward`` hooks; DynamicKV offload
+        # relies on ``qkv_proj`` hooks to populate ``offload_q_last``.
+        try:
+            ac = get_ascend_config()
+            if (
+                use_full_aclgraph
+                and bool(getattr(ac, "dynamic_kv_enabled", False))
+                and str(getattr(ac, "dynamic_kv_impl", "offload")) == "offload"
+            ):
+                use_full_aclgraph = False
+                logger.info(
+                    "[DynamicKV][offload] skip ACLGraph FULL wrap "
+                    "(required for Q-capture forward hooks)"
+                )
+        except Exception:
+            pass
+        if use_full_aclgraph:
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(self.model,
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL)
+
+        # DynamicKV offload: install q_proj hooks for per-layer Q capture.
+        # This does not change the attention execution path; it only observes
+        # q_proj outputs during prefill last chunk.
+        try:
+            ascend_cfg = get_ascend_config()
+            dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
+            dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
+            if dyn_enabled and dyn_impl == "offload":
+                # Lazy initialize shared state containers.
+                _DYNKV_STATE.setdefault("offload_q_last", {})
+                _DYNKV_STATE.setdefault("offload_ctx", None)
+                _DYNKV_STATE.setdefault("offload_hooks", [])
+                lock = _DYNKV_STATE.setdefault("offload_lock", threading.Lock())
+
+                def should_enable() -> bool:
+                    try:
+                        ctx = _DYNKV_STATE.get("offload_ctx")
+                        return ctx is not None and isinstance(ctx, OffloadCaptureContext)
+                    except Exception:
+                        return False
+
+                def get_ctx() -> OffloadCaptureContext | None:
+                    try:
+                        ctx = _DYNKV_STATE.get("offload_ctx")
+                        return ctx if isinstance(ctx, OffloadCaptureContext) else None
+                    except Exception:
+                        return None
+
+                q_last_store = _DYNKV_STATE["offload_q_last"]
+                if not isinstance(q_last_store, dict):
+                    q_last_store = {}
+                    _DYNKV_STATE["offload_q_last"] = q_last_store
+
+                # Avoid duplicate installs.
+                if not _DYNKV_STATE.get("offload_hooks"):
+                    handles = install_qproj_hooks(
+                        model=self.model,
+                        should_enable=should_enable,
+                        get_capture_ctx=get_ctx,
+                        q_last_store=q_last_store,
+                        window_size=int(getattr(ascend_cfg, "dynamic_kv_window_size", 16)),
+                    )
+                    _DYNKV_STATE["offload_hooks"] = handles
+        except Exception:
+            logger.exception("[DynamicKV][offload] failed to install q_proj hooks")
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -2455,6 +3088,9 @@ class NPUModelRunner(GPUModelRunner):
         bind_kv_cache(kv_caches,
                       self.compilation_config.static_forward_context,
                       self.kv_caches, num_attn_module)
+        # ``self.kv_caches`` is a per-layer list after bind; DynamicKV offload needs
+        # the name->(k,v) dict for ``run_offload_rewrite_and_build_updates``.
+        self._kv_caches_by_layer_name = kv_caches
         return kv_caches
 
     def _allocate_kv_cache_tensors(
@@ -2890,7 +3526,8 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config.kv_cache_groups):
             attn_backends = get_attn_backends_for_group(  # type: ignore
                 kv_cache_group_spec)
-            self.attn_groups.append(create_attn_groups(attn_backends[0], i))
+            groups = create_attn_groups(attn_backends[0], i)
+            self.attn_groups.append(groups)
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()

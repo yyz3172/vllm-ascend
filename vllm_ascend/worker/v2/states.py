@@ -65,6 +65,8 @@ class AscendRequestState(RequestState):
         self.prefill_token_ids: CpuGpuBuffer = self._make_buffer(  # type: ignore
             (self.max_num_reqs, self.max_model_len),
             dtype=torch.int32)
+        # Disaggregated serving: store per-request kv_transfer_params (CPU-side).
+        self.kv_transfer_params_by_req_id: dict[str, dict] = {}
 
     def add_request(
         self,
@@ -86,6 +88,17 @@ class AscendRequestState(RequestState):
         )
         req_idx = self.req_id_to_index[req_id]
         self.num_computed_tokens_cpu[req_idx] = num_computed_tokens
+        try:
+            if sampling_params is not None and sampling_params.extra_args is not None:
+                kvp = sampling_params.extra_args.get("kv_transfer_params")
+                if isinstance(kvp, dict):
+                    self.kv_transfer_params_by_req_id[req_id] = kvp
+        except Exception:
+            pass
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        self.kv_transfer_params_by_req_id.pop(req_id, None)
 
 
 @contextmanager
