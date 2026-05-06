@@ -7,6 +7,7 @@ The execution duration of each stage (including pre/post-processing, model forwa
 ## Usage
 * Use the environment variable `VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE` to enable this feature.
 * Use the non-blocking API `ProfileExecuteDuration().capture_async` to set observation points asynchronously when you need to observe the execution duration.
+* **`prepare input` uses `capture_cpu_wall`** (host wall clock) because NPU Event timing can overlap with forward graph replay on multi-stream Ascend decode; other stages still use NPU Events.
 * Use the blocking API `ProfileExecuteDuration().pop_captured_sync` at an appropriate time to get and print the execution durations of all observed stages.
 
 **We have instrumented the key inference stages (including pre-processing, model forward pass, etc.) for execution duration profiling. Execute the script as follows:**

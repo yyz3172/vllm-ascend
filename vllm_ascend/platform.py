@@ -431,6 +431,12 @@ class NPUPlatform(Platform):
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
+        # Ascend uses an optimized opaque attention operator path for
+        # correctness/performance parity with upstream vLLM kernels.
+        #
+        # NOTE: Some experimental features may want to hook Python attention
+        # forward. Those features must be implemented without globally
+        # disabling opaque ops, otherwise base generation quality can regress.
         return True
 
     @classmethod

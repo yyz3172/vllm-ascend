@@ -264,6 +264,11 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata_builders=self.attn_metadata_builders,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
+            req_ids=req_ids,
+            kv_transfer_params_list=[
+                self.req_states.kv_transfer_params_by_req_id.get(rid)  # type: ignore[attr-defined]
+                for rid in req_ids
+            ],
             query_start_loc_gpu=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=self.input_buffers.seq_lens,
