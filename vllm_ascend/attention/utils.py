@@ -14,18 +14,88 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
                                get_ascend_device_type)
 
-
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+    from vllm.config.compilation import CUDAGraphMode
+
     if vllm_config.speculative_config is not None:
         return False
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
-    from vllm.config.compilation import CUDAGraphMode
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         return False
 
     return runtime_shape in get_ascend_config().pa_shape_list
+
+
+def _merge_dynamic_kv_lens_list(
+    dyn_lens: list[int] | None,
+    fallback_lens: list[int] | None,
+) -> list[int] | None:
+    """Merge per-request DynamicKV lens with fallback (e.g. padded slots)."""
+    if dyn_lens is None:
+        return fallback_lens
+    if fallback_lens is None or len(fallback_lens) != len(dyn_lens):
+        return list(dyn_lens)
+    if not any(v < 0 for v in dyn_lens):
+        return list(dyn_lens)
+    return [d if d >= 0 else f for d, f in zip(dyn_lens, fallback_lens)]
+
+
+def fia_dynamic_kv_seq_lens_list(attn_metadata: Any) -> list[int] | None:
+    """FIA ``actual_seq_lengths_kv`` for PD DynamicKV decode graph updates."""
+    return _merge_dynamic_kv_lens_list(
+        getattr(attn_metadata, "dynamic_kv_seq_lens_list", None),
+        getattr(attn_metadata, "seq_lens_list", None),
+    )
+
+
+def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
+    """Paged-attention ``context_lens`` for PD DynamicKV decode.
+
+    Prefer ``dynamic_kv_seq_lens_tensor`` when set. For entries with negative
+    lens (e.g. padded batch slots), fall back to ``seq_lens``.
+    """
+    dl = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+    if dl is None:
+        return attn_metadata.seq_lens
+    t = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+    sl = attn_metadata.seq_lens
+    if isinstance(t, torch.Tensor) and isinstance(sl, torch.Tensor):
+        if (int(t.numel()) == len(dl) and t.device == sl.device
+                and t.dtype == sl.dtype):
+            if (t < 0).any():
+                return torch.where(t >= 0, t, sl)
+            return t
+    ctx = torch.tensor(dl, device=sl.device, dtype=sl.dtype)
+    if (ctx < 0).any():
+        return torch.where(ctx >= 0, ctx, sl)
+    return ctx
+
+
+def pa_dynamic_kv_context_lens_for_graph_update(
+    attn_metadata: Any,
+    context_lens_buf: torch.Tensor | None,
+) -> torch.Tensor:
+    """PA ``context_lens`` for ACL graph replay / ``graph_task_update``.
+
+    Reuse the tensor captured into ``attn_params`` and copy runtime values
+    in-place when shapes match. Passing a fresh tensor each step can leave the
+    replayed op reading stale lengths on some Ascend builds.
+    """
+    ctx = pa_dynamic_kv_context_lens(attn_metadata)
+    if (
+        context_lens_buf is not None
+        and isinstance(ctx, torch.Tensor)
+        and isinstance(context_lens_buf, torch.Tensor)
+        and context_lens_buf.device == ctx.device
+        and context_lens_buf.dtype == ctx.dtype
+        and int(context_lens_buf.numel()) == int(ctx.numel())
+    ):
+        if context_lens_buf.data_ptr() != ctx.data_ptr():
+            context_lens_buf.copy_(ctx)
+        return context_lens_buf
+    return ctx
 
 
 @lru_cache(maxsize=1)
@@ -100,6 +170,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: Optional[
         AscendPrefillContextParallelMetadata] = None
 
+    # DynamicKV: whether this ChunkedPrefill step is the last chunk.
+    # This is computed in the attn metadata builder and used by attention backend
+    # to avoid compressing KV cache on every chunk.
+    dynamic_kv_is_last_chunk: bool = False
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int,
                  num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -128,6 +203,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.
             prefill_context_parallel_metadata,
+            dynamic_kv_is_last_chunk=self.dynamic_kv_is_last_chunk,
             max_seq_len=self.max_seq_len)
 
 

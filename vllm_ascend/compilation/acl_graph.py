@@ -19,7 +19,11 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
-from vllm_ascend.attention.utils import using_paged_attention
+from vllm_ascend.attention.utils import (
+    fia_dynamic_kv_seq_lens_list,
+    pa_dynamic_kv_context_lens_for_graph_update,
+    using_paged_attention,
+)
 
 from ..utils import weak_ref_tensors
 
@@ -191,7 +195,6 @@ class ACLGraphWrapper:
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
 
-        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
@@ -220,11 +223,13 @@ def weak_ref_workspaces(params):
 
 def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
     graph_params = get_graph_params()
+    attn_metadata = forward_context.attn_metadata
+    attn_keys = list(attn_metadata.keys())
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
-                forward_context.attn_metadata,
+                attn_keys,
                 graph_params.attn_params[runtime_shape],
                 graph_params.handles[runtime_shape],
                 graph_params.events[runtime_shape],
@@ -237,10 +242,17 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 num_heads,
                 scale,
                 block_table,
-                seq_lens,
+                context_lens_buf,
                 output,
             ) = param
-            seq_lens = forward_context.attn_metadata[key].seq_lens
+            meta = attn_metadata[key]
+            # PD DynamicKV: must use compressed per-layer kv lens, not logical
+            # seq_lens (block-aligned transferred footprint).
+            context_lens = pa_dynamic_kv_context_lens_for_graph_update(
+                meta, context_lens_buf)
+            meta_block_table = getattr(meta, "block_tables", None)
+            if meta_block_table is not None:
+                block_table = meta_block_table
 
             torch.npu.graph_task_update_begin(update_stream, handle)
             torch_npu._npu_paged_attention(
@@ -251,7 +263,7 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 num_heads=num_heads,
                 scale_value=scale,
                 block_table=block_table,
-                context_lens=seq_lens,
+                context_lens=context_lens,
                 out=output,
                 workspace=graph_params.workspaces.get(runtime_shape),
             )
@@ -304,8 +316,11 @@ def _update_attn_fia_params(update_stream,
                     key].actual_seq_lengths_q
                 attn_count = attn_count + 1
             else:
-                seq_lens = attn_metadata[key].seq_lens_list
-                actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+                meta = attn_metadata[key]
+                seq_lens = fia_dynamic_kv_seq_lens_list(meta)
+                if seq_lens is None:
+                    seq_lens = meta.seq_lens_list
+                actual_seq_lengths_q = meta.actual_seq_lengths_q
 
             torch.npu.graph_task_update_begin(update_stream, handle)
             torch_npu.npu_fused_infer_attention_score.out(
