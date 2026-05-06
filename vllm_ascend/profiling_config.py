@@ -102,6 +102,9 @@ SERVICE_PROFILING_SYMBOLS_YAML = """
   min_version: "0.9.1"
   handler: msserviceprofiler.vllm_profiler.vllm_v1.model_hookers:capture_async
 
+# NOTE: do NOT hook capture_cpu_wall to capture_async — that reintroduces NPU
+# Event timing for ``prepare input`` on multi-stream Ascend decode.
+
 # ===== Request Lifecycle =====
 - symbol: vllm.v1.engine.async_llm:AsyncLLM.add_request
   min_version: "0.9.1"
