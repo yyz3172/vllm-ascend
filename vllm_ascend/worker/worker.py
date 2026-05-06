@@ -40,6 +40,7 @@ from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.model_executor import set_random_seed
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -58,16 +59,11 @@ from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (AscendDeviceType, check_ascend_device_type,
                                enable_sp, get_ascend_device_type,
-                               register_ascend_customop, vllm_version_is)
+                               register_ascend_customop)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
-
-if vllm_version_is("0.13.0"):
-    from vllm.model_executor.utils import set_random_seed
-else:
-    from vllm.utils.torch_utils import set_random_seed
 
 torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
     ["torch.npu.current_stream"],

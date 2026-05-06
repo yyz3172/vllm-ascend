@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -19,9 +21,115 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
-from vllm_ascend.attention.utils import using_paged_attention
+from vllm_ascend.attention.utils import (
+    dynkv_profile_pa_enabled,
+    fia_dynamic_kv_seq_lens_list,
+    pa_dynamic_kv_context_lens_for_graph_update,
+    using_paged_attention,
+)
 
 from ..utils import weak_ref_tensors
+
+# ACL graph replay wall time (ms) for one decode forward step.
+_DYNKV_GRAPH_REPLAY_MS: float = 0.0
+# NPU Event + sync on replay() — full-graph device time (MLP+PA+…).
+_DYNKV_GRAPH_NPU_MS: float = 0.0
+# Per-step breakdown of ``_update_attn_pa_params`` (``model_acl``).
+_DYNKV_MODEL_ACL_ACC: dict[str, float] = {
+    "layers": 0.0,
+    "ctx_lens_ms": 0.0,
+    "block_table_ms": 0.0,
+    "block_table_swap": 0.0,
+    "graph_update_ms": 0.0,
+    "gu_begin_ms": 0.0,
+    "gu_pa_ms": 0.0,
+    "gu_end_ms": 0.0,
+    "event_record_ms": 0.0,
+    "loop_other_ms": 0.0,
+    "total_ms": 0.0,
+}
+
+
+def dynkv_model_acl_profile_enabled() -> bool:
+    return os.environ.get("VLLM_DYNKV_PROFILE_MODEL_ACL", "0") == "1"
+
+
+def dynkv_model_acl_profile_reset() -> None:
+    for k in _DYNKV_MODEL_ACL_ACC:
+        _DYNKV_MODEL_ACL_ACC[k] = 0.0
+
+
+def dynkv_model_acl_profile_log() -> None:
+    if not dynkv_model_acl_profile_enabled():
+        return
+    layers = int(_DYNKV_MODEL_ACL_ACC["layers"])
+    if layers <= 0:
+        return
+    total = float(_DYNKV_MODEL_ACL_ACC["total_ms"])
+    ctx = float(_DYNKV_MODEL_ACL_ACC["ctx_lens_ms"])
+    bt = float(_DYNKV_MODEL_ACL_ACC["block_table_ms"])
+    gu = float(_DYNKV_MODEL_ACL_ACC["graph_update_ms"])
+    ev = float(_DYNKV_MODEL_ACL_ACC["event_record_ms"])
+    other = float(_DYNKV_MODEL_ACL_ACC["loop_other_ms"])
+    gu_begin = float(_DYNKV_MODEL_ACL_ACC["gu_begin_ms"])
+    gu_pa = float(_DYNKV_MODEL_ACL_ACC["gu_pa_ms"])
+    gu_end = float(_DYNKV_MODEL_ACL_ACC["gu_end_ms"])
+    bt_swap = int(_DYNKV_MODEL_ACL_ACC["block_table_swap"])
+    logger.info(
+        "[DynamicKV][model_acl_profile] layers=%d ctx_lens=%.2fms "
+        "block_table=%.2fms block_table_swap=%d graph_update=%.2fms "
+        "gu_begin=%.2fms gu_pa=%.2fms gu_end=%.2fms event_record=%.2fms "
+        "loop_other=%.2fms total=%.2fms "
+        "per_layer_ctx=%.3fms per_layer_graph_update=%.3fms",
+        layers,
+        ctx,
+        bt,
+        bt_swap,
+        gu,
+        gu_begin,
+        gu_pa,
+        gu_end,
+        ev,
+        other,
+        total,
+        ctx / layers,
+        gu / layers,
+    )
+
+
+def dynkv_graph_replay_profile_enabled() -> bool:
+    return os.environ.get("VLLM_DYNKV_PROFILE_FORWARD", "0") == "1"
+
+
+def dynkv_graph_npu_profile_enabled() -> bool:
+    """Sync after aclgraph.replay(); gated by ``VLLM_DYNKV_PROFILE_PA`` (+ FORWARD)."""
+    return dynkv_profile_pa_enabled()
+
+
+def dynkv_graph_replay_profile_reset() -> None:
+    global _DYNKV_GRAPH_REPLAY_MS, _DYNKV_GRAPH_NPU_MS
+    _DYNKV_GRAPH_REPLAY_MS = 0.0
+    _DYNKV_GRAPH_NPU_MS = 0.0
+
+
+def dynkv_graph_replay_profile_take_ms() -> float:
+    global _DYNKV_GRAPH_REPLAY_MS
+    return float(_DYNKV_GRAPH_REPLAY_MS)
+
+
+def dynkv_graph_npu_profile_take_ms() -> float:
+    global _DYNKV_GRAPH_NPU_MS
+    return float(_DYNKV_GRAPH_NPU_MS)
+
+
+def _dynkv_graph_replay_profile_record(ms: float) -> None:
+    global _DYNKV_GRAPH_REPLAY_MS
+    _DYNKV_GRAPH_REPLAY_MS += float(ms)
+
+
+def _dynkv_graph_npu_profile_record(ms: float) -> None:
+    global _DYNKV_GRAPH_NPU_MS
+    _DYNKV_GRAPH_NPU_MS += float(ms)
 
 
 @dataclasses.dataclass
@@ -191,7 +299,6 @@ class ACLGraphWrapper:
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
 
-        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
@@ -204,7 +311,23 @@ class ACLGraphWrapper:
                      if self.vllm_config.speculative_config else False)
         if self.runtime_mode != CUDAGraphMode.FULL or not forward_context.is_draft_model or not use_eagle:
             torch.npu.synchronize()
+        _prof_replay_wall = dynkv_graph_replay_profile_enabled()
+        _prof_replay_npu = dynkv_graph_npu_profile_enabled()
+        if _prof_replay_wall:
+            _t0_replay = time.perf_counter()
+        _ev0 = None
+        if _prof_replay_npu:
+            _ev0 = torch_npu.npu.Event(enable_timing=True)
+            _ev0.record()
         entry.aclgraph.replay()
+        if _prof_replay_npu and _ev0 is not None:
+            _ev1 = torch_npu.npu.Event(enable_timing=True)
+            _ev1.record()
+            _ev1.synchronize()
+            _dynkv_graph_npu_profile_record(float(_ev0.elapsed_time(_ev1)))
+        if _prof_replay_wall:
+            _dynkv_graph_replay_profile_record(
+                (time.perf_counter() - _t0_replay) * 1000)
         return entry.output
 
 
@@ -220,11 +343,17 @@ def weak_ref_workspaces(params):
 
 def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
     graph_params = get_graph_params()
+    attn_metadata = forward_context.attn_metadata
+    attn_keys = list(attn_metadata.keys())
+    _prof = dynkv_model_acl_profile_enabled()
+    if _prof:
+        dynkv_model_acl_profile_reset()
+        _t0_total = time.perf_counter()
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
-                forward_context.attn_metadata,
+                attn_keys,
                 graph_params.attn_params[runtime_shape],
                 graph_params.handles[runtime_shape],
                 graph_params.events[runtime_shape],
@@ -237,12 +366,36 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 num_heads,
                 scale,
                 block_table,
-                seq_lens,
+                context_lens_buf,
                 output,
             ) = param
-            seq_lens = forward_context.attn_metadata[key].seq_lens
-
+            meta = attn_metadata[key]
+            # PD DynamicKV: must use compressed per-layer kv lens, not logical
+            # seq_lens (block-aligned transferred footprint).
+            if _prof:
+                _t0_ctx = time.perf_counter()
+            context_lens = pa_dynamic_kv_context_lens_for_graph_update(
+                meta, context_lens_buf)
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"] += (
+                    time.perf_counter() - _t0_ctx) * 1000
+                _t0_bt = time.perf_counter()
+            meta_block_table = getattr(meta, "block_tables", None)
+            if meta_block_table is not None:
+                if (_prof and isinstance(block_table, torch.Tensor)
+                        and isinstance(meta_block_table, torch.Tensor)
+                        and block_table.data_ptr() != meta_block_table.data_ptr()):
+                    _DYNKV_MODEL_ACL_ACC["block_table_swap"] += 1.0
+                block_table = meta_block_table
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["block_table_ms"] += (
+                    time.perf_counter() - _t0_bt) * 1000
+                _t0_gu = time.perf_counter()
             torch.npu.graph_task_update_begin(update_stream, handle)
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["gu_begin_ms"] += (
+                    time.perf_counter() - _t0_gu) * 1000
+                _t0_pa = time.perf_counter()
             torch_npu._npu_paged_attention(
                 query=query,
                 key_cache=key_cache,
@@ -251,13 +404,40 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 num_heads=num_heads,
                 scale_value=scale,
                 block_table=block_table,
-                context_lens=seq_lens,
+                context_lens=context_lens,
                 out=output,
                 workspace=graph_params.workspaces.get(runtime_shape),
             )
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["gu_pa_ms"] += (
+                    time.perf_counter() - _t0_pa) * 1000
+                _t0_gu_end = time.perf_counter()
             torch.npu.graph_task_update_end(update_stream)
-
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["gu_end_ms"] += (
+                    time.perf_counter() - _t0_gu_end) * 1000
+                _DYNKV_MODEL_ACL_ACC["graph_update_ms"] += (
+                    time.perf_counter() - _t0_gu) * 1000
+                _t0_ev = time.perf_counter()
             event.record(update_stream)
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["event_record_ms"] += (
+                    time.perf_counter() - _t0_ev) * 1000
+                _DYNKV_MODEL_ACL_ACC["layers"] += 1.0
+    if _prof:
+        _DYNKV_MODEL_ACL_ACC["total_ms"] = (
+            time.perf_counter() - _t0_total) * 1000
+        _sum_parts = (
+            _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"]
+            + _DYNKV_MODEL_ACL_ACC["block_table_ms"]
+            + _DYNKV_MODEL_ACL_ACC["graph_update_ms"]
+            + _DYNKV_MODEL_ACL_ACC["event_record_ms"]
+        )
+        _DYNKV_MODEL_ACL_ACC["loop_other_ms"] = max(
+            0.0,
+            _DYNKV_MODEL_ACL_ACC["total_ms"] - _sum_parts,
+        )
+        dynkv_model_acl_profile_log()
 
 
 def _update_attn_fia_params(update_stream,
@@ -304,8 +484,11 @@ def _update_attn_fia_params(update_stream,
                     key].actual_seq_lengths_q
                 attn_count = attn_count + 1
             else:
-                seq_lens = attn_metadata[key].seq_lens_list
-                actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+                meta = attn_metadata[key]
+                seq_lens = fia_dynamic_kv_seq_lens_list(meta)
+                if seq_lens is None:
+                    seq_lens = meta.seq_lens_list
+                actual_seq_lengths_q = meta.actual_seq_lengths_q
 
             torch.npu.graph_task_update_begin(update_stream, handle)
             torch_npu.npu_fused_infer_attention_score.out(

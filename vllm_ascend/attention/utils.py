@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, List, Optional
@@ -14,18 +15,175 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
                                get_ascend_device_type)
 
-
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+    from vllm.config.compilation import CUDAGraphMode
+
     if vllm_config.speculative_config is not None:
         return False
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
-    from vllm.config.compilation import CUDAGraphMode
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         return False
 
     return runtime_shape in get_ascend_config().pa_shape_list
+
+
+def _merge_dynamic_kv_lens_list(
+    dyn_lens: list[int] | None,
+    fallback_lens: list[int] | None,
+) -> list[int] | None:
+    """Merge per-request DynamicKV lens with fallback (e.g. padded slots)."""
+    if dyn_lens is None:
+        return fallback_lens
+    if fallback_lens is None or len(fallback_lens) != len(dyn_lens):
+        return list(dyn_lens)
+    if not any(v < 0 for v in dyn_lens):
+        return list(dyn_lens)
+    return [d if d >= 0 else f for d, f in zip(dyn_lens, fallback_lens)]
+
+
+def fia_dynamic_kv_seq_lens_list(attn_metadata: Any) -> list[int] | None:
+    """FIA ``actual_seq_lengths_kv`` for PD DynamicKV decode graph updates."""
+    return _merge_dynamic_kv_lens_list(
+        getattr(attn_metadata, "dynamic_kv_seq_lens_list", None),
+        getattr(attn_metadata, "seq_lens_list", None),
+    )
+
+
+def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
+    """Paged-attention ``context_lens`` for PD DynamicKV decode.
+
+    Prefer ``dynamic_kv_seq_lens_tensor`` when set. For entries with negative
+    lens (e.g. padded batch slots), fall back to ``seq_lens``.
+    """
+    dl = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+    if dl is None:
+        return attn_metadata.seq_lens
+    t = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+    sl = attn_metadata.seq_lens
+    if isinstance(t, torch.Tensor) and isinstance(sl, torch.Tensor):
+        n_dl = len(dl)
+        if (t.device == sl.device and t.dtype == sl.dtype
+                and int(t.numel()) == int(sl.numel()) and int(t.numel()) >= n_dl):
+            # FULL-graph pinned buffer (prepare-filled); avoid torch.tensor(dl).
+            if not (t < 0).any():
+                return t
+            return torch.where(t >= 0, t, sl)
+        if (int(t.numel()) == n_dl and t.device == sl.device
+                and t.dtype == sl.dtype):
+            if (t < 0).any():
+                return torch.where(t >= 0, t, sl)
+            return t
+    ctx = torch.tensor(dl, device=sl.device, dtype=sl.dtype)
+    if (ctx < 0).any():
+        return torch.where(ctx >= 0, ctx, sl)
+    return ctx
+
+
+def dynkv_profile_pa_enabled() -> bool:
+    """``VLLM_DYNKV_PROFILE_PA=1`` (+ FORWARD): graph replay NPU sync + eager PA layer timing."""
+    return (
+        os.environ.get("VLLM_DYNKV_PROFILE_FORWARD", "0") == "1"
+        and os.environ.get("VLLM_DYNKV_PROFILE_PA", "0") == "1"
+    )
+
+
+def dynkv_pa_kv_tokens_avg_from_attn_metadata(
+    attn_metadata: Any,
+) -> float | None:
+    """Mean of per-layer ``max(context_lens)`` for forward_profile (PA decode)."""
+    if attn_metadata is None:
+        return None
+    metas = (attn_metadata.values()
+             if isinstance(attn_metadata, dict) else [attn_metadata])
+    maxes: list[float] = []
+    for meta in metas:
+        if meta is None:
+            continue
+        try:
+            ctx = pa_dynamic_kv_context_lens(meta)
+            if isinstance(ctx, torch.Tensor) and ctx.numel() > 0:
+                maxes.append(float(ctx.max().item()))
+        except Exception:
+            continue
+    if not maxes:
+        return None
+    return sum(maxes) / len(maxes)
+
+
+def dynkv_fill_graph_context_lens_buf(
+    attn_metadata: Any,
+    context_lens_buf: torch.Tensor,
+    *,
+    stacked_row: torch.Tensor | None = None,
+) -> None:
+    """Write runtime lens into the tensor pinned at FULL-graph PA capture.
+
+    Called from ``_prepare_inputs`` so ``model_acl`` can reuse ``context_lens_buf``
+    without a per-layer ``copy_`` in ``pa_dynamic_kv_context_lens_for_graph_update``.
+    """
+    sl = attn_metadata.seq_lens
+    if stacked_row is not None and isinstance(sl, torch.Tensor):
+        row = stacked_row
+        n_buf = int(context_lens_buf.numel())
+        n_row = int(row.numel())
+        if (row.device == context_lens_buf.device
+                and row.dtype == context_lens_buf.dtype):
+            if n_row < n_buf and int(sl.numel()) == n_buf:
+                context_lens_buf.copy_(sl)
+                part = context_lens_buf[:n_row]
+                if (row < 0).any():
+                    part.copy_(torch.where(row >= 0, row, sl[:n_row]))
+                else:
+                    part.copy_(row)
+                return
+            if n_row == n_buf:
+                if (row < 0).any():
+                    context_lens_buf.copy_(torch.where(row >= 0, row, sl))
+                else:
+                    context_lens_buf.copy_(row)
+                return
+    ctx = pa_dynamic_kv_context_lens(attn_metadata)
+    if (isinstance(ctx, torch.Tensor)
+            and context_lens_buf.data_ptr() != ctx.data_ptr()
+            and int(ctx.numel()) == int(context_lens_buf.numel())
+            and ctx.device == context_lens_buf.device
+            and ctx.dtype == context_lens_buf.dtype):
+        context_lens_buf.copy_(ctx)
+
+
+def pa_dynamic_kv_context_lens_for_graph_update(
+    attn_metadata: Any,
+    context_lens_buf: torch.Tensor | None,
+) -> torch.Tensor:
+    """PA ``context_lens`` for ACL graph replay / ``graph_task_update``.
+
+    Reuse the tensor captured into ``attn_params`` and copy runtime values
+    in-place when shapes match. Passing a fresh tensor each step can leave the
+    replayed op reading stale lengths on some Ascend builds.
+    """
+    pinned = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+    if (
+        context_lens_buf is not None
+        and isinstance(pinned, torch.Tensor)
+        and isinstance(context_lens_buf, torch.Tensor)
+        and pinned.data_ptr() == context_lens_buf.data_ptr()
+    ):
+        return context_lens_buf
+    ctx = pa_dynamic_kv_context_lens(attn_metadata)
+    if (
+        context_lens_buf is not None
+        and isinstance(ctx, torch.Tensor)
+        and isinstance(context_lens_buf, torch.Tensor)
+        and context_lens_buf.device == ctx.device
+        and context_lens_buf.dtype == ctx.dtype
+        and int(context_lens_buf.numel()) == int(ctx.numel())
+    ):
+        if context_lens_buf.data_ptr() != ctx.data_ptr():
+            context_lens_buf.copy_(ctx)
+        return context_lens_buf
+    return ctx
 
 
 @lru_cache(maxsize=1)
@@ -100,6 +258,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: Optional[
         AscendPrefillContextParallelMetadata] = None
 
+    # DynamicKV: whether this ChunkedPrefill step is the last chunk.
+    # This is computed in the attn metadata builder and used by attention backend
+    # to avoid compressing KV cache on every chunk.
+    dynamic_kv_is_last_chunk: bool = False
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int,
                  num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -128,6 +291,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.
             prefill_context_parallel_metadata,
+            dynamic_kv_is_last_chunk=self.dynamic_kv_is_last_chunk,
             max_seq_len=self.max_seq_len)
 
 
