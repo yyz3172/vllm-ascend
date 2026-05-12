@@ -1048,6 +1048,29 @@ class NPUModelRunner(GPUModelRunner):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
+        # DynamicKV scheme A (PD decode): after ``compute_slot_mapping``, CPU layout
+        # for ``token_positions_np`` / ``req_indices`` is final; upload once per
+        # ``_prepare_inputs`` for on-device slot remap (not per KV group / per layer).
+        dynkv_decode_token_pos_t: Optional[torch.Tensor] = None
+        dynkv_decode_req_idx_t: Optional[torch.Tensor] = None
+        if getattr(self, "is_kv_consumer", False):
+            try:
+                _ac_dyn = get_ascend_config()
+                if bool(getattr(_ac_dyn, "dynamic_kv_enabled", False)):
+                    dynkv_decode_token_pos_t = torch.as_tensor(
+                        token_positions_np,
+                        device=self.device,
+                        dtype=torch.int64,
+                    )
+                    dynkv_decode_req_idx_t = torch.as_tensor(
+                        req_indices,
+                        device=self.device,
+                        dtype=torch.int64,
+                    )
+            except Exception:
+                dynkv_decode_token_pos_t = None
+                dynkv_decode_req_idx_t = None
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -1243,27 +1266,6 @@ class NPUModelRunner(GPUModelRunner):
                                 getattr(common_attn_metadata, "req_ids", None))
                 except Exception:
                     pass
-
-                # PD+DynamicKV decode: upload token layout once per attention group
-                # (not per layer) so slot remapping stays on-device.
-                dynkv_decode_req_idx_t: Optional[torch.Tensor] = None
-                dynkv_decode_token_pos_t: Optional[torch.Tensor] = None
-                if getattr(self, "is_kv_consumer", False):
-                    try:
-                        _dynkv_slot_dev = slot_mapping.device
-                        dynkv_decode_token_pos_t = torch.as_tensor(
-                            token_positions_np,
-                            device=_dynkv_slot_dev,
-                            dtype=torch.int64,
-                        )
-                        dynkv_decode_req_idx_t = torch.as_tensor(
-                            req_indices,
-                            device=_dynkv_slot_dev,
-                            dtype=torch.int64,
-                        )
-                    except Exception:
-                        dynkv_decode_token_pos_t = None
-                        dynkv_decode_req_idx_t = None
 
                 for layer_name in attn_group.layer_names:
                     # vLLM will index attn_metadata by layer_name. We must ensure
