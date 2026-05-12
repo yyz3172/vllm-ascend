@@ -1244,6 +1244,27 @@ class NPUModelRunner(GPUModelRunner):
                 except Exception:
                     pass
 
+                # PD+DynamicKV decode: upload token layout once per attention group
+                # (not per layer) so slot remapping stays on-device.
+                dynkv_decode_req_idx_t: Optional[torch.Tensor] = None
+                dynkv_decode_token_pos_t: Optional[torch.Tensor] = None
+                if getattr(self, "is_kv_consumer", False):
+                    try:
+                        _dynkv_slot_dev = slot_mapping.device
+                        dynkv_decode_token_pos_t = torch.as_tensor(
+                            token_positions_np,
+                            device=_dynkv_slot_dev,
+                            dtype=torch.int64,
+                        )
+                        dynkv_decode_req_idx_t = torch.as_tensor(
+                            req_indices,
+                            device=_dynkv_slot_dev,
+                            dtype=torch.int64,
+                        )
+                    except Exception:
+                        dynkv_decode_token_pos_t = None
+                        dynkv_decode_req_idx_t = None
+
                 for layer_name in attn_group.layer_names:
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
@@ -1280,19 +1301,9 @@ class NPUModelRunner(GPUModelRunner):
                                 kv_list.append(kvp if isinstance(kvp, dict) else {})
                             if kv_list and len(kv_list) == len(rid_list):
                                 tmp_lens: list[int] = []
-                                dyn_slot_mapping_np = None
-                                try:
-                                    dyn_slot_mapping_np = (
-                                        meta_i.slot_mapping.detach().cpu().numpy().copy()
-                                    )
-                                    block_tables_np = (
-                                        meta_i.block_tables.detach().cpu().numpy()
-                                    )
-                                    bs_dyn = int(self.block_size)
-                                except Exception:
-                                    dyn_slot_mapping_np = None
-                                    block_tables_np = None
-                                    bs_dyn = 0
+                                bs_dyn = int(self.block_size)
+                                # (req_idx, base_tokens, Li) for on-device slot remapping.
+                                slot_remap_jobs: list[tuple[int, int, int]] = []
                                 for req_idx, kvp in enumerate(kv_list):
                                     if not kvp:
                                         tmp_lens.append(-1)
@@ -1359,28 +1370,10 @@ class NPUModelRunner(GPUModelRunner):
                                             # written immediately after each layer's
                                             # packed prefix (`Li + step`), not at the
                                             # global transferred-token position.
-                                            if (use_dyn_base
-                                                    and dyn_slot_mapping_np is not None
-                                                    and block_tables_np is not None
-                                                    and bs_dyn > 0):
-                                                try:
-                                                    mask = (req_indices == req_idx)
-                                                    if mask.any():
-                                                        rel = (
-                                                            token_positions_np[mask]
-                                                            - (int(base_tokens) - 1)
-                                                        )
-                                                        tgt_pos = int(Li) + rel
-                                                        bt_row = block_tables_np[req_idx]
-                                                        block_ids = bt_row[
-                                                            tgt_pos // bs_dyn
-                                                        ]
-                                                        dyn_slot_mapping_np[mask] = (
-                                                            block_ids * bs_dyn
-                                                            + (tgt_pos % bs_dyn)
-                                                        )
-                                                except Exception:
-                                                    dyn_slot_mapping_np = None
+                                            if use_dyn_base and bs_dyn > 0:
+                                                slot_remap_jobs.append(
+                                                    (req_idx, int(base_tokens),
+                                                     int(Li)))
                                             # PD validation: restore important-token mask on decode worker.
                                             try:
                                                 rid_here = (
@@ -1429,13 +1422,34 @@ class NPUModelRunner(GPUModelRunner):
                                 if tmp_lens and not all(v < 0 for v in tmp_lens):
                                     setattr(meta_i, "dynamic_kv_seq_lens_list",
                                             tmp_lens)
-                                    if dyn_slot_mapping_np is not None:
+                                    if (
+                                        slot_remap_jobs
+                                        and dynkv_decode_token_pos_t is not None
+                                        and dynkv_decode_req_idx_t is not None
+                                    ):
                                         try:
-                                            meta_i.slot_mapping = torch.as_tensor(
-                                                dyn_slot_mapping_np,
-                                                device=meta_i.slot_mapping.device,
-                                                dtype=meta_i.slot_mapping.dtype,
+                                            dyn_slot_t = meta_i.slot_mapping.clone(
                                             )
+                                            bt_dev = meta_i.block_tables
+                                            for (job_req_idx, job_base_tokens,
+                                                 job_Li) in slot_remap_jobs:
+                                                mask = (
+                                                    dynkv_decode_req_idx_t
+                                                    == job_req_idx)
+                                                rel = (
+                                                    dynkv_decode_token_pos_t[mask]
+                                                    - (job_base_tokens - 1))
+                                                tgt_pos = int(job_Li) + rel
+                                                bt_row = bt_dev[job_req_idx]
+                                                idx = tgt_pos // bs_dyn
+                                                block_ids = bt_row[idx].to(
+                                                    torch.int64)
+                                                new_slots = (
+                                                    block_ids * bs_dyn
+                                                    + (tgt_pos % bs_dyn))
+                                                dyn_slot_t[mask] = new_slots.to(
+                                                    meta_i.slot_mapping.dtype)
+                                            meta_i.slot_mapping = dyn_slot_t
                                             if layer_idx == 0:
                                                 logger.debug(
                                                     "[DynamicKV][decode] applied per-layer slot_mapping override"
