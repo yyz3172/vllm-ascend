@@ -303,6 +303,10 @@ class NPUModelRunner(GPUModelRunner):
 
         self.is_multimodal_model = self.model_config.is_multimodal_model
         self.block_size = vllm_config.cache_config.block_size
+        # DynamicKV PD decode: reusable [layer, token] slot scratch (scheme 2).
+        self._dynkv_slot_stack_buf: Optional[torch.Tensor] = None
+        self._dynkv_slot_stack_cap_L: int = 0
+        self._dynkv_slot_stack_cap_n: int = 0
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
@@ -1267,7 +1271,36 @@ class NPUModelRunner(GPUModelRunner):
                 except Exception:
                     pass
 
-                for layer_name in attn_group.layer_names:
+                # Scheme 1: (req_idx, base_tokens) -> (mask, rel); rel does not depend
+                # on layer ``Li``, reused across ``layer_names`` in this attn_group.
+                dynkv_mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor,
+                                                                  torch.Tensor]] = {}
+                _dynkv_layer_names = list(attn_group.layer_names)
+                _dynkv_L = len(_dynkv_layer_names)
+                _dynkv_n = int(attn_metadata_i.slot_mapping.numel())
+                _dynkv_stack: Optional[torch.Tensor] = None
+                if _dynkv_L > 0 and _dynkv_n > 0:
+                    _need_L = max(_dynkv_L, self._dynkv_slot_stack_cap_L)
+                    _need_n = max(_dynkv_n, self._dynkv_slot_stack_cap_n)
+                    _sb = self._dynkv_slot_stack_buf
+                    if (
+                        _sb is None
+                        or _sb.shape[0] < _need_L
+                        or _sb.shape[1] < _need_n
+                        or _sb.device != attn_metadata_i.slot_mapping.device
+                        or _sb.dtype != attn_metadata_i.slot_mapping.dtype
+                    ):
+                        self._dynkv_slot_stack_buf = torch.empty(
+                            (_need_L, _need_n),
+                            device=attn_metadata_i.slot_mapping.device,
+                            dtype=attn_metadata_i.slot_mapping.dtype,
+                        )
+                        self._dynkv_slot_stack_cap_L = _need_L
+                        self._dynkv_slot_stack_cap_n = _need_n
+                        _sb = self._dynkv_slot_stack_buf
+                    _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
+
+                for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
                     # populated, otherwise DynamicKV cannot resolve layer_idx.
@@ -1430,17 +1463,37 @@ class NPUModelRunner(GPUModelRunner):
                                         and dynkv_decode_req_idx_t is not None
                                     ):
                                         try:
-                                            dyn_slot_t = meta_i.slot_mapping.clone(
-                                            )
+                                            base_sm = meta_i.slot_mapping
+                                            n_sm = int(base_sm.numel())
+                                            if (
+                                                _dynkv_stack is not None
+                                                and _dyn_li < _dynkv_stack.shape[0]
+                                                and n_sm <= _dynkv_stack.shape[1]
+                                            ):
+                                                dyn_slot_t = _dynkv_stack[
+                                                    _dyn_li, :n_sm]
+                                                dyn_slot_t.copy_(base_sm)
+                                            else:
+                                                dyn_slot_t = base_sm.clone()
                                             bt_dev = meta_i.block_tables
                                             for (job_req_idx, job_base_tokens,
                                                  job_Li) in slot_remap_jobs:
-                                                mask = (
-                                                    dynkv_decode_req_idx_t
-                                                    == job_req_idx)
-                                                rel = (
-                                                    dynkv_decode_token_pos_t[mask]
-                                                    - (job_base_tokens - 1))
+                                                _ck = (int(job_req_idx),
+                                                       int(job_base_tokens))
+                                                _cached = dynkv_mask_rel_cache.get(
+                                                    _ck)
+                                                if _cached is None:
+                                                    mask = (
+                                                        dynkv_decode_req_idx_t
+                                                        == job_req_idx)
+                                                    rel = (
+                                                        dynkv_decode_token_pos_t[
+                                                            mask]
+                                                        - (job_base_tokens - 1))
+                                                    dynkv_mask_rel_cache[_ck] = (
+                                                        mask, rel)
+                                                else:
+                                                    mask, rel = _cached
                                                 tgt_pos = int(job_Li) + rel
                                                 bt_row = bt_dev[job_req_idx]
                                                 idx = tgt_pos // bs_dyn
@@ -1450,7 +1503,7 @@ class NPUModelRunner(GPUModelRunner):
                                                     block_ids * bs_dyn
                                                     + (tgt_pos % bs_dyn))
                                                 dyn_slot_t[mask] = new_slots.to(
-                                                    meta_i.slot_mapping.dtype)
+                                                    base_sm.dtype)
                                             meta_i.slot_mapping = dyn_slot_t
                                             if layer_idx == 0:
                                                 logger.debug(
