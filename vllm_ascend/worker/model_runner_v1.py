@@ -686,9 +686,13 @@ class NPUModelRunner(GPUModelRunner):
                         if isinstance(offset, int) and offset != 0:
                             offset_by_req_idx[req_idx] = int(offset)
                     if offset_by_req_idx:
+                        per_req_off = np.zeros(num_reqs, dtype=positions_np.dtype)
                         for req_idx, offset in offset_by_req_idx.items():
-                            mask = (req_indices == req_idx)
-                            positions_np[mask] += offset
+                            ri = int(req_idx)
+                            if 0 <= ri < num_reqs:
+                                per_req_off[ri] = int(offset)
+                        # Vectorized: same as ``positions_np[req==r]+=off`` per r (scheme A).
+                        positions_np += per_req_off[req_indices]
                         prev_offsets = getattr(self, "_dynkv_last_rope_offsets",
                                                None)
                         if prev_offsets != offset_by_req_idx:
