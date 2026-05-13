@@ -1457,6 +1457,24 @@ class NPUModelRunner(GPUModelRunner):
                                 if tmp_lens and not all(v < 0 for v in tmp_lens):
                                     setattr(meta_i, "dynamic_kv_seq_lens_list",
                                             tmp_lens)
+                                    try:
+                                        _sl_kv = meta_i.seq_lens
+                                        if isinstance(_sl_kv, torch.Tensor):
+                                            setattr(
+                                                meta_i,
+                                                "dynamic_kv_seq_lens_tensor",
+                                                torch.tensor(
+                                                    tmp_lens,
+                                                    device=_sl_kv.device,
+                                                    dtype=_sl_kv.dtype,
+                                                ),
+                                            )
+                                    except Exception:
+                                        try:
+                                            delattr(meta_i,
+                                                    "dynamic_kv_seq_lens_tensor")
+                                        except Exception:
+                                            pass
                                     if (
                                         slot_remap_jobs
                                         and dynkv_decode_token_pos_t is not None

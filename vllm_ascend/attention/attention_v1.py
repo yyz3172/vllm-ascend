@@ -201,6 +201,9 @@ class AscendMetadata:
     req_ids: List[str] = None  # type: ignore
     # PD DynamicKV：本层各请求的 kv 长度（与 req_ids 对齐）。
     dynamic_kv_seq_lens_list: Optional[List[int]] = None
+    # When set (e.g. NPUModelRunner PD decode), paged attention uses this tensor
+    # instead of ``torch.tensor(dynamic_kv_seq_lens_list)`` each call.
+    dynamic_kv_seq_lens_tensor: Optional[torch.Tensor] = None
     # PD DynamicKV：本层各请求保留的 token 下标（与 req_ids 对齐）。
     # Each element is a python list of token indices in original prompt space.
     dynamic_kv_keep_indices_list: Optional[List[List[int]]] = None
@@ -469,6 +472,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
             model_type = ""
         self._dynamickv_model_type_ok = (model_type in self._dynamickv_model_types)
 
+    @staticmethod
+    def _pa_dynamic_kv_context_lens(
+            attn_metadata: AscendMetadata) -> torch.Tensor:
+        """Paged-attention ``context_lens`` for DynamicKV decode.
+
+        Prefer ``dynamic_kv_seq_lens_tensor`` (built alongside the list in the
+        model runner) to avoid per-call ``torch.tensor(list)`` allocation.
+        """
+        dl = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+        if dl is None:
+            return attn_metadata.seq_lens
+        t = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+        sl = attn_metadata.seq_lens
+        if isinstance(t, torch.Tensor) and isinstance(sl, torch.Tensor):
+            if (int(t.numel()) == len(dl) and t.device == sl.device
+                    and t.dtype == sl.dtype):
+                return t
+        return torch.tensor(dl, device=sl.device, dtype=sl.dtype)
+
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
         if flashcomm2_oshard_manager.flashcomm2_oshard_enable():
@@ -575,16 +597,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_heads=self.num_heads,
                     scale_value=self.scale,
                     block_table=attn_metadata.block_tables,
-                    context_lens=(
-                        torch.tensor(
-                            getattr(attn_metadata, "dynamic_kv_seq_lens_list"),
-                            device=attn_metadata.seq_lens.device,
-                            dtype=attn_metadata.seq_lens.dtype,
-                        )
-                        if getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
-                        is not None
-                        else attn_metadata.seq_lens
-                    ),
+                    context_lens=self._pa_dynamic_kv_context_lens(attn_metadata),
                     out=output)
                 update_graph_params_workspaces(num_tokens, workspace)
 
@@ -603,16 +616,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.num_heads,
                 self.scale,
                 attn_metadata.block_tables,
-                (
-                    torch.tensor(
-                        getattr(attn_metadata, "dynamic_kv_seq_lens_list"),
-                        device=attn_metadata.seq_lens.device,
-                        dtype=attn_metadata.seq_lens.dtype,
-                    )
-                    if getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
-                    is not None
-                    else attn_metadata.seq_lens
-                ),
+                self._pa_dynamic_kv_context_lens(attn_metadata),
                 weak_ref_tensors(output),
             ))
 
@@ -625,16 +629,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_heads=self.num_heads,
                 scale_value=self.scale,
                 block_table=attn_metadata.block_tables,
-                context_lens=(
-                    torch.tensor(
-                        getattr(attn_metadata, "dynamic_kv_seq_lens_list"),
-                        device=attn_metadata.seq_lens.device,
-                        dtype=attn_metadata.seq_lens.dtype,
-                    )
-                    if getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
-                    is not None
-                    else attn_metadata.seq_lens
-                ),
+                context_lens=self._pa_dynamic_kv_context_lens(attn_metadata),
                 out=output,
                 workspace=workspace)
             handle = torch.npu.graph_task_group_end(stream)
@@ -734,11 +729,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and attn_metadata.seq_lens.shape[0] == query.size(0)):
             dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
             if dyn_lens_list is not None:
-                context_lens = torch.tensor(
-                    dyn_lens_list,
-                    device=attn_metadata.seq_lens.device,
-                    dtype=attn_metadata.seq_lens.dtype,
-                )
+                context_lens = self._pa_dynamic_kv_context_lens(attn_metadata)
                 return self._forward_decode_with_mask_validation(
                     query=query,
                     attn_metadata=attn_metadata,
@@ -791,11 +782,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         context_lens = attn_metadata.seq_lens
         dyn_keep = getattr(attn_metadata, "dynamic_kv_keep_indices_list", None)
         dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+        used_keep_derive = False
 
         # If keep indices exist, prefer to derive kv_len from indices.
         if dyn_keep is not None and isinstance(dyn_keep, list) and dyn_keep:
             try:
                 dyn_lens_list = [len(x) for x in dyn_keep]
+                used_keep_derive = True
             except Exception:
                 pass
 
@@ -834,11 +827,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 setattr(attn_metadata, "_dynamic_kv_decode_logged", True)
             # Per-layer kv_len override for PD DynamicKV.
             # Expect dyn_lens_list to be ordered by request order in the batch.
-            context_lens = torch.tensor(
-                dyn_lens_list,
-                device=attn_metadata.seq_lens.device,
-                dtype=attn_metadata.seq_lens.dtype,
-            )
+            sl = attn_metadata.seq_lens
+            if not used_keep_derive:
+                _t = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+                if (isinstance(_t, torch.Tensor) and isinstance(sl, torch.Tensor)
+                        and int(_t.numel()) == len(dyn_lens_list)
+                        and _t.device == sl.device
+                        and _t.dtype == sl.dtype):
+                    context_lens = _t
+                else:
+                    context_lens = torch.tensor(
+                        dyn_lens_list,
+                        device=sl.device,
+                        dtype=sl.dtype,
+                    )
+            else:
+                context_lens = torch.tensor(
+                    dyn_lens_list,
+                    device=sl.device,
+                    dtype=sl.dtype,
+                )
         # ``mask`` validation: decode uses full KV + ``npu_fusion_attention`` mask
         # (indices from PD). ``zero`` validation: KV already zeroed on prefill; decode
         # uses normal paged attention.
