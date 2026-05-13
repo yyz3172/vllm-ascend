@@ -145,6 +145,38 @@ if get_ascend_device_type() == AscendDeviceType._310P:
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+_DYNKV_MERGE_LIST_KEYS: tuple[str, ...] = (
+    "per_layer_kv_lens",
+    "per_layer_keep_indices",
+    "per_layer_important_indices",
+    "prefix_remote_block_ids",
+)
+
+
+def _merge_dynamic_kv_drain_with_execute(
+    dk_drain: dict[str, Any] | None,
+    dk_execute: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge ``dynamic_kv`` from drain vs execute_model without dropping offload fields.
+
+    Execute (prefill rewrite) normally wins key conflicts. If execute carries an
+    empty list for a merge-listed field while drain has a non-empty list (e.g.
+    ``per_layer_kv_lens`` populated only in ``_DYNKV_STATE``), keep the drain value
+    so TPOT metadata stays consistent with attention.
+    """
+    d = dict(dk_drain) if isinstance(dk_drain, dict) else {}
+    e = dict(dk_execute) if isinstance(dk_execute, dict) else {}
+    out: dict[str, Any] = {**d, **e}
+    for k in _DYNKV_MERGE_LIST_KEYS:
+        v_e = e.get(k)
+        v_d = d.get(k)
+        e_ok = isinstance(v_e, list) and len(v_e) > 0
+        d_ok = isinstance(v_d, list) and len(v_d) > 0
+        if d_ok and not e_ok:
+            out[k] = v_d
+    return out
+
+
 def _merge_kv_xfer_updates_drain(
     existing: dict[str, dict[str, Any]] | None,
     drain: dict[str, dict[str, Any]] | None,
@@ -168,10 +200,10 @@ def _merge_kv_xfer_updates_drain(
         dk_e = e_req.get("dynamic_kv")
         dk_u = u_req.get("dynamic_kv")
         if isinstance(dk_e, dict) or isinstance(dk_u, dict):
-            out_req["dynamic_kv"] = {
-                **(dk_u if isinstance(dk_u, dict) else {}),
-                **(dk_e if isinstance(dk_e, dict) else {}),
-            }
+            out_req["dynamic_kv"] = _merge_dynamic_kv_drain_with_execute(
+                dk_u if isinstance(dk_u, dict) else None,
+                dk_e if isinstance(dk_e, dict) else None,
+            )
         merged[rid] = out_req
     return merged
 
@@ -2305,8 +2337,8 @@ class NPUModelRunner(GPUModelRunner):
         # worker DynamicKV (etc.) into the output *before* the scheduler runs
         # ``request_finished``. Ascend splits execute_model/sample_tokens and
         # does not use that context manager, so without this drain the scheduler
-        # only sees mooncake_connector's uniform ``min(prompt, max_capacity)``
-        # fallback for ``per_layer_kv_lens``.
+        # may miss ``per_layer_kv_lens`` and hit Mooncake's
+        # ``no_compress_fallback`` (full ``prompt_len`` per layer).
         if kv_connector_output is not None and has_kv_transfer_group():
             try:
                 kc = get_kv_transfer_group()
@@ -2316,7 +2348,7 @@ class NPUModelRunner(GPUModelRunner):
                         req_ids_set.update(kv_connector_output.finished_sending)
                     if kv_connector_output.finished_recving:
                         req_ids_set.update(kv_connector_output.finished_recving)
-                    if scheduler_output.finished_req_ids:
+                    if not req_ids_set and scheduler_output.finished_req_ids:
                         req_ids_set.update(scheduler_output.finished_req_ids)
                     if not req_ids_set:
                         req_ids_set.update(
