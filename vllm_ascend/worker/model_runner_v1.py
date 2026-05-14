@@ -1641,6 +1641,14 @@ class NPUModelRunner(GPUModelRunner):
                     if _dynkv_profile:
                         _t_layer_slot_remap = (time.perf_counter() - _t0_sr) * 1000
 
+                # Pre-build layer_name -> layer_idx map to avoid repeated extract_layer_index calls
+                _layer_idx_map: dict[str, int] = {}
+                for _ln in _dynkv_layer_names:
+                    try:
+                        _layer_idx_map[_ln] = int(extract_layer_index(_ln, num_attn_module=1))
+                    except Exception:
+                        _layer_idx_map[_ln] = -1
+
                 for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
@@ -1658,12 +1666,7 @@ class NPUModelRunner(GPUModelRunner):
                         _t_layer_copy_meta += (time.perf_counter() - _t0_cm) * 1000
                     if all_tmp_lens is not None and slot_jobs_all is not None:
                         _t0_ot = time.perf_counter() if _dynkv_profile else 0
-                        try:
-                            layer_idx = int(
-                                extract_layer_index(layer_name,
-                                                    num_attn_module=1))
-                        except Exception:
-                            layer_idx = -1
+                        layer_idx = _layer_idx_map.get(layer_name, -1)
                         tmp_lens_layer = all_tmp_lens[_dyn_li]
                         slot_remap_jobs = slot_jobs_all[_dyn_li]
                         if (layer_idx >= 0 and tmp_lens_layer
