@@ -208,6 +208,115 @@ def _merge_kv_xfer_updates_drain(
     return merged
 
 
+def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
+    *,
+    dyn_layer_names: list[str],
+    rid_list: list[str],
+    kv_list: list[dict[str, Any]],
+    n_r: int,
+    input_batch: Any,
+    block_size: int,
+) -> tuple[list[list[int]], list[list[tuple[int, int, int]]]]:
+    """Build per-layer ``tmp_lens`` (length ``n_r``) and slot remap jobs on TP rank0.
+
+    Mirrors the per-request loop previously executed once per layer inside
+    ``_prepare_inputs``; factored out so TP can ``broadcast_object`` once per
+    KV group instead of once per layer.
+    """
+    all_tmp_lens: list[list[int]] = []
+    slot_jobs_all: list[list[tuple[int, int, int]]] = []
+    bs_dyn = int(block_size)
+    for layer_name in dyn_layer_names:
+        tmp_row = [-1] * n_r
+        jobs: list[tuple[int, int, int]] = []
+        try:
+            layer_idx = int(
+                extract_layer_index(layer_name, num_attn_module=1))
+        except Exception:
+            layer_idx = -1
+        if layer_idx < 0:
+            all_tmp_lens.append(tmp_row)
+            slot_jobs_all.append(jobs)
+            continue
+        for req_idx in range(n_r):
+            kvp = kv_list[req_idx]
+            if not kvp:
+                tmp_row[req_idx] = -1
+                continue
+            dyn = kvp.get("dynamic_kv") or {}
+            per_layer = dyn.get("per_layer_kv_lens")
+            pii = dyn.get("per_layer_important_indices")
+            try:
+                npt = int(
+                    input_batch.num_prompt_tokens[req_idx])
+                ncomp = int(
+                    input_batch.num_computed_tokens_cpu[req_idx])
+            except Exception:
+                npt, ncomp = 0, 0
+            base_tokens = npt
+            transferred = dyn.get("transferred_tokens")
+            use_dyn_base = isinstance(transferred, int) and transferred > 0
+            if use_dyn_base:
+                base_tokens = int(transferred)
+            decode_extra = max(0, ncomp - base_tokens + 2)
+            if layer_idx == 0:
+                logger.debug(
+                    "[DynamicKV][decode_extra] req_idx=%d "
+                    "npt=%d ncomp=%d transferred=%s base=%d decode_extra=%d dyn_base=%s",
+                    req_idx,
+                    npt,
+                    ncomp,
+                    transferred,
+                    base_tokens,
+                    decode_extra,
+                    use_dyn_base,
+                )
+            if (isinstance(per_layer, list) and layer_idx < len(per_layer)):
+                try:
+                    Li = int(per_layer[layer_idx])
+                except Exception:
+                    Li = -1
+                if Li > 0:
+                    tmp_row[req_idx] = Li + decode_extra
+                    if use_dyn_base and bs_dyn > 0:
+                        jobs.append(
+                            (req_idx, int(base_tokens), int(Li)))
+                    try:
+                        rid_here = (
+                            rid_list[req_idx]
+                            if req_idx < len(rid_list) else None)
+                        if (
+                            rid_here
+                            and isinstance(pii, list)
+                            and layer_idx < len(pii)
+                        ):
+                            idxs_layer = pii[layer_idx]
+                            if isinstance(idxs_layer, list):
+                                li_tot = int(Li) + int(decode_extra)
+                                mcpu = torch.zeros(
+                                    li_tot, dtype=torch.bool)
+                                for t in idxs_layer:
+                                    ti = int(t)
+                                    if 0 <= ti < int(Li):
+                                        mcpu[ti] = True
+                                if decode_extra > 0 and li_tot > int(Li):
+                                    mcpu[int(Li):li_tot] = True
+                                save_validation_mask(
+                                    str(rid_here),
+                                    int(layer_idx),
+                                    mcpu,
+                                )
+                    except Exception:
+                        pass
+                else:
+                    tmp_row[req_idx] = -1
+            else:
+                tmp_row[req_idx] = -1
+        all_tmp_lens.append(tmp_row)
+        slot_jobs_all.append(jobs)
+    return all_tmp_lens, slot_jobs_all
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -1336,235 +1445,176 @@ class NPUModelRunner(GPUModelRunner):
                         _sb = self._dynkv_slot_stack_buf
                     _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
 
+                # PD DynamicKV (decode): build all layers' ``tmp_lens`` / slot jobs on
+                # rank-0 once, ``broadcast_object`` once per KV group (not per layer),
+                # then upload ``dynamic_kv_seq_lens`` as a single [L, R] tensor.
+                all_tmp_lens: list[list[int]] | None = None
+                slot_jobs_all: list[list[tuple[int, int, int]]] | None = None
+                stacked_dyn_lens_t: Optional[torch.Tensor] = None
+                if getattr(self, "is_kv_consumer", False) and _dynkv_L > 0:
+                    n_r_dyn = int(num_reqs)
+                    rid_list_dyn = list(req_ids[:n_r_dyn])
+                    kv_list_dyn: list[dict[str, Any]] = []
+                    for rid in rid_list_dyn:
+                        req = self.requests.get(rid)
+                        kvp = getattr(req, "kv_transfer_params",
+                                      None) if req is not None else None
+                        kv_list_dyn.append(
+                            kvp if isinstance(kvp, dict) else {})
+                    if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
+                        tg_pre = get_tp_group()
+                        built_dyn: tuple[
+                            list[list[int]],
+                            list[list[tuple[int, int, int]]],
+                        ] | None = None
+                        if tg_pre.world_size > 1:
+                            if get_tensor_model_parallel_rank() == 0:
+                                built_dyn = (
+                                    _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
+                                        dyn_layer_names=_dynkv_layer_names,
+                                        rid_list=rid_list_dyn,
+                                        kv_list=kv_list_dyn,
+                                        n_r=n_r_dyn,
+                                        input_batch=self.input_batch,
+                                        block_size=int(self.block_size),
+                                    ))
+                            built_dyn = tg_pre.broadcast_object(
+                                built_dyn
+                                if get_tensor_model_parallel_rank() == 0 else None,
+                                src=0,
+                            )
+                        else:
+                            built_dyn = (
+                                _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
+                                    dyn_layer_names=_dynkv_layer_names,
+                                    rid_list=rid_list_dyn,
+                                    kv_list=kv_list_dyn,
+                                    n_r=n_r_dyn,
+                                    input_batch=self.input_batch,
+                                    block_size=int(self.block_size),
+                                ))
+                        if built_dyn is not None:
+                            all_tmp_lens, slot_jobs_all = built_dyn
+                    else:
+                        all_tmp_lens = [[-1] * n_r_dyn
+                                        for _ in range(_dynkv_L)]
+                        slot_jobs_all = [[] for _ in range(_dynkv_L)]
+                    if all_tmp_lens is not None:
+                        try:
+                            _sl0 = attn_metadata_i.seq_lens
+                            if isinstance(_sl0, torch.Tensor):
+                                stacked_dyn_lens_t = torch.tensor(
+                                    all_tmp_lens,
+                                    device=_sl0.device,
+                                    dtype=_sl0.dtype,
+                                )
+                        except Exception:
+                            stacked_dyn_lens_t = None
+
+                bs_dyn = int(self.block_size)
                 for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
                     # populated, otherwise DynamicKV cannot resolve layer_idx.
                     try:
-                        import copy as _copy
-
-                        meta_i = _copy.copy(attn_metadata_i)
+                        meta_i = copy(attn_metadata_i)
                     except Exception:
                         meta_i = attn_metadata_i
                     try:
                         setattr(meta_i, "layer_name", layer_name)
                     except Exception:
                         pass
-                    # PD DynamicKV (decode consumer): mirror v2 ``attn_utils`` so
-                    # paged attention uses per-layer ``kv_len`` from
-                    # ``request.kv_transfer_params`` instead of full logical
-                    # ``seq_lens`` (which would read past compressed KV).
-                    if getattr(self, "is_kv_consumer", False):
+                    if all_tmp_lens is not None and slot_jobs_all is not None:
                         try:
                             layer_idx = int(
                                 extract_layer_index(layer_name,
                                                     num_attn_module=1))
                         except Exception:
                             layer_idx = -1
-                        if layer_idx >= 0:
-                            n_r = int(num_reqs)
-                            rid_list = list(req_ids[:n_r])
-                            kv_list: list[dict[str, Any]] = []
-                            for rid in rid_list:
-                                req = self.requests.get(rid)
-                                kvp = getattr(req, "kv_transfer_params",
-                                              None) if req is not None else None
-                                kv_list.append(kvp if isinstance(kvp, dict) else {})
-                            if kv_list and len(kv_list) == len(rid_list):
-                                tmp_lens: list[int] = []
-                                bs_dyn = int(self.block_size)
-                                # (req_idx, base_tokens, Li) for on-device slot remapping.
-                                slot_remap_jobs: list[tuple[int, int, int]] = []
-                                for req_idx, kvp in enumerate(kv_list):
-                                    if not kvp:
-                                        tmp_lens.append(-1)
-                                        continue
-                                    dyn = kvp.get("dynamic_kv") or {}
-                                    per_layer = dyn.get("per_layer_kv_lens")
-                                    pii = dyn.get("per_layer_important_indices")
-                                    try:
-                                        npt = int(
-                                            self.input_batch.num_prompt_tokens[
-                                                req_idx])
-                                        ncomp = int(
-                                            self.input_batch.
-                                            num_computed_tokens_cpu[req_idx])
-                                    except Exception:
-                                        npt, ncomp = 0, 0
-                                    # PD+DynamicKV: scheduler's `num_computed_tokens`
-                                    # starts at `transferred_tokens` (< num_prompt_tokens
-                                    # because of compression). Use that as the base for
-                                    # decode_extra so per-layer kv_len grows as new
-                                    # decode KVs are written into cache.
-                                    base_tokens = npt
-                                    transferred = dyn.get("transferred_tokens")
-                                    use_dyn_base = isinstance(
-                                        transferred, int) and transferred > 0
-                                    if use_dyn_base:
-                                        base_tokens = int(transferred)
-                                    # `num_computed_tokens` points to the position of
-                                    # current decode query token. For PD remote prefill,
-                                    # scheduler initializes it at `base_tokens - 1`.
-                                    # Context length must include the current token, so
-                                    # the first decode step contributes one token.
-                                    decode_extra = max(
-                                        0, ncomp - base_tokens + 2)
+                        tmp_lens_layer = all_tmp_lens[_dyn_li]
+                        slot_remap_jobs = slot_jobs_all[_dyn_li]
+                        if (layer_idx >= 0 and tmp_lens_layer
+                                and not all(v < 0 for v in tmp_lens_layer)):
+                            setattr(meta_i, "dynamic_kv_seq_lens_list",
+                                    tmp_lens_layer)
+                            try:
+                                if stacked_dyn_lens_t is not None:
+                                    setattr(
+                                        meta_i,
+                                        "dynamic_kv_seq_lens_tensor",
+                                        stacked_dyn_lens_t[_dyn_li],
+                                    )
+                                else:
+                                    _sl_kv = meta_i.seq_lens
+                                    if isinstance(_sl_kv, torch.Tensor):
+                                        setattr(
+                                            meta_i,
+                                            "dynamic_kv_seq_lens_tensor",
+                                            torch.tensor(
+                                                tmp_lens_layer,
+                                                device=_sl_kv.device,
+                                                dtype=_sl_kv.dtype,
+                                            ),
+                                        )
+                            except Exception:
+                                try:
+                                    delattr(meta_i,
+                                            "dynamic_kv_seq_lens_tensor")
+                                except Exception:
+                                    pass
+                            if (
+                                slot_remap_jobs
+                                and dynkv_decode_token_pos_t is not None
+                                and dynkv_decode_req_idx_t is not None
+                            ):
+                                try:
+                                    base_sm = meta_i.slot_mapping
+                                    n_sm = int(base_sm.numel())
+                                    if (
+                                        _dynkv_stack is not None
+                                        and _dyn_li < _dynkv_stack.shape[0]
+                                        and n_sm <= _dynkv_stack.shape[1]
+                                    ):
+                                        dyn_slot_t = _dynkv_stack[
+                                            _dyn_li, :n_sm]
+                                        dyn_slot_t.copy_(base_sm)
+                                    else:
+                                        dyn_slot_t = base_sm.clone()
+                                    bt_dev = meta_i.block_tables
+                                    for (job_req_idx, job_base_tokens,
+                                         job_Li) in slot_remap_jobs:
+                                        _ck = (int(job_req_idx),
+                                               int(job_base_tokens))
+                                        _cached = dynkv_mask_rel_cache.get(
+                                            _ck)
+                                        if _cached is None:
+                                            mask = (
+                                                dynkv_decode_req_idx_t
+                                                == job_req_idx)
+                                            rel = (
+                                                dynkv_decode_token_pos_t[mask]
+                                                - (job_base_tokens - 1))
+                                            dynkv_mask_rel_cache[_ck] = (
+                                                mask, rel)
+                                        else:
+                                            mask, rel = _cached
+                                        tgt_pos = int(job_Li) + rel
+                                        bt_row = bt_dev[job_req_idx]
+                                        idx = tgt_pos // bs_dyn
+                                        block_ids = bt_row[idx].to(
+                                            torch.int64)
+                                        new_slots = (
+                                            block_ids * bs_dyn
+                                            + (tgt_pos % bs_dyn))
+                                        dyn_slot_t[mask] = new_slots.to(
+                                            base_sm.dtype)
+                                    meta_i.slot_mapping = dyn_slot_t
                                     if layer_idx == 0:
                                         logger.debug(
-                                            "[DynamicKV][decode_extra] req_idx=%d "
-                                            "npt=%d ncomp=%d transferred=%s base=%d decode_extra=%d dyn_base=%s",
-                                            req_idx,
-                                            npt,
-                                            ncomp,
-                                            transferred,
-                                            base_tokens,
-                                            decode_extra,
-                                            use_dyn_base,
+                                            "[DynamicKV][decode] applied per-layer slot_mapping override"
                                         )
-                                    # Do not pass ``per_layer_keep_indices`` into
-                                    # paged decode: indices live in *original*
-                                    # prompt coordinates while offload packs KV
-                                    # contiguously in cache slots ``0..Li-1``.
-                                    # Length-only ``context_lens`` matches the
-                                    # packed layout; grow with decode tokens via
-                                    # ``decode_extra``.
-                                    if (isinstance(per_layer, list)
-                                            and layer_idx < len(per_layer)):
-                                        try:
-                                            Li = int(per_layer[layer_idx])
-                                        except Exception:
-                                            Li = -1
-                                        if Li > 0:
-                                            tmp_lens.append(Li + decode_extra)
-                                            # PD+DynamicKV offload uses per-layer
-                                            # packed prompt lengths. Decode KV must be
-                                            # written immediately after each layer's
-                                            # packed prefix (`Li + step`), not at the
-                                            # global transferred-token position.
-                                            if use_dyn_base and bs_dyn > 0:
-                                                slot_remap_jobs.append(
-                                                    (req_idx, int(base_tokens),
-                                                     int(Li)))
-                                            # PD validation: restore important-token mask on decode worker.
-                                            try:
-                                                rid_here = (
-                                                    rid_list[req_idx]
-                                                    if req_idx < len(rid_list)
-                                                    else None
-                                                )
-                                                if (
-                                                    rid_here
-                                                    and isinstance(pii, list)
-                                                    and layer_idx < len(pii)
-                                                ):
-                                                    idxs_layer = pii[layer_idx]
-                                                    if isinstance(idxs_layer, list):
-                                                        li_tot = int(Li) + int(decode_extra)
-                                                        mcpu = torch.zeros(
-                                                            li_tot, dtype=torch.bool
-                                                        )
-                                                        for t in idxs_layer:
-                                                            ti = int(t)
-                                                            if 0 <= ti < int(Li):
-                                                                mcpu[ti] = True
-                                                        if decode_extra > 0 and li_tot > int(Li):
-                                                            mcpu[int(Li) : li_tot] = True
-                                                        save_validation_mask(
-                                                            str(rid_here),
-                                                            int(layer_idx),
-                                                            mcpu,
-                                                        )
-                                            except Exception:
-                                                pass
-                                        else:
-                                            tmp_lens.append(-1)
-                                    else:
-                                        tmp_lens.append(-1)
-                                # TP decode: rank-0 builds from ``kv_transfer_params``;
-                                # other ranks may miss the dict — broadcast lens list.
-                                tg = get_tp_group()
-                                if tg.world_size > 1:
-                                    tmp_lens = tg.broadcast_object(
-                                        tmp_lens
-                                        if get_tensor_model_parallel_rank() == 0
-                                        else None,
-                                        src=0,
-                                    )
-                                if tmp_lens and not all(v < 0 for v in tmp_lens):
-                                    setattr(meta_i, "dynamic_kv_seq_lens_list",
-                                            tmp_lens)
-                                    try:
-                                        _sl_kv = meta_i.seq_lens
-                                        if isinstance(_sl_kv, torch.Tensor):
-                                            setattr(
-                                                meta_i,
-                                                "dynamic_kv_seq_lens_tensor",
-                                                torch.tensor(
-                                                    tmp_lens,
-                                                    device=_sl_kv.device,
-                                                    dtype=_sl_kv.dtype,
-                                                ),
-                                            )
-                                    except Exception:
-                                        try:
-                                            delattr(meta_i,
-                                                    "dynamic_kv_seq_lens_tensor")
-                                        except Exception:
-                                            pass
-                                    if (
-                                        slot_remap_jobs
-                                        and dynkv_decode_token_pos_t is not None
-                                        and dynkv_decode_req_idx_t is not None
-                                    ):
-                                        try:
-                                            base_sm = meta_i.slot_mapping
-                                            n_sm = int(base_sm.numel())
-                                            if (
-                                                _dynkv_stack is not None
-                                                and _dyn_li < _dynkv_stack.shape[0]
-                                                and n_sm <= _dynkv_stack.shape[1]
-                                            ):
-                                                dyn_slot_t = _dynkv_stack[
-                                                    _dyn_li, :n_sm]
-                                                dyn_slot_t.copy_(base_sm)
-                                            else:
-                                                dyn_slot_t = base_sm.clone()
-                                            bt_dev = meta_i.block_tables
-                                            for (job_req_idx, job_base_tokens,
-                                                 job_Li) in slot_remap_jobs:
-                                                _ck = (int(job_req_idx),
-                                                       int(job_base_tokens))
-                                                _cached = dynkv_mask_rel_cache.get(
-                                                    _ck)
-                                                if _cached is None:
-                                                    mask = (
-                                                        dynkv_decode_req_idx_t
-                                                        == job_req_idx)
-                                                    rel = (
-                                                        dynkv_decode_token_pos_t[
-                                                            mask]
-                                                        - (job_base_tokens - 1))
-                                                    dynkv_mask_rel_cache[_ck] = (
-                                                        mask, rel)
-                                                else:
-                                                    mask, rel = _cached
-                                                tgt_pos = int(job_Li) + rel
-                                                bt_row = bt_dev[job_req_idx]
-                                                idx = tgt_pos // bs_dyn
-                                                block_ids = bt_row[idx].to(
-                                                    torch.int64)
-                                                new_slots = (
-                                                    block_ids * bs_dyn
-                                                    + (tgt_pos % bs_dyn))
-                                                dyn_slot_t[mask] = new_slots.to(
-                                                    base_sm.dtype)
-                                            meta_i.slot_mapping = dyn_slot_t
-                                            if layer_idx == 0:
-                                                logger.debug(
-                                                    "[DynamicKV][decode] applied per-layer slot_mapping override"
-                                                )
-                                        except Exception:
-                                            pass
+                                except Exception:
+                                    pass
                     attn_metadata[layer_name] = meta_i
 
         # update global cos, sin
