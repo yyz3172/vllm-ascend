@@ -18,7 +18,9 @@
 #
 
 import math
+import os
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -1423,6 +1425,19 @@ class NPUModelRunner(GPUModelRunner):
                 _dynkv_layer_names = list(attn_group.layer_names)
                 _dynkv_L = len(_dynkv_layer_names)
                 _dynkv_n = int(attn_metadata_i.slot_mapping.numel())
+
+                # Timing accumulators (only used when VLLM_DYNKV_PROFILE_PREPARE=1)
+                _dynkv_profile = os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
+                _t_stack_init = 0.0
+                _t_kv_list_build = 0.0
+                _t_build_helper = 0.0
+                _t_broadcast = 0.0
+                _t_stacked_tensor = 0.0
+                _t_layer_copy_meta = 0.0
+                _t_layer_slot_remap = 0.0
+                _t_layer_other = 0.0
+
+                _t0_stack = time.perf_counter() if _dynkv_profile else 0
                 _dynkv_stack: Optional[torch.Tensor] = None
                 if _dynkv_L > 0 and _dynkv_n > 0:
                     _need_L = max(_dynkv_L, self._dynkv_slot_stack_cap_L)
@@ -1444,6 +1459,8 @@ class NPUModelRunner(GPUModelRunner):
                         self._dynkv_slot_stack_cap_n = _need_n
                         _sb = self._dynkv_slot_stack_buf
                     _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
+                if _dynkv_profile:
+                    _t_stack_init = (time.perf_counter() - _t0_stack) * 1000
 
                 # PD DynamicKV (decode): build all layers' ``tmp_lens`` / slot jobs on
                 # rank-0 once, ``broadcast_object`` once per KV group (not per layer),
@@ -1451,26 +1468,18 @@ class NPUModelRunner(GPUModelRunner):
                 all_tmp_lens: list[list[int]] | None = None
                 slot_jobs_all: list[list[tuple[int, int, int]]] | None = None
                 stacked_dyn_lens_t: Optional[torch.Tensor] = None
-                # Timing accumulators (only used when VLLM_DYNKV_PROFILE_PREPARE=1)
-                import os as _os_dynkv
-                import time as _time_dynkv
-                _dynkv_profile = _os_dynkv.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
-                _t_build_helper = 0.0
-                _t_broadcast = 0.0
-                _t_stacked_tensor = 0.0
-                _t_layer_copy_meta = 0.0
-                _t_layer_slot_remap = 0.0
-                _t_layer_other = 0.0
                 if getattr(self, "is_kv_consumer", False) and _dynkv_L > 0:
+                    _t0_kvlist = time.perf_counter() if _dynkv_profile else 0
                     n_r_dyn = int(num_reqs)
                     rid_list_dyn = list(req_ids[:n_r_dyn])
-                    kv_list_dyn: list[dict[str, Any]] = []
-                    for rid in rid_list_dyn:
-                        req = self.requests.get(rid)
-                        kvp = getattr(req, "kv_transfer_params",
-                                      None) if req is not None else None
-                        kv_list_dyn.append(
-                            kvp if isinstance(kvp, dict) else {})
+                    kv_list_dyn: list[dict[str, Any]] = [
+                        (lambda r: r if isinstance(r, dict) else {})(
+                            getattr(self.requests.get(rid), "kv_transfer_params", None)
+                        )
+                        for rid in rid_list_dyn
+                    ]
+                    if _dynkv_profile:
+                        _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
                     if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
                         tg_pre = get_tp_group()
                         built_dyn: tuple[
@@ -1479,7 +1488,7 @@ class NPUModelRunner(GPUModelRunner):
                         ] | None = None
                         if tg_pre.world_size > 1:
                             if get_tensor_model_parallel_rank() == 0:
-                                _t0_bh = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                                _t0_bh = time.perf_counter() if _dynkv_profile else 0
                                 built_dyn = (
                                     _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
                                         dyn_layer_names=_dynkv_layer_names,
@@ -1490,17 +1499,17 @@ class NPUModelRunner(GPUModelRunner):
                                         block_size=int(self.block_size),
                                     ))
                                 if _dynkv_profile:
-                                    _t_build_helper = (_time_dynkv.perf_counter() - _t0_bh) * 1000
-                            _t0_bc = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                                    _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
+                            _t0_bc = time.perf_counter() if _dynkv_profile else 0
                             built_dyn = tg_pre.broadcast_object(
                                 built_dyn
                                 if get_tensor_model_parallel_rank() == 0 else None,
                                 src=0,
                             )
                             if _dynkv_profile:
-                                _t_broadcast = (_time_dynkv.perf_counter() - _t0_bc) * 1000
+                                _t_broadcast = (time.perf_counter() - _t0_bc) * 1000
                         else:
-                            _t0_bh = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                            _t0_bh = time.perf_counter() if _dynkv_profile else 0
                             built_dyn = (
                                 _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
                                     dyn_layer_names=_dynkv_layer_names,
@@ -1511,7 +1520,7 @@ class NPUModelRunner(GPUModelRunner):
                                     block_size=int(self.block_size),
                                 ))
                             if _dynkv_profile:
-                                _t_build_helper = (_time_dynkv.perf_counter() - _t0_bh) * 1000
+                                _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
                         if built_dyn is not None:
                             all_tmp_lens, slot_jobs_all = built_dyn
                     else:
@@ -1522,14 +1531,14 @@ class NPUModelRunner(GPUModelRunner):
                         try:
                             _sl0 = attn_metadata_i.seq_lens
                             if isinstance(_sl0, torch.Tensor):
-                                _t0_st = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                                _t0_st = time.perf_counter() if _dynkv_profile else 0
                                 stacked_dyn_lens_t = torch.tensor(
                                     all_tmp_lens,
                                     device=_sl0.device,
                                     dtype=_sl0.dtype,
                                 )
                                 if _dynkv_profile:
-                                    _t_stacked_tensor = (_time_dynkv.perf_counter() - _t0_st) * 1000
+                                    _t_stacked_tensor = (time.perf_counter() - _t0_st) * 1000
                         except Exception:
                             stacked_dyn_lens_t = None
 
@@ -1549,7 +1558,7 @@ class NPUModelRunner(GPUModelRunner):
                     and dynkv_decode_req_idx_t is not None
                     and _dynkv_L > 0
                 ):
-                    _t0_sr = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                    _t0_sr = time.perf_counter() if _dynkv_profile else 0
                     try:
                         base_sm = attn_metadata_i.slot_mapping
                         _slot_n_sm = int(base_sm.numel())
@@ -1630,13 +1639,13 @@ class NPUModelRunner(GPUModelRunner):
                     except Exception:
                         _slot_remap_done = False
                     if _dynkv_profile:
-                        _t_layer_slot_remap = (_time_dynkv.perf_counter() - _t0_sr) * 1000
+                        _t_layer_slot_remap = (time.perf_counter() - _t0_sr) * 1000
 
                 for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
                     # populated, otherwise DynamicKV cannot resolve layer_idx.
-                    _t0_cm = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                    _t0_cm = time.perf_counter() if _dynkv_profile else 0
                     try:
                         meta_i = copy(attn_metadata_i)
                     except Exception:
@@ -1646,9 +1655,9 @@ class NPUModelRunner(GPUModelRunner):
                     except Exception:
                         pass
                     if _dynkv_profile:
-                        _t_layer_copy_meta += (_time_dynkv.perf_counter() - _t0_cm) * 1000
+                        _t_layer_copy_meta += (time.perf_counter() - _t0_cm) * 1000
                     if all_tmp_lens is not None and slot_jobs_all is not None:
-                        _t0_ot = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                        _t0_ot = time.perf_counter() if _dynkv_profile else 0
                         try:
                             layer_idx = int(
                                 extract_layer_index(layer_name,
@@ -1687,7 +1696,7 @@ class NPUModelRunner(GPUModelRunner):
                                 except Exception:
                                     pass
                             if _dynkv_profile:
-                                _t_layer_other += (_time_dynkv.perf_counter() - _t0_ot) * 1000
+                                _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
 
                             # Assign pre-computed slot_mapping from batched remap
                             if _slot_remap_done and _slot_n_sm > 0:
@@ -1698,7 +1707,7 @@ class NPUModelRunner(GPUModelRunner):
                                 and dynkv_decode_req_idx_t is not None
                             ):
                                 # Fallback: per-layer remap (should not happen if batched succeeded)
-                                _t0_sr_fb = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                                _t0_sr_fb = time.perf_counter() if _dynkv_profile else 0
                                 try:
                                     base_sm = meta_i.slot_mapping
                                     n_sm = int(base_sm.numel())
@@ -1748,19 +1757,21 @@ class NPUModelRunner(GPUModelRunner):
                                 except Exception:
                                     pass
                                 if _dynkv_profile:
-                                    _t_layer_slot_remap += (_time_dynkv.perf_counter() - _t0_sr_fb) * 1000
+                                    _t_layer_slot_remap += (time.perf_counter() - _t0_sr_fb) * 1000
                         else:
                             if _dynkv_profile:
-                                _t_layer_other += (_time_dynkv.perf_counter() - _t0_ot) * 1000
+                                _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
                     attn_metadata[layer_name] = meta_i
                 # Print timing summary once per step (only layer 0 triggers print)
                 if _dynkv_profile and _dynkv_L > 0:
                     logger.info(
-                        "[DynamicKV][prepare_profile] layers=%d build_helper=%.2fms "
-                        "broadcast=%.2fms stacked_tensor=%.2fms "
-                        "layer_copy_meta=%.2fms layer_slot_remap=%.2fms layer_other=%.2fms "
-                        "total_loop=%.2fms",
+                        "[DynamicKV][prepare_profile] layers=%d stack_init=%.2fms "
+                        "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
+                        "stacked_tensor=%.2fms layer_copy_meta=%.2fms "
+                        "layer_slot_remap=%.2fms layer_other=%.2fms total_loop=%.2fms",
                         _dynkv_L,
+                        _t_stack_init,
+                        _t_kv_list_build,
                         _t_build_helper,
                         _t_broadcast,
                         _t_stacked_tensor,
