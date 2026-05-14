@@ -1578,8 +1578,20 @@ class NPUModelRunner(GPUModelRunner):
                                     key = (int(job_req_idx), int(job_base_tokens))
                                     job_key_to_Li_per_layer[key][li] = int(job_Li)
 
+                            # 2.5 Batch build all Li tensors in ONE CPU->NPU transfer
+                            job_keys_list = list(job_key_to_Li_per_layer.keys())
+                            n_jobs = len(job_keys_list)
+                            if n_jobs > 0:
+                                all_Li_lists = [job_key_to_Li_per_layer[k] for k in job_keys_list]
+                                # Single CPU->NPU transfer for all requests
+                                _Li_device = dynkv_decode_token_pos_t.device
+                                _Li_dtype = dynkv_decode_token_pos_t.dtype
+                                all_Li_tensor = torch.tensor(
+                                    all_Li_lists, device=_Li_device, dtype=_Li_dtype
+                                )  # [N_jobs, L]
+
                             # 3. For each (req_idx, base_tokens), batch compute new_slots
-                            for (job_req_idx, job_base_tokens), Li_list in job_key_to_Li_per_layer.items():
+                            for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
                                 _ck = (job_req_idx, job_base_tokens)
                                 _cached = dynkv_mask_rel_cache.get(_ck)
                                 if _cached is None:
@@ -1596,12 +1608,8 @@ class NPUModelRunner(GPUModelRunner):
                                 if n_masked == 0:
                                     continue
 
-                                # Li_tensor: [L,] -> [L, 1] for broadcast
-                                Li_tensor = torch.tensor(
-                                    Li_list,
-                                    device=rel.device,
-                                    dtype=rel.dtype,
-                                ).unsqueeze(1)  # [L, 1]
+                                # Li_tensor: use pre-built tensor slice (no CPU->NPU here)
+                                Li_tensor = all_Li_tensor[_job_i].unsqueeze(1)  # [L, 1]
 
                                 # tgt_pos_2d: [L, n_masked]
                                 tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # broadcast
@@ -1623,11 +1631,12 @@ class NPUModelRunner(GPUModelRunner):
                                 # Write to _dynkv_stack[:, mask] for valid layers in ONE op
                                 # Use torch.where to select: valid layers get new_slots_2d,
                                 # invalid layers keep original base_sm values.
+                                # Optimization: base_masked is same for all layers (from broadcast init)
                                 stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
-                                current_masked = stack_view[:, mask]  # [L, n_masked]
+                                base_masked = base_sm[mask]  # [n_masked,] - reuse base_sm directly
                                 valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)  # [L, 1]
                                 final_vals = torch.where(
-                                    valid_layer_mask_2d, new_slots_2d, current_masked
+                                    valid_layer_mask_2d, new_slots_2d, base_masked  # base_masked broadcasts
                                 )
                                 stack_view[:, mask] = final_vals  # single write op
 
