@@ -1534,6 +1534,101 @@ class NPUModelRunner(GPUModelRunner):
                             stacked_dyn_lens_t = None
 
                 bs_dyn = int(self.block_size)
+
+                # ============================================================
+                # Batched slot_remap: do all layers' slot remapping ONCE here,
+                # outside the per-layer loop, to avoid 32x small NPU kernels.
+                # ============================================================
+                _slot_remap_done = False
+                _slot_n_sm = 0
+                if (
+                    all_tmp_lens is not None
+                    and slot_jobs_all is not None
+                    and _dynkv_stack is not None
+                    and dynkv_decode_token_pos_t is not None
+                    and dynkv_decode_req_idx_t is not None
+                    and _dynkv_L > 0
+                ):
+                    _t0_sr = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                    try:
+                        base_sm = attn_metadata_i.slot_mapping
+                        _slot_n_sm = int(base_sm.numel())
+                        bt_dev = attn_metadata_i.block_tables
+                        if _slot_n_sm > 0 and _slot_n_sm <= _dynkv_stack.shape[1]:
+                            # 1. Broadcast base_sm to all layers at once
+                            _dynkv_stack[:_dynkv_L, :_slot_n_sm] = base_sm.unsqueeze(0)
+
+                            # 2. Collect per-(req_idx, base_tokens) -> Li per layer
+                            # slot_jobs_all[li] = [(req_idx, base_tokens, Li), ...]
+                            # Group by (req_idx, base_tokens), collect Li for each layer
+                            job_key_to_Li_per_layer: dict[
+                                tuple[int, int], list[int]
+                            ] = defaultdict(lambda: [-1] * _dynkv_L)
+                            for li in range(_dynkv_L):
+                                for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[li]:
+                                    key = (int(job_req_idx), int(job_base_tokens))
+                                    job_key_to_Li_per_layer[key][li] = int(job_Li)
+
+                            # 3. For each (req_idx, base_tokens), batch compute new_slots
+                            for (job_req_idx, job_base_tokens), Li_list in job_key_to_Li_per_layer.items():
+                                _ck = (job_req_idx, job_base_tokens)
+                                _cached = dynkv_mask_rel_cache.get(_ck)
+                                if _cached is None:
+                                    mask = (dynkv_decode_req_idx_t == job_req_idx)
+                                    rel = (
+                                        dynkv_decode_token_pos_t[mask]
+                                        - (job_base_tokens - 1)
+                                    )
+                                    dynkv_mask_rel_cache[_ck] = (mask, rel)
+                                else:
+                                    mask, rel = _cached
+
+                                n_masked = int(rel.numel())
+                                if n_masked == 0:
+                                    continue
+
+                                # Li_tensor: [L,] -> [L, 1] for broadcast
+                                Li_tensor = torch.tensor(
+                                    Li_list,
+                                    device=rel.device,
+                                    dtype=rel.dtype,
+                                ).unsqueeze(1)  # [L, 1]
+
+                                # tgt_pos_2d: [L, n_masked]
+                                tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # broadcast
+
+                                # For layers where Li == -1, we skip (handled by original base_sm)
+                                # But we still compute; the result is garbage for Li=-1 layers,
+                                # we'll mask it out.
+                                valid_layer_mask = (Li_tensor.squeeze(1) >= 0)  # [L,]
+
+                                bt_row = bt_dev[job_req_idx]  # [max_blocks,]
+                                idx_2d = tgt_pos_2d // bs_dyn  # [L, n_masked]
+                                # Clamp to valid range to avoid OOB
+                                idx_2d = idx_2d.clamp(min=0, max=bt_row.shape[0] - 1)
+                                block_ids_2d = bt_row[idx_2d].to(torch.int64)  # [L, n_masked]
+                                new_slots_2d = (
+                                    block_ids_2d * bs_dyn + (tgt_pos_2d % bs_dyn)
+                                ).to(base_sm.dtype)  # [L, n_masked]
+
+                                # Write to _dynkv_stack[:, mask] for valid layers only
+                                # _dynkv_stack shape: [L, n_sm], mask selects columns
+                                # We need to write new_slots_2d[li, :] to _dynkv_stack[li, mask]
+                                # for each layer li where valid_layer_mask[li] is True.
+                                for li in range(_dynkv_L):
+                                    if valid_layer_mask[li]:
+                                        _dynkv_stack[li, :_slot_n_sm][mask] = new_slots_2d[li]
+
+                            _slot_remap_done = True
+                            logger.debug(
+                                "[DynamicKV][decode] batched slot_remap for %d layers, %d job_keys",
+                                _dynkv_L, len(job_key_to_Li_per_layer),
+                            )
+                    except Exception:
+                        _slot_remap_done = False
+                    if _dynkv_profile:
+                        _t_layer_slot_remap = (_time_dynkv.perf_counter() - _t0_sr) * 1000
+
                 for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
@@ -1590,12 +1685,17 @@ class NPUModelRunner(GPUModelRunner):
                                     pass
                             if _dynkv_profile:
                                 _t_layer_other += (_time_dynkv.perf_counter() - _t0_ot) * 1000
-                            if (
+
+                            # Assign pre-computed slot_mapping from batched remap
+                            if _slot_remap_done and _slot_n_sm > 0:
+                                meta_i.slot_mapping = _dynkv_stack[_dyn_li, :_slot_n_sm]
+                            elif (
                                 slot_remap_jobs
                                 and dynkv_decode_token_pos_t is not None
                                 and dynkv_decode_req_idx_t is not None
                             ):
-                                _t0_sr = _time_dynkv.perf_counter() if _dynkv_profile else 0
+                                # Fallback: per-layer remap (should not happen if batched succeeded)
+                                _t0_sr_fb = _time_dynkv.perf_counter() if _dynkv_profile else 0
                                 try:
                                     base_sm = meta_i.slot_mapping
                                     n_sm = int(base_sm.numel())
@@ -1640,12 +1740,12 @@ class NPUModelRunner(GPUModelRunner):
                                     meta_i.slot_mapping = dyn_slot_t
                                     if layer_idx == 0:
                                         logger.debug(
-                                            "[DynamicKV][decode] applied per-layer slot_mapping override"
+                                            "[DynamicKV][decode] fallback per-layer slot_mapping override"
                                         )
                                 except Exception:
                                     pass
                                 if _dynkv_profile:
-                                    _t_layer_slot_remap += (_time_dynkv.perf_counter() - _t0_sr) * 1000
+                                    _t_layer_slot_remap += (_time_dynkv.perf_counter() - _t0_sr_fb) * 1000
                         else:
                             if _dynkv_profile:
                                 _t_layer_other += (_time_dynkv.perf_counter() - _t0_ot) * 1000
