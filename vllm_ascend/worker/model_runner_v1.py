@@ -1611,13 +1611,16 @@ class NPUModelRunner(GPUModelRunner):
                                     block_ids_2d * bs_dyn + (tgt_pos_2d % bs_dyn)
                                 ).to(base_sm.dtype)  # [L, n_masked]
 
-                                # Write to _dynkv_stack[:, mask] for valid layers only
-                                # _dynkv_stack shape: [L, n_sm], mask selects columns
-                                # We need to write new_slots_2d[li, :] to _dynkv_stack[li, mask]
-                                # for each layer li where valid_layer_mask[li] is True.
-                                for li in range(_dynkv_L):
-                                    if valid_layer_mask[li]:
-                                        _dynkv_stack[li, :_slot_n_sm][mask] = new_slots_2d[li]
+                                # Write to _dynkv_stack[:, mask] for valid layers in ONE op
+                                # Use torch.where to select: valid layers get new_slots_2d,
+                                # invalid layers keep original base_sm values.
+                                stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
+                                current_masked = stack_view[:, mask]  # [L, n_masked]
+                                valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)  # [L, 1]
+                                final_vals = torch.where(
+                                    valid_layer_mask_2d, new_slots_2d, current_masked
+                                )
+                                stack_view[:, mask] = final_vals  # single write op
 
                             _slot_remap_done = True
                             logger.debug(
