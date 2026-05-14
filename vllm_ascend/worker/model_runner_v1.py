@@ -1615,13 +1615,10 @@ class NPUModelRunner(GPUModelRunner):
                                 tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # broadcast
 
                                 # For layers where Li == -1, we skip (handled by original base_sm)
-                                # But we still compute; the result is garbage for Li=-1 layers,
-                                # we'll mask it out.
                                 valid_layer_mask = (Li_tensor.squeeze(1) >= 0)  # [L,]
 
                                 bt_row = bt_dev[job_req_idx]  # [max_blocks,]
                                 idx_2d = tgt_pos_2d // bs_dyn  # [L, n_masked]
-                                # Clamp to valid range to avoid OOB
                                 idx_2d = idx_2d.clamp(min=0, max=bt_row.shape[0] - 1)
                                 block_ids_2d = bt_row[idx_2d].to(torch.int64)  # [L, n_masked]
                                 new_slots_2d = (
@@ -1629,16 +1626,13 @@ class NPUModelRunner(GPUModelRunner):
                                 ).to(base_sm.dtype)  # [L, n_masked]
 
                                 # Write to _dynkv_stack[:, mask] for valid layers in ONE op
-                                # Use torch.where to select: valid layers get new_slots_2d,
-                                # invalid layers keep original base_sm values.
-                                # Optimization: base_masked is same for all layers (from broadcast init)
                                 stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
-                                base_masked = base_sm[mask]  # [n_masked,] - reuse base_sm directly
-                                valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)  # [L, 1]
+                                base_masked = base_sm[mask]
+                                valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)
                                 final_vals = torch.where(
-                                    valid_layer_mask_2d, new_slots_2d, base_masked  # base_masked broadcasts
+                                    valid_layer_mask_2d, new_slots_2d, base_masked
                                 )
-                                stack_view[:, mask] = final_vals  # single write op
+                                stack_view[:, mask] = final_vals
 
                             _slot_remap_done = True
                             logger.debug(
