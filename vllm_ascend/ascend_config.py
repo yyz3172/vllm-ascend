@@ -23,6 +23,37 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+def _parse_turboquant_kv_bits_pair(raw: object) -> tuple[int, int]:
+    """Parse ``additional_config['turboquant_kv_bits']`` into (key_bits, value_bits).
+
+    Accepts:
+    - ``int`` (4 or 8): same width for K and V;
+    - ``sequence`` of length 2: ``[key_bits, value_bits]``;
+    - ``dict`` with ``key`` / ``k`` and ``value`` / ``v`` (ints 4 or 8).
+    """
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 2:
+            raise ValueError(
+                "additional_config['turboquant_kv_bits'] as list/tuple must "
+                f"have length 2 [key_bits, value_bits], got {raw!r}"
+            )
+        k, v = int(raw[0]), int(raw[1])
+    elif isinstance(raw, dict):
+        k = int(raw.get("key", raw.get("k", 4)))
+        v = int(raw.get("value", raw.get("v", 4)))
+    elif raw is None:
+        k = v = 4
+    else:
+        k = v = int(raw)
+    for name, b in ("key", k), ("value", v):
+        if b not in (4, 8):
+            raise ValueError(
+                "additional_config['turboquant_kv_bits'] "
+                f"{name} width must be 4 or 8, got {b}"
+            )
+    return k, v
+
+
 class AscendConfig:
     """
     Configuration Object for additional_config from vllm.configs.
@@ -60,6 +91,13 @@ class AscendConfig:
                 "using it without these features may result in significant performance degradation."
             )
 
+        _tq_raw = additional_config.get("turboquant_kv_bits", 4)
+        self.turboquant_kv_bits_key, self.turboquant_kv_bits_value = (
+            _parse_turboquant_kv_bits_pair(_tq_raw)
+        )
+        # Legacy field: key bits (historical name ``turboquant_kv_bits``).
+        self.turboquant_kv_bits = self.turboquant_kv_bits_key
+        
         self.enable_shared_expert_dp = (
             additional_config.get("enable_shared_expert_dp", False)
             and vllm_config.parallel_config.enable_expert_parallel

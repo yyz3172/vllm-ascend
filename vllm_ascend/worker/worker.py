@@ -393,6 +393,8 @@ class NPUWorker(WorkerBase):
             )
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if self.profiler is not None:
+            self.profiler.step()
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -616,6 +618,7 @@ class NPUWorker(WorkerBase):
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
             with_stack=False,
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=3, repeat=1, skip_first=1),
             profile_memory=profiler_config.torch_profiler_with_memory,
             # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
             # The with_stack option in torch_npu.profiler introduces significant time overhead.

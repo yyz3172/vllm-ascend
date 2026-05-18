@@ -762,8 +762,12 @@ class VllmRunner:
         swap_space: int = 4,
         enforce_eager: bool | None = False,
         quantization: str | None = None,
+        profiler_config: str | None = None,
         **kwargs,
     ) -> None:
+        if profiler_config is not None:
+            kwargs = {**kwargs, "profiler_config": profiler_config}
+
         data_parallel_size = int(kwargs.get("data_parallel_size", 1))
         if data_parallel_size > 1:
             raise ValueError("VllmRunner does not support `data_parallel_size > 1`; use `DPVllmRunner` instead.")
@@ -786,6 +790,8 @@ class VllmRunner:
             quantization=quantization,
             **kwargs,
         )
+        print("profiler_config", profiler_config)
+        self.model.start_profile()
 
     @staticmethod
     def _finalize_generate_outputs(req_outputs: list[RequestOutput]) -> list[tuple[list[list[int]], list[str]]]:
@@ -962,6 +968,7 @@ class VllmRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.model.stop_profile()
         del self.model
         clear_ascend_config()
         cleanup_dist_env_and_memory()

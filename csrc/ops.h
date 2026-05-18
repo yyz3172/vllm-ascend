@@ -24,6 +24,43 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+  // TurboQuant unpack+lookup+scale kernel:
+  // packed [N, P] uint8 -> y_hat [N, D] fp16, where y_hat = codebook[idx] * norm.
+  extern void turboquant_unpack_lookup_scale_impl(
+    void *stream,
+    void *packed,        // uint8
+    void *codebook,      // fp16
+    void *y_hat,         // fp16
+    uint32_t nVec,
+    uint32_t headSize,
+    uint32_t packedBytes,
+    uint32_t vecPerCore);
+
+  // TurboQuant pack+nearest-centroid kernel:
+  // y [N, D] fp16 + codebook [16] fp16 + norms [N, 1] fp16 -> packed [N, P] uint8.
+  extern void turboquant_pack_nearest_scale_impl(
+    void *stream,
+    void *y,             // fp16
+    void *codebook,      // fp16
+    void *norms_fp16,    // fp16
+    void *packed,        // uint8
+    uint32_t nVec,
+    uint32_t headSize,
+    uint32_t packedBytes,
+    uint32_t vecPerCore);
+
+  // 8-bit pack: codebook [256] fp16.
+  extern void turboquant_pack_nearest_scale_8bit_impl(
+    void *stream,
+    void *y,
+    void *codebook,
+    void *norms_fp16,
+    void *packed,
+    uint32_t nVec,
+    uint32_t headSize,
+    uint32_t packedBytes,
+    uint32_t vecPerCore);
+
   extern void get_masked_input_and_mask_impl(
     void* stream,
     void* input,

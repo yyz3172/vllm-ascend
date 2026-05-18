@@ -48,6 +48,234 @@
 #include <c10/util/Logging.h>
 
 namespace vllm_ascend {
+// TurboQuant decode (packed uint8 -> fp16/bf16).
+// Two-stage implementation:
+//  1) AscendC kernel: unpack uint4 + codebook lookup + scale by norm -> y_hat [N, D] fp16
+//  2) Use optimized NPU matmul: out = y_hat @ rotation -> fp16/bf16
+//
+// packed: [N, P] uint8, where P = D/2 + 2 (uint4 indices packed + fp16 norm)
+// codebook: [16] fp16, rotation: [D, D] fp16.
+at::Tensor turboquant_decode_packed_blocks(
+    const at::Tensor &packed,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    int64_t head_size,
+    int64_t out_dtype_code) {
+    TORCH_CHECK(packed.is_privateuseone(), "packed must be on NPU");
+    TORCH_CHECK(packed.scalar_type() == at::kByte, "packed must be uint8");
+    TORCH_CHECK(codebook.is_privateuseone(), "codebook must be on NPU");
+    TORCH_CHECK(rotation.is_privateuseone(), "rotation must be on NPU");
+    TORCH_CHECK(codebook.scalar_type() == at::kHalf, "codebook must be fp16");
+    TORCH_CHECK(rotation.scalar_type() == at::kHalf, "rotation must be fp16");
+    TORCH_CHECK(codebook.numel() == 16, "codebook must have 16 entries");
+    TORCH_CHECK(rotation.dim() == 2 && rotation.size(0) == head_size && rotation.size(1) == head_size,
+                "rotation must be [D, D]");
+    TORCH_CHECK(head_size % 2 == 0, "head_size must be even for 4-bit packing");
+
+    const int64_t packed_bytes = head_size / 2 + 2;
+    TORCH_CHECK(packed.dim() == 2 && packed.size(1) == packed_bytes,
+                "packed must be [N, P] with P=head_size/2+2");
+
+    at::ScalarType out_dtype = (out_dtype_code == 1) ? at::kBFloat16 : at::kHalf;
+    // Stage 1 output always fp16 for matmul compatibility/perf.
+    // IMPORTANT: The AscendC stage-1 kernel treats `packed` as contiguous row-major bytes.
+    // If `packed` is a view with non-trivial strides, raw pointer indexing will read
+    // the wrong bytes and corrupt decode (often showing up as garbled text output).
+    const at::Tensor packed_c = packed.contiguous();
+    const at::Tensor codebook_c = codebook.contiguous();
+    const at::Tensor rotation_c = rotation.contiguous();
+
+    at::Tensor y_hat = at::empty({packed_c.size(0), head_size}, packed_c.options().dtype(at::kHalf));
+    at::Tensor out = at::empty({packed_c.size(0), head_size}, packed_c.options().dtype(out_dtype));
+
+    const c10_npu::OptionalNPUGuard npuGuard(packed_c.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    // Choose per-core work granularity. Keep it small to reduce tail latency.
+    // This can be tuned after profiling.
+    uint32_t vec_per_core = 4;
+    if (packed.size(0) >= 8192) vec_per_core = 16;
+    else if (packed.size(0) >= 2048) vec_per_core = 8;
+
+    // Stage 1: unpack+lookup+scale.
+    turboquant_unpack_lookup_scale_impl(
+        stream,
+        const_cast<void *>(packed_c.data_ptr()),
+        const_cast<void *>(codebook_c.data_ptr()),
+        y_hat.data_ptr(),
+        static_cast<uint32_t>(packed_c.size(0)),
+        static_cast<uint32_t>(head_size),
+        static_cast<uint32_t>(packed_bytes),
+        vec_per_core);
+    // Stage 2: matmul on NPU.
+    //
+    // IMPORTANT: Keep Stage2 numerically aligned with the PyTorch reference path
+    // (`at::matmul(y_hat, rotation)`), otherwise greedy decoding can diverge wildly
+    // even when Stage1 is only slightly off.
+    at::Tensor x_hat = at::matmul(y_hat, rotation_c);
+    if (out_dtype == at::kHalf) {
+        out.copy_(x_hat);
+    } else {
+        out.copy_(x_hat.to(out_dtype));
+    }
+    return out;
+}
+
+// TurboQuant decode for compact KV cache blocks.
+// packed: [U, BS, H, P] uint8, rotation_batched: [BS*H, D, D] fp16.
+// Output: [U, BS, H, D] fp16/bf16.
+at::Tensor turboquant_decode_packed_blocks_compact(
+    const at::Tensor &packed,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation_batched,
+    int64_t head_size,
+    int64_t out_dtype_code) {
+    TORCH_CHECK(packed.is_privateuseone(), "packed must be on NPU");
+    TORCH_CHECK(packed.scalar_type() == at::kByte, "packed must be uint8");
+    TORCH_CHECK(codebook.is_privateuseone(), "codebook must be on NPU");
+    TORCH_CHECK(rotation_batched.is_privateuseone(), "rotation_batched must be on NPU");
+    TORCH_CHECK(codebook.scalar_type() == at::kHalf, "codebook must be fp16");
+    TORCH_CHECK(codebook.numel() == 16, "codebook must have 16 entries");
+    TORCH_CHECK(packed.dim() == 4, "packed must be [U, BS, H, P]");
+    TORCH_CHECK(head_size % 2 == 0, "head_size must be even for 4-bit packing");
+
+    const int64_t U = packed.size(0);
+    const int64_t BS = packed.size(1);
+    const int64_t H = packed.size(2);
+    const int64_t packed_bytes = head_size / 2 + 2;
+    TORCH_CHECK(packed.size(3) == packed_bytes, "packed last dim must be head_size/2+2");
+
+    const int64_t batch = BS * H;
+    TORCH_CHECK(rotation_batched.dim() == 3, "rotation_batched must be [batch, D, D]");
+    TORCH_CHECK(rotation_batched.size(0) == batch, "rotation_batched batch mismatch");
+    TORCH_CHECK(rotation_batched.size(1) == head_size && rotation_batched.size(2) == head_size,
+                "rotation_batched must be [batch, D, D]");
+    TORCH_CHECK(rotation_batched.scalar_type() == at::kHalf, "rotation_batched must be fp16");
+
+    at::ScalarType out_dtype = (out_dtype_code == 1) ? at::kBFloat16 : at::kHalf;
+    const at::Tensor codebook_c = codebook.contiguous();
+    const at::Tensor rotation_batched_c = rotation_batched.contiguous();
+    at::Tensor y_hat = at::empty({U * batch, head_size}, packed.options().dtype(at::kHalf));
+    at::Tensor out = at::empty({U, BS, H, head_size}, packed.options().dtype(out_dtype));
+
+    const c10_npu::OptionalNPUGuard npuGuard(packed.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    // Stage 1: unpack+lookup+scale over flattened vectors.
+    const uint32_t n_vec = static_cast<uint32_t>(U * batch);
+    uint32_t vec_per_core = 8;
+    if (n_vec >= 8192) vec_per_core = 16;
+    else if (n_vec < 2048) vec_per_core = 4;
+    at::Tensor packed_flat = packed.reshape({U * batch, packed_bytes}).contiguous();
+    turboquant_unpack_lookup_scale_impl(
+        stream,
+        const_cast<void *>(packed_flat.data_ptr()),
+        const_cast<void *>(codebook_c.data_ptr()),
+        y_hat.data_ptr(),
+        n_vec,
+        static_cast<uint32_t>(head_size),
+        static_cast<uint32_t>(packed_bytes),
+        vec_per_core);
+
+    // Stage 2: batched matmul.
+    //
+    // NOTE: `at::bmm` requires A/B to have the same leading batch dim.
+    // Here we want per-(bs,h) rotation: for each batch index t in [0, batch),
+    //   out[u, t, :] = y_hat[u, t, :] @ rotation_batched[t, :, :]
+    //
+    // Use `at::matmul` batch-broadcasting rules:
+    //   y3: [batch, U, D]
+    //   r3: [batch, D, D]
+    // => x3: [batch, U, D]
+    at::Tensor y3 = y_hat.view({U, batch, head_size}).transpose(0, 1).contiguous();
+    at::Tensor x3 = at::matmul(y3, rotation_batched_c);
+    at::Tensor x_hat = x3.transpose(0, 1).contiguous().view({U, BS, H, head_size});
+    if (out_dtype == at::kHalf) {
+        out.copy_(x_hat);
+    } else {
+        out.copy_(x_hat.to(out_dtype));
+    }
+    return out;
+}
+
+// TurboQuant encode (fp16 rotated unit vectors -> packed uint8), 4- or 8-bit MSE path.
+// y: [N, D] fp16 where y = (x/||x||) @ R^T in fp16; norms_fp16: [N,1] fp16 (||x||).
+// bits 4: codebook [16] fp16, packed width D/2+2; bits 8: codebook [256] fp16, width D+2.
+at::Tensor turboquant_encode_packed_blocks(
+    const at::Tensor &y,
+    const at::Tensor &codebook,
+    const at::Tensor &norms_fp16,
+    int64_t head_size,
+    int64_t bits) {
+    TORCH_CHECK(y.is_privateuseone(), "y must be on NPU");
+    TORCH_CHECK(y.scalar_type() == at::kHalf, "y must be fp16");
+    TORCH_CHECK(y.dim() == 2 && y.size(1) == head_size, "y must be [N, head_size]");
+    TORCH_CHECK(codebook.is_privateuseone(), "codebook must be on NPU");
+    TORCH_CHECK(codebook.scalar_type() == at::kHalf, "codebook must be fp16");
+    TORCH_CHECK(bits == 4 || bits == 8, "TurboQuant encode supports bits 4 or 8 only, got ", bits);
+    if (bits == 4) {
+        TORCH_CHECK(codebook.numel() == 16, "4-bit encode: codebook must have 16 entries");
+        TORCH_CHECK(head_size % 2 == 0, "head_size must be even for 4-bit packing");
+    } else {
+        TORCH_CHECK(codebook.numel() == 256, "8-bit encode: codebook must have 256 entries");
+    }
+    TORCH_CHECK(norms_fp16.is_privateuseone(), "norms_fp16 must be on NPU");
+    TORCH_CHECK(norms_fp16.scalar_type() == at::kHalf, "norms_fp16 must be fp16");
+    TORCH_CHECK(norms_fp16.dim() == 2 && norms_fp16.size(1) == 1,
+                "norms_fp16 must be [N, 1]");
+    TORCH_CHECK(norms_fp16.size(0) == y.size(0), "norms_fp16 batch must match y");
+
+    const int64_t packed_bytes = bits == 8 ? head_size + 2 : head_size / 2 + 2;
+    const at::Tensor y_c = y.contiguous();
+    const at::Tensor codebook_c = codebook.contiguous();
+    const at::Tensor norms_c = norms_fp16.contiguous();
+
+    at::Tensor packed = at::empty({y_c.size(0), packed_bytes}, y_c.options().dtype(at::kByte));
+
+    const c10_npu::OptionalNPUGuard npuGuard(y_c.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    uint32_t vec_per_core = 4;
+    if (bits == 8) {
+        vec_per_core = 2;
+        if (y_c.size(0) >= 8192) {
+            vec_per_core = 8;
+        } else if (y_c.size(0) >= 2048) {
+            vec_per_core = 4;
+        }
+    } else if (y_c.size(0) >= 8192) {
+        vec_per_core = 16;
+    } else if (y_c.size(0) >= 2048) {
+        vec_per_core = 8;
+    }
+
+    if (bits == 4) {
+        // aclrtStream is an opaque handle (typically void*); impl uses void* for C linkage.
+        turboquant_pack_nearest_scale_impl(
+            static_cast<void *>(stream),
+            const_cast<void *>(y_c.data_ptr()),
+            const_cast<void *>(codebook_c.data_ptr()),
+            const_cast<void *>(norms_c.data_ptr()),
+            packed.data_ptr(),
+            static_cast<uint32_t>(y_c.size(0)),
+            static_cast<uint32_t>(head_size),
+            static_cast<uint32_t>(packed_bytes),
+            vec_per_core);
+    } else {
+        turboquant_pack_nearest_scale_8bit_impl(
+            static_cast<void *>(stream),
+            const_cast<void *>(y_c.data_ptr()),
+            const_cast<void *>(codebook_c.data_ptr()),
+            const_cast<void *>(norms_c.data_ptr()),
+            packed.data_ptr(),
+            static_cast<uint32_t>(y_c.size(0)),
+            static_cast<uint32_t>(head_size),
+            static_cast<uint32_t>(packed_bytes),
+            vec_per_core);
+    }
+    return packed;
+}
+
 void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
                  const torch::Tensor& block_mapping, aclrtStream stream)
 {
@@ -759,6 +987,22 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");    
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
+
+    // TurboQuant packed decode (MVP).
+    ops.def(
+        "turboquant_decode_packed_blocks(Tensor packed, Tensor codebook, Tensor rotation, int head_size, int out_dtype_code) -> Tensor"
+    );
+    ops.impl("turboquant_decode_packed_blocks", torch::kPrivateUse1, &vllm_ascend::turboquant_decode_packed_blocks);
+
+    // TurboQuant packed decode for compact KV blocks: packed [U, BS, H, P], rotation_batched [BS*H, D, D].
+    ops.def(
+        "turboquant_decode_packed_blocks_compact(Tensor packed, Tensor codebook, Tensor rotation_batched, int head_size, int out_dtype_code) -> Tensor"
+    );
+    ops.impl("turboquant_decode_packed_blocks_compact", torch::kPrivateUse1, &vllm_ascend::turboquant_decode_packed_blocks_compact);
+
+    ops.def(
+        "turboquant_encode_packed_blocks(Tensor y, Tensor codebook, Tensor norms_fp16, int head_size, int bits) -> Tensor");
+    ops.impl("turboquant_encode_packed_blocks", torch::kPrivateUse1, &vllm_ascend::turboquant_encode_packed_blocks);
 
     ops.def(
         "grouped_matmul_swiglu_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor x_scale,"
