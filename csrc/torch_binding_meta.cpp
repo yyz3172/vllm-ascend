@@ -243,6 +243,52 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
+at::Tensor turboquant_decode_packed_blocks_meta(
+    const at::Tensor &packed,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    int64_t head_size,
+    int64_t out_dtype_code) {
+    (void)codebook;
+    (void)rotation;
+    // packed: [N, P] -> output [N, D]
+    TORCH_CHECK(packed.dim() == 2, "packed must be 2D");
+    auto N = packed.sym_size(0);
+    at::ScalarType out_dtype = (out_dtype_code == 1) ? at::kBFloat16 : at::kHalf;
+    return at::empty_symint({N, head_size}, packed.options().dtype(out_dtype).device(at::kMeta));
+}
+
+at::Tensor turboquant_decode_packed_blocks_compact_meta(
+    const at::Tensor &packed,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation_batched,
+    int64_t head_size,
+    int64_t out_dtype_code) {
+    (void)codebook;
+    (void)rotation_batched;
+    TORCH_CHECK(packed.dim() == 4, "packed must be 4D");
+    at::ScalarType out_dtype = (out_dtype_code == 1) ? at::kBFloat16 : at::kHalf;
+    auto U = packed.sym_size(0);
+    auto BS = packed.sym_size(1);
+    auto H = packed.sym_size(2);
+    return at::empty_symint({U, BS, H, head_size}, packed.options().dtype(out_dtype).device(at::kMeta));
+}
+
+at::Tensor turboquant_encode_packed_blocks_meta(
+    const at::Tensor &y,
+    const at::Tensor &codebook,
+    const at::Tensor &norms_fp16,
+    int64_t head_size,
+    int64_t bits) {
+    (void)codebook;
+    (void)norms_fp16;
+    TORCH_CHECK(y.dim() == 2, "y must be 2D");
+    TORCH_CHECK(bits == 4 || bits == 8, "bits must be 4 or 8");
+    auto N = y.sym_size(0);
+    int64_t packed_bytes = bits == 8 ? head_size + 2 : head_size / 2 + 2;
+    return at::empty_symint({N, packed_bytes}, y.options().dtype(at::kByte).device(at::kMeta));
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
@@ -1876,6 +1922,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+    // TurboQuant packed decode
+    ops.impl("turboquant_decode_packed_blocks", &vllm_ascend::meta::turboquant_decode_packed_blocks_meta);
+    // TurboQuant packed decode for compact KV blocks
+    ops.impl("turboquant_decode_packed_blocks_compact", &vllm_ascend::meta::turboquant_decode_packed_blocks_compact_meta);
+    // TurboQuant packed encode (4-bit MSE quant)
+    ops.impl("turboquant_encode_packed_blocks", &vllm_ascend::meta::turboquant_encode_packed_blocks_meta);
 }
 }
 #endif

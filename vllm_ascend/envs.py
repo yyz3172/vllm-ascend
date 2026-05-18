@@ -66,6 +66,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # In this case, developers need to set this value to "0.9.0" to make sure
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
+    # Emit per-step KV profiling summary logs even if higher-level aggregation
+    # is not reached. Intended for debugging.
+    "VLLM_ASCEND_KV_PROFILE_LOG":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_KV_PROFILE_LOG", "0"))),
+    # Use the compiled NPU custom op for TurboQuant decode (packed->fp16/bf16).
+    "VLLM_ASCEND_TURBOQUANT_DECODE_OP":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP", "1"))),
+    # Use the compiled NPU custom op for TurboQuant encode (fp16 y + norms -> packed uint8),
+    # 4-bit MSE path only; 8-bit falls back to PyTorch.
+    "VLLM_ASCEND_TURBOQUANT_ENCODE_OP":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_ENCODE_OP", "1"))),
+    # TurboQuant codebook construction method:
+    # - "fast": use a deterministic, precomputed codebook (recommended for serving)
+    # - "sample": approximate via Beta sampling + Lloyd-like iterations (very slow)
+    "VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD":
+    lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD", "fast").lower(),
+    # TurboQuant KV quantizer implementation: v1 (default), v2 (Lloyd–Max
+    # centroids), or v3 (same quantize as v2, formula-based dequant per index).
+    # ``turboquant_kv_bits``: int (same K/V), or ``[key_bits, value_bits]``, or
+    # ``{"key": 8, "value": 4}`` (each 4 or 8).
+    "VLLM_ASCEND_TURBOQUANT_MSE_IMPL":
+    lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_MSE_IMPL", "v1").lower().strip(),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),

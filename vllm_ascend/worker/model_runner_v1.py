@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import inspect
 import logging
 import math
 import sys
@@ -28,7 +29,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, TypeAlias
 
 import numpy as np
 import torch
@@ -70,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    TurboQuantAttentionSpec,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -128,6 +130,11 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
+from vllm_ascend.kv_specs import turboquant_attention_spec_cls
+from vllm_ascend.ops.turboquant_kv_cache import (
+    log_turboquant_kv_banner_once,
+    turboquant_packed_bytes_per_vector,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
@@ -206,6 +213,35 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
+def _tq_full_attention_spec_ctor_kwargs(
+    tq_cls: type,
+    *,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    tq_slot_size: int,
+) -> Dict[str, Any]:
+    """Only pass fields that ``tq_cls.__init__`` accepts (handles older vLLM)."""
+    base = dict(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+        tq_slot_size=tq_slot_size,
+    )
+    params = inspect.signature(tq_cls.__init__).parameters
+    out = {k: v for k, v in base.items() if k in params}
+    if "kv_quant_mode" in params:
+        try:
+            from vllm.v1.kv_cache_interface import (  # noqa: PLC0415
+                KVQuantMode as _KQM,
+            )
+        except ImportError:
+            pass
+        else:
+            out["kv_quant_mode"] = _KQM.NONE
+    return out
 
 @dataclass
 class GraphCaptureContext:
@@ -335,6 +371,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        log_turboquant_kv_banner_once(
+            cache_dtype=self.cache_config.cache_dtype,
+            turboquant_kv_bits_key=self.ascend_config.turboquant_kv_bits_key,
+            turboquant_kv_bits_value=self.ascend_config.turboquant_kv_bits_value,
+        )
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -4151,6 +4192,28 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
+                    turboquant_var_width_sizes: tuple[int, int] | None = None
+                    if not self.model_config.use_mla and self.cache_config.cache_dtype == "turboquant":
+                        sp_any = self._attention_spec_for_layer(
+                            layer_name, kv_cache_config)
+                        assert isinstance(sp_any, AttentionSpec)
+                        pk = turboquant_packed_bytes_per_vector(
+                            sp_any.head_size,
+                            bits=self.ascend_config.turboquant_kv_bits_key,
+                        )
+                        pv = turboquant_packed_bytes_per_vector(
+                            sp_any.head_size,
+                            bits=self.ascend_config.turboquant_kv_bits_value,
+                        )
+                        sum_slot = pk + pv
+                        tqs = getattr(sp_any, "tq_slot_size", 0)
+                        sz_i = kv_cache_tensor.size
+                        if tqs > 0 and tqs == sum_slot and sz_i > 0:
+                            k_part = sz_i * pk // sum_slot
+                            turboquant_var_width_sizes = (
+                                k_part,
+                                sz_i - k_part,
+                            )
                     current_sparse_sfa_c8 = False
                     current_sparse_li_c8 = False
                     has_indexer_cache = False
@@ -4221,7 +4284,9 @@ class NPUModelRunner(GPUModelRunner):
                         else:
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
 
-                    if not (self.use_sparse and current_sparse_sfa_c8):
+                    if turboquant_var_width_sizes is not None:
+                        k_tensor_size, v_tensor_size = turboquant_var_width_sizes
+                    elif not (self.use_sparse and current_sparse_sfa_c8):
                         k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
                         v_tensor_size = (
                             int(kv_cache_tensor.size // v_tensor_split_factor)
@@ -4346,6 +4411,19 @@ class NPUModelRunner(GPUModelRunner):
             reshaped_kv_tensors.append(tensor)
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
+
+
+    @staticmethod
+    def _attention_spec_for_layer(
+            layer_name: str, kv_cache_config: KVCacheConfig) -> KVCacheSpec:
+        """Resolve the KVCacheSpec backing ``layer_name`` (handles uniform wraps)."""
+        for g in kv_cache_config.kv_cache_groups:
+            if layer_name in g.layer_names:
+                spec = g.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[layer_name]
+                return spec
+        raise AssertionError(f"No KV cache group found for layer {layer_name}")
 
 
     def _reshape_kv_cache_tensors(
@@ -4565,6 +4643,7 @@ class NPUModelRunner(GPUModelRunner):
                             block_size,
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
+                            cache_dtype_str=self.cache_config.cache_dtype
                         )
                         if self.hybrid_with_attn_and_mamba:
                             if not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
@@ -4594,12 +4673,76 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
                         )
+                    turboquant_asym = False
+                    pk_tq: int | None = None
+                    pv_tq: int | None = None
+                    if (self.cache_config.cache_dtype == "turboquant"
+                            and isinstance(current_kv_cache_spec, AttentionSpec)):
+                        pk_tq = turboquant_packed_bytes_per_vector(
+                            current_kv_cache_spec.head_size,
+                            bits=self.ascend_config.turboquant_kv_bits_key,
+                        )
+                        pv_tq = turboquant_packed_bytes_per_vector(
+                            current_kv_cache_spec.head_size,
+                            bits=self.ascend_config.turboquant_kv_bits_value,
+                        )
+                        tqs = getattr(current_kv_cache_spec, "tq_slot_size", 0)
+                        if (tqs > 0 and tqs == pk_tq + pv_tq
+                                and not self.model_config.use_mla):
+                            turboquant_asym = True
+                    if turboquant_asym and pk_tq is not None and pv_tq is not None:
+                        base = kv_cache_shape[1:-1]
+                        k_shape = (*base, pk_tq)
+                        v_shape = (*base, pv_tq)
+                    elif (isinstance(current_kv_cache_spec, TurboQuantAttentionSpec)
+                          and self.cache_config.cache_dtype == "turboquant"):
+                        # Legacy symmetric layout: two tensors each
+                        # ``block * heads * max(P_k, P_v)`` bytes per page.
+                        denom = (2 * current_kv_cache_spec.block_size
+                                 * current_kv_cache_spec.num_kv_heads)
+                        assert current_kv_cache_spec.page_size_bytes % denom == 0, (
+                            f"TurboQuant page_size_bytes={current_kv_cache_spec.page_size_bytes}"
+                            f" not divisible by 2*block*heads="
+                            f"{denom} (block={current_kv_cache_spec.block_size}, "
+                            f"heads={current_kv_cache_spec.num_kv_heads})")
+                        packed_width = current_kv_cache_spec.page_size_bytes // denom
+                        expect_pack = max(
+                            turboquant_packed_bytes_per_vector(
+                                current_kv_cache_spec.head_size,
+                                bits=self.ascend_config.turboquant_kv_bits_key,
+                            ),
+                            turboquant_packed_bytes_per_vector(
+                                current_kv_cache_spec.head_size,
+                                bits=self.ascend_config.turboquant_kv_bits_value,
+                            ),
+                        )
+                        if packed_width != expect_pack:
+                            logger.warning(
+                                "TurboQuant allocator packed width per vector is "
+                                "%s but additional_config (key=%s value=%s) implies "
+                                "%s bytes; using "
+                                "%s for KV tensor views. Set "
+                                "turboquant_kv_bits to match vLLM's "
+                                "TurboQuantAttentionSpec page layout or KV "
+                                "writes/decodes may be wrong.",
+                                packed_width,
+                                self.ascend_config.turboquant_kv_bits_key,
+                                self.ascend_config.turboquant_kv_bits_value,
+                                expect_pack,
+                                packed_width,
+                            )
+                        kv_cache_shape = (*kv_cache_shape[:-1], packed_width)
                     if not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
-                        k_shape = kv_cache_shape[1:]
-                        if hasattr(current_kv_cache_spec, "head_size_v"):
-                            v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
-                        else:
-                            v_shape = k_shape
+                        if not turboquant_asym:
+                            k_shape = kv_cache_shape[1:]
+                            if hasattr(current_kv_cache_spec, "head_size_v"):
+                                v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
+                            else:
+                                v_shape = k_shape
+                            # if hasattr(current_kv_cache_spec, "head_size_v"):
+                            #     v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
+                            # else:
+                            #     v_shape = k_shape
                     else:
                         # k_cache: nope_cache    v_cache: rope_cache
                         mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
