@@ -450,7 +450,9 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_slot_stack_buf: Optional[torch.Tensor] = None
         self._dynkv_slot_stack_cap_L: int = 0
         self._dynkv_slot_stack_cap_n: int = 0
-        # slot_mapping tensors pinned during ACL graph capture: {num_tokens: {layer: Tensor}}
+        # Per-layer slot_mapping pinned during FULL ACL graph capture
+        # ({num_tokens: {layer_name: Tensor}}). Required for all FULL-graph decode,
+        # not only when DynamicKV is enabled.
         self._dynkv_graph_slot_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
@@ -703,6 +705,51 @@ class NPUModelRunner(GPUModelRunner):
             return self.model.unwrap()
         return self.model
 
+    @staticmethod
+    def _is_dynamic_kv_enabled() -> bool:
+        return bool(getattr(get_ascend_config(), "dynamic_kv_enabled", False))
+
+    def _get_graph_slot_bufs_for_tokens(
+        self,
+        num_input_tokens: int,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        bufs = self._dynkv_graph_slot_bufs.get(int(num_input_tokens))
+        if bufs is not None:
+            return bufs
+        for cap_n in sorted(self._dynkv_graph_slot_bufs.keys()):
+            if cap_n >= int(num_input_tokens):
+                return self._dynkv_graph_slot_bufs[cap_n]
+        return None
+
+    def _prepare_standard_layer_attn_metadata(
+        self,
+        base_meta: Any,
+        layer_name: str,
+        graph_slot_bufs: Optional[dict[str, torch.Tensor]],
+        slot_n: int,
+    ) -> Any:
+        """Default per-layer metadata (vLLM-style); pins FULL-graph slot buffers."""
+        try:
+            meta_i = copy(base_meta)
+        except Exception:
+            meta_i = base_meta
+        try:
+            setattr(meta_i, "layer_name", layer_name)
+        except Exception:
+            pass
+        if graph_slot_bufs is not None and slot_n > 0:
+            captured_sm = graph_slot_bufs.get(layer_name)
+            if captured_sm is not None:
+                meta_i.slot_mapping = captured_sm
+                try:
+                    n_sm = min(int(captured_sm.numel()), slot_n)
+                    if n_sm > 0:
+                        meta_i.slot_mapping[:n_sm].copy_(
+                            base_meta.slot_mapping[:n_sm])
+                except Exception:
+                    pass
+        return meta_i
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -804,9 +851,7 @@ class NPUModelRunner(GPUModelRunner):
                 and getattr(self, "is_kv_consumer", False)):
             try:
                 ascend_cfg = get_ascend_config()
-                dyn_enabled = bool(
-                    getattr(ascend_cfg, "dynamic_kv_enabled", False))
-                if dyn_enabled:
+                if self._is_dynamic_kv_enabled():
                     offset_by_req_idx: dict[int, int] = {}
                     for req_idx in range(num_reqs):
                         req_id = req_ids[req_idx]
@@ -990,32 +1035,33 @@ class NPUModelRunner(GPUModelRunner):
         # Determine if this step finishes the prompt for all requests.
         dynamic_kv_is_last_chunk = False
         dynkv_max_capacity = None
-        try:
-            if self.attn_state in (AscendAttentionState.PrefillNoCache,
-                                   AscendAttentionState.ChunkedPrefill):
-                comp = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                sched = num_scheduled_tokens[:num_reqs]
-                total = num_tokens_np[:num_reqs]
-                # `dynamic_kv.prompt_kv_len_budget` is a per-layer KV budget target, not a hard cap on
-                # how many prompt tokens get chunked prefill. Using
-                # min(prompt_len, max_capacity) here marks the *first* chunk as
-                # "last" for long prompts and breaks DynamicKV + PD metadata.
-                try:
-                    dynkv_cfg = None
-                    add_cfg = getattr(self.vllm_config, "additional_config", None)
-                    if isinstance(add_cfg, dict):
-                        dynkv_cfg = add_cfg.get("dynamic_kv")
-                    if isinstance(dynkv_cfg, dict):
-                        mc = dynkv_cfg.get("prompt_kv_len_budget")
-                        if isinstance(mc, int) and mc > 0:
-                            dynkv_max_capacity = mc
-                except Exception:
-                    dynkv_max_capacity = None
-                total_eff = total
-                dynamic_kv_is_last_chunk = bool(
-                    np.all((comp + sched) >= total_eff))
-        except Exception:
-            dynamic_kv_is_last_chunk = False
+        if self._is_dynamic_kv_enabled():
+            try:
+                if self.attn_state in (AscendAttentionState.PrefillNoCache,
+                                       AscendAttentionState.ChunkedPrefill):
+                    comp = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    sched = num_scheduled_tokens[:num_reqs]
+                    total = num_tokens_np[:num_reqs]
+                    # `dynamic_kv.prompt_kv_len_budget` is a per-layer KV budget target, not a hard cap on
+                    # how many prompt tokens get chunked prefill. Using
+                    # min(prompt_len, max_capacity) here marks the *first* chunk as
+                    # "last" for long prompts and breaks DynamicKV + PD metadata.
+                    try:
+                        dynkv_cfg = None
+                        add_cfg = getattr(self.vllm_config, "additional_config", None)
+                        if isinstance(add_cfg, dict):
+                            dynkv_cfg = add_cfg.get("dynamic_kv")
+                        if isinstance(dynkv_cfg, dict):
+                            mc = dynkv_cfg.get("prompt_kv_len_budget")
+                            if isinstance(mc, int) and mc > 0:
+                                dynkv_max_capacity = mc
+                    except Exception:
+                        dynkv_max_capacity = None
+                    total_eff = total
+                    dynamic_kv_is_last_chunk = bool(
+                        np.all((comp + sched) >= total_eff))
+            except Exception:
+                dynamic_kv_is_last_chunk = False
         if self.pcp_size > 1:
             # while pcp > 1, we need the original num_scheduled_tokens before split
             # to calculate discard_requests_mask
@@ -1200,7 +1246,7 @@ class NPUModelRunner(GPUModelRunner):
         if getattr(self, "is_kv_consumer", False):
             try:
                 _ac_dyn = get_ascend_config()
-                if bool(getattr(_ac_dyn, "dynamic_kv_enabled", False)):
+                if self._is_dynamic_kv_enabled():
                     dynkv_decode_token_pos_t = torch.as_tensor(
                         token_positions_np,
                         device=self.device,
@@ -1397,13 +1443,13 @@ class NPUModelRunner(GPUModelRunner):
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args)
-                # DynamicKV: propagate gating fields to backend metadata.
-                try:
-                    setattr(attn_metadata_i, "dynamic_kv_is_last_chunk",
-                            getattr(common_attn_metadata,
-                                    "dynamic_kv_is_last_chunk", False))
-                except Exception:
-                    pass
+                if self._is_dynamic_kv_enabled():
+                    try:
+                        setattr(attn_metadata_i, "dynamic_kv_is_last_chunk",
+                                getattr(common_attn_metadata,
+                                        "dynamic_kv_is_last_chunk", False))
+                    except Exception:
+                        pass
                 try:
                     if getattr(attn_metadata_i, "req_ids", None) is None:
                         setattr(attn_metadata_i, "req_ids",
@@ -1411,76 +1457,117 @@ class NPUModelRunner(GPUModelRunner):
                 except Exception:
                     pass
 
-                # Scheme 1: (req_idx, base_tokens) -> (mask, rel); rel does not depend
-                # on layer ``Li``, reused across ``layer_names`` in this attn_group.
-                dynkv_mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor,
-                                                                  torch.Tensor]] = {}
-                _dynkv_layer_names = list(attn_group.layer_names)
-                _dynkv_L = len(_dynkv_layer_names)
-                _dynkv_n = int(attn_metadata_i.slot_mapping.numel())
+                _run_dynkv_decode_prepare = (
+                    self._is_dynamic_kv_enabled()
+                    and getattr(self, "is_kv_consumer", False))
+                if not _run_dynkv_decode_prepare:
+                    _graph_slot_bufs_std = self._get_graph_slot_bufs_for_tokens(
+                        int(num_input_tokens))
+                    try:
+                        _slot_n_std = int(attn_metadata_i.slot_mapping.numel())
+                    except Exception:
+                        _slot_n_std = 0
+                    for layer_name in attn_group.layer_names:
+                        attn_metadata[layer_name] = (
+                            self._prepare_standard_layer_attn_metadata(
+                                attn_metadata_i,
+                                layer_name,
+                                _graph_slot_bufs_std,
+                                _slot_n_std,
+                            ))
+                else:
+                    # DynamicKV PD decode: compressed context_lens + slot_remap.
+                    # Scheme 1: (req_idx, base_tokens) -> (mask, rel); rel does not depend
+                    # on layer ``Li``, reused across ``layer_names`` in this attn_group.
+                    dynkv_mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor,
+                                                                      torch.Tensor]] = {}
+                    _dynkv_layer_names = list(attn_group.layer_names)
+                    _dynkv_L = len(_dynkv_layer_names)
+                    _dynkv_n = int(attn_metadata_i.slot_mapping.numel())
 
-                # Timing accumulators (only used when VLLM_DYNKV_PROFILE_PREPARE=1)
-                _dynkv_profile = os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
-                _t_stack_init = 0.0
-                _t_kv_list_build = 0.0
-                _t_build_helper = 0.0
-                _t_broadcast = 0.0
-                _t_stacked_tensor = 0.0
-                _t_layer_copy_meta = 0.0
-                _t_layer_slot_remap = 0.0
-                _t_layer_other = 0.0
+                    # Timing accumulators (only used when VLLM_DYNKV_PROFILE_PREPARE=1)
+                    _dynkv_profile = os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
+                    _t_stack_init = 0.0
+                    _t_kv_list_build = 0.0
+                    _t_build_helper = 0.0
+                    _t_broadcast = 0.0
+                    _t_stacked_tensor = 0.0
+                    _t_layer_copy_meta = 0.0
+                    _t_layer_slot_remap = 0.0
+                    _t_layer_other = 0.0
 
-                _t0_stack = time.perf_counter() if _dynkv_profile else 0
-                _dynkv_stack: Optional[torch.Tensor] = None
-                if _dynkv_L > 0 and _dynkv_n > 0:
-                    _need_L = max(_dynkv_L, self._dynkv_slot_stack_cap_L)
-                    _need_n = max(_dynkv_n, self._dynkv_slot_stack_cap_n)
-                    _sb = self._dynkv_slot_stack_buf
-                    if (
-                        _sb is None
-                        or _sb.shape[0] < _need_L
-                        or _sb.shape[1] < _need_n
-                        or _sb.device != attn_metadata_i.slot_mapping.device
-                        or _sb.dtype != attn_metadata_i.slot_mapping.dtype
-                    ):
-                        self._dynkv_slot_stack_buf = torch.empty(
-                            (_need_L, _need_n),
-                            device=attn_metadata_i.slot_mapping.device,
-                            dtype=attn_metadata_i.slot_mapping.dtype,
-                        )
-                        self._dynkv_slot_stack_cap_L = _need_L
-                        self._dynkv_slot_stack_cap_n = _need_n
+                    _t0_stack = time.perf_counter() if _dynkv_profile else 0
+                    _dynkv_stack: Optional[torch.Tensor] = None
+                    if _dynkv_L > 0 and _dynkv_n > 0:
+                        _need_L = max(_dynkv_L, self._dynkv_slot_stack_cap_L)
+                        _need_n = max(_dynkv_n, self._dynkv_slot_stack_cap_n)
                         _sb = self._dynkv_slot_stack_buf
-                    _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
-                if _dynkv_profile:
-                    _t_stack_init = (time.perf_counter() - _t0_stack) * 1000
-
-                # PD DynamicKV (decode): build all layers' ``tmp_lens`` / slot jobs on
-                # rank-0 once, ``broadcast_object`` once per KV group (not per layer),
-                # then upload ``dynamic_kv_seq_lens`` as a single [L, R] tensor.
-                all_tmp_lens: list[list[int]] | None = None
-                slot_jobs_all: list[list[tuple[int, int, int]]] | None = None
-                stacked_dyn_lens_t: Optional[torch.Tensor] = None
-                if getattr(self, "is_kv_consumer", False) and _dynkv_L > 0:
-                    _t0_kvlist = time.perf_counter() if _dynkv_profile else 0
-                    n_r_dyn = int(num_reqs)
-                    rid_list_dyn = list(req_ids[:n_r_dyn])
-                    kv_list_dyn: list[dict[str, Any]] = [
-                        (lambda r: r if isinstance(r, dict) else {})(
-                            getattr(self.requests.get(rid), "kv_transfer_params", None)
-                        )
-                        for rid in rid_list_dyn
-                    ]
+                        if (
+                            _sb is None
+                            or _sb.shape[0] < _need_L
+                            or _sb.shape[1] < _need_n
+                            or _sb.device != attn_metadata_i.slot_mapping.device
+                            or _sb.dtype != attn_metadata_i.slot_mapping.dtype
+                        ):
+                            self._dynkv_slot_stack_buf = torch.empty(
+                                (_need_L, _need_n),
+                                device=attn_metadata_i.slot_mapping.device,
+                                dtype=attn_metadata_i.slot_mapping.dtype,
+                            )
+                            self._dynkv_slot_stack_cap_L = _need_L
+                            self._dynkv_slot_stack_cap_n = _need_n
+                            _sb = self._dynkv_slot_stack_buf
+                        _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
                     if _dynkv_profile:
-                        _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
-                    if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
-                        tg_pre = get_tp_group()
-                        built_dyn: tuple[
-                            list[list[int]],
-                            list[list[tuple[int, int, int]]],
-                        ] | None = None
-                        if tg_pre.world_size > 1:
-                            if get_tensor_model_parallel_rank() == 0:
+                        _t_stack_init = (time.perf_counter() - _t0_stack) * 1000
+
+                    # PD DynamicKV (decode): build all layers' ``tmp_lens`` / slot jobs on
+                    # rank-0 once, ``broadcast_object`` once per KV group (not per layer),
+                    # then upload ``dynamic_kv_seq_lens`` as a single [L, R] tensor.
+                    all_tmp_lens: list[list[int]] | None = None
+                    slot_jobs_all: list[list[tuple[int, int, int]]] | None = None
+                    stacked_dyn_lens_t: Optional[torch.Tensor] = None
+                    if _dynkv_L > 0:
+                        _t0_kvlist = time.perf_counter() if _dynkv_profile else 0
+                        n_r_dyn = int(num_reqs)
+                        rid_list_dyn = list(req_ids[:n_r_dyn])
+                        kv_list_dyn: list[dict[str, Any]] = [
+                            (lambda r: r if isinstance(r, dict) else {})(
+                                getattr(self.requests.get(rid), "kv_transfer_params", None)
+                            )
+                            for rid in rid_list_dyn
+                        ]
+                        if _dynkv_profile:
+                            _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
+                        if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
+                            tg_pre = get_tp_group()
+                            built_dyn: tuple[
+                                list[list[int]],
+                                list[list[tuple[int, int, int]]],
+                            ] | None = None
+                            if tg_pre.world_size > 1:
+                                if get_tensor_model_parallel_rank() == 0:
+                                    _t0_bh = time.perf_counter() if _dynkv_profile else 0
+                                    built_dyn = (
+                                        _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
+                                            dyn_layer_names=_dynkv_layer_names,
+                                            rid_list=rid_list_dyn,
+                                            kv_list=kv_list_dyn,
+                                            n_r=n_r_dyn,
+                                            input_batch=self.input_batch,
+                                            block_size=int(self.block_size),
+                                        ))
+                                    if _dynkv_profile:
+                                        _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
+                                _t0_bc = time.perf_counter() if _dynkv_profile else 0
+                                built_dyn = tg_pre.broadcast_object(
+                                    built_dyn
+                                    if get_tensor_model_parallel_rank() == 0 else None,
+                                    src=0,
+                                )
+                                if _dynkv_profile:
+                                    _t_broadcast = (time.perf_counter() - _t0_bc) * 1000
+                            else:
                                 _t0_bh = time.perf_counter() if _dynkv_profile else 0
                                 built_dyn = (
                                     _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
@@ -1493,326 +1580,318 @@ class NPUModelRunner(GPUModelRunner):
                                     ))
                                 if _dynkv_profile:
                                     _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
-                            _t0_bc = time.perf_counter() if _dynkv_profile else 0
-                            built_dyn = tg_pre.broadcast_object(
-                                built_dyn
-                                if get_tensor_model_parallel_rank() == 0 else None,
-                                src=0,
-                            )
-                            if _dynkv_profile:
-                                _t_broadcast = (time.perf_counter() - _t0_bc) * 1000
+                            if built_dyn is not None:
+                                all_tmp_lens, slot_jobs_all = built_dyn
                         else:
-                            _t0_bh = time.perf_counter() if _dynkv_profile else 0
-                            built_dyn = (
-                                _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
-                                    dyn_layer_names=_dynkv_layer_names,
-                                    rid_list=rid_list_dyn,
-                                    kv_list=kv_list_dyn,
-                                    n_r=n_r_dyn,
-                                    input_batch=self.input_batch,
-                                    block_size=int(self.block_size),
-                                ))
-                            if _dynkv_profile:
-                                _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
-                        if built_dyn is not None:
-                            all_tmp_lens, slot_jobs_all = built_dyn
-                    else:
-                        all_tmp_lens = [[-1] * n_r_dyn
-                                        for _ in range(_dynkv_L)]
-                        slot_jobs_all = [[] for _ in range(_dynkv_L)]
-                    if all_tmp_lens is not None:
-                        try:
-                            _sl0 = attn_metadata_i.seq_lens
-                            if isinstance(_sl0, torch.Tensor):
-                                _t0_st = time.perf_counter() if _dynkv_profile else 0
-                                stacked_dyn_lens_t = torch.tensor(
-                                    all_tmp_lens,
-                                    device=_sl0.device,
-                                    dtype=_sl0.dtype,
-                                )
-                                if _dynkv_profile:
-                                    _t_stacked_tensor = (time.perf_counter() - _t0_st) * 1000
-                        except Exception:
-                            stacked_dyn_lens_t = None
-
-                bs_dyn = int(self.block_size)
-
-                # ============================================================
-                # Batched slot_remap: do all layers' slot remapping ONCE here,
-                # outside the per-layer loop, to avoid 32x small NPU kernels.
-                # ============================================================
-                _slot_remap_done = False
-                _slot_n_sm = 0
-                if (
-                    all_tmp_lens is not None
-                    and slot_jobs_all is not None
-                    and _dynkv_stack is not None
-                    and dynkv_decode_token_pos_t is not None
-                    and dynkv_decode_req_idx_t is not None
-                    and _dynkv_L > 0
-                ):
-                    _t0_sr = time.perf_counter() if _dynkv_profile else 0
-                    try:
-                        base_sm = attn_metadata_i.slot_mapping
-                        _slot_n_sm = int(base_sm.numel())
-                        bt_dev = attn_metadata_i.block_tables
-                        if _slot_n_sm > 0 and _slot_n_sm <= _dynkv_stack.shape[1]:
-                            # 1. Broadcast base_sm to all layers at once
-                            _dynkv_stack[:_dynkv_L, :_slot_n_sm] = base_sm.unsqueeze(0)
-
-                            # 2. Collect per-(req_idx, base_tokens) -> Li per layer
-                            # slot_jobs_all[li] = [(req_idx, base_tokens, Li), ...]
-                            # Group by (req_idx, base_tokens), collect Li for each layer
-                            job_key_to_Li_per_layer: dict[
-                                tuple[int, int], list[int]
-                            ] = defaultdict(lambda: [-1] * _dynkv_L)
-                            for li in range(_dynkv_L):
-                                for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[li]:
-                                    key = (int(job_req_idx), int(job_base_tokens))
-                                    job_key_to_Li_per_layer[key][li] = int(job_Li)
-
-                            # 2.5 Batch build all Li tensors in ONE CPU->NPU transfer
-                            job_keys_list = list(job_key_to_Li_per_layer.keys())
-                            n_jobs = len(job_keys_list)
-                            if n_jobs > 0:
-                                all_Li_lists = [job_key_to_Li_per_layer[k] for k in job_keys_list]
-                                # Single CPU->NPU transfer for all requests
-                                _Li_device = dynkv_decode_token_pos_t.device
-                                _Li_dtype = dynkv_decode_token_pos_t.dtype
-                                all_Li_tensor = torch.tensor(
-                                    all_Li_lists, device=_Li_device, dtype=_Li_dtype
-                                )  # [N_jobs, L]
-
-                            # 3. For each (req_idx, base_tokens), batch compute new_slots
-                            for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
-                                _ck = (job_req_idx, job_base_tokens)
-                                _cached = dynkv_mask_rel_cache.get(_ck)
-                                if _cached is None:
-                                    mask = (dynkv_decode_req_idx_t == job_req_idx)
-                                    # token_pos starts at transferred-1 on first decode;
-                                    # subtract (base-1) so rel=0 maps to slot Li.
-                                    rel = (
-                                        dynkv_decode_token_pos_t[mask]
-                                        - (job_base_tokens - 1)
-                                    )
-                                    dynkv_mask_rel_cache[_ck] = (mask, rel)
-                                else:
-                                    mask, rel = _cached
-
-                                n_masked = int(rel.numel())
-                                if n_masked == 0:
-                                    continue
-
-                                # Li_tensor: use pre-built tensor slice (no CPU->NPU here)
-                                Li_tensor = all_Li_tensor[_job_i].unsqueeze(1)  # [L, 1]
-
-                                # tgt_pos_2d: [L, n_masked]
-                                tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # broadcast
-
-                                # For layers where Li == -1, we skip (handled by original base_sm)
-                                valid_layer_mask = (Li_tensor.squeeze(1) >= 0)  # [L,]
-
-                                bt_row = bt_dev[job_req_idx]  # [max_blocks,]
-                                idx_2d = tgt_pos_2d // bs_dyn  # [L, n_masked]
-                                idx_2d = idx_2d.clamp(min=0, max=bt_row.shape[0] - 1)
-                                block_ids_2d = bt_row[idx_2d].to(torch.int64)  # [L, n_masked]
-                                new_slots_2d = (
-                                    block_ids_2d * bs_dyn + (tgt_pos_2d % bs_dyn)
-                                ).to(base_sm.dtype)  # [L, n_masked]
-
-                                # Write to _dynkv_stack[:, mask] for valid layers in ONE op
-                                stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
-                                base_masked = base_sm[mask]
-                                valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)
-                                final_vals = torch.where(
-                                    valid_layer_mask_2d, new_slots_2d, base_masked
-                                )
-                                stack_view[:, mask] = final_vals
-
-                            _slot_remap_done = True
-                            logger.debug(
-                                "[DynamicKV][decode] batched slot_remap for %d layers, %d job_keys",
-                                _dynkv_L, len(job_key_to_Li_per_layer),
-                            )
-                    except Exception:
-                        _slot_remap_done = False
-                    if _dynkv_profile:
-                        _t_layer_slot_remap = (time.perf_counter() - _t0_sr) * 1000
-
-                # Pre-build layer_name -> layer_idx map to avoid repeated extract_layer_index calls
-                _layer_idx_map: dict[str, int] = {}
-                for _ln in _dynkv_layer_names:
-                    try:
-                        _layer_idx_map[_ln] = int(extract_layer_index(_ln, num_attn_module=1))
-                    except Exception:
-                        _layer_idx_map[_ln] = -1
-
-                _dynkv_need_slot_bufs = (
-                    all_tmp_lens is not None
-                    and slot_jobs_all is not None
-                    and _slot_remap_done
-                    and _slot_n_sm > 0
-                )
-                _graph_slot_bufs = self._dynkv_graph_slot_bufs.get(
-                    int(num_input_tokens))
-                if _graph_slot_bufs is None and self._dynkv_graph_slot_bufs:
-                    for _cap_n in sorted(self._dynkv_graph_slot_bufs.keys()):
-                        if _cap_n >= int(num_input_tokens):
-                            _graph_slot_bufs = self._dynkv_graph_slot_bufs[
-                                _cap_n]
-                            break
-                for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
-                    # vLLM will index attn_metadata by layer_name. We must ensure
-                    # each layer sees its own metadata instance with `layer_name`
-                    # populated, otherwise DynamicKV cannot resolve layer_idx.
-                    _t0_cm = time.perf_counter() if _dynkv_profile else 0
-                    try:
-                        meta_i = copy(attn_metadata_i)
-                    except Exception:
-                        meta_i = attn_metadata_i
-                    # FULL graph replay uses slot_mapping addresses from capture.
-                    # Reuse those buffers and copy remapped slots in-place each step.
-                    if _dynkv_need_slot_bufs:
-                        _captured_sm = (
-                            _graph_slot_bufs.get(layer_name)
-                            if _graph_slot_bufs is not None else None)
-                        if _captured_sm is not None:
-                            meta_i.slot_mapping = _captured_sm
-                        else:
+                            all_tmp_lens = [[-1] * n_r_dyn
+                                            for _ in range(_dynkv_L)]
+                            slot_jobs_all = [[] for _ in range(_dynkv_L)]
+                        if all_tmp_lens is not None:
                             try:
-                                meta_i.slot_mapping = meta_i.slot_mapping.clone()
+                                _sl0 = attn_metadata_i.seq_lens
+                                if isinstance(_sl0, torch.Tensor):
+                                    _t0_st = time.perf_counter() if _dynkv_profile else 0
+                                    stacked_dyn_lens_t = torch.tensor(
+                                        all_tmp_lens,
+                                        device=_sl0.device,
+                                        dtype=_sl0.dtype,
+                                    )
+                                    if _dynkv_profile:
+                                        _t_stacked_tensor = (time.perf_counter() - _t0_st) * 1000
                             except Exception:
-                                pass
-                    try:
-                        setattr(meta_i, "layer_name", layer_name)
-                    except Exception:
-                        pass
-                    if _dynkv_profile:
-                        _t_layer_copy_meta += (time.perf_counter() - _t0_cm) * 1000
-                    if all_tmp_lens is not None and slot_jobs_all is not None:
-                        _t0_ot = time.perf_counter() if _dynkv_profile else 0
-                        layer_idx = _layer_idx_map.get(layer_name, -1)
-                        tmp_lens_layer = all_tmp_lens[_dyn_li]
-                        slot_remap_jobs = slot_jobs_all[_dyn_li]
-                        if (layer_idx >= 0 and tmp_lens_layer
-                                and not all(v < 0 for v in tmp_lens_layer)):
-                            setattr(meta_i, "dynamic_kv_seq_lens_list",
-                                    tmp_lens_layer)
-                            try:
-                                if stacked_dyn_lens_t is not None:
-                                    setattr(
-                                        meta_i,
-                                        "dynamic_kv_seq_lens_tensor",
-                                        stacked_dyn_lens_t[_dyn_li],
+                                stacked_dyn_lens_t = None
+
+                    bs_dyn = int(self.block_size)
+
+                    # ============================================================
+                    # Batched slot_remap: do all layers' slot remapping ONCE here,
+                    # outside the per-layer loop, to avoid 32x small NPU kernels.
+                    # ============================================================
+                    _slot_remap_done = False
+                    _slot_n_sm = 0
+                    if (
+                        all_tmp_lens is not None
+                        and slot_jobs_all is not None
+                        and _dynkv_stack is not None
+                        and dynkv_decode_token_pos_t is not None
+                        and dynkv_decode_req_idx_t is not None
+                        and _dynkv_L > 0
+                    ):
+                        _t0_sr = time.perf_counter() if _dynkv_profile else 0
+                        try:
+                            base_sm = attn_metadata_i.slot_mapping
+                            _slot_n_sm = int(base_sm.numel())
+                            bt_dev = attn_metadata_i.block_tables
+                            if _slot_n_sm > 0 and _slot_n_sm <= _dynkv_stack.shape[1]:
+                                # 1. Broadcast base_sm to all layers at once
+                                _dynkv_stack[:_dynkv_L, :_slot_n_sm] = base_sm.unsqueeze(0)
+
+                                # 2. Collect per-(req_idx, base_tokens) -> Li per layer
+                                # slot_jobs_all[li] = [(req_idx, base_tokens, Li), ...]
+                                # Group by (req_idx, base_tokens), collect Li for each layer
+                                job_key_to_Li_per_layer: dict[
+                                    tuple[int, int], list[int]
+                                ] = defaultdict(lambda: [-1] * _dynkv_L)
+                                for li in range(_dynkv_L):
+                                    for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[li]:
+                                        key = (int(job_req_idx), int(job_base_tokens))
+                                        job_key_to_Li_per_layer[key][li] = int(job_Li)
+
+                                # 2.5 Batch build all Li tensors in ONE CPU->NPU transfer
+                                job_keys_list = list(job_key_to_Li_per_layer.keys())
+                                n_jobs = len(job_keys_list)
+                                if n_jobs > 0:
+                                    all_Li_lists = [job_key_to_Li_per_layer[k] for k in job_keys_list]
+                                    # Single CPU->NPU transfer for all requests
+                                    _Li_device = dynkv_decode_token_pos_t.device
+                                    _Li_dtype = dynkv_decode_token_pos_t.dtype
+                                    all_Li_tensor = torch.tensor(
+                                        all_Li_lists, device=_Li_device, dtype=_Li_dtype
+                                    )  # [N_jobs, L]
+
+                                # 3. For each (req_idx, base_tokens), batch compute new_slots
+                                for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
+                                    _ck = (job_req_idx, job_base_tokens)
+                                    _cached = dynkv_mask_rel_cache.get(_ck)
+                                    if _cached is None:
+                                        mask = (dynkv_decode_req_idx_t == job_req_idx)
+                                        # token_pos starts at transferred-1 on first decode;
+                                        # subtract (base-1) so rel=0 maps to slot Li.
+                                        rel = (
+                                            dynkv_decode_token_pos_t[mask]
+                                            - (job_base_tokens - 1)
+                                        )
+                                        dynkv_mask_rel_cache[_ck] = (mask, rel)
+                                    else:
+                                        mask, rel = _cached
+
+                                    n_masked = int(rel.numel())
+                                    if n_masked == 0:
+                                        continue
+
+                                    # Li_tensor: use pre-built tensor slice (no CPU->NPU here)
+                                    Li_tensor = all_Li_tensor[_job_i].unsqueeze(1)  # [L, 1]
+
+                                    # tgt_pos_2d: [L, n_masked]
+                                    tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # broadcast
+
+                                    # For layers where Li == -1, we skip (handled by original base_sm)
+                                    valid_layer_mask = (Li_tensor.squeeze(1) >= 0)  # [L,]
+
+                                    bt_row = bt_dev[job_req_idx]  # [max_blocks,]
+                                    idx_2d = tgt_pos_2d // bs_dyn  # [L, n_masked]
+                                    idx_2d = idx_2d.clamp(min=0, max=bt_row.shape[0] - 1)
+                                    block_ids_2d = bt_row[idx_2d].to(torch.int64)  # [L, n_masked]
+                                    new_slots_2d = (
+                                        block_ids_2d * bs_dyn + (tgt_pos_2d % bs_dyn)
+                                    ).to(base_sm.dtype)  # [L, n_masked]
+
+                                    # Write to _dynkv_stack[:, mask] for valid layers in ONE op
+                                    stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
+                                    base_masked = base_sm[mask]
+                                    valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)
+                                    final_vals = torch.where(
+                                        valid_layer_mask_2d, new_slots_2d, base_masked
                                     )
-                                else:
-                                    _sl_kv = meta_i.seq_lens
-                                    if isinstance(_sl_kv, torch.Tensor):
+                                    stack_view[:, mask] = final_vals
+
+                                _slot_remap_done = True
+                                logger.debug(
+                                    "[DynamicKV][decode] batched slot_remap for %d layers, %d job_keys",
+                                    _dynkv_L, len(job_key_to_Li_per_layer),
+                                )
+                        except Exception:
+                            _slot_remap_done = False
+                        if _dynkv_profile:
+                            _t_layer_slot_remap = (time.perf_counter() - _t0_sr) * 1000
+
+                    if _slot_n_sm == 0 and _dynkv_L > 0:
+                        try:
+                            _slot_n_sm = int(attn_metadata_i.slot_mapping.numel())
+                        except Exception:
+                            _slot_n_sm = 0
+
+                    # Pre-build layer_name -> layer_idx map to avoid repeated extract_layer_index calls
+                    _layer_idx_map: dict[str, int] = {}
+                    for _ln in _dynkv_layer_names:
+                        try:
+                            _layer_idx_map[_ln] = int(extract_layer_index(_ln, num_attn_module=1))
+                        except Exception:
+                            _layer_idx_map[_ln] = -1
+
+                    _graph_slot_bufs = self._dynkv_graph_slot_bufs.get(
+                        int(num_input_tokens))
+                    if _graph_slot_bufs is None and self._dynkv_graph_slot_bufs:
+                        for _cap_n in sorted(self._dynkv_graph_slot_bufs.keys()):
+                            if _cap_n >= int(num_input_tokens):
+                                _graph_slot_bufs = self._dynkv_graph_slot_bufs[
+                                    _cap_n]
+                                break
+                    # FULL graph capture pins a distinct ``slot_mapping`` per layer.
+                    # Replay must write into those buffers every step, not only when
+                    # DynamicKV slot_remap runs (``enabled=false`` still uses PA graph).
+                    _use_graph_slot_bufs = (
+                        _graph_slot_bufs is not None and _slot_n_sm > 0)
+                    for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
+                        # vLLM will index attn_metadata by layer_name. We must ensure
+                        # each layer sees its own metadata instance with `layer_name`
+                        # populated, otherwise DynamicKV cannot resolve layer_idx.
+                        _t0_cm = time.perf_counter() if _dynkv_profile else 0
+                        try:
+                            meta_i = copy(attn_metadata_i)
+                        except Exception:
+                            meta_i = attn_metadata_i
+                        # FULL graph replay uses slot_mapping addresses from capture.
+                        # Reuse those buffers and copy runtime slots in-place each step.
+                        if _use_graph_slot_bufs:
+                            _captured_sm = _graph_slot_bufs.get(layer_name)
+                            if _captured_sm is not None:
+                                meta_i.slot_mapping = _captured_sm
+                            else:
+                                try:
+                                    meta_i.slot_mapping = meta_i.slot_mapping.clone()
+                                except Exception:
+                                    pass
+                        try:
+                            setattr(meta_i, "layer_name", layer_name)
+                        except Exception:
+                            pass
+                        if _dynkv_profile:
+                            _t_layer_copy_meta += (time.perf_counter() - _t0_cm) * 1000
+                        if all_tmp_lens is not None and slot_jobs_all is not None:
+                            _t0_ot = time.perf_counter() if _dynkv_profile else 0
+                            layer_idx = _layer_idx_map.get(layer_name, -1)
+                            tmp_lens_layer = all_tmp_lens[_dyn_li]
+                            slot_remap_jobs = slot_jobs_all[_dyn_li]
+                            if (layer_idx >= 0 and tmp_lens_layer
+                                    and not all(v < 0 for v in tmp_lens_layer)):
+                                setattr(meta_i, "dynamic_kv_seq_lens_list",
+                                        tmp_lens_layer)
+                                try:
+                                    if stacked_dyn_lens_t is not None:
                                         setattr(
                                             meta_i,
                                             "dynamic_kv_seq_lens_tensor",
-                                            torch.tensor(
-                                                tmp_lens_layer,
-                                                device=_sl_kv.device,
-                                                dtype=_sl_kv.dtype,
-                                            ),
+                                            stacked_dyn_lens_t[_dyn_li],
                                         )
-                            except Exception:
-                                try:
-                                    delattr(meta_i,
-                                            "dynamic_kv_seq_lens_tensor")
+                                    else:
+                                        _sl_kv = meta_i.seq_lens
+                                        if isinstance(_sl_kv, torch.Tensor):
+                                            setattr(
+                                                meta_i,
+                                                "dynamic_kv_seq_lens_tensor",
+                                                torch.tensor(
+                                                    tmp_lens_layer,
+                                                    device=_sl_kv.device,
+                                                    dtype=_sl_kv.dtype,
+                                                ),
+                                            )
                                 except Exception:
-                                    pass
-                            if _dynkv_profile:
-                                _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
+                                    try:
+                                        delattr(meta_i,
+                                                "dynamic_kv_seq_lens_tensor")
+                                    except Exception:
+                                        pass
+                                if _dynkv_profile:
+                                    _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
 
-                            # Assign pre-computed slot_mapping from batched remap
-                            if _slot_remap_done and _slot_n_sm > 0:
+                                # Assign pre-computed slot_mapping from batched remap
+                                if _slot_remap_done and _slot_n_sm > 0:
+                                    _sm = meta_i.slot_mapping
+                                    _n_sm = min(int(_sm.numel()), _slot_n_sm)
+                                    if _n_sm > 0:
+                                        _sm[:_n_sm].copy_(
+                                            _dynkv_stack[_dyn_li, :_n_sm])
+                                elif (
+                                    slot_remap_jobs
+                                    and dynkv_decode_token_pos_t is not None
+                                    and dynkv_decode_req_idx_t is not None
+                                ):
+                                    # Fallback: per-layer remap (should not happen if batched succeeded)
+                                    _t0_sr_fb = time.perf_counter() if _dynkv_profile else 0
+                                    try:
+                                        base_sm = meta_i.slot_mapping
+                                        n_sm = int(base_sm.numel())
+                                        if (
+                                            _dynkv_stack is not None
+                                            and _dyn_li < _dynkv_stack.shape[0]
+                                            and n_sm <= _dynkv_stack.shape[1]
+                                        ):
+                                            dyn_slot_t = _dynkv_stack[
+                                                _dyn_li, :n_sm]
+                                            dyn_slot_t.copy_(base_sm)
+                                        else:
+                                            dyn_slot_t = base_sm.clone()
+                                        bt_dev = meta_i.block_tables
+                                        for (job_req_idx, job_base_tokens,
+                                             job_Li) in slot_remap_jobs:
+                                            _ck = (int(job_req_idx),
+                                                   int(job_base_tokens))
+                                            _cached = dynkv_mask_rel_cache.get(
+                                                _ck)
+                                            if _cached is None:
+                                                mask = (
+                                                    dynkv_decode_req_idx_t
+                                                    == job_req_idx)
+                                                rel = (
+                                                    dynkv_decode_token_pos_t[mask]
+                                                    - (job_base_tokens - 1))
+                                                dynkv_mask_rel_cache[_ck] = (
+                                                    mask, rel)
+                                            else:
+                                                mask, rel = _cached
+                                            tgt_pos = int(job_Li) + rel
+                                            bt_row = bt_dev[job_req_idx]
+                                            idx = tgt_pos // bs_dyn
+                                            block_ids = bt_row[idx].to(
+                                                torch.int64)
+                                            new_slots = (
+                                                block_ids * bs_dyn
+                                                + (tgt_pos % bs_dyn))
+                                            dyn_slot_t[mask] = new_slots.to(
+                                                base_sm.dtype)
+                                        if dyn_slot_t.data_ptr() != base_sm.data_ptr():
+                                            base_sm.copy_(dyn_slot_t)
+                                        if layer_idx == 0:
+                                            logger.debug(
+                                                "[DynamicKV][decode] fallback per-layer slot_mapping override"
+                                            )
+                                    except Exception:
+                                        pass
+                                    if _dynkv_profile:
+                                        _t_layer_slot_remap += (time.perf_counter() - _t0_sr_fb) * 1000
+                            else:
+                                if _dynkv_profile:
+                                    _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
+                        if (_use_graph_slot_bufs and not _slot_remap_done
+                                and _slot_n_sm > 0):
+                            try:
                                 _sm = meta_i.slot_mapping
                                 _n_sm = min(int(_sm.numel()), _slot_n_sm)
                                 if _n_sm > 0:
                                     _sm[:_n_sm].copy_(
-                                        _dynkv_stack[_dyn_li, :_n_sm])
-                            elif (
-                                slot_remap_jobs
-                                and dynkv_decode_token_pos_t is not None
-                                and dynkv_decode_req_idx_t is not None
-                            ):
-                                # Fallback: per-layer remap (should not happen if batched succeeded)
-                                _t0_sr_fb = time.perf_counter() if _dynkv_profile else 0
-                                try:
-                                    base_sm = meta_i.slot_mapping
-                                    n_sm = int(base_sm.numel())
-                                    if (
-                                        _dynkv_stack is not None
-                                        and _dyn_li < _dynkv_stack.shape[0]
-                                        and n_sm <= _dynkv_stack.shape[1]
-                                    ):
-                                        dyn_slot_t = _dynkv_stack[
-                                            _dyn_li, :n_sm]
-                                        dyn_slot_t.copy_(base_sm)
-                                    else:
-                                        dyn_slot_t = base_sm.clone()
-                                    bt_dev = meta_i.block_tables
-                                    for (job_req_idx, job_base_tokens,
-                                         job_Li) in slot_remap_jobs:
-                                        _ck = (int(job_req_idx),
-                                               int(job_base_tokens))
-                                        _cached = dynkv_mask_rel_cache.get(
-                                            _ck)
-                                        if _cached is None:
-                                            mask = (
-                                                dynkv_decode_req_idx_t
-                                                == job_req_idx)
-                                            rel = (
-                                                dynkv_decode_token_pos_t[mask]
-                                                - (job_base_tokens - 1))
-                                            dynkv_mask_rel_cache[_ck] = (
-                                                mask, rel)
-                                        else:
-                                            mask, rel = _cached
-                                        tgt_pos = int(job_Li) + rel
-                                        bt_row = bt_dev[job_req_idx]
-                                        idx = tgt_pos // bs_dyn
-                                        block_ids = bt_row[idx].to(
-                                            torch.int64)
-                                        new_slots = (
-                                            block_ids * bs_dyn
-                                            + (tgt_pos % bs_dyn))
-                                        dyn_slot_t[mask] = new_slots.to(
-                                            base_sm.dtype)
-                                    if dyn_slot_t.data_ptr() != base_sm.data_ptr():
-                                        base_sm.copy_(dyn_slot_t)
-                                    if layer_idx == 0:
-                                        logger.debug(
-                                            "[DynamicKV][decode] fallback per-layer slot_mapping override"
-                                        )
-                                except Exception:
-                                    pass
-                                if _dynkv_profile:
-                                    _t_layer_slot_remap += (time.perf_counter() - _t0_sr_fb) * 1000
-                        else:
-                            if _dynkv_profile:
-                                _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
-                    attn_metadata[layer_name] = meta_i
-                # Print timing summary once per step (only layer 0 triggers print)
-                if _dynkv_profile and _dynkv_L > 0:
-                    logger.info(
-                        "[DynamicKV][prepare_profile] layers=%d stack_init=%.2fms "
-                        "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
-                        "stacked_tensor=%.2fms layer_copy_meta=%.2fms "
-                        "layer_slot_remap=%.2fms layer_other=%.2fms total_loop=%.2fms",
-                        _dynkv_L,
-                        _t_stack_init,
-                        _t_kv_list_build,
-                        _t_build_helper,
-                        _t_broadcast,
-                        _t_stacked_tensor,
-                        _t_layer_copy_meta,
-                        _t_layer_slot_remap,
-                        _t_layer_other,
-                        _t_layer_copy_meta + _t_layer_slot_remap + _t_layer_other,
-                    )
+                                        attn_metadata_i.slot_mapping[:_n_sm])
+                            except Exception:
+                                pass
+                        attn_metadata[layer_name] = meta_i
+                    # Print timing summary once per step (only layer 0 triggers print)
+                    if _dynkv_profile and _dynkv_L > 0:
+                        logger.info(
+                            "[DynamicKV][prepare_profile] layers=%d stack_init=%.2fms "
+                            "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
+                            "stacked_tensor=%.2fms layer_copy_meta=%.2fms "
+                            "layer_slot_remap=%.2fms layer_other=%.2fms total_loop=%.2fms",
+                            _dynkv_L,
+                            _t_stack_init,
+                            _t_kv_list_build,
+                            _t_build_helper,
+                            _t_broadcast,
+                            _t_stacked_tensor,
+                            _t_layer_copy_meta,
+                            _t_layer_slot_remap,
+                            _t_layer_other,
+                            _t_layer_copy_meta + _t_layer_slot_remap + _t_layer_other,
+                        )
 
         # update global cos, sin
         update_cos_sin(positions)
@@ -2301,9 +2380,8 @@ class NPUModelRunner(GPUModelRunner):
                 # memory across finished requests (OOM after many requests).
                 try:
                     ascend_cfg = get_ascend_config()
-                    dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
                     dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
-                    if dyn_enabled and dyn_impl == "offload" and getattr(
+                    if self._is_dynamic_kv_enabled() and dyn_impl == "offload" and getattr(
                             self, "is_kv_producer", False):
                         num_reqs = int(self.input_batch.num_reqs)
                         req_ids = list(self.input_batch.req_ids)
@@ -2337,7 +2415,7 @@ class NPUModelRunner(GPUModelRunner):
                             seq_lens=seq_lens,
                             finished_idx=finished_idx,
                         )
-                    elif dyn_enabled and dyn_impl == "offload":
+                    elif self._is_dynamic_kv_enabled() and dyn_impl == "offload":
                         _DYNKV_STATE["offload_ctx"] = None
                 except Exception:
                     _DYNKV_STATE["offload_ctx"] = None
@@ -2360,9 +2438,8 @@ class NPUModelRunner(GPUModelRunner):
             _dynkv_offload_q_cleanup_rids: list[str] = []
             try:
                 ascend_cfg = get_ascend_config()
-                dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
                 dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
-                if dyn_enabled and dyn_impl == "offload" and has_kv_transfer_group():
+                if self._is_dynamic_kv_enabled() and dyn_impl == "offload" and has_kv_transfer_group():
                     # Only meaningful on KV producer (prefill) side.
                     kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
                     if kv_cfg is not None and getattr(kv_cfg, "is_kv_producer", False):
@@ -3367,9 +3444,8 @@ class NPUModelRunner(GPUModelRunner):
         # breaks decode quality.
         try:
             ascend_cfg = get_ascend_config()
-            dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
             dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
-            if dyn_enabled and dyn_impl == "offload":
+            if self._is_dynamic_kv_enabled() and dyn_impl == "offload":
                 _DYNKV_STATE.setdefault("offload_q_last", {})
                 _DYNKV_STATE.setdefault("offload_ctx", None)
                 _DYNKV_STATE.setdefault("offload_hooks", [])
