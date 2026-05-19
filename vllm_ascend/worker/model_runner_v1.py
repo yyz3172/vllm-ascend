@@ -477,6 +477,8 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_slot_stack_buf: Optional[torch.Tensor] = None
         self._dynkv_slot_stack_cap_L: int = 0
         self._dynkv_slot_stack_cap_n: int = 0
+        # slot_mapping tensors pinned during ACL graph capture: {num_tokens: {layer: Tensor}}
+        self._dynkv_graph_slot_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
@@ -1711,6 +1713,14 @@ class NPUModelRunner(GPUModelRunner):
                     and _slot_remap_done
                     and _slot_n_sm > 0
                 )
+                _graph_slot_bufs = self._dynkv_graph_slot_bufs.get(
+                    int(num_input_tokens))
+                if _graph_slot_bufs is None and self._dynkv_graph_slot_bufs:
+                    for _cap_n in sorted(self._dynkv_graph_slot_bufs.keys()):
+                        if _cap_n >= int(num_input_tokens):
+                            _graph_slot_bufs = self._dynkv_graph_slot_bufs[
+                                _cap_n]
+                            break
                 for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
@@ -1720,14 +1730,19 @@ class NPUModelRunner(GPUModelRunner):
                         meta_i = copy(attn_metadata_i)
                     except Exception:
                         meta_i = attn_metadata_i
-                    # FULL graph capture/replay pins ``slot_mapping`` tensor addresses.
-                    # Per-layer Li differs, so each layer needs its own buffer; remap
-                    # must update that buffer in-place (not replace the reference).
+                    # FULL graph replay uses slot_mapping addresses from capture.
+                    # Reuse those buffers and copy remapped slots in-place each step.
                     if _dynkv_need_slot_bufs:
-                        try:
-                            meta_i.slot_mapping = meta_i.slot_mapping.clone()
-                        except Exception:
-                            pass
+                        _captured_sm = (
+                            _graph_slot_bufs.get(layer_name)
+                            if _graph_slot_bufs is not None else None)
+                        if _captured_sm is not None:
+                            meta_i.slot_mapping = _captured_sm
+                        else:
+                            try:
+                                meta_i.slot_mapping = meta_i.slot_mapping.clone()
+                            except Exception:
+                                pass
                     try:
                         setattr(meta_i, "layer_name", layer_name)
                     except Exception:
@@ -1784,11 +1799,20 @@ class NPUModelRunner(GPUModelRunner):
                                         "VLLM_DYNKV_DEBUG_DECODE", "0") == "1"
                                 ):
                                     try:
+                                        _cap_sm = (
+                                            _graph_slot_bufs.get(layer_name)
+                                            if _graph_slot_bufs else None)
                                         logger.info(
                                             "[DynamicKV][slot_mapping] "
-                                            "layer=0 slot0=%s ptr=%s",
+                                            "layer=0 slot0=%s ptr=%s "
+                                            "captured_ptr=%s pinned=%s",
                                             int(_sm[0].item()),
                                             hex(_sm.data_ptr()),
+                                            hex(_cap_sm.data_ptr())
+                                            if _cap_sm is not None else "none",
+                                            (_cap_sm is not None
+                                             and _sm.data_ptr()
+                                             == _cap_sm.data_ptr()),
                                         )
                                     except Exception:
                                         pass
@@ -3127,6 +3151,26 @@ class NPUModelRunner(GPUModelRunner):
                         except Exception:
                             pass
                         attn_metadata[layer_name] = meta_i
+
+            if is_graph_capturing and attn_metadata:
+                self._dynkv_graph_slot_bufs[int(num_tokens)] = {
+                    str(ln): attn_metadata[ln].slot_mapping
+                    for ln in attn_metadata
+                    if getattr(attn_metadata[ln], "slot_mapping", None)
+                    is not None
+                }
+                if os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
+                    try:
+                        _sample = next(iter(attn_metadata.values()))
+                        logger.info(
+                            "[DynamicKV][slot_mapping] capture registered "
+                            "num_tokens=%d layers=%d sample_ptr=%s",
+                            int(num_tokens),
+                            len(self._dynkv_graph_slot_bufs[int(num_tokens)]),
+                            hex(_sample.slot_mapping.data_ptr()),
+                        )
+                    except Exception:
+                        pass
 
         return attn_metadata
 
