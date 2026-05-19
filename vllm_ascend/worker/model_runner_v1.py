@@ -1705,6 +1705,12 @@ class NPUModelRunner(GPUModelRunner):
                     except Exception:
                         _layer_idx_map[_ln] = -1
 
+                _dynkv_need_slot_bufs = (
+                    all_tmp_lens is not None
+                    and slot_jobs_all is not None
+                    and _slot_remap_done
+                    and _slot_n_sm > 0
+                )
                 for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                     # vLLM will index attn_metadata by layer_name. We must ensure
                     # each layer sees its own metadata instance with `layer_name`
@@ -1714,6 +1720,14 @@ class NPUModelRunner(GPUModelRunner):
                         meta_i = copy(attn_metadata_i)
                     except Exception:
                         meta_i = attn_metadata_i
+                    # FULL graph capture/replay pins ``slot_mapping`` tensor addresses.
+                    # Per-layer Li differs, so each layer needs its own buffer; remap
+                    # must update that buffer in-place (not replace the reference).
+                    if _dynkv_need_slot_bufs:
+                        try:
+                            meta_i.slot_mapping = meta_i.slot_mapping.clone()
+                        except Exception:
+                            pass
                     try:
                         setattr(meta_i, "layer_name", layer_name)
                     except Exception:
@@ -1759,7 +1773,25 @@ class NPUModelRunner(GPUModelRunner):
 
                             # Assign pre-computed slot_mapping from batched remap
                             if _slot_remap_done and _slot_n_sm > 0:
-                                meta_i.slot_mapping = _dynkv_stack[_dyn_li, :_slot_n_sm]
+                                _sm = meta_i.slot_mapping
+                                _n_sm = min(int(_sm.numel()), _slot_n_sm)
+                                if _n_sm > 0:
+                                    _sm[:_n_sm].copy_(
+                                        _dynkv_stack[_dyn_li, :_n_sm])
+                                if (
+                                    layer_idx == 0
+                                    and os.environ.get(
+                                        "VLLM_DYNKV_DEBUG_DECODE", "0") == "1"
+                                ):
+                                    try:
+                                        logger.info(
+                                            "[DynamicKV][slot_mapping] "
+                                            "layer=0 slot0=%s ptr=%s",
+                                            int(_sm[0].item()),
+                                            hex(_sm.data_ptr()),
+                                        )
+                                    except Exception:
+                                        pass
                             elif (
                                 slot_remap_jobs
                                 and dynkv_decode_token_pos_t is not None
@@ -1808,7 +1840,8 @@ class NPUModelRunner(GPUModelRunner):
                                             + (tgt_pos % bs_dyn))
                                         dyn_slot_t[mask] = new_slots.to(
                                             base_sm.dtype)
-                                    meta_i.slot_mapping = dyn_slot_t
+                                    if dyn_slot_t.data_ptr() != base_sm.data_ptr():
+                                        base_sm.copy_(dyn_slot_t)
                                     if layer_idx == 0:
                                         logger.debug(
                                             "[DynamicKV][decode] fallback per-layer slot_mapping override"
@@ -3083,6 +3116,12 @@ class NPUModelRunner(GPUModelRunner):
                             meta_i = _copy.copy(meta_src)
                         except Exception:
                             meta_i = meta_src
+                        # Each layer must own ``slot_mapping`` storage so FULL-graph
+                        # reshape_and_cache pins distinct addresses per layer.
+                        try:
+                            meta_i.slot_mapping = meta_i.slot_mapping.clone()
+                        except Exception:
+                            pass
                         try:
                             setattr(meta_i, "layer_name", layer_name)
                         except Exception:
