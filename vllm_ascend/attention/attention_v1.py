@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar, List, Optional, Tuple, Type
@@ -55,7 +56,10 @@ from vllm_ascend.attention.dynamic_kv import (
     update_and_reset_budget_per_kv_head,
 )
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
-                                         enable_cp, split_decodes_and_prefills,
+                                         _DIAG_PA_PATH,
+                                         enable_cp,
+                                         pa_dynamic_kv_context_lens,
+                                         split_decodes_and_prefills,
                                          using_paged_attention)
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.compilation.acl_graph import (
@@ -457,6 +461,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # execution path unchanged and rewrites KV after prefill elsewhere.
         self._dynamickv_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
         self._dynamickv_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False)) and (self._dynamickv_impl == "attn")
+        # Scheme D: offload mode also needs Q-capture inside attention forward
+        self._dynamickv_offload_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False)) and (self._dynamickv_impl == "offload")
         self._dynamickv_window_size = int(getattr(ascend_cfg, "dynamic_kv_window_size", 16))
         self._dynamickv_prompt_kv_len_budget = int(getattr(ascend_cfg, "dynamic_kv_prompt_kv_len_budget", 512))
         self._dynamickv_pooling = getattr(ascend_cfg, "dynamic_kv_pooling", "none")
@@ -475,21 +481,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     @staticmethod
     def _pa_dynamic_kv_context_lens(
             attn_metadata: AscendMetadata) -> torch.Tensor:
-        """Paged-attention ``context_lens`` for DynamicKV decode.
-
-        Prefer ``dynamic_kv_seq_lens_tensor`` (built alongside the list in the
-        model runner) to avoid per-call ``torch.tensor(list)`` allocation.
-        """
-        dl = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
-        if dl is None:
-            return attn_metadata.seq_lens
-        t = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
-        sl = attn_metadata.seq_lens
-        if isinstance(t, torch.Tensor) and isinstance(sl, torch.Tensor):
-            if (int(t.numel()) == len(dl) and t.device == sl.device
-                    and t.dtype == sl.dtype):
-                return t
-        return torch.tensor(dl, device=sl.device, dtype=sl.dtype)
+        return pa_dynamic_kv_context_lens(attn_metadata)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -636,6 +628,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_params.handles[num_tokens].append(handle)
             return output
 
+    @staticmethod
+    def _merge_seq_lens_with_fallback(
+        dyn_lens: list[int] | None,
+        fallback_lens: list[int] | None,
+    ) -> list[int] | None:
+        """Merge dynamic kv lens with fallback, handling negative values.
+
+        When dyn_lens contains negative values (e.g., -1 for uncompressed
+        requests), use the corresponding fallback value instead.
+        """
+        if dyn_lens is None:
+            return fallback_lens
+        if fallback_lens is None or len(fallback_lens) != len(dyn_lens):
+            return dyn_lens
+        # Check if any negative values exist
+        if not any(v < 0 for v in dyn_lens):
+            return dyn_lens
+        # Merge: use dyn_lens if >= 0, else fallback
+        return [d if d >= 0 else f for d, f in zip(dyn_lens, fallback_lens)]
+
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor,
                         attn_metadata: AscendMetadata):
         dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
@@ -660,7 +672,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_block, block_size, -1)
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1)
-            actual_seq_lengths_kv = dyn_lens_list or attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = self._merge_seq_lens_with_fallback(
+                dyn_lens_list, attn_metadata.seq_lens_list)
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
             key = self.key_cache.view(  # type: ignore
@@ -668,7 +681,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1)
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = dyn_lens_list or attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = self._merge_seq_lens_with_fallback(
+                dyn_lens_list, attn_metadata.seq_lens_list)
         # chunked prefill.
         else:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
@@ -677,7 +691,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1)
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = dyn_lens_list or attn_metadata.seq_lens_list
+            actual_seq_lengths_kv = self._merge_seq_lens_with_fallback(
+                dyn_lens_list, attn_metadata.seq_lens_list)
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor,
@@ -741,14 +756,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and attn_metadata.seq_lens.shape[0] == query.size(0)):
             return self._forward_fia_slidingwindow(query, attn_metadata,
                                                    output)
+        import os
+        _pa_decode_prof = (
+            os.environ.get("VLLM_DYNKV_PROFILE_PA", "0") == "1"
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        )
+        _t0_prep_fia = time.perf_counter() if _pa_decode_prof else 0.0
         key, value, block_size, block_table, actual_seq_lengths_kv \
             = self._get_fia_params(key, value, attn_metadata)
+        _t_prep_fia = (
+            (time.perf_counter() - _t0_prep_fia) * 1000
+            if _pa_decode_prof
+            else 0.0
+        )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache and self.attn_type != AttentionType.ENCODER_DECODER:
             key = key[:num_tokens]
             value = value[:num_tokens]
         # Get workspace from cache or calculate it if not present.
+        _t0_score = time.perf_counter() if _pa_decode_prof else 0.0
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
@@ -764,10 +791,69 @@ class AscendAttentionBackendImpl(AttentionImpl):
             scale=self.scale,
             sparse_mode=3,
         )
+        _t_score = (
+            (time.perf_counter() - _t0_score) * 1000
+            if _pa_decode_prof
+            else 0.0
+        )
 
         attn_output = attn_output.view(num_tokens, self.num_heads,
                                        self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
+
+        if _pa_decode_prof:
+            try:
+                _lid = int(
+                    extract_layer_index(
+                        attn_metadata.layer_name, num_attn_module=1
+                    )
+                )
+            except Exception:
+                _lid = -1
+            if _lid == 0:
+                _dyn_list = getattr(
+                    attn_metadata, "dynamic_kv_seq_lens_list", None
+                )
+                _t_tensor = getattr(
+                    attn_metadata, "dynamic_kv_seq_lens_tensor", None
+                )
+                _sl = attn_metadata.seq_lens
+                _from_t = False
+                if (
+                    _dyn_list is not None
+                    and isinstance(_t_tensor, torch.Tensor)
+                    and isinstance(_sl, torch.Tensor)
+                    and int(_t_tensor.numel()) == len(_dyn_list)
+                    and _t_tensor.device == _sl.device
+                    and _t_tensor.dtype == _sl.dtype
+                ):
+                    _from_t = True
+                _ctx_sum = -1
+                if actual_seq_lengths_kv is not None:
+                    if isinstance(actual_seq_lengths_kv, torch.Tensor):
+                        _ctx_sum = int(actual_seq_lengths_kv.sum().item())
+                    else:
+                        try:
+                            _ctx_sum = int(
+                                sum(int(x) for x in actual_seq_lengths_kv)
+                            )
+                        except Exception:
+                            _ctx_sum = -1
+                _orig_sum = -1
+                if isinstance(attn_metadata.seq_lens, torch.Tensor):
+                    _orig_sum = int(attn_metadata.seq_lens.sum().item())
+                _t_total_fia = _t_prep_fia + _t_score
+                logger.info(
+                    "[DynamicKV][PA_profile] layer=0 prep=%.3fms pa_kernel=%.3fms "
+                    "total=%.3fms ctx_lens_sum=%d orig_seq_lens_sum=%d "
+                    "from_tensor=%s",
+                    _t_prep_fia,
+                    _t_score,
+                    _t_total_fia,
+                    _ctx_sum,
+                    _orig_sum,
+                    _from_t,
+                )
         return output
 
     def forward_paged_attention(
@@ -776,9 +862,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import os
+        import time
+        _pa_profile = os.environ.get("VLLM_DYNKV_PROFILE_PA", "0") == "1"
+        _t0_total = time.perf_counter() if _pa_profile else 0
+
         forward_context: ForwardContext = get_forward_context()
         if forward_context.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+
+        _t0_prep = time.perf_counter() if _pa_profile else 0
         context_lens = attn_metadata.seq_lens
         dyn_keep = getattr(attn_metadata, "dynamic_kv_keep_indices_list", None)
         dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
@@ -792,39 +885,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             except Exception:
                 pass
 
+        _ctx_lens_from_tensor = False
         if dyn_lens_list is not None:
-            if not getattr(attn_metadata, "_dynamic_kv_decode_logged", False):
-                try:
-                    layer_idx = int(extract_layer_index(attn_metadata.layer_name, num_attn_module=1))
-                except Exception:
-                    layer_idx = -1
-                if dyn_keep is not None and isinstance(dyn_keep, list) and len(dyn_keep) == len(dyn_lens_list):
-                    bad = 0
-                    for idxs, kv_len in zip(dyn_keep, dyn_lens_list):
-                        if not isinstance(idxs, list):
-                            bad += 1
-                            continue
-                        if len(idxs) != int(kv_len):
-                            bad += 1
-                            continue
-                        if any((not isinstance(t, int)) for t in idxs):
-                            bad += 1
-                            continue
-                        if any(idxs[i] > idxs[i + 1] for i in range(len(idxs) - 1)):
-                            bad += 1
-                            continue
-                        if idxs and (idxs[0] < 0):
-                            bad += 1
-                            continue
-                    if bad:
-                        logger.warning(
-                            "[DynamicKV][Decode] keep_indices consistency warnings: layer=%s layer_idx=%d bad_reqs=%d/%d",
-                            attn_metadata.layer_name,
-                            layer_idx,
-                            bad,
-                            len(dyn_lens_list),
-                        )
-                setattr(attn_metadata, "_dynamic_kv_decode_logged", True)
             # Per-layer kv_len override for PD DynamicKV.
             # Expect dyn_lens_list to be ordered by request order in the batch.
             sl = attn_metadata.seq_lens
@@ -834,19 +896,52 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         and int(_t.numel()) == len(dyn_lens_list)
                         and _t.device == sl.device
                         and _t.dtype == sl.dtype):
-                    context_lens = _t
+                    # Handle negative values: use original seq_lens for those positions
+                    if (_t < 0).any():
+                        context_lens = torch.where(_t >= 0, _t, sl)
+                    else:
+                        context_lens = _t
+                    _ctx_lens_from_tensor = True
                 else:
-                    context_lens = torch.tensor(
+                    ctx = torch.tensor(
                         dyn_lens_list,
                         device=sl.device,
                         dtype=sl.dtype,
                     )
+                    # Handle negative values
+                    if (ctx < 0).any():
+                        context_lens = torch.where(ctx >= 0, ctx, sl)
+                    else:
+                        context_lens = ctx
             else:
-                context_lens = torch.tensor(
+                ctx = torch.tensor(
                     dyn_lens_list,
                     device=sl.device,
                     dtype=sl.dtype,
                 )
+                # Handle negative values (from keep_indices derivation)
+                if (ctx < 0).any():
+                    context_lens = torch.where(ctx >= 0, ctx, sl)
+                else:
+                    context_lens = ctx
+        _t_prep = (time.perf_counter() - _t0_prep) * 1000 if _pa_profile else 0
+
+        # Diagnostic: log context_lens values for debugging
+        if os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
+            try:
+                _layer_idx_dbg = int(extract_layer_index(attn_metadata.layer_name, num_attn_module=1))
+            except Exception:
+                _layer_idx_dbg = -1
+            if _layer_idx_dbg == 0:
+                _orig_sl = attn_metadata.seq_lens
+                _ctx_vals = context_lens.tolist() if isinstance(context_lens, torch.Tensor) else context_lens
+                _orig_vals = _orig_sl.tolist() if isinstance(_orig_sl, torch.Tensor) else _orig_sl
+                logger.info(
+                    "[DynamicKV][PA_debug] layer=0 context_lens=%s orig_seq_lens=%s",
+                    _ctx_vals[:4] if isinstance(_ctx_vals, list) else _ctx_vals,
+                    _orig_vals[:4] if isinstance(_orig_vals, list) else _orig_vals,
+                )
+
         # ``mask`` validation: decode uses full KV + ``npu_fusion_attention`` mask
         # (indices from PD). ``zero`` validation: KV already zeroed on prefill; decode
         # uses normal paged attention.
@@ -857,7 +952,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 context_lens=context_lens,
                 output=output,
             )
-        
+
+        _t0_pa = time.perf_counter() if _pa_profile else 0
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -869,6 +965,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=context_lens,
             out=output,
         )
+        _t_pa = (time.perf_counter() - _t0_pa) * 1000 if _pa_profile else 0
+        _t_total = (time.perf_counter() - _t0_total) * 1000 if _pa_profile else 0
+
+        # Log only for layer 0 to reduce output
+        if _pa_profile:
+            try:
+                _layer_idx = int(extract_layer_index(attn_metadata.layer_name, num_attn_module=1))
+            except Exception:
+                _layer_idx = -1
+            if _layer_idx == 0:
+                _ctx_sum = int(context_lens.sum().item()) if isinstance(context_lens, torch.Tensor) else -1
+                _orig_sum = int(attn_metadata.seq_lens.sum().item()) if isinstance(attn_metadata.seq_lens, torch.Tensor) else -1
+                logger.info(
+                    "[DynamicKV][PA_profile] layer=0 prep=%.3fms pa_kernel=%.3fms total=%.3fms "
+                    "ctx_lens_sum=%d orig_seq_lens_sum=%d from_tensor=%s",
+                    _t_prep, _t_pa, _t_total, _ctx_sum, _orig_sum, _ctx_lens_from_tensor,
+                )
         return output
 
     def _forward_decode_with_mask_validation(
@@ -1074,6 +1187,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event.record()
         return key, value
 
+    _diag_forward_impl_logged = False
+
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1084,6 +1199,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
+
+        # 诊断日志：只打印一次（状态挂在 Impl 类上，勿用 AscendAttentionBackend）
+        if _DIAG_PA_PATH and not AscendAttentionBackendImpl._diag_forward_impl_logged:
+            AscendAttentionBackendImpl._diag_forward_impl_logged = True
+            is_decode_only = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            use_pa = using_paged_attention(num_tokens, self.vllm_config)
+            no_sliding = self.sliding_window is None
+            print(f"[PA_PATH_DIAG] forward_impl: num_tokens={num_tokens}")
+            print(f"[PA_PATH_DIAG] attn_state={attn_metadata.attn_state}, is DecodeOnly={is_decode_only}")
+            print(f"[PA_PATH_DIAG] sliding_window={self.sliding_window}, is None={no_sliding}")
+            print(f"[PA_PATH_DIAG] using_paged_attention()={use_pa}")
+            print(f"[PA_PATH_DIAG] => will use PA path: {is_decode_only and use_pa and no_sliding}")
+
         if (attn_metadata.attn_state == AscendAttentionState.DecodeOnly
                 and using_paged_attention(num_tokens, self.vllm_config)
                 and self.sliding_window is None):
@@ -1878,6 +2006,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if has_kv_inputs:
                     key, value = self.reshape_and_cache(
                         key, value, kv_cache, attn_metadata)
+
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling":
             attn_output = self._forward_encoder_attention(

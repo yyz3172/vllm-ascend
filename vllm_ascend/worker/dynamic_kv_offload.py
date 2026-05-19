@@ -18,6 +18,9 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
+_HOOK_DEBUG = os.environ.get("VLLM_DYNKV_DEBUG_QCAP", "0") == "1"
+_HOOK_FIRED: set[str] = set()
+
 import torch
 from vllm.logger import logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -141,6 +144,9 @@ def install_qproj_hooks(
 
     def _hook_qkv_proj(module, inputs, output, *, module_name: str):
         """Llama/Mistral: fused QKV linear; slice Q from concatenated output."""
+        if _HOOK_DEBUG and module_name not in _HOOK_FIRED:
+            _HOOK_FIRED.add(module_name)
+            logger.info("[DynamicKV][offload] qkv_proj hook FIRED: %s", module_name)
         if not should_enable():
             return
         ctx = get_capture_ctx()
@@ -219,8 +225,9 @@ def install_qproj_hooks(
             continue
 
     logger.info(
-        "[DynamicKV][offload] installed %d Q-capture hooks (qkv_proj + q_proj)",
+        "[DynamicKV][offload] installed %d Q-capture hooks (qkv_proj + q_proj): hooked_qkv=%s",
         len(handles),
+        list(hooked_qkv)[:5] if hooked_qkv else "none",
     )
     return handles
 

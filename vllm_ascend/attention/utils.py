@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, List, Optional
@@ -14,18 +15,61 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
                                get_ascend_device_type)
 
+_DIAG_PA_PATH = os.environ.get("VLLM_DIAG_PA_PATH", "0") == "1"
+_diag_pa_logged = False
+
 
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+    global _diag_pa_logged
+    from vllm.config.compilation import CUDAGraphMode
+
+    # 诊断日志：只打印一次
+    if _DIAG_PA_PATH and not _diag_pa_logged:
+        _diag_pa_logged = True
+        spec_cfg = vllm_config.speculative_config
+        device_type = get_ascend_device_type()
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        pa_shape_list = get_ascend_config().pa_shape_list
+        print(f"[PA_PATH_DIAG] runtime_shape={runtime_shape}")
+        print(f"[PA_PATH_DIAG] speculative_config is None: {spec_cfg is None}")
+        print(f"[PA_PATH_DIAG] device_type={device_type}, is_A5={device_type == AscendDeviceType.A5}")
+        print(f"[PA_PATH_DIAG] cudagraph_mode={cudagraph_mode}, need FULL_DECODE_ONLY={CUDAGraphMode.FULL_DECODE_ONLY}")
+        print(f"[PA_PATH_DIAG] cudagraph_mode == FULL_DECODE_ONLY: {cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY}")
+        print(f"[PA_PATH_DIAG] pa_shape_list={pa_shape_list}")
+        print(f"[PA_PATH_DIAG] runtime_shape in pa_shape_list: {runtime_shape in pa_shape_list}")
+
     if vllm_config.speculative_config is not None:
         return False
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
-    from vllm.config.compilation import CUDAGraphMode
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         return False
 
     return runtime_shape in get_ascend_config().pa_shape_list
+
+
+def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
+    """Paged-attention ``context_lens`` for PD DynamicKV decode.
+
+    Prefer ``dynamic_kv_seq_lens_tensor`` when set. For entries with negative
+    lens (e.g. padded batch slots), fall back to ``seq_lens``.
+    """
+    dl = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+    if dl is None:
+        return attn_metadata.seq_lens
+    t = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+    sl = attn_metadata.seq_lens
+    if isinstance(t, torch.Tensor) and isinstance(sl, torch.Tensor):
+        if (int(t.numel()) == len(dl) and t.device == sl.device
+                and t.dtype == sl.dtype):
+            if (t < 0).any():
+                return torch.where(t >= 0, t, sl)
+            return t
+    ctx = torch.tensor(dl, device=sl.device, dtype=sl.dtype)
+    if (ctx < 0).any():
+        return torch.where(ctx >= 0, ctx, sl)
+    return ctx
 
 
 @lru_cache(maxsize=1)

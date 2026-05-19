@@ -146,8 +146,7 @@ def build_attn_metadata(
                         use_shared_len = isinstance(
                             transferred, int) and transferred > 0
                         if use_shared_len:
-                            # Scheduler starts at `transferred - 1`; include
-                            # current decode token.
+                            # Scheduler starts at transferred-1; +2 matches model_runner_v1.
                             decode_extra = max(0, ncomp - int(transferred) + 2)
                         else:
                             decode_extra = 0

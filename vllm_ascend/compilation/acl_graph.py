@@ -19,7 +19,10 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
-from vllm_ascend.attention.utils import using_paged_attention
+from vllm_ascend.attention.utils import (
+    pa_dynamic_kv_context_lens,
+    using_paged_attention,
+)
 
 from ..utils import weak_ref_tensors
 
@@ -240,7 +243,13 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 seq_lens,
                 output,
             ) = param
-            seq_lens = forward_context.attn_metadata[key].seq_lens
+            meta = forward_context.attn_metadata[key]
+            # PD DynamicKV: must use compressed per-layer kv lens, not logical
+            # seq_lens (block-aligned transferred footprint).
+            context_lens = pa_dynamic_kv_context_lens(meta)
+            meta_block_table = getattr(meta, "block_tables", None)
+            if meta_block_table is not None:
+                block_table = meta_block_table
 
             torch.npu.graph_task_update_begin(update_stream, handle)
             torch_npu._npu_paged_attention(
@@ -251,7 +260,7 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 num_heads=num_heads,
                 scale_value=scale,
                 block_table=block_table,
-                context_lens=seq_lens,
+                context_lens=context_lens,
                 out=output,
                 workspace=graph_params.workspaces.get(runtime_shape),
             )
