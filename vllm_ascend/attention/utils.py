@@ -49,6 +49,28 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
     return runtime_shape in get_ascend_config().pa_shape_list
 
 
+def _merge_dynamic_kv_lens_list(
+    dyn_lens: list[int] | None,
+    fallback_lens: list[int] | None,
+) -> list[int] | None:
+    """Merge per-request DynamicKV lens with fallback (e.g. padded slots)."""
+    if dyn_lens is None:
+        return fallback_lens
+    if fallback_lens is None or len(fallback_lens) != len(dyn_lens):
+        return list(dyn_lens)
+    if not any(v < 0 for v in dyn_lens):
+        return list(dyn_lens)
+    return [d if d >= 0 else f for d, f in zip(dyn_lens, fallback_lens)]
+
+
+def fia_dynamic_kv_seq_lens_list(attn_metadata: Any) -> list[int] | None:
+    """FIA ``actual_seq_lengths_kv`` for PD DynamicKV decode graph updates."""
+    return _merge_dynamic_kv_lens_list(
+        getattr(attn_metadata, "dynamic_kv_seq_lens_list", None),
+        getattr(attn_metadata, "seq_lens_list", None),
+    )
+
+
 def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
     """Paged-attention ``context_lens`` for PD DynamicKV decode.
 
@@ -69,6 +91,31 @@ def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
     ctx = torch.tensor(dl, device=sl.device, dtype=sl.dtype)
     if (ctx < 0).any():
         return torch.where(ctx >= 0, ctx, sl)
+    return ctx
+
+
+def pa_dynamic_kv_context_lens_for_graph_update(
+    attn_metadata: Any,
+    context_lens_buf: torch.Tensor | None,
+) -> torch.Tensor:
+    """PA ``context_lens`` for ACL graph replay / ``graph_task_update``.
+
+    Reuse the tensor captured into ``attn_params`` and copy runtime values
+    in-place when shapes match. Passing a fresh tensor each step can leave the
+    replayed op reading stale lengths on some Ascend builds.
+    """
+    ctx = pa_dynamic_kv_context_lens(attn_metadata)
+    if (
+        context_lens_buf is not None
+        and isinstance(ctx, torch.Tensor)
+        and isinstance(context_lens_buf, torch.Tensor)
+        and context_lens_buf.device == ctx.device
+        and context_lens_buf.dtype == ctx.dtype
+        and int(context_lens_buf.numel()) == int(ctx.numel())
+    ):
+        if context_lens_buf.data_ptr() != ctx.data_ptr():
+            context_lens_buf.copy_(ctx)
+        return context_lens_buf
     return ctx
 
 
