@@ -1484,13 +1484,6 @@ class MooncakeConnectorScheduler:
         if isinstance(dynamic_kv_payload, dict):
             transferred_tokens = len(send_block_ids) * int(self.block_size)
             dynamic_kv_payload["transferred_tokens"] = int(transferred_tokens)
-            logger.info(
-                "[DynamicKV][PD] transferred_tokens recorded: request_id=%s "
-                "original_prompt_len=%s transferred_tokens=%d",
-                request.request_id,
-                dynamic_kv_payload.get("original_prompt_len"),
-                transferred_tokens,
-            )
 
         # Delay-free pins the full prefill allocation until async send completes.
         delay_free_blocks = len(computed_block_ids) > 0

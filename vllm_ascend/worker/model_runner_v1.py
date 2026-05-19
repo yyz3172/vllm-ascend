@@ -273,25 +273,6 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
             # includes the current decode query in context_lens.
             # Example: transferred=2560, first step ncomp=2559 -> decode_extra=1.
             decode_extra = max(0, ncomp - base_tokens + 2)
-            if layer_idx == 0 and os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
-                # Detailed diagnostic for first layer
-                per_layer_sample = None
-                if isinstance(per_layer, list) and len(per_layer) > 0:
-                    per_layer_sample = f"[L0={per_layer[0]}, len={len(per_layer)}]"
-                logger.info(
-                    "[DynamicKV][decode_diag] req_idx=%d rid=%s "
-                    "npt=%d ncomp=%d transferred=%s base=%d decode_extra=%d use_dyn=%s "
-                    "per_layer=%s",
-                    req_idx,
-                    rid_list[req_idx] if req_idx < len(rid_list) else "?",
-                    npt,
-                    ncomp,
-                    transferred,
-                    base_tokens,
-                    decode_extra,
-                    use_dyn_base,
-                    per_layer_sample,
-                )
             if (isinstance(per_layer, list) and layer_idx < len(per_layer)):
                 try:
                     Li = int(per_layer[layer_idx])
@@ -299,14 +280,6 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
                     Li = -1
                 if Li > 0:
                     tmp_row[req_idx] = Li + decode_extra
-                    # Log the computed context_lens for layer 0
-                    if layer_idx == 0 and os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
-                        logger.info(
-                            "[DynamicKV][context_lens] req_idx=%d Li=%d decode_extra=%d "
-                            "context_lens=%d (ncomp=%d base=%d transferred=%s)",
-                            req_idx, Li, decode_extra, Li + decode_extra,
-                            ncomp, base_tokens, transferred,
-                        )
                     if use_dyn_base and bs_dyn > 0:
                         jobs.append(
                             (req_idx, int(base_tokens), int(Li)))
@@ -865,15 +838,6 @@ class NPUModelRunner(GPUModelRunner):
                                 per_req_off[ri] = int(offset)
                         # Vectorized: same as ``positions_np[req==r]+=off`` per r (scheme A).
                         positions_np += per_req_off[req_indices]
-                        prev_offsets = getattr(self, "_dynkv_last_rope_offsets",
-                                               None)
-                        if prev_offsets != offset_by_req_idx:
-                            setattr(self, "_dynkv_last_rope_offsets",
-                                    dict(offset_by_req_idx))
-                            logger.info(
-                                "[DynamicKV][decode] applied RoPE offsets: %s",
-                                offset_by_req_idx,
-                            )
             except Exception as e:
                 logger.warning(
                     "[DynamicKV][decode] RoPE offset apply failed: %s", e)
@@ -1509,30 +1473,6 @@ class NPUModelRunner(GPUModelRunner):
                     ]
                     if _dynkv_profile:
                         _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
-                    # Diagnostic: check if kv_transfer_params contains dynamic_kv
-                    if os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
-                        for _di, _kvp in enumerate(kv_list_dyn[:2]):  # Log first 2
-                            _dyn = _kvp.get("dynamic_kv") if _kvp else None
-                            if isinstance(_dyn, dict):
-                                _pll = _dyn.get("per_layer_kv_lens")
-                                _tt = _dyn.get("transferred_tokens")
-                                logger.info(
-                                    "[DynamicKV][kv_params] req_idx=%d rid=%s "
-                                    "has_dynamic_kv=True transferred=%s per_layer_len=%s L0=%s",
-                                    _di,
-                                    rid_list_dyn[_di] if _di < len(rid_list_dyn) else "?",
-                                    _tt,
-                                    len(_pll) if isinstance(_pll, list) else None,
-                                    _pll[0] if isinstance(_pll, list) and _pll else None,
-                                )
-                            else:
-                                logger.info(
-                                    "[DynamicKV][kv_params] req_idx=%d rid=%s "
-                                    "has_dynamic_kv=False kvp_keys=%s",
-                                    _di,
-                                    rid_list_dyn[_di] if _di < len(rid_list_dyn) else "?",
-                                    list(_kvp.keys()) if _kvp else None,
-                                )
                     if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
                         tg_pre = get_tp_group()
                         built_dyn: tuple[
@@ -1793,29 +1733,6 @@ class NPUModelRunner(GPUModelRunner):
                                 if _n_sm > 0:
                                     _sm[:_n_sm].copy_(
                                         _dynkv_stack[_dyn_li, :_n_sm])
-                                if (
-                                    layer_idx == 0
-                                    and os.environ.get(
-                                        "VLLM_DYNKV_DEBUG_DECODE", "0") == "1"
-                                ):
-                                    try:
-                                        _cap_sm = (
-                                            _graph_slot_bufs.get(layer_name)
-                                            if _graph_slot_bufs else None)
-                                        logger.info(
-                                            "[DynamicKV][slot_mapping] "
-                                            "layer=0 slot0=%s ptr=%s "
-                                            "captured_ptr=%s pinned=%s",
-                                            int(_sm[0].item()),
-                                            hex(_sm.data_ptr()),
-                                            hex(_cap_sm.data_ptr())
-                                            if _cap_sm is not None else "none",
-                                            (_cap_sm is not None
-                                             and _sm.data_ptr()
-                                             == _cap_sm.data_ptr()),
-                                        )
-                                    except Exception:
-                                        pass
                             elif (
                                 slot_remap_jobs
                                 and dynkv_decode_token_pos_t is not None
@@ -1966,24 +1883,6 @@ class NPUModelRunner(GPUModelRunner):
         else:
             update_attn_params(self.update_stream, forward_context,
                                runtime_num_tokens, self.vllm_config)
-        if os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
-            try:
-                from vllm_ascend.attention.utils import pa_dynamic_kv_context_lens
-                for _k, _m in (forward_context.attn_metadata or {}).items():
-                    if _m is None:
-                        continue
-                    _ctx = pa_dynamic_kv_context_lens(_m)
-                    _sl = _m.seq_lens
-                    _ctx_sum = int(_ctx.sum().item()) if hasattr(_ctx, "sum") else -1
-                    _sl_sum = int(_sl.sum().item()) if hasattr(_sl, "sum") else -1
-                    logger.info(
-                        "[DynamicKV][aclgraph_pre_update] layer=%s "
-                        "context_lens_sum=%d seq_lens_sum=%d",
-                        _k, _ctx_sum, _sl_sum,
-                    )
-                    break
-            except Exception:
-                pass
 
     def _generate_process_reqs_hidden_states(self, maybe_padded_num_tokens,
                                              input_ids, positions,
@@ -2404,13 +2303,8 @@ class NPUModelRunner(GPUModelRunner):
                     ascend_cfg = get_ascend_config()
                     dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
                     dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
-                    _is_kv_producer = getattr(self, "is_kv_producer", False)
-                    if os.environ.get("VLLM_DYNKV_DEBUG_QCAP", "0") == "1":
-                        logger.info(
-                            "[DynamicKV][offload] ctx setup check: dyn_enabled=%s dyn_impl=%s is_kv_producer=%s",
-                            dyn_enabled, dyn_impl, _is_kv_producer,
-                        )
-                    if dyn_enabled and dyn_impl == "offload" and _is_kv_producer:
+                    if dyn_enabled and dyn_impl == "offload" and getattr(
+                            self, "is_kv_producer", False):
                         num_reqs = int(self.input_batch.num_reqs)
                         req_ids = list(self.input_batch.req_ids)
                         # query_start_loc is cumulative starts for each req in this step.
@@ -2502,16 +2396,6 @@ class NPUModelRunner(GPUModelRunner):
                                 if not isinstance(q_last_store, dict):
                                     q_last_store = {}
                                 done_idx = [int(i) for i in ctx.finished_idx if int(i) >= 0]
-                                if os.environ.get("VLLM_DYNKV_DEBUG_QCAP", "0") == "1":
-                                    for _i in done_idx:
-                                        _rid = ctx.req_ids[_i]
-                                        _layers = q_last_store.get(_rid) or {}
-                                        logger.info(
-                                            "[DynamicKV][offload] pre-rewrite Q capture: "
-                                            "request_id=%s layers=%d",
-                                            _rid,
-                                            len(_layers) if isinstance(_layers, dict) else 0,
-                                        )
                                 # Subselect to only finished requests.
                                 idx_one = torch.tensor(
                                     done_idx,
@@ -3159,18 +3043,6 @@ class NPUModelRunner(GPUModelRunner):
                     if getattr(attn_metadata[ln], "slot_mapping", None)
                     is not None
                 }
-                if os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
-                    try:
-                        _sample = next(iter(attn_metadata.values()))
-                        logger.info(
-                            "[DynamicKV][slot_mapping] capture registered "
-                            "num_tokens=%d layers=%d sample_ptr=%s",
-                            int(num_tokens),
-                            len(self._dynkv_graph_slot_bufs[int(num_tokens)]),
-                            hex(_sample.slot_mapping.data_ptr()),
-                        )
-                    except Exception:
-                        pass
 
         return attn_metadata
 
@@ -3497,10 +3369,6 @@ class NPUModelRunner(GPUModelRunner):
             ascend_cfg = get_ascend_config()
             dyn_enabled = bool(getattr(ascend_cfg, "dynamic_kv_enabled", False))
             dyn_impl = str(getattr(ascend_cfg, "dynamic_kv_impl", "offload"))
-            logger.info(
-                "[DynamicKV][offload] hook install check: dyn_enabled=%s dyn_impl=%s",
-                dyn_enabled, dyn_impl,
-            )
             if dyn_enabled and dyn_impl == "offload":
                 _DYNKV_STATE.setdefault("offload_q_last", {})
                 _DYNKV_STATE.setdefault("offload_ctx", None)

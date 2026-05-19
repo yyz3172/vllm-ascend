@@ -56,7 +56,6 @@ from vllm_ascend.attention.dynamic_kv import (
     update_and_reset_budget_per_kv_head,
 )
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
-                                         _DIAG_PA_PATH,
                                          enable_cp,
                                          pa_dynamic_kv_context_lens,
                                          split_decodes_and_prefills,
@@ -756,26 +755,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and attn_metadata.seq_lens.shape[0] == query.size(0)):
             return self._forward_fia_slidingwindow(query, attn_metadata,
                                                    output)
-        import os
-        _pa_decode_prof = (
-            os.environ.get("VLLM_DYNKV_PROFILE_PA", "0") == "1"
-            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-        )
-        _t0_prep_fia = time.perf_counter() if _pa_decode_prof else 0.0
         key, value, block_size, block_table, actual_seq_lengths_kv \
             = self._get_fia_params(key, value, attn_metadata)
-        _t_prep_fia = (
-            (time.perf_counter() - _t0_prep_fia) * 1000
-            if _pa_decode_prof
-            else 0.0
-        )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache and self.attn_type != AttentionType.ENCODER_DECODER:
             key = key[:num_tokens]
             value = value[:num_tokens]
         # Get workspace from cache or calculate it if not present.
-        _t0_score = time.perf_counter() if _pa_decode_prof else 0.0
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
@@ -791,69 +778,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             scale=self.scale,
             sparse_mode=3,
         )
-        _t_score = (
-            (time.perf_counter() - _t0_score) * 1000
-            if _pa_decode_prof
-            else 0.0
-        )
 
         attn_output = attn_output.view(num_tokens, self.num_heads,
                                        self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
-
-        if _pa_decode_prof:
-            try:
-                _lid = int(
-                    extract_layer_index(
-                        attn_metadata.layer_name, num_attn_module=1
-                    )
-                )
-            except Exception:
-                _lid = -1
-            if _lid == 0:
-                _dyn_list = getattr(
-                    attn_metadata, "dynamic_kv_seq_lens_list", None
-                )
-                _t_tensor = getattr(
-                    attn_metadata, "dynamic_kv_seq_lens_tensor", None
-                )
-                _sl = attn_metadata.seq_lens
-                _from_t = False
-                if (
-                    _dyn_list is not None
-                    and isinstance(_t_tensor, torch.Tensor)
-                    and isinstance(_sl, torch.Tensor)
-                    and int(_t_tensor.numel()) == len(_dyn_list)
-                    and _t_tensor.device == _sl.device
-                    and _t_tensor.dtype == _sl.dtype
-                ):
-                    _from_t = True
-                _ctx_sum = -1
-                if actual_seq_lengths_kv is not None:
-                    if isinstance(actual_seq_lengths_kv, torch.Tensor):
-                        _ctx_sum = int(actual_seq_lengths_kv.sum().item())
-                    else:
-                        try:
-                            _ctx_sum = int(
-                                sum(int(x) for x in actual_seq_lengths_kv)
-                            )
-                        except Exception:
-                            _ctx_sum = -1
-                _orig_sum = -1
-                if isinstance(attn_metadata.seq_lens, torch.Tensor):
-                    _orig_sum = int(attn_metadata.seq_lens.sum().item())
-                _t_total_fia = _t_prep_fia + _t_score
-                logger.info(
-                    "[DynamicKV][PA_profile] layer=0 prep=%.3fms pa_kernel=%.3fms "
-                    "total=%.3fms ctx_lens_sum=%d orig_seq_lens_sum=%d "
-                    "from_tensor=%s",
-                    _t_prep_fia,
-                    _t_score,
-                    _t_total_fia,
-                    _ctx_sum,
-                    _orig_sum,
-                    _from_t,
-                )
         return output
 
     def forward_paged_attention(
@@ -862,16 +790,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import os
-        import time
-        _pa_profile = os.environ.get("VLLM_DYNKV_PROFILE_PA", "0") == "1"
-        _t0_total = time.perf_counter() if _pa_profile else 0
-
         forward_context: ForwardContext = get_forward_context()
         if forward_context.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
 
-        _t0_prep = time.perf_counter() if _pa_profile else 0
         context_lens = attn_metadata.seq_lens
         dyn_keep = getattr(attn_metadata, "dynamic_kv_keep_indices_list", None)
         dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
@@ -885,7 +807,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             except Exception:
                 pass
 
-        _ctx_lens_from_tensor = False
         if dyn_lens_list is not None:
             # Per-layer kv_len override for PD DynamicKV.
             # Expect dyn_lens_list to be ordered by request order in the batch.
@@ -901,7 +822,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         context_lens = torch.where(_t >= 0, _t, sl)
                     else:
                         context_lens = _t
-                    _ctx_lens_from_tensor = True
                 else:
                     ctx = torch.tensor(
                         dyn_lens_list,
@@ -924,23 +844,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     context_lens = torch.where(ctx >= 0, ctx, sl)
                 else:
                     context_lens = ctx
-        _t_prep = (time.perf_counter() - _t0_prep) * 1000 if _pa_profile else 0
-
-        # Diagnostic: log context_lens values for debugging
-        if os.environ.get("VLLM_DYNKV_DEBUG_DECODE", "0") == "1":
-            try:
-                _layer_idx_dbg = int(extract_layer_index(attn_metadata.layer_name, num_attn_module=1))
-            except Exception:
-                _layer_idx_dbg = -1
-            if _layer_idx_dbg == 0:
-                _orig_sl = attn_metadata.seq_lens
-                _ctx_vals = context_lens.tolist() if isinstance(context_lens, torch.Tensor) else context_lens
-                _orig_vals = _orig_sl.tolist() if isinstance(_orig_sl, torch.Tensor) else _orig_sl
-                logger.info(
-                    "[DynamicKV][PA_debug] layer=0 context_lens=%s orig_seq_lens=%s",
-                    _ctx_vals[:4] if isinstance(_ctx_vals, list) else _ctx_vals,
-                    _orig_vals[:4] if isinstance(_orig_vals, list) else _orig_vals,
-                )
 
         # ``mask`` validation: decode uses full KV + ``npu_fusion_attention`` mask
         # (indices from PD). ``zero`` validation: KV already zeroed on prefill; decode
@@ -953,7 +856,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 output=output,
             )
 
-        _t0_pa = time.perf_counter() if _pa_profile else 0
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -965,23 +867,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=context_lens,
             out=output,
         )
-        _t_pa = (time.perf_counter() - _t0_pa) * 1000 if _pa_profile else 0
-        _t_total = (time.perf_counter() - _t0_total) * 1000 if _pa_profile else 0
-
-        # Log only for layer 0 to reduce output
-        if _pa_profile:
-            try:
-                _layer_idx = int(extract_layer_index(attn_metadata.layer_name, num_attn_module=1))
-            except Exception:
-                _layer_idx = -1
-            if _layer_idx == 0:
-                _ctx_sum = int(context_lens.sum().item()) if isinstance(context_lens, torch.Tensor) else -1
-                _orig_sum = int(attn_metadata.seq_lens.sum().item()) if isinstance(attn_metadata.seq_lens, torch.Tensor) else -1
-                logger.info(
-                    "[DynamicKV][PA_profile] layer=0 prep=%.3fms pa_kernel=%.3fms total=%.3fms "
-                    "ctx_lens_sum=%d orig_seq_lens_sum=%d from_tensor=%s",
-                    _t_prep, _t_pa, _t_total, _ctx_sum, _orig_sum, _ctx_lens_from_tensor,
-                )
         return output
 
     def _forward_decode_with_mask_validation(
@@ -1187,8 +1072,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event.record()
         return key, value
 
-    _diag_forward_impl_logged = False
-
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1199,18 +1082,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
-
-        # 诊断日志：只打印一次（状态挂在 Impl 类上，勿用 AscendAttentionBackend）
-        if _DIAG_PA_PATH and not AscendAttentionBackendImpl._diag_forward_impl_logged:
-            AscendAttentionBackendImpl._diag_forward_impl_logged = True
-            is_decode_only = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            use_pa = using_paged_attention(num_tokens, self.vllm_config)
-            no_sliding = self.sliding_window is None
-            print(f"[PA_PATH_DIAG] forward_impl: num_tokens={num_tokens}")
-            print(f"[PA_PATH_DIAG] attn_state={attn_metadata.attn_state}, is DecodeOnly={is_decode_only}")
-            print(f"[PA_PATH_DIAG] sliding_window={self.sliding_window}, is None={no_sliding}")
-            print(f"[PA_PATH_DIAG] using_paged_attention()={use_pa}")
-            print(f"[PA_PATH_DIAG] => will use PA path: {is_decode_only and use_pa and no_sliding}")
 
         if (attn_metadata.attn_state == AscendAttentionState.DecodeOnly
                 and using_paged_attention(num_tokens, self.vllm_config)

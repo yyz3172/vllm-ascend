@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, List, Optional
@@ -15,28 +14,8 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
                                get_ascend_device_type)
 
-_DIAG_PA_PATH = os.environ.get("VLLM_DIAG_PA_PATH", "0") == "1"
-_diag_pa_logged = False
-
-
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
-    global _diag_pa_logged
     from vllm.config.compilation import CUDAGraphMode
-
-    # 诊断日志：只打印一次
-    if _DIAG_PA_PATH and not _diag_pa_logged:
-        _diag_pa_logged = True
-        spec_cfg = vllm_config.speculative_config
-        device_type = get_ascend_device_type()
-        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
-        pa_shape_list = get_ascend_config().pa_shape_list
-        print(f"[PA_PATH_DIAG] runtime_shape={runtime_shape}")
-        print(f"[PA_PATH_DIAG] speculative_config is None: {spec_cfg is None}")
-        print(f"[PA_PATH_DIAG] device_type={device_type}, is_A5={device_type == AscendDeviceType.A5}")
-        print(f"[PA_PATH_DIAG] cudagraph_mode={cudagraph_mode}, need FULL_DECODE_ONLY={CUDAGraphMode.FULL_DECODE_ONLY}")
-        print(f"[PA_PATH_DIAG] cudagraph_mode == FULL_DECODE_ONLY: {cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY}")
-        print(f"[PA_PATH_DIAG] pa_shape_list={pa_shape_list}")
-        print(f"[PA_PATH_DIAG] runtime_shape in pa_shape_list: {runtime_shape in pa_shape_list}")
 
     if vllm_config.speculative_config is not None:
         return False
