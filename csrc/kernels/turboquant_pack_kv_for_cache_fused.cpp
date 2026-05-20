@@ -50,12 +50,11 @@ __aicore__ inline float sqrt_f32(float x) {
 }
 
 __aicore__ inline uint8_t nearest_codebook_index_gm(
-    const AscendC::GlobalTensor<half> &codebookGm, half y) {
+    const AscendC::GlobalTensor<half>& codebookGm, float yf) {
     float best = 1e30f;
     uint8_t best_k = 0;
-    float yf = half_to_float(y);
     for (int k = 0; k < TQ_PACK_K; ++k) {
-        float ck = half_to_float(codebookGm.GetValue(k));
+        float ck = (float)codebookGm.GetValue(k);
         float d = abs_f32(yf - ck);
         if (d < best) {
             best = d;
@@ -65,19 +64,30 @@ __aicore__ inline uint8_t nearest_codebook_index_gm(
     return best_k;
 }
 
-// y[j] = sum_i x_unit[i] * rotation_t[i, j]; rotation_t in GM row-major [D,D].
+// y[j] = sum_i x_unit_fp32[i] * rotation_t[i, j]; match PyTorch: unit fp32 @ R^T fp32.
 __aicore__ inline void rotate_unit_vector_gm(
-    const half* x_unit,
+    const float* x_unit_fp32,
     const AscendC::GlobalTensor<half>& rotationTGm,
     half* y_out) {
     for (int j = 0; j < TQ_PACK_D; ++j) {
         float acc = 0.f;
         for (int i = 0; i < TQ_PACK_D; ++i) {
-            acc += half_to_float(x_unit[i]) *
+            acc += x_unit_fp32[i] *
                    half_to_float(rotationTGm.GetValue((uint32_t)(i * TQ_PACK_D + j)));
         }
         y_out[j] = float_to_half(acc);
     }
+}
+
+__aicore__ inline void write_norm_fp16_le(
+    AscendC::GlobalTensor<uint8_t>& packedGm, uint64_t out_base, half norm_h) {
+    union {
+        half h;
+        uint16_t u;
+    } normBits {};
+    normBits.h = norm_h;
+    packedGm.SetValue(out_base + (uint32_t)TQ_PACK_D, (uint8_t)(normBits.u & 0xFFu));
+    packedGm.SetValue(out_base + (uint32_t)TQ_PACK_D + 1, (uint8_t)((normBits.u >> 8) & 0xFFu));
 }
 
 // Pack one vector from GM input row -> GM packed row (indices + norm bytes + pad).
@@ -97,23 +107,23 @@ __aicore__ inline void pack_vector_gm_to_gm(
     float norm = sqrt_f32(sumsq);
     float inv = 1.0f / (norm + 1e-10f);
 
-    half x_unit[TQ_PACK_D];
+    // Keep unit in fp32 through rotation (same as reference: unit @ rot_t.float()).
+    float x_unit_fp32[TQ_PACK_D];
     for (int i = 0; i < TQ_PACK_D; ++i) {
         float xf = half_to_float(xGm.GetValue(x_base + (uint32_t)i));
-        x_unit[i] = float_to_half(xf * inv);
+        x_unit_fp32[i] = xf * inv;
     }
 
     half y[TQ_PACK_D];
-    rotate_unit_vector_gm(x_unit, rotationTGm, y);
+    rotate_unit_vector_gm(x_unit_fp32, rotationTGm, y);
 
     for (int j = 0; j < TQ_PACK_D; ++j) {
-        packedGm.SetValue(out_base + (uint32_t)j, nearest_codebook_index_gm(codebookGm, y[j]));
+        float yf = (float)y[j];
+        packedGm.SetValue(out_base + (uint32_t)j, nearest_codebook_index_gm(codebookGm, yf));
     }
 
     half norm_h = float_to_half(norm);
-    uint8_t* nb = reinterpret_cast<uint8_t*>(&norm_h);
-    packedGm.SetValue(out_base + (uint32_t)TQ_PACK_D, nb[0]);
-    packedGm.SetValue(out_base + (uint32_t)TQ_PACK_D + 1, nb[1]);
+    write_norm_fp16_le(packedGm, out_base, norm_h);
 
     for (uint32_t k = (uint32_t)TQ_PACK_D + 2; k < slot_w; ++k) {
         packedGm.SetValue(out_base + k, (uint8_t)0);
@@ -152,9 +162,16 @@ public:
     __aicore__ inline void Process() {
         const uint32_t core = AscendC::GetBlockIdx();
         const uint32_t start = core * vecPerCore_;
-        const uint32_t end = start + vecPerCore_;
+        uint32_t end = start + vecPerCore_;
+        if (end > nVec_) {
+            end = nVec_;
+        }
+        if (core == 1) {
+            AscendC::printf("tq_pack: core=%u start=%u end=%u nVec=%u vecPerCore=%u，slot_w_k_=%u，slot_w_v_=%u\n",
+                   core, start, end, nVec_, vecPerCore_, slot_w_k_, slot_w_v_);
+        }
 
-        for (uint32_t v = start; v < end && v < nVec_; ++v) {
+        for (uint32_t v = start; v < end; ++v) {
             const uint64_t x_base = (uint64_t)v * TQ_PACK_D;
             const uint64_t out_k = (uint64_t)v * slot_w_k_;
             const uint64_t out_v = (uint64_t)v * slot_w_v_;
