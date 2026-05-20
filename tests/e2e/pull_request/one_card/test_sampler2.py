@@ -82,12 +82,6 @@ def _run_greedy(
     # env.setdefault("VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD", "sample")
     if turboquant_decode_op is not None:
         env["VLLM_ASCEND_TURBOQUANT_DECODE_OP"] = turboquant_decode_op
-        # If the user enables deep decode debug, propagate it into the spawned
-        # engine/worker processes for the custom-op run.
-        if turboquant_decode_op == "1":
-            dbg = os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG")
-            if dbg:
-                env["VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG"] = dbg
     with _patched_env(env):
         clear_ascend_config()
         runner_kwargs = dict(
@@ -188,15 +182,10 @@ def _test_qwen3_turboquant_decode_accuracy(prompts: list[str]) -> None:
 if __name__ == "__main__":
     print("开始运行测试...")
     try:
-        # test_qwen3_topk()
-        # print("测试 1 完成")
-        # Run accuracy comparison test in script mode as well.
         prompts = [
             "Hello, my name is",
         ]
-        # Optional deep debug for custom TurboQuant decode:
-        #   export VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG=1
         _test_qwen3_turboquant_decode_accuracy(prompts=prompts)
-        print("测试 2 完成（turboquant ref vs custom）")
+        print("测试 完成（turboquant ref vs custom）")
     except Exception as e:
         print(f"运行出错: {e}")

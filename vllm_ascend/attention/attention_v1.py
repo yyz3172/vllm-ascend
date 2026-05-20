@@ -1552,25 +1552,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
             
             if self.kv_cache_dtype == "turboquant":
-                k_slice = (
-                    key[:attn_metadata.num_actual_tokens]
-                    if not encoder_decoder
-                    else key
-                )
-                v_slice = (
-                    value[:attn_metadata.num_actual_tokens].contiguous()
-                    if not encoder_decoder
-                    else value
-                )
-                slots_slice = (
-                    slots[:attn_metadata.num_actual_tokens]
-                    if not encoder_decoder
-                    else slots
-                )
-                if k_slice.numel() > 0:
+                if attn_metadata.num_actual_tokens > 0:
                     packed_k, packed_v = turboquant_pack_kv_for_cache(
-                        key=k_slice,
-                        value=v_slice,
+                        key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
+                        value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
                         bits_key=self.turboquant_kv_bits_key,
                         bits_value=self.turboquant_kv_bits_value,
                         slot_w_k=self.key_cache.shape[-1],
@@ -1581,7 +1566,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         value=packed_v,
                         key_cache=self.key_cache,
                         value_cache=self.value_cache,
-                        slot_indices=slots_slice,
+                        slot_indices=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots,
                     )
                 if self.is_kv_producer:
                     attn_metadata.reshape_cache_event.record()

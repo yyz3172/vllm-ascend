@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 import os
-import sys
 
 import torch
 import vllm_ascend.envs as envs_ascend
@@ -54,22 +53,6 @@ def _c_ascend_turboquant_op_available(op_name: str) -> bool:
         return False
     lib = getattr(torch.ops, "_C_ascend", None)
     return lib is not None and hasattr(lib, op_name)
-
-
-def _env_truthy(name: str, default: str = "0") -> bool:
-    v = os.getenv(name, default)
-    try:
-        return bool(int(v))
-    except Exception:
-        return str(v).lower() in ("1", "true", "yes", "y", "on")
-
-
-def _stderr_print(msg: str) -> None:
-    # Ensure this is visible even if logger handlers are filtered.
-    try:
-        print(msg, file=sys.stderr, flush=True)
-    except Exception:
-        pass
 
 
 def pack_uint4(indices: torch.Tensor) -> torch.Tensor:
@@ -129,142 +112,6 @@ def _unpack_turboquant_indices(idx_packed: torch.Tensor, head_size: int, bits: i
             f"8-bit indices last dim must be head_size={head_size}, got {idx_packed.shape[-1]}."
         )
     return idx_packed.to(dtype=torch.uint8)
-
-
-def _debug_log_turboquant_decode_diff(
-    *,
-    tag: str,
-    packed: torch.Tensor,
-    head_size: int,
-    dtype: torch.dtype,
-    out_custom: torch.Tensor,
-    bits: int = 4,
-) -> None:
-    """Compare custom decode vs reference decode on the same packed tensor.
-
-    Enable with:
-      export VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG=1
-    """
-    if not _env_truthy("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG", "0"):
-        return
-
-    # Reference path (force): temporarily disable custom op for this call only.
-    old = os.environ.get("VLLM_ASCEND_TURBOQUANT_DECODE_OP")
-    os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP"] = "0"
-    try:
-        out_ref = turboquant_dequantize_from_packed_bytes(
-            packed, head_size=head_size, dtype=dtype, bits=bits
-        ).to(dtype=out_custom.dtype)
-    finally:
-        if old is None:
-            os.environ.pop("VLLM_ASCEND_TURBOQUANT_DECODE_OP", None)
-        else:
-            os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP"] = old
-
-    # Tensor stats (fp32 space for stable comparisons)
-    a = out_custom.detach().to(torch.float32).reshape(-1)
-    b = out_ref.detach().to(torch.float32).reshape(-1)
-    diff = (a - b).abs()
-    packed_flat = packed.reshape(-1, packed.shape[-1]).detach()
-    idx_len = turboquant_indices_byte_len(head_size, bits)
-    nb = packed_flat[:, idx_len : idx_len + 2].to(torch.uint8)
-    norms_fp16 = nb.contiguous().view(torch.float16).to(torch.float32).reshape(-1)
-
-    msg = (
-        f"[TurboQuant decode debug] {tag} packed={tuple(packed.shape)} "
-        f"contiguous={bool(packed.is_contiguous())} "
-        f"stride={tuple(packed.stride()) if packed.dim() > 0 else ()} "
-        f"diff_max={float(diff.max().item()) if diff.numel() else 0.0:.6g} "
-        f"diff_mean={float(diff.mean().item()) if diff.numel() else 0.0:.6g} "
-        f"ref_norm_fp16_mean={float(norms_fp16.mean().item()) if norms_fp16.numel() else 0.0:.6g} "
-        f"ref_norm_fp16_max={float(norms_fp16.max().item()) if norms_fp16.numel() else 0.0:.6g} "
-        f"custom_fp32_mean={float(a.mean().item()) if a.numel() else 0.0:.6g} "
-        f"ref_fp32_mean={float(b.mean().item()) if b.numel() else 0.0:.6g}"
-    )
-    # Always print to stderr: EngineCore/worker logging may not surface vllm.logger warnings
-    # to the user's console depending on vLLM log configuration.
-    print(msg, file=sys.stderr, flush=True)
-    logger.warning(msg)
-
-
-def _debug_log_turboquant_decode_compact_diff(
-    *,
-    tag: str,
-    packed: torch.Tensor,
-    head_size: int,
-    dtype: torch.dtype,
-    out_custom: torch.Tensor,
-    bits: int = 4,
-) -> None:
-    """Same as _debug_log_turboquant_decode_diff but for compact op paths."""
-    if not _env_truthy("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG", "0"):
-        return
-
-    old = os.environ.get("VLLM_ASCEND_TURBOQUANT_DECODE_OP")
-    os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP"] = "0"
-    try:
-        out_ref = turboquant_dequantize_from_packed_bytes(
-            packed, head_size=head_size, dtype=dtype, bits=bits
-        ).to(dtype=out_custom.dtype)
-    finally:
-        if old is None:
-            os.environ.pop("VLLM_ASCEND_TURBOQUANT_DECODE_OP", None)
-        else:
-            os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP"] = old
-
-    a = out_custom.detach().to(torch.float32).reshape(-1)
-    b = out_ref.detach().to(torch.float32).reshape(-1)
-    diff = (a - b).abs()
-
-    packed_flat = packed.reshape(-1, packed.shape[-1]).detach()
-    idx_len = turboquant_indices_byte_len(head_size, bits)
-    nb = packed_flat[:, idx_len : idx_len + 2].to(torch.uint8)
-    norms_fp16 = nb.contiguous().view(torch.float16).to(torch.float32).reshape(-1)
-
-    msg = (
-        f"[TurboQuant decode debug] {tag} packed={tuple(packed.shape)} "
-        f"contiguous={bool(packed.is_contiguous())} "
-        f"stride={tuple(packed.stride()) if packed.dim() > 0 else ()} "
-        f"diff_max={float(diff.max().item()) if diff.numel() else 0.0:.6g} "
-        f"diff_mean={float(diff.mean().item()) if diff.numel() else 0.0:.6g} "
-        f"ref_norm_fp16_mean={float(norms_fp16.mean().item()) if norms_fp16.numel() else 0.0:.6g} "
-        f"ref_norm_fp16_max={float(norms_fp16.max().item()) if norms_fp16.numel() else 0.0:.6g} "
-        f"custom_fp32_mean={float(a.mean().item()) if a.numel() else 0.0:.6g} "
-        f"ref_fp32_mean={float(b.mean().item()) if b.numel() else 0.0:.6g}"
-    )
-    print(msg, file=sys.stderr, flush=True)
-    logger.warning(msg)
-
-
-def _stage1_ref_y_hat_from_packed(
-    *,
-    packed: torch.Tensor,
-    head_size: int,
-    codebook_fp16: torch.Tensor,
-    bits: int = 4,
-) -> torch.Tensor:
-    """Reference Stage1: unpack indices + codebook lookup + scale by norm (V1 path).
-
-    Args:
-      packed: [..., P] uint8
-      codebook_fp16: [K] fp16 on same device, K = 2**bits
-    Returns:
-      y_hat: [..., head_size] fp16
-    """
-    packed_bytes = turboquant_packed_bytes_per_vector(head_size, bits=bits)
-    packed_flat = packed.reshape(-1, packed_bytes)
-    idx_len = turboquant_indices_byte_len(head_size, bits)
-    idx_packed = packed_flat[:, :idx_len]
-    norm_bytes = packed_flat[:, idx_len : idx_len + 2]
-
-    indices = _unpack_turboquant_indices(idx_packed, head_size, bits)
-    y = codebook_fp16[indices.to(torch.int64)]
-    norms_fp16 = norm_bytes.contiguous().view(torch.float16).view(-1, 1)
-    y_hat = (y * norms_fp16).to(torch.float16)
-    return y_hat.reshape(*packed.shape[:-1], head_size)
-
-
-_RAN_STAGE_SPLIT_DEBUG = False
 
 
 def _turboquant_u32_tuple_from_fp32_le_hex(*hex_chunks: str) -> tuple[int, ...]:
@@ -665,14 +512,6 @@ def _pad_packed_to_slot_width(packed: torch.Tensor, slot_width: int) -> torch.Te
 
 def turboquant_quantize_to_packed_bytes(x: torch.Tensor, *, bits: int = 4) -> torch.Tensor:
     head_size = x.shape[-1]
-    logger.debug(
-        "TurboQuant(ascend) quantize: x=%s dtype=%s device=%s bits=%d head_size=%d",
-        tuple(x.shape),
-        x.dtype,
-        x.device,
-        bits,
-        head_size,
-    )
     packed_bytes = turboquant_packed_bytes_per_vector(head_size, bits=bits)
     quantizer = _get_quantizer(head_size, bits, str(x.device), _current_mse_impl())
 
@@ -687,13 +526,6 @@ def turboquant_quantize_to_packed_bytes(x: torch.Tensor, *, bits: int = 4) -> to
         and head_size % 2 == 0
         and _c_ascend_turboquant_op_available("turboquant_encode_packed_blocks")
     ):
-        logger.warning_once(
-            "TurboQuant encode op hit: x=%s device=%s head_size=%d bits=%d",
-            tuple(x.shape),
-            x.device,
-            head_size,
-            bits,
-        )
         x_fc = x_flat.contiguous()
         x_f32 = x_fc.float()
         norms = torch.linalg.vector_norm(x_f32, dim=-1, keepdim=True)
@@ -745,15 +577,6 @@ def turboquant_dequantize_from_packed_bytes(
     if row_w != packed_bytes:
         packed_logical = packed_logical.contiguous()
 
-    logger.debug(
-        "TurboQuant(ascend) dequantize: packed=%s packed_dtype=%s device=%s bits=%d head_size=%d out_dtype=%s",
-        tuple(packed.shape),
-        packed.dtype,
-        packed.device,
-        bits,
-        head_size,
-        dtype,
-    )
     # Fast path: use compiled NPU custom op when available.
     # NOTE: Some torch/torch_npu builds do not expose Tensor.is_privateuseone().
     # Use device.type as a stable fallback to detect NPU tensors.
@@ -767,15 +590,6 @@ def turboquant_dequantize_from_packed_bytes(
             and _current_mse_impl() != "v3"
             and dtype in (torch.float16, torch.bfloat16)
             and _c_ascend_turboquant_op_available("turboquant_decode_packed_blocks")):
-        if _env_truthy("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG", "0"):
-            _stderr_print("[TurboQuant decode debug] HIT custom op: turboquant_decode_packed_blocks")
-        logger.warning_once(
-            "TurboQuant decode op hit: packed=%s device=%s head_size=%d dtype=%s",
-            tuple(packed.shape),
-            packed.device,
-            head_size,
-            dtype,
-        )
         # codebook: [16] fp16 on NPU, rotation: [D, D] fp16 on NPU
         quantizer = _get_quantizer(head_size, bits, str(packed.device), _current_mse_impl())
         if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != packed.device:
@@ -807,14 +621,6 @@ def turboquant_dequantize_from_packed_bytes(
             0 if dtype == torch.float16 else 1,
         )
         out = out.reshape(*packed.shape[:-1], head_size)
-        _debug_log_turboquant_decode_diff(
-            tag="turboquant_decode_packed_blocks",
-            packed=packed_logical,
-            head_size=head_size,
-            dtype=dtype,
-            out_custom=out,
-            bits=bits,
-        )
         return out
 
     # Reference path (PyTorch ops).
@@ -997,8 +803,6 @@ def turboquant_decode_kv_cache_compact(
             and _current_mse_impl() != "v3"
             and dtype in (torch.float16, torch.bfloat16)
             and _c_ascend_turboquant_op_available("turboquant_decode_packed_blocks_compact")):
-        if _env_truthy("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG", "0"):
-            _stderr_print("[TurboQuant decode debug] HIT custom op: turboquant_decode_packed_blocks_compact")
         quantizer = _get_quantizer(head_size, bk, str(key_packed.device), _current_mse_impl())
         if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != key_packed.device:
             quantizer._codebook_fp16 = quantizer.codebook.to(device=key_packed.device, dtype=torch.float16)
@@ -1022,49 +826,6 @@ def turboquant_decode_kv_cache_compact(
             head_size,
             0 if dtype == torch.float16 else 1,
         )  # [2U, BS, H, D]
-
-        # Optional stage split debug: isolate Stage1 vs Stage2 by using identity rotation.
-        global _RAN_STAGE_SPLIT_DEBUG
-        if (not _RAN_STAGE_SPLIT_DEBUG
-                and _env_truthy("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG", "0")
-                and _env_truthy("VLLM_ASCEND_TURBOQUANT_DECODE_STAGE_SPLIT", "0")):
-            _RAN_STAGE_SPLIT_DEBUG = True
-            try:
-                ident = torch.eye(
-                    head_size, dtype=torch.float16, device=key_packed.device
-                ).unsqueeze(0).expand(batch, -1, -1).contiguous()
-                y_custom = torch.ops._C_ascend.turboquant_decode_packed_blocks_compact(
-                    packed_kv,
-                    quantizer._codebook_fp16,
-                    ident,
-                    head_size,
-                    0,  # fp16
-                )  # [2U, BS, H, D] == Stage1 output in fp16
-                y_ref = _stage1_ref_y_hat_from_packed(
-                    packed=packed_kv,
-                    head_size=head_size,
-                    codebook_fp16=quantizer._codebook_fp16,
-                    bits=bk,
-                )
-                a = y_custom.detach().to(torch.float32).reshape(-1)
-                b = y_ref.detach().to(torch.float32).reshape(-1)
-                d = (a - b).abs()
-                _stderr_print(
-                    "[TurboQuant decode debug] stage-split(compact): "
-                    f"stage1_diff_max={float(d.max().item()) if d.numel() else 0.0:.6g} "
-                    f"stage1_diff_mean={float(d.mean().item()) if d.numel() else 0.0:.6g}"
-                )
-            except Exception as e:
-                _stderr_print(f"[TurboQuant decode debug] stage-split(compact) failed: {e!r}")
-
-        _debug_log_turboquant_decode_compact_diff(
-            tag="turboquant_decode_packed_blocks_compact",
-            packed=packed_kv,
-            head_size=head_size,
-            dtype=dtype,
-            out_custom=decoded_kv,
-            bits=bk,
-        )
         u = key_packed.shape[0]
         k, v = decoded_kv[:u], decoded_kv[u:]
     else:
