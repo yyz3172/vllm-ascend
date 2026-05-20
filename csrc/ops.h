@@ -61,6 +61,22 @@ namespace vllm_ascend {
     uint32_t packedBytes,
     uint32_t vecPerCore);
 
+  // Fused TurboQuant KV pack (initial: fp16, 8bit, head_size=128, K/V together).
+  // key/value: [N, 128] fp16; codebook: [256] fp16; rotation_t: [128,128] fp16.
+  // packed_k/v: [N, slot_w_*] uint8 (returned to PyTorch as int8 storage).
+  extern void turboquant_pack_kv_for_cache_fused_fp16_8bit_128_impl(
+    void *stream,
+    void *key,
+    void *value,
+    void *codebook,
+    void *rotation_t,
+    void *packed_k,
+    void *packed_v,
+    uint32_t nVec,
+    uint32_t slot_w_k,
+    uint32_t slot_w_v,
+    uint32_t vecPerCore);
+
   extern void get_masked_input_and_mask_impl(
     void* stream,
     void* input,

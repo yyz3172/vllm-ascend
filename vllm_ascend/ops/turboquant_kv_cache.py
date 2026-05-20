@@ -516,15 +516,8 @@ def turboquant_quantize_to_packed_bytes(x: torch.Tensor, *, bits: int = 4) -> to
     quantizer = _get_quantizer(head_size, bits, str(x.device), _current_mse_impl())
 
     x_flat = x.reshape(-1, head_size)
-
-    dev_type = getattr(getattr(x, "device", None), "type", None)
-    is_npu_tensor = dev_type in ("npu", "privateuseone")
     if (
         envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP
-        and is_npu_tensor
-        and bits == 4
-        and head_size % 2 == 0
-        and _c_ascend_turboquant_op_available("turboquant_encode_packed_blocks")
     ):
         x_fc = x_flat.contiguous()
         x_f32 = x_fc.float()
@@ -640,6 +633,22 @@ def turboquant_dequantize_from_packed_bytes(
     return x_hat.reshape(*packed.shape[:-1], head_size)
 
 
+def _ensure_quantizer_fp16_views(
+    quantizer: TurboQuantMSE | TurboQuantMSEV2 | TurboQuantMSEV3,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (codebook_fp16, rotation_t_fp16) on ``device`` for custom encode ops."""
+    if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != device:
+        quantizer._codebook_fp16 = quantizer.codebook.to(
+            device=device, dtype=torch.float16
+        )
+    if quantizer._rotation_t_fp16 is None or quantizer._rotation_t_fp16.device != device:
+        quantizer._rotation_t_fp16 = quantizer.rotation_t.to(
+            device=device, dtype=torch.float16
+        )
+    return quantizer._codebook_fp16, quantizer._rotation_t_fp16
+
+
 def turboquant_pack_kv_for_cache(
     *,
     key: torch.Tensor,  # [T, H, D]
@@ -648,16 +657,76 @@ def turboquant_pack_kv_for_cache(
     bits_value: int,
     slot_w_k: int,
     slot_w_v: int,
+    codebook: torch.Tensor | None = None,
+    rotation: torch.Tensor | None = None,
+    codebook_value: torch.Tensor | None = None,
+    rotation_value: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize K/V to packed uint8 rows padded to cache slot width (no cache scatter).
+    """Quantize K/V to packed rows padded to cache slot width (no cache scatter).
 
     Intended for ``torch_npu._npu_reshape_and_cache`` on Ascend, which performs the
     paged layout write when the last dim matches ``key_cache`` / ``value_cache``.
+
+    When ``VLLM_ASCEND_TURBOQUANT_ENCODE_OP=1`` and the fused NPU op is built,
+    uses ``turboquant_pack_kv_for_cache``: norm + ``@ R^T`` + nearest-neighbor
+    encode. If ``bits_key == bits_value``, K and V are encoded in one batched
+    kernel launch.
+
+    Optional ``codebook`` / ``rotation`` (``R^T``, fp16) override the per-head
+    quantizer tables; ``codebook_value`` / ``rotation_value`` apply to V when
+    K/V bit widths differ.
     """
     if key.numel() == 0:
         return key, value
     if value.dtype != key.dtype:
         raise ValueError("Key/value dtypes must match for turboquant.")
+
+    head_size = key.shape[-1]
+
+    dev_type = getattr(getattr(key, "device", None), "type", None)
+    is_npu_tensor = dev_type in ("npu", "privateuseone")
+    fused_supported = (
+        is_npu_tensor
+        and key.dtype == torch.float16
+        and bits_key == 8
+        and bits_value == 8
+        and head_size == 128
+        and _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache")
+    )
+
+    if envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP and fused_supported:
+        qk = _get_quantizer(head_size, bits_key, str(key.device), _current_mse_impl())
+        qv = qk if bits_key == bits_value else _get_quantizer(
+            head_size, bits_value, str(key.device), _current_mse_impl()
+        )
+        if codebook is None or rotation is None:
+            cb_k, rot_k = _ensure_quantizer_fp16_views(qk, key.device)
+        else:
+            cb_k = codebook.to(device=key.device, dtype=torch.float16)
+            rot_k = rotation.to(device=key.device, dtype=torch.float16)
+        if bits_key == bits_value:
+            cb_v, rot_v = cb_k, rot_k
+        elif codebook_value is None or rotation_value is None:
+            cb_v, rot_v = _ensure_quantizer_fp16_views(qv, key.device)
+        else:
+            cb_v = codebook_value.to(device=key.device, dtype=torch.float16)
+            rot_v = rotation_value.to(device=key.device, dtype=torch.float16)
+
+        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
+            key.contiguous(),
+            value.contiguous(),
+            cb_k,
+            rot_k,
+            cb_v,
+            rot_v,
+            bits_key,
+            bits_value,
+            slot_w_k,
+            slot_w_v,
+        )
+        _sync_npu_if_needed(key.device)
+        return packed_k, packed_v
+
     packed_k = _pad_packed_to_slot_width(
         turboquant_quantize_to_packed_bytes(key, bits=bits_key), slot_w_k
     )
