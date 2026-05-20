@@ -308,64 +308,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         grammar_output: GrammarOutput | None,
     ):
-        # Keep a reference to input_batch for best-effort KV profiling logs.
-        # GPUModelRunner.sample_tokens will clear execute_model_state.
-        input_batch = None
-        if self.execute_model_state is not None:
-            try:
-                _, input_batch, _ = self.execute_model_state
-            except Exception:
-                input_batch = None
-
-        out = super().sample_tokens(grammar_output)
-
-        # KV profiling summary (best-effort).
-        try:
-            if input_batch is not None and hasattr(input_batch, "attn_metadata"):
-                attn_md = input_batch.attn_metadata
-                profiles = []
-                states = []
-                if isinstance(attn_md, dict):
-                    for v in attn_md.values():
-                        if hasattr(v, "kv_profile"):
-                            profiles.append(getattr(v, "kv_profile"))
-                        if hasattr(v, "attn_state"):
-                            states.append(getattr(v, "attn_state"))
-                else:
-                    if hasattr(attn_md, "kv_profile"):
-                        profiles.append(getattr(attn_md, "kv_profile"))
-                    if hasattr(attn_md, "attn_state"):
-                        states.append(getattr(attn_md, "attn_state"))
-
-                if profiles:
-                    agg: dict[str, float] = {}
-                    for p in profiles:
-                        if not isinstance(p, dict):
-                            continue
-                        for k, val in p.items():
-                            if isinstance(val, (int, float)):
-                                agg[k] = agg.get(k, 0.0) + float(val)
-
-                    if agg:
-                        # Derive a human-readable phase label.
-                        captured_name = "Prefill"
-                        if any(str(s).endswith("DecodeOnly") for s in states):
-                            captured_name = "Decode"
-                        logger.info(
-                            "KV profile [%s]: write_calls=%.0f write_tokens=%.0f write_ms=%.2f "
-                            "decode_calls=%.0f decode_blocks=%.0f decode_ms=%.2f",
-                            captured_name,
-                            agg.get("kv_write_calls", 0.0),
-                            agg.get("kv_write_tokens", 0.0),
-                            agg.get("kv_write_ms", 0.0),
-                            agg.get("kv_decode_calls", 0.0),
-                            agg.get("kv_decode_blocks", 0.0),
-                            agg.get("kv_decode_ms", 0.0),
-                        )
-        except Exception:
-            logger.debug("KV profiling summary failed.", exc_info=True)
-
-        return out
+        return super().sample_tokens(grammar_output)
 
     def sample(
         self,

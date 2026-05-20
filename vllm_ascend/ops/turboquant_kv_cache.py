@@ -968,7 +968,7 @@ def turboquant_decode_kv_cache_compact(
         return empty, empty, block_tables
 
     used = bt[valid]
-    used_sorted, _ = torch.sort(used.unique())
+    used_sorted = used.unique()
     logger.debug(
         "TurboQuant(ascend) decode_compact: block_tables=%s used_blocks=%d",
         tuple(block_tables.shape),
