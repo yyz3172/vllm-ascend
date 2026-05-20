@@ -88,9 +88,6 @@ def _run_greedy(
             dbg = os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG")
             if dbg:
                 env["VLLM_ASCEND_TURBOQUANT_DECODE_DEBUG"] = dbg
-    # Keep logs quiet; tests should be deterministic and fast.
-    env.setdefault("VLLM_ASCEND_KV_PROFILE_LOG", "0")
-
     with _patched_env(env):
         clear_ascend_config()
         runner_kwargs = dict(

@@ -66,10 +66,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # In this case, developers need to set this value to "0.9.0" to make sure
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
-    # Emit per-step KV profiling summary logs even if higher-level aggregation
-    # is not reached. Intended for debugging.
-    "VLLM_ASCEND_KV_PROFILE_LOG":
-    lambda: bool(int(os.getenv("VLLM_ASCEND_KV_PROFILE_LOG", "0"))),
     # Use the compiled NPU custom op for TurboQuant decode (packed->fp16/bf16).
     "VLLM_ASCEND_TURBOQUANT_DECODE_OP":
     lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP", "1"))),
