@@ -474,6 +474,109 @@ at::Tensor turboquant_encode_packed_blocks(
     return packed;
 }
 
+namespace {
+
+at::Tensor turboquant_pad_packed_row_to_slot(const at::Tensor &packed, int64_t slot_w) {
+    const int64_t w = packed.size(-1);
+    if (w == slot_w) {
+        return packed;
+    }
+    TORCH_CHECK(w < slot_w, "packed width ", w, " exceeds cache slot width ", slot_w);
+    return at::constant_pad_nd(packed, {0, slot_w - w});
+}
+
+}  // namespace
+
+// TurboQuant pack K/V for paged cache: norm + rotate + nearest-neighbor encode.
+// When bits_key == bits_value, K and V are encoded in one batched kernel launch.
+// key/value: [T, H, D] fp16/bf16 on NPU; codebook_*: [2^bits] fp16; rotation_t_*: [D, D] fp16 (R^T).
+std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &codebook_key,
+    const at::Tensor &rotation_t_key,
+    const at::Tensor &codebook_value,
+    const at::Tensor &rotation_t_value,
+    int64_t bits_key,
+    int64_t bits_value,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    TORCH_CHECK(key.is_privateuseone(), "key must be on NPU");
+    TORCH_CHECK(value.is_privateuseone(), "value must be on NPU");
+    TORCH_CHECK(key.dim() >= 1 && value.dim() >= 1, "key/value must have at least 1 dim");
+    TORCH_CHECK(key.scalar_type() == value.scalar_type(),
+                "key and value must have the same dtype");
+    TORCH_CHECK(bits_key == 4 || bits_key == 8, "bits_key must be 4 or 8");
+    TORCH_CHECK(bits_value == 4 || bits_value == 8, "bits_value must be 4 or 8");
+
+    const int64_t head_size = key.size(-1);
+    TORCH_CHECK(value.size(-1) == head_size, "key/value head_size mismatch");
+    if (bits_key == 4 || bits_value == 4) {
+        TORCH_CHECK(head_size % 2 == 0, "head_size must be even for 4-bit packing");
+    }
+
+    // Initial fused implementation supports only: fp16 + bits_key==bits_value==8 + head_size==128.
+    TORCH_CHECK(key.scalar_type() == at::kHalf, "initial fused pack supports fp16 only");
+    TORCH_CHECK(bits_key == 8 && bits_value == 8, "initial fused pack supports 8-bit only");
+    TORCH_CHECK(head_size == 128, "initial fused pack supports head_size=128 only");
+    TORCH_CHECK(codebook_key.numel() == 256, "8-bit codebook must have 256 entries");
+    TORCH_CHECK(rotation_t_key.dim() == 2 && rotation_t_key.size(0) == 128 && rotation_t_key.size(1) == 128,
+                "rotation_t_key must be [128,128]");
+    TORCH_CHECK(codebook_value.numel() == 256, "8-bit codebook must have 256 entries");
+    TORCH_CHECK(rotation_t_value.dim() == 2 && rotation_t_value.size(0) == 128 && rotation_t_value.size(1) == 128,
+                "rotation_t_value must be [128,128]");
+    TORCH_CHECK(at::equal(codebook_key, codebook_value),
+                "initial fused pack expects same codebook for key/value");
+    TORCH_CHECK(at::equal(rotation_t_key, rotation_t_value),
+                "initial fused pack expects same rotation_t for key/value");
+
+    at::Tensor key_flat = key.reshape({-1, head_size}).contiguous();
+    at::Tensor value_flat = value.reshape({-1, head_size}).contiguous();
+    const int64_t n_vec = key_flat.size(0);
+    TORCH_CHECK(value_flat.size(0) == n_vec, "key/value row count mismatch");
+
+    const int64_t packed_bytes = head_size + 2;
+    TORCH_CHECK(slot_w_k >= packed_bytes, "slot_w_k must be >= head_size+2 for 8-bit");
+    TORCH_CHECK(slot_w_v >= packed_bytes, "slot_w_v must be >= head_size+2 for 8-bit");
+
+    const at::Tensor key_c = key_flat.contiguous();
+    const at::Tensor value_c = value_flat.contiguous();
+    const at::Tensor codebook_c = codebook_key.contiguous();
+    const at::Tensor rot_c = rotation_t_key.contiguous();
+
+    at::Tensor packed_k = at::empty({n_vec, slot_w_k}, key.options().dtype(at::kByte));
+    at::Tensor packed_v = at::empty({n_vec, slot_w_v}, key.options().dtype(at::kByte));
+
+    const c10_npu::OptionalNPUGuard npuGuard(key_c.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    uint32_t vec_per_core = 1;
+    if (n_vec >= 8192) vec_per_core = 4;
+    else if (n_vec >= 2048) vec_per_core = 2;
+
+    turboquant_pack_kv_for_cache_fused_fp16_8bit_128_impl(
+        static_cast<void *>(stream),
+        const_cast<void *>(key_c.data_ptr()),
+        const_cast<void *>(value_c.data_ptr()),
+        const_cast<void *>(codebook_c.data_ptr()),
+        const_cast<void *>(rot_c.data_ptr()),
+        packed_k.data_ptr(),
+        packed_v.data_ptr(),
+        static_cast<uint32_t>(n_vec),
+        static_cast<uint32_t>(slot_w_k),
+        static_cast<uint32_t>(slot_w_v),
+        vec_per_core);
+
+    std::vector<int64_t> shape_k(key.sizes().begin(), key.sizes().end());
+    std::vector<int64_t> shape_v(value.sizes().begin(), value.sizes().end());
+    shape_k.back() = slot_w_k;
+    shape_v.back() = slot_w_v;
+
+    return std::make_tuple(
+        packed_k.reshape(shape_k).to(at::kChar),
+        packed_v.reshape(shape_v).to(at::kChar));
+}
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
 // 310P and A5 builds.
@@ -2589,6 +2692,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "turboquant_encode_packed_blocks(Tensor y, Tensor codebook, Tensor norms_fp16, int head_size, int bits) -> Tensor");
     ops.impl("turboquant_encode_packed_blocks", torch::kPrivateUse1, &vllm_ascend::turboquant_encode_packed_blocks);
+
+    ops.def(
+        "turboquant_pack_kv_for_cache(Tensor key, Tensor value, Tensor codebook_key, Tensor rotation_t_key, "
+        "Tensor codebook_value, Tensor rotation_t_value, int bits_key, int bits_value, int slot_w_k, int slot_w_v) "
+        "-> (Tensor, Tensor)");
+    ops.impl("turboquant_pack_kv_for_cache", torch::kPrivateUse1,
+             &vllm_ascend::turboquant_pack_kv_for_cache);
 
     ops.def(
         "grouped_matmul_swiglu_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor x_scale,"
