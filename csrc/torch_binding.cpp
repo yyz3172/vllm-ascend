@@ -21,11 +21,19 @@
 #include <ATen/core/Formatting.h>
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/framework/utils/OpPreparation.h>
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include <torch_npu/csrc/npu/Module.h>
+#include "acl/acl.h"
+#include "acl/acl_rt.h"
+#include "kernel_tiling/kernel_tiling.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
 #include "ops.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
@@ -245,6 +253,53 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
                     ", size=", size_data[i]);
     }
 }
+namespace {
+
+std::vector<uint8_t> GenerateTurboQuantRotateTiling(
+    platform_ascendc::PlatformAscendC* ascendc_platform,
+    uint32_t block_dim,
+    uint32_t vec_per_core) {
+    std::vector<uint8_t> tiling_buf(sizeof(TCubeTiling), 0);
+    optiling::TCubeTiling tiling_data;
+    matmul_tiling::MultiCoreMatmulTiling tiling_api(*ascendc_platform);
+
+    // SetDim is the number of AIV clients participating in the KFC matmul handshake.
+    // One MIX launch block expands to AIV-0/AIV-1 plus AIC-0, so keep this local
+    // matmul at two AIV participants. Do not scale it by <<<blockDim>>>.
+    (void)block_dim;
+    tiling_api.SetDim(2);
+    tiling_api.SetAType(
+        matmul_tiling::TPosition::VECOUT,
+        matmul_tiling::CubeFormat::ND,
+        matmul_tiling::DataType::DT_FLOAT16,
+        false);
+    tiling_api.SetBType(
+        matmul_tiling::TPosition::GM,
+        matmul_tiling::CubeFormat::ND,
+        matmul_tiling::DataType::DT_FLOAT16,
+        false);
+    tiling_api.SetCType(
+        matmul_tiling::TPosition::VECIN,
+        matmul_tiling::CubeFormat::ND,
+        matmul_tiling::DataType::DT_FLOAT16);
+    tiling_api.SetBiasType(
+        matmul_tiling::TPosition::GM,
+        matmul_tiling::CubeFormat::ND,
+        matmul_tiling::DataType::DT_FLOAT16);
+    tiling_api.SetOrgShape(vec_per_core, 128, 128);
+    tiling_api.SetShape(vec_per_core, 128, 128);
+    tiling_api.EnableBias(false);
+    tiling_api.SetBufferSpace(-1, -1, -1);
+
+    const int64_t ret = tiling_api.GetTiling(tiling_data);
+    TORCH_CHECK(ret != -1, "failed to generate TurboQuant rotate matmul tiling");
+    const uint32_t tiling_size = tiling_data.GetDataSize();
+    TORCH_CHECK(tiling_size <= tiling_buf.size(), "TurboQuant rotate tiling buffer is too small");
+    tiling_data.SaveToBuffer(tiling_buf.data(), tiling_size);
+    return tiling_buf;
+}
+
+}  // namespace
 
 // TurboQuant decode (packed uint8 -> fp16/bf16).
 // Two-stage implementation:
@@ -501,8 +556,25 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
     int64_t bits_value,
     int64_t slot_w_k,
     int64_t slot_w_v) {
+    const uint32_t debug_blocks =
+        std::getenv("VLLM_ASCEND_TURBOQUANT_DEBUG_BLOCKS") != nullptr ? 1U : 0U;
+    if (debug_blocks != 0U) {
+        std::printf(
+            "[TQ_PACK] enter key_dim=%ld value_dim=%ld bits_key=%ld bits_value=%ld slot_w_k=%ld slot_w_v=%ld\n",
+            static_cast<long>(key.dim()), static_cast<long>(value.dim()), static_cast<long>(bits_key),
+            static_cast<long>(bits_value), static_cast<long>(slot_w_k), static_cast<long>(slot_w_v));
+        std::fflush(stdout);
+    }
     TORCH_CHECK(key.is_privateuseone(), "key must be on NPU");
     TORCH_CHECK(value.is_privateuseone(), "value must be on NPU");
+    TORCH_CHECK(codebook_key.is_privateuseone() && codebook_value.is_privateuseone(),
+                "codebooks must be on NPU");
+    TORCH_CHECK(rotation_t_key.is_privateuseone() && rotation_t_value.is_privateuseone(),
+                "rotations must be on NPU");
+    TORCH_CHECK(value.device() == key.device() && codebook_key.device() == key.device() &&
+                    codebook_value.device() == key.device() && rotation_t_key.device() == key.device() &&
+                    rotation_t_value.device() == key.device(),
+                "key/value/codebooks/rotations must be on the same NPU device");
     TORCH_CHECK(key.dim() >= 1 && value.dim() >= 1, "key/value must have at least 1 dim");
     TORCH_CHECK(key.scalar_type() == value.scalar_type(),
                 "key and value must have the same dtype");
@@ -519,17 +591,37 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
     TORCH_CHECK(key.scalar_type() == at::kHalf, "initial fused pack supports fp16 only");
     TORCH_CHECK(bits_key == 8 && bits_value == 8, "initial fused pack supports 8-bit only");
     TORCH_CHECK(head_size == 128, "initial fused pack supports head_size=128 only");
+    TORCH_CHECK(codebook_key.scalar_type() == at::kHalf && codebook_value.scalar_type() == at::kHalf,
+                "initial fused pack expects fp16 codebooks");
+    TORCH_CHECK(rotation_t_key.scalar_type() == at::kHalf && rotation_t_value.scalar_type() == at::kHalf,
+                "initial fused pack expects fp16 rotations");
     TORCH_CHECK(codebook_key.numel() == 256, "8-bit codebook must have 256 entries");
     TORCH_CHECK(rotation_t_key.dim() == 2 && rotation_t_key.size(0) == 128 && rotation_t_key.size(1) == 128,
                 "rotation_t_key must be [128,128]");
     TORCH_CHECK(codebook_value.numel() == 256, "8-bit codebook must have 256 entries");
     TORCH_CHECK(rotation_t_value.dim() == 2 && rotation_t_value.size(0) == 128 && rotation_t_value.size(1) == 128,
                 "rotation_t_value must be [128,128]");
+    if (debug_blocks != 0U) {
+        std::printf("[TQ_PACK] before equal checks\n");
+        std::fflush(stdout);
+    }
     TORCH_CHECK(at::equal(codebook_key, codebook_value),
                 "initial fused pack expects same codebook for key/value");
+    if (debug_blocks != 0U) {
+        std::printf("[TQ_PACK] codebook equal check done\n");
+        std::fflush(stdout);
+    }
     TORCH_CHECK(at::equal(rotation_t_key, rotation_t_value),
                 "initial fused pack expects same rotation_t for key/value");
+    if (debug_blocks != 0U) {
+        std::printf("[TQ_PACK] rotation equal check done\n");
+        std::fflush(stdout);
+    }
 
+    if (debug_blocks != 0U) {
+        std::printf("[TQ_PACK] before reshape/contiguous\n");
+        std::fflush(stdout);
+    }
     at::Tensor key_flat = key.reshape({-1, head_size}).contiguous();
     at::Tensor value_flat = value.reshape({-1, head_size}).contiguous();
     const int64_t n_vec = key_flat.size(0);
@@ -543,17 +635,64 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
     const at::Tensor value_c = value_flat.contiguous();
     const at::Tensor codebook_c = codebook_key.contiguous();
     const at::Tensor rot_c = rotation_t_key.contiguous();
+    if (debug_blocks != 0U) {
+        std::printf("[TQ_PACK] contiguous done nVec=%ld\n", static_cast<long>(n_vec));
+        std::fflush(stdout);
+    }
 
     at::Tensor packed_k = at::empty({n_vec, slot_w_k}, key.options().dtype(at::kByte));
     at::Tensor packed_v = at::empty({n_vec, slot_w_v}, key.options().dtype(at::kByte));
 
     const c10_npu::OptionalNPUGuard npuGuard(key_c.device());
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+    TORCH_CHECK(ascendc_platform != nullptr, "failed to get AscendC platform info");
+    const uint32_t workspace_size = ascendc_platform->GetLibApiWorkSpaceSize();
+    at::Tensor workspace = at::empty(
+        {static_cast<int64_t>(workspace_size)},
+        at::TensorOptions().dtype(at::kByte).device(key_c.device()));
+    if (debug_blocks != 0U) {
+        std::printf("[TQ_PACK] workspace allocated size=%u\n", workspace_size);
+        std::fflush(stdout);
+    }
 
-    uint32_t vec_per_core = 1;
-    if (n_vec >= 8192) vec_per_core = 4;
-    else if (n_vec >= 2048) vec_per_core = 2;
-
+    // Batch rows per core for one [M,128]@[128,128] matmul (Cube M aligned to 16).
+    // Small n_vec still uses one core with M padded to 16, not n_vec separate M=1 matmuls.
+    uint32_t vec_per_core = 128;
+    if (n_vec < 128) {
+        vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
+        if (vec_per_core == 0) {
+            vec_per_core = 16;
+        }
+    }
+    const uint32_t block_dim = static_cast<uint32_t>((n_vec + vec_per_core - 1) / vec_per_core);
+    const std::vector<uint8_t> rotate_tiling_host =
+        GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, vec_per_core);
+    TORCH_CHECK(
+        rotate_tiling_host.size() >= sizeof(TCubeTiling),
+        "TurboQuant rotate tiling buffer is too small, got ", rotate_tiling_host.size(),
+        " expected at least ", sizeof(TCubeTiling));
+    at::Tensor rotate_tiling = at::empty(
+        {static_cast<int64_t>(rotate_tiling_host.size())},
+        at::TensorOptions().dtype(at::kByte).device(key_c.device()));
+    const aclError copy_ret = aclrtMemcpy(
+        rotate_tiling.data_ptr(),
+        rotate_tiling_host.size(),
+        rotate_tiling_host.data(),
+        rotate_tiling_host.size(),
+        ACL_MEMCPY_HOST_TO_DEVICE);
+    TORCH_CHECK(copy_ret == ACL_SUCCESS, "failed to copy TurboQuant rotate tiling to NPU, ret=", copy_ret);
+    if (debug_blocks != 0U) {
+        const auto* rotate_tiling =
+            reinterpret_cast<const TCubeTiling*>(rotate_tiling_host.data());
+        std::printf(
+            "[TQ_PACK] launch blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld "
+            "workspace=%u tiling=%zu usedCore=%d M=%d N=%d singleN=%d\n",
+            block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
+            static_cast<long>(slot_w_v), workspace_size, rotate_tiling_host.size(),
+            rotate_tiling->usedCoreNum, rotate_tiling->M, rotate_tiling->N, rotate_tiling->singleCoreN);
+        std::fflush(stdout);
+    }
     turboquant_pack_kv_for_cache_fused_fp16_8bit_128_impl(
         static_cast<void *>(stream),
         const_cast<void *>(key_c.data_ptr()),
@@ -565,7 +704,10 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
         static_cast<uint32_t>(n_vec),
         static_cast<uint32_t>(slot_w_k),
         static_cast<uint32_t>(slot_w_v),
-        vec_per_core);
+        vec_per_core,
+        debug_blocks,
+        workspace.data_ptr(),
+        rotate_tiling.data_ptr());
 
     std::vector<int64_t> shape_k(key.sizes().begin(), key.sizes().end());
     std::vector<int64_t> shape_v(value.sizes().begin(), value.sizes().end());
