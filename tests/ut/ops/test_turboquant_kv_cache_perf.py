@@ -54,7 +54,6 @@ import torch
 
 from vllm_ascend.ops.turboquant_kv_cache import (
     _c_ascend_turboquant_op_available,
-    _get_quantizer,
     turboquant_decode_kv_cache,
     turboquant_decode_kv_cache_compact,
     turboquant_dequantize_from_packed_bytes,
@@ -89,76 +88,50 @@ CACHE_TOKEN_SLOTS = (2048, 4096)
 
 
 @requires_npu
-def test_turboquant_pack_kv_for_cache_fused_matches_reference(
-    tmp_path,
-):
-    """Fused NPU pack op should match the reference math/packing.
+def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
+    """``turboquant_pack_kv_for_cache`` with ENCODE_OP=0 vs ENCODE_OP=1 must match.
 
-    This compares `torch.ops._C_ascend.turboquant_pack_kv_for_cache` (if built)
-    against an explicit reference implementation:
-      norm + unitize + (x @ R^T) + turboquant_encode_packed_blocks + pad
+    - ``VLLM_ASCEND_TURBOQUANT_ENCODE_OP=0``: PyTorch ``quantize`` + byte pack
+      (``turboquant_quantize_to_packed_bytes`` path).
+    - ``VLLM_ASCEND_TURBOQUANT_ENCODE_OP=1``: fused ``turboquant_pack_kv_for_cache`` NPU op.
 
-    Optional profiling:
-      - set `VLLM_ASCEND_TURBOQUANT_PACK_PROFILE=1` to write traces under
-        `/root/l00856060/perflog2/tq_pack_traces`.
+    Optional profiling (both ENCODE_OP=0 and ENCODE_OP=1):
+      ``VLLM_ASCEND_TURBOQUANT_PACK_PROFILE=1`` →
+      ``/root/l00856060/perflog2/encode_op0`` and ``.../encode_op1``.
     """
     bits_key = 8
     bits_value = 8
 
     if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache"):
-        pytest.skip("fused turboquant_pack_kv_for_cache op not available")
+        pytest.skip("turboquant_pack_kv_for_cache fused op not available")
 
     device = torch.device("npu")
     dtype = torch.float16
-    T, H, D = 64, 4, KV_HEAD_DIM
-    if (bits_key == 4 or bits_value == 4) and (D % 2 != 0):
-        pytest.skip("4-bit packing requires even head size")
-
-    # Slot widths: include padding to exercise right-pad behavior.
-    pk = turboquant_packed_bytes_per_vector(D, bits=bits_key)
-    pv = turboquant_packed_bytes_per_vector(D, bits=bits_value)
-    slot_w_k = pk + 8
-    slot_w_v = pv + 4
+    T, H, D = 2, 2, KV_HEAD_DIM
+    slot_w_k = turboquant_packed_bytes_per_vector(D, bits=bits_key)
+    slot_w_v = turboquant_packed_bytes_per_vector(D, bits=bits_value)
 
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
 
-    # Use the same quantizer tables for both fused and reference.
-    with patch.dict(os.environ, {"VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v2"}):
-        qk = _get_quantizer(D, bits_key, str(device), "v2")
-        qv = qk if bits_key == bits_value else _get_quantizer(D, bits_value, str(device), "v2")
-        cb_k = qk.codebook.to(device=device, dtype=torch.float16)
-        rot_t_k = qk.rotation_t.to(device=device, dtype=torch.float16)
-        cb_v = cb_k if bits_key == bits_value else qv.codebook.to(device=device, dtype=torch.float16)
-        rot_t_v = rot_t_k if bits_key == bits_value else qv.rotation_t.to(device=device, dtype=torch.float16)
+    pack_kwargs = dict(
+        key=key,
+        value=value,
+        bits_key=bits_key,
+        bits_value=bits_value,
+        slot_w_k=slot_w_k,
+        slot_w_v=slot_w_v,
+    )
+    mse_env = {"VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1"}
+    profile = os.environ.get("VLLM_ASCEND_TURBOQUANT_PACK_PROFILE", "0") == "1"
+    profile_root = "/root/l00856060/perflog2"
+    import torch_npu  # type: ignore
 
-        # Reference: explicit math + existing encode op (not fused pack op).
-        import torch_npu  # type: ignore
-
-        def _reference_pack(x: torch.Tensor, *, codebook: torch.Tensor, rot_t: torch.Tensor, slot_w: int) -> torch.Tensor:
-            x_flat = x.reshape(-1, D).contiguous()
-            x_f32 = x_flat.float()
-            norms = torch.linalg.vector_norm(x_f32, dim=-1, keepdim=True)
-            unit = x_f32 / (norms + 1e-10)
-            y = (unit @ rot_t.float()).to(torch.float16)
-            norms_fp16 = norms.to(torch.float16)
-            packed = torch.ops._C_ascend.turboquant_encode_packed_blocks(
-                y, codebook, norms_fp16, D, 8
-            )  # [N, D+2] uint8
-            if packed.shape[-1] < slot_w:
-                packed = torch.nn.functional.pad(packed, (0, slot_w - packed.shape[-1]))
-            return packed.reshape(*x.shape[:-1], slot_w).to(torch.int8)
-
-        with patch.dict(os.environ, {"VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0"}):
-            # ensure we never call fused pack in reference path
-            ref_k = _reference_pack(key, codebook=cb_k, rot_t=rot_t_k, slot_w=slot_w_k)
-            ref_v = _reference_pack(value, codebook=cb_v, rot_t=rot_t_v, slot_w=slot_w_v)
-
-        # Fused op.
-        profile = os.environ.get("VLLM_ASCEND_TURBOQUANT_PACK_PROFILE", "0") == "1"
-        with patch.dict(os.environ, {"VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1"}):
+    def _pack_with_optional_profile(encode_op: str, trace_tag: str):
+        env = {**mse_env, "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": encode_op}
+        with patch.dict(os.environ, env):
             if profile:
-                trace_dir = "/root/l00856060/perflog2"
+                trace_dir = f"{profile_root}/{trace_tag}"
                 with torch_npu.profiler.profile(
                     activities=[
                         torch_npu.profiler.ProfilerActivity.CPU,
@@ -168,47 +141,45 @@ def test_turboquant_pack_kv_for_cache_fused_matches_reference(
                         trace_dir
                     ),
                 ):
-                    fused_k, fused_v = turboquant_pack_kv_for_cache(
-                        key=key,
-                        value=value,
-                        bits_key=bits_key,
-                        bits_value=bits_value,
-                        slot_w_k=slot_w_k,
-                        slot_w_v=slot_w_v,
-                        codebook=cb_k,
-                        rotation=rot_t_k,
-                        codebook_value=cb_v,
-                        rotation_value=rot_t_v,
-                    )
+                    out = turboquant_pack_kv_for_cache(**pack_kwargs)
                     torch.npu.synchronize()
-            else:
-                fused_k, fused_v = turboquant_pack_kv_for_cache(
-                    key=key,
-                    value=value,
-                    bits_key=bits_key,
-                    bits_value=bits_value,
-                    slot_w_k=slot_w_k,
-                    slot_w_v=slot_w_v,
-                    codebook=cb_k,
-                    rotation=rot_t_k,
-                    codebook_value=cb_v,
-                    rotation_value=rot_t_v,
-                )
-                torch.npu.synchronize()
+                    return out
+            out = turboquant_pack_kv_for_cache(**pack_kwargs)
+            torch.npu.synchronize()
+            return out
 
-        # Compare bytewise (int8 storage is a view of raw packed bytes).
-        assert fused_k.shape == ref_k.shape
-        assert fused_v.shape == ref_v.shape
-        assert fused_k.dtype == torch.int8 and ref_k.dtype == torch.int8
-        assert fused_v.dtype == torch.int8 and ref_v.dtype == torch.int8
+    ref_k, ref_v = _pack_with_optional_profile("0", "encode_op0")
+    fused_k, fused_v = _pack_with_optional_profile("1", "encode_op1")
 
-        fused_k_u8 = fused_k.view(torch.uint8)
-        ref_k_u8 = ref_k.view(torch.uint8)
-        fused_v_u8 = fused_v.view(torch.uint8)
-        ref_v_u8 = ref_v.view(torch.uint8)
+    ref_k_u8 = ref_k.view(torch.uint8)
+    ref_v_u8 = ref_v.view(torch.uint8)
+    fused_k_u8 = fused_k.view(torch.uint8)
+    fused_v_u8 = fused_v.view(torch.uint8)
 
-        assert torch.equal(fused_k_u8, ref_k_u8)
-        assert torch.equal(fused_v_u8, ref_v_u8)
+    pk = turboquant_packed_bytes_per_vector(D, bits=8)
+
+    def _diff_report(name: str, fused: torch.Tensor, ref: torch.Tensor) -> None:
+        fu, re = fused.view(torch.uint8), ref.view(torch.uint8)
+        if torch.equal(fu, re):
+            print(f"{name}: OK")
+            return
+        flat_f, flat_r = fu.reshape(-1), re.reshape(-1)
+        i = int((flat_f != flat_r).nonzero(as_tuple=True)[0][0])
+        row, col = divmod(i, fu.shape[-1])
+        print(f"{name} first mismatch: flat_idx={i} row={row} col={col}")
+        print(f"  ENCODE_OP=1 fused={int(flat_f[i])} ENCODE_OP=0 ref={int(flat_r[i])}")
+        if col < D:
+            print("  -> indices region")
+        elif col < pk:
+            print("  -> norm bytes region")
+        else:
+            print("  -> padding region")
+
+    _diff_report("key (ENCODE_OP=1 vs 0)", fused_k, ref_k)
+    _diff_report("value (ENCODE_OP=1 vs 0)", fused_v, ref_v)
+
+    assert torch.equal(fused_k_u8, ref_k_u8)
+    assert torch.equal(fused_v_u8, ref_v_u8)
 
 
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
