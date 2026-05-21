@@ -100,7 +100,7 @@ def _pack_turboquant_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
     _validate_turboquant_bits(bits)
     if bits == 4:
         return pack_uint4(indices)
-    return indices.to(dtype=torch.uint8).contiguous()
+    return indices
 
 
 def _unpack_turboquant_indices(idx_packed: torch.Tensor, head_size: int, bits: int) -> torch.Tensor:
@@ -111,7 +111,7 @@ def _unpack_turboquant_indices(idx_packed: torch.Tensor, head_size: int, bits: i
         raise ValueError(
             f"8-bit indices last dim must be head_size={head_size}, got {idx_packed.shape[-1]}."
         )
-    return idx_packed.to(dtype=torch.uint8)
+    return idx_packed.view(dtype=torch.uint8)
 
 
 def _turboquant_u32_tuple_from_fp32_le_hex(*hex_chunks: str) -> tuple[int, ...]:
@@ -624,8 +624,9 @@ def turboquant_dequantize_from_packed_bytes(
     norm_bytes = packed_flat[:, idx_len : idx_len + 2]
 
     indices = _unpack_turboquant_indices(idx_packed, head_size, bits)
-    norms_fp16 = norm_bytes.contiguous().view(torch.float16).view(-1, 1)
-    norms = norms_fp16.to(dtype=torch.float32)
+    # norms_fp16 = norm_bytes.contiguous().view(torch.float16).view(-1, 1)
+    # norms = norms_fp16.to(dtype=torch.float32)
+    norms = norm_bytes.contiguous().view(torch.float16).view(-1, 1)
     if not torch.isfinite(norms).all():
         norms = torch.nan_to_num(norms, nan=0.0, posinf=65504.0, neginf=0.0)
 
@@ -733,7 +734,7 @@ def turboquant_pack_kv_for_cache(
     packed_v = _pad_packed_to_slot_width(
         turboquant_quantize_to_packed_bytes(value, bits=bits_value), slot_w_v
     )
-    return packed_k.to(dtype=torch.int8), packed_v.to(dtype=torch.int8)
+    return packed_k.view(dtype=torch.int8), packed_v.view(dtype=torch.int8)
 
 
 def turboquant_store_kv(
@@ -836,7 +837,7 @@ def turboquant_decode_kv_cache_compact(
         empty = torch.empty((0,) + key_cache.shape[1:-1] + (head_size,), dtype=dtype, device=key_cache.device)
         return empty, empty, block_tables
 
-    bt = block_tables.to(torch.int64)
+    bt = block_tables.to(torch.int32)
     valid = bt >= 0
     if not torch.any(valid):
         empty = torch.empty((0,) + key_cache.shape[1:-1] + (head_size,), dtype=dtype, device=key_cache.device)
@@ -908,6 +909,6 @@ def turboquant_decode_kv_cache_compact(
     # Remap block tables to compact indices.
     # block_tables_compact = searchsorted(used_sorted, bt) for valid entries.
     bt_compact = bt.clone()
-    bt_compact[valid] = torch.searchsorted(used_sorted, bt[valid])
+    bt_compact[valid] = torch.searchsorted(used_sorted, used, out_int32=True)
     return k, v, bt_compact.to(block_tables.dtype)
 
