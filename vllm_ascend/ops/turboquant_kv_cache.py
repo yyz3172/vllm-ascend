@@ -683,19 +683,7 @@ def turboquant_pack_kv_for_cache(
         raise ValueError("Key/value dtypes must match for turboquant.")
 
     head_size = key.shape[-1]
-
-    dev_type = getattr(getattr(key, "device", None), "type", None)
-    is_npu_tensor = dev_type in ("npu", "privateuseone")
-    fused_supported = (
-        is_npu_tensor
-        and key.dtype == torch.float16
-        and bits_key == 8
-        and bits_value == 8
-        and head_size == 128
-        and _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache")
-    )
-
-    if envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP and fused_supported:
+    if envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP:
         qk = _get_quantizer(head_size, bits_key, str(key.device), _current_mse_impl())
         qv = qk if bits_key == bits_value else _get_quantizer(
             head_size, bits_value, str(key.device), _current_mse_impl()
