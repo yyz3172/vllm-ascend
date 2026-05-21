@@ -46,3 +46,7 @@ if os.getenv("SHM_BARRIER", "true").lower() in ("true", "1"):
 
 if envs.VLLM_ASCEND_BALANCE_SCHEDULING and vllm_version_is('0.13.0'):
     import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
+
+# Ascend torch profiler: allow /start_profile when only VLLM_TORCH_PROFILER_DIR is set.
+if os.getenv("VLLM_TORCH_PROFILER_DIR"):
+    import vllm_ascend.patch.platform.patch_profile_api_router  # noqa

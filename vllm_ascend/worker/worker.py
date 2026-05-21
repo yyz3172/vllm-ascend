@@ -19,6 +19,8 @@
 
 import copy
 import gc
+import glob
+import os
 from types import NoneType
 from typing import Optional
 
@@ -134,7 +136,9 @@ class NPUWorker(WorkerBase):
 
             init_cached_hf_modules()
 
-        self.profiler = self._init_profiler()
+        # Lazy-init Ascend torch profiler on /start_profile (see profile()).
+        self.profiler = None
+        self._torch_profiling_active = False
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -310,6 +314,12 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+
+        # Advance Ascend profiler schedule only on real forward steps (idle engine
+        # steps must not consume the active window before decode work runs).
+        if (self._torch_profiling_active and self.profiler is not None
+                and forward_pass):
+            self.profiler.step()
         if forward_pass and not get_pp_group().is_first_rank:
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise it will conflict with the all-gather operation in flashcomm1.
             if enable_sp():
@@ -445,12 +455,135 @@ class NPUWorker(WorkerBase):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def profile(self, is_start: bool = True):
-        if self.profiler is None:
+        if not self._resolve_torch_profiler_trace_dir():
             raise RuntimeError("Profiler is not enabled.")
         if is_start:
+            # Fresh profiler per session so schedule step_num starts at 0.
+            self.profiler = self._init_profiler()
+            self._torch_profiling_active = True
             self.profiler.start()
+            logger.info(
+                "Ascend PyTorch Profiler started on rank %s (active_steps=%s).",
+                self.local_rank,
+                self._torch_profiler_active_steps(),
+            )
         else:
-            self.profiler.stop()
+            trace_root = self._resolve_torch_profiler_trace_dir()
+            trace_rank_dir = (
+                os.path.join(trace_root, f"rank_{self.local_rank}")
+                if trace_root else None)
+            if self.profiler is not None and self._torch_profiling_active:
+                self._advance_torch_profiler_to_save()
+                self.profiler.stop()
+                if trace_rank_dir:
+                    self._finalize_torch_profiler_export(trace_rank_dir,
+                                                       trace_root)
+            self._torch_profiling_active = False
+
+    @staticmethod
+    def _torch_profiler_active_steps() -> int:
+        return max(
+            1,
+            int(os.getenv("VLLM_ASCEND_TORCH_PROFILER_ACTIVE_STEPS", "512")),
+        )
+
+    @staticmethod
+    def _profiler_env_bool(val: object, default: bool = False) -> bool:
+        if val is None:
+            return default
+        return str(val).strip().lower() in ("1", "true", "yes")
+
+    def _advance_torch_profiler_to_save(self) -> None:
+        """Advance schedule to RECORD_AND_SAVE before stop() finalizes trace."""
+        from torch_npu.profiler.scheduler import ProfilerAction
+
+        prof = self.profiler
+        if prof is None:
+            return
+        max_steps = self._torch_profiler_active_steps() + 4
+        for _ in range(max_steps):
+            if prof.current_action in (
+                    ProfilerAction.RECORD_AND_SAVE,
+                    ProfilerAction.NONE,
+            ):
+                return
+            prof.step()
+
+    def _find_profiler_artifacts(self, *roots: str | None) -> tuple[list[str], list[str]]:
+        ascend_pts: list[str] = []
+        dbs: list[str] = []
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            ascend_pts.extend(
+                glob.glob(os.path.join(root, "*_ascend_pt")))
+            for pattern in ("**/*.db", "**/analysis.db",
+                              "**/ascend_pytorch_profiler*.db"):
+                dbs.extend(glob.glob(os.path.join(root, pattern),
+                                     recursive=True))
+        ascend_pts = sorted(dict.fromkeys(ascend_pts),
+                            key=os.path.getmtime,
+                            reverse=True)
+        dbs = sorted(dict.fromkeys(dbs))
+        return ascend_pts, dbs
+
+    def _finalize_torch_profiler_export(
+        self,
+        trace_rank_dir: str,
+        trace_root: str | None,
+    ) -> None:
+        """After /stop_profile: parse raw *_ascend_pt for Insight (.db optional).
+
+        Online vLLM serve uses POST start/stop; parsing runs in the worker process
+        (not offline batch inference). ExportType.Db during capture triggers a
+        broken msprof daemon parse on stop(), so capture uses Text and we parse here.
+        """
+        deliver_kind = os.getenv("VLLM_ASCEND_TORCH_PROFILER_EXPORT_TYPE",
+                                 "db").strip().lower()
+        analyse_targets: list[str] = []
+        prof_path = getattr(self.profiler.prof_if, "prof_path", None)
+        if prof_path and os.path.isdir(prof_path):
+            analyse_targets.append(os.path.realpath(prof_path))
+        analyse_targets.extend(
+            sorted(glob.glob(os.path.join(trace_rank_dir, "*_ascend_pt")),
+                   key=os.path.getmtime,
+                   reverse=True))
+        analyse_targets = list(dict.fromkeys(analyse_targets))
+
+        if not analyse_targets:
+            logger.warning(
+                "Ascend profiler (rank %s): no *_ascend_pt under %s (realpath).",
+                self.local_rank,
+                trace_rank_dir,
+            )
+            return
+
+        ascend_pt = analyse_targets[0]
+        if deliver_kind == "db":
+            from torch_npu.profiler.profiler import analyse
+
+            for target in analyse_targets[:2]:
+                try:
+                    analyse(target, export_type=["db", "text"])
+                except Exception as e:
+                    logger.error(
+                        "Ascend profiler analyse failed (rank %s, %s): %s",
+                        self.local_rank,
+                        target,
+                        e,
+                    )
+
+        ascend_pts, dbs = self._find_profiler_artifacts(
+            trace_rank_dir, trace_root, ascend_pt)
+        logger.info(
+            "Ascend PyTorch Profiler stopped on rank %s. "
+            "Insight: import this directory (ascend_pt is sufficient): %s | "
+            "ascend_pt=%s | db=%s",
+            self.local_rank,
+            trace_rank_dir,
+            ascend_pts[:2] or "none",
+            dbs[:3] or "none (import *_ascend_pt in Insight directly)",
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
@@ -484,44 +617,128 @@ class NPUWorker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
-    def _init_profiler(self):
-        # Torch profiler. Enabled and configured through env vars:
-        # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
-        if envs_vllm.VLLM_TORCH_PROFILER_DIR:
-            if envs_ascend.MSMONITOR_USE_DAEMON:
-                raise RuntimeError(
-                    "MSMONITOR_USE_DAEMON and VLLM_TORCH_PROFILER_DIR cannot be both set at the same time."
-                )
-            torch_profiler_trace_dir = envs_vllm.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
-
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                export_type=torch_npu.profiler.ExportType.Text,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                msprof_tx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-                l2_cache=False,
-                op_attr=False,
-                data_simplification=False,
-                record_op_args=False,
-                gc_detect_threshold=None,
-            )
-
-            return torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
-                with_stack=envs_vllm.VLLM_TORCH_PROFILER_WITH_STACK,
-                profile_memory=envs_vllm.\
-                    VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
-                with_modules=False,
-                experimental_config=experimental_config,
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir))
-        else:
+    def _resolve_torch_profiler_trace_dir(self) -> str | None:
+        """Directory for Ascend PyTorch Profiler output (MindStudio Insight input)."""
+        trace_dir = envs_vllm.VLLM_TORCH_PROFILER_DIR
+        if not trace_dir:
+            profiler_config = getattr(self.vllm_config, "profiler_config", None)
+            trace_dir = getattr(profiler_config, "torch_profiler_dir", None)
+        if not trace_dir:
             return None
+        return os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(trace_dir))))
+
+    @staticmethod
+    def _torch_profiler_experimental_config() -> "torch_npu.profiler._ExperimentalConfig":
+        """Build experimental_config for MindStudio Insight (host + device timeline)."""
+        deliver_kind = os.getenv("VLLM_ASCEND_TORCH_PROFILER_EXPORT_TYPE",
+                                 "db").strip().lower()
+        # Capture as Text: ExportType.Db during stop() triggers msprof daemon parse
+        # errors under vLLM multiprocess workers; .db is produced in
+        # _finalize_torch_profiler_export() after stop when deliver_kind=db.
+        capture_kind = os.getenv("VLLM_ASCEND_TORCH_PROFILER_CAPTURE_EXPORT",
+                                 "text").strip().lower()
+        if capture_kind == "db":
+            export_type = torch_npu.profiler.ExportType.Db
+        else:
+            export_type = torch_npu.profiler.ExportType.Text
+        _ = deliver_kind  # used after stop in _finalize_torch_profiler_export
+
+        level = os.getenv("VLLM_ASCEND_TORCH_PROFILER_LEVEL", "1").strip()
+        level_map = {
+            "0": torch_npu.profiler.ProfilerLevel.Level0,
+            "1": torch_npu.profiler.ProfilerLevel.Level1,
+            "2": torch_npu.profiler.ProfilerLevel.Level2,
+        }
+        profiler_level = level_map.get(level,
+                                       torch_npu.profiler.ProfilerLevel.Level1)
+
+        msprof_tx = os.getenv("VLLM_ASCEND_TORCH_PROFILER_MSTX", "0") == "1"
+        aic_metrics = torch_npu.profiler.AiCMetrics.AiCoreNone
+        if os.getenv("VLLM_ASCEND_TORCH_PROFILER_AIC_METRICS", "0") == "1":
+            aic_metrics = torch_npu.profiler.AiCMetrics.AiCoreUtilization
+
+        return torch_npu.profiler._ExperimentalConfig(
+            export_type=export_type,
+            profiler_level=profiler_level,
+            msprof_tx=msprof_tx,
+            aic_metrics=aic_metrics,
+            l2_cache=os.getenv("VLLM_ASCEND_TORCH_PROFILER_L2_CACHE", "0")
+            == "1",
+            op_attr=False,
+            data_simplification=os.getenv(
+                "VLLM_ASCEND_TORCH_PROFILER_DATA_SIMPLIFICATION", "1") != "0",
+            record_op_args=False,
+            gc_detect_threshold=None,
+        )
+
+    def _init_profiler(self):
+        # Ascend PyTorch Profiler: set VLLM_TORCH_PROFILER_DIR or pass
+        # --profiler-config '{"profiler":"torch","torch_profiler_dir":"..."}'.
+        # Control capture via POST /start_profile and /stop_profile (mounted when
+        # VLLM_TORCH_PROFILER_DIR is set; --profiler-config is optional). Export:
+        # Insight imports the output dir.
+        torch_profiler_trace_dir = self._resolve_torch_profiler_trace_dir()
+        if not torch_profiler_trace_dir:
+            return None
+        if envs_ascend.MSMONITOR_USE_DAEMON:
+            raise RuntimeError(
+                "MSMONITOR_USE_DAEMON and VLLM_TORCH_PROFILER_DIR cannot be "
+                "both set at the same time.")
+        trace_root = torch_profiler_trace_dir
+        torch_profiler_trace_dir = os.path.join(trace_root,
+                                              f"rank_{self.local_rank}")
+        os.makedirs(torch_profiler_trace_dir, exist_ok=True)
+        logger.info(
+            "Ascend PyTorch Profiler enabled. Traces will be saved to: %s "
+            "(root=%s, export_type=%s, level=%s; import dir in MindStudio Insight)",
+            torch_profiler_trace_dir,
+            trace_root,
+            os.getenv("VLLM_ASCEND_TORCH_PROFILER_EXPORT_TYPE", "db"),
+            os.getenv("VLLM_ASCEND_TORCH_PROFILER_LEVEL", "1"),
+        )
+
+        experimental_config = self._torch_profiler_experimental_config()
+
+        active_steps = self._torch_profiler_active_steps()
+        # repeat=0: keep cycling active windows (repeat=1 ends in NONE and drops data).
+        prof_schedule = torch_npu.profiler.schedule(
+            wait=0,
+            warmup=1,
+            active=active_steps,
+            repeat=0,
+        )
+        with_stack = self._profiler_env_bool(
+            envs_vllm.VLLM_TORCH_PROFILER_WITH_STACK)
+        profile_memory = self._profiler_env_bool(
+            envs_vllm.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY)
+        # Daemon analyse during stop() is unreliable in vLLM workers; keep False.
+        analyse_on_stop = (
+            os.getenv("VLLM_ASCEND_TORCH_PROFILER_ANALYSE_ONLINE", "0") == "1")
+        try:
+            torch_npu.profiler.profile.enable_profiler_in_child_thread(
+                profile_memory=profile_memory,
+                with_stack=with_stack,
+            )
+        except Exception:
+            pass
+
+        return torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=prof_schedule,
+            with_stack=with_stack,
+            profile_memory=profile_memory,
+            with_modules=False,
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                torch_profiler_trace_dir,
+                worker_name=f"rank_{self.local_rank}",
+                analyse_flag=analyse_on_stop,
+                async_mode=False,
+            ))
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
