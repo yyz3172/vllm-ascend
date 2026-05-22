@@ -1038,8 +1038,10 @@ class NPUModelRunner(GPUModelRunner):
         layer_name: str,
         graph_slot_bufs: Optional[dict[str, torch.Tensor]],
         slot_n: int,
+        profile_acc: Optional[dict[str, float]] = None,
     ) -> Any:
         """Default per-layer metadata (vLLM-style); pins FULL-graph slot buffers."""
+        _t0_cm = time.perf_counter() if profile_acc is not None else 0
         try:
             meta_i = copy(base_meta)
         except Exception:
@@ -1048,7 +1050,12 @@ class NPUModelRunner(GPUModelRunner):
             setattr(meta_i, "layer_name", layer_name)
         except Exception:
             pass
+        if profile_acc is not None:
+            profile_acc["layer_copy_meta"] = profile_acc.get(
+                "layer_copy_meta", 0.0) + (
+                    time.perf_counter() - _t0_cm) * 1000
         if graph_slot_bufs is not None and slot_n > 0:
+            _t0_sr = time.perf_counter() if profile_acc is not None else 0
             captured_sm = graph_slot_bufs.get(layer_name)
             if captured_sm is not None:
                 meta_i.slot_mapping = captured_sm
@@ -1059,6 +1066,10 @@ class NPUModelRunner(GPUModelRunner):
                             base_meta.slot_mapping[:n_sm])
                 except Exception:
                     pass
+            if profile_acc is not None:
+                profile_acc["layer_slot_remap"] = profile_acc.get(
+                    "layer_slot_remap", 0.0) + (
+                        time.perf_counter() - _t0_sr) * 1000
         return meta_i
 
     def _prepare_inputs(
@@ -1772,12 +1783,22 @@ class NPUModelRunner(GPUModelRunner):
                     self._is_dynamic_kv_enabled()
                     and getattr(self, "is_kv_consumer", False))
                 if not _run_dynkv_decode_prepare:
+                    _dynkv_profile_std = (
+                        os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0")
+                        == "1")
                     _graph_slot_bufs_std = self._get_graph_slot_bufs_for_tokens(
                         int(num_input_tokens))
                     try:
                         _slot_n_std = int(attn_metadata_i.slot_mapping.numel())
                     except Exception:
                         _slot_n_std = 0
+                    _std_L = len(attn_group.layer_names)
+                    _std_profile_acc: Optional[dict[str, float]] = None
+                    if _dynkv_profile_std and _std_L > 0:
+                        _std_profile_acc = {
+                            "layer_copy_meta": 0.0,
+                            "layer_slot_remap": 0.0,
+                        }
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = (
                             self._prepare_standard_layer_attn_metadata(
@@ -1785,7 +1806,27 @@ class NPUModelRunner(GPUModelRunner):
                                 layer_name,
                                 _graph_slot_bufs_std,
                                 _slot_n_std,
+                                profile_acc=_std_profile_acc,
                             ))
+                    if _dynkv_profile_std and _std_L > 0:
+                        _t_cm = float(
+                            _std_profile_acc.get("layer_copy_meta", 0.0)
+                            if _std_profile_acc else 0.0)
+                        _t_sr = float(
+                            _std_profile_acc.get("layer_slot_remap", 0.0)
+                            if _std_profile_acc else 0.0)
+                        logger.info(
+                            "[DynamicKV][prepare_profile] layers=%d "
+                            "stack_init=0.00ms kv_list_build=0.00ms "
+                            "build_helper=0.00ms broadcast=0.00ms "
+                            "stacked_tensor=0.00ms layer_copy_meta=%.2fms "
+                            "layer_slot_remap=%.2fms layer_other=0.00ms "
+                            "total_loop=%.2fms",
+                            _std_L,
+                            _t_cm,
+                            _t_sr,
+                            _t_cm + _t_sr,
+                        )
                 else:
                     # DynamicKV PD decode: compressed context_lens + slot_remap.
                     # Scheme 1: (req_idx, base_tokens) -> (mask, rel); rel does not depend
