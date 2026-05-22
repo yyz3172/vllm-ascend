@@ -112,6 +112,54 @@ def dynkv_pa_kv_tokens_avg_from_attn_metadata(
     return sum(maxes) / len(maxes)
 
 
+def dynkv_fill_all_graph_context_lens_bufs(
+    *,
+    layer_names: list[str],
+    context_lens_bufs: dict[str, torch.Tensor],
+    stacked_dyn_lens_t: torch.Tensor,
+    seq_lens: torch.Tensor,
+    all_tmp_lens: list[list[int]],
+    layer_idx_map: dict[str, int],
+) -> None:
+    """Batch-fill per-layer graph ``context_lens`` buffers (prepare P1)."""
+    if not context_lens_bufs or stacked_dyn_lens_t is None:
+        return
+    if not isinstance(seq_lens, torch.Tensor):
+        return
+    n_layers = min(
+        len(layer_names),
+        int(stacked_dyn_lens_t.shape[0]),
+        len(all_tmp_lens),
+    )
+    for li in range(n_layers):
+        layer_name = layer_names[li]
+        buf = context_lens_bufs.get(layer_name)
+        if buf is None:
+            continue
+        tmp_lens_layer = all_tmp_lens[li]
+        if (layer_idx_map.get(layer_name, -1) < 0
+                or not tmp_lens_layer
+                or all(v < 0 for v in tmp_lens_layer)):
+            continue
+        row = stacked_dyn_lens_t[li]
+        n_buf = int(buf.numel())
+        n_row = int(row.numel())
+        if row.device != buf.device or row.dtype != buf.dtype:
+            continue
+        if n_row < n_buf and int(seq_lens.numel()) == n_buf:
+            buf.copy_(seq_lens)
+            part = buf[:n_row]
+            if (row < 0).any():
+                part.copy_(torch.where(row >= 0, row, seq_lens[:n_row]))
+            else:
+                part.copy_(row)
+        elif n_row == n_buf:
+            if (row < 0).any():
+                buf.copy_(torch.where(row >= 0, row, seq_lens))
+            else:
+                buf.copy_(row)
+
+
 def dynkv_fill_graph_context_lens_buf(
     attn_metadata: Any,
     context_lens_buf: torch.Tensor,

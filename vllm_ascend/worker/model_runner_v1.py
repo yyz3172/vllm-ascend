@@ -99,6 +99,7 @@ from vllm_ascend.attention.dynamic_kv import (
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    dynkv_fill_all_graph_context_lens_bufs,
     dynkv_fill_graph_context_lens_buf,
     dynkv_pa_kv_tokens_avg_from_attn_metadata,
     using_paged_attention,
@@ -704,6 +705,7 @@ class NPUModelRunner(GPUModelRunner):
         # Per-layer context_lens pinned during FULL PA graph capture.
         self._dynkv_graph_context_lens_bufs: dict[int, dict[str, torch.Tensor]] = (
             {})
+        self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
@@ -983,6 +985,76 @@ class NPUModelRunner(GPUModelRunner):
                 return self._dynkv_graph_context_lens_bufs[cap_n]
         return None
 
+    @staticmethod
+    def _dynkv_prepare_profile_enabled() -> bool:
+        return os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
+
+    def _dynkv_prepare_step_acc_reset(self) -> None:
+        if self._dynkv_prepare_profile_enabled():
+            self._dynkv_prepare_step_acc = {
+                "update_states_ms": 0.0,
+                "prepare_core_ms": 0.0,
+                "prepare_attn_build_ms": 0.0,
+            }
+        else:
+            self._dynkv_prepare_step_acc = None
+
+    def _dynkv_prepare_step_acc_add(self, key: str, ms: float) -> None:
+        acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        if isinstance(acc, dict):
+            acc[key] = float(acc.get(key, 0.0)) + float(ms)
+
+    def _dynkv_log_prepare_profile_ext(self) -> None:
+        acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        if not isinstance(acc, dict):
+            return
+        logger.info(
+            "[DynamicKV][prepare_profile_ext] update_states=%.2fms "
+            "prepare_core=%.2fms prepare_attn_build=%.2fms",
+            float(acc.get("update_states_ms", 0.0)),
+            float(acc.get("prepare_core_ms", 0.0)),
+            float(acc.get("prepare_attn_build_ms", 0.0)),
+        )
+
+    @staticmethod
+    def _dynkv_log_prepare_profile_loop(
+        *,
+        layers: int,
+        stack_init: float,
+        kv_list_build: float,
+        build_helper: float,
+        broadcast: float,
+        stacked_tensor: float,
+        layer_ctx_fill_batch: float,
+        layer_slot_assign: float,
+        layer_copy_meta: float,
+        layer_slot_remap: float,
+        layer_meta_assign: float,
+    ) -> None:
+        total_loop = (layer_copy_meta + layer_slot_remap + layer_meta_assign
+                      + layer_slot_assign)
+        logger.info(
+            "[DynamicKV][prepare_profile] layers=%d stack_init=%.2fms "
+            "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
+            "stacked_tensor=%.2fms layer_ctx_fill_batch=%.2fms "
+            "layer_slot_assign=%.2fms layer_copy_meta=%.2fms "
+            "layer_slot_remap=%.2fms layer_meta_assign=%.2fms "
+            "layer_other=%.2fms total_loop=%.2fms",
+            layers,
+            stack_init,
+            kv_list_build,
+            build_helper,
+            broadcast,
+            stacked_tensor,
+            layer_ctx_fill_batch,
+            layer_slot_assign,
+            layer_copy_meta,
+            layer_slot_remap,
+            layer_meta_assign,
+            layer_meta_assign,
+            total_loop,
+        )
+
     def _register_dynkv_graph_context_lens_bufs_from_capture(
         self,
         num_input_tokens: int,
@@ -1084,6 +1156,10 @@ class NPUModelRunner(GPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+
+        _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        _t0_prepare_core = (time.perf_counter()
+                            if isinstance(_prep_acc, dict) else 0)
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1583,6 +1659,12 @@ class NPUModelRunner(GPUModelRunner):
                 dynkv_decode_token_pos_t = None
                 dynkv_decode_req_idx_t = None
 
+        if isinstance(_prep_acc, dict):
+            self._dynkv_prepare_step_acc_add(
+                "prepare_core_ms",
+                (time.perf_counter() - _t0_prepare_core) * 1000,
+            )
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -1761,10 +1843,17 @@ class NPUModelRunner(GPUModelRunner):
                             num_decode_draft_tokens_cpu=self.
                             num_decode_draft_tokens.cpu[:num_reqs],
                         )
+                _t0_attn_build = (time.perf_counter()
+                                 if isinstance(_prep_acc, dict) else 0)
                 attn_metadata_i = builder.build(
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args)
+                if isinstance(_prep_acc, dict):
+                    self._dynkv_prepare_step_acc_add(
+                        "prepare_attn_build_ms",
+                        (time.perf_counter() - _t0_attn_build) * 1000,
+                    )
                 if self._is_dynamic_kv_enabled():
                     try:
                         setattr(attn_metadata_i, "dynamic_kv_is_last_chunk",
@@ -1815,17 +1904,18 @@ class NPUModelRunner(GPUModelRunner):
                         _t_sr = float(
                             _std_profile_acc.get("layer_slot_remap", 0.0)
                             if _std_profile_acc else 0.0)
-                        logger.info(
-                            "[DynamicKV][prepare_profile] layers=%d "
-                            "stack_init=0.00ms kv_list_build=0.00ms "
-                            "build_helper=0.00ms broadcast=0.00ms "
-                            "stacked_tensor=0.00ms layer_copy_meta=%.2fms "
-                            "layer_slot_remap=%.2fms layer_other=0.00ms "
-                            "total_loop=%.2fms",
-                            _std_L,
-                            _t_cm,
-                            _t_sr,
-                            _t_cm + _t_sr,
+                        self._dynkv_log_prepare_profile_loop(
+                            layers=_std_L,
+                            stack_init=0.0,
+                            kv_list_build=0.0,
+                            build_helper=0.0,
+                            broadcast=0.0,
+                            stacked_tensor=0.0,
+                            layer_ctx_fill_batch=0.0,
+                            layer_slot_assign=0.0,
+                            layer_copy_meta=_t_cm,
+                            layer_slot_remap=_t_sr,
+                            layer_meta_assign=0.0,
                         )
                 else:
                     # DynamicKV PD decode: compressed context_lens + slot_remap.
@@ -1848,7 +1938,9 @@ class NPUModelRunner(GPUModelRunner):
                     _t_stacked_tensor = 0.0
                     _t_layer_copy_meta = 0.0
                     _t_layer_slot_remap = 0.0
-                    _t_layer_other = 0.0
+                    _t_layer_ctx_fill_batch = 0.0
+                    _t_layer_slot_assign = 0.0
+                    _t_layer_meta_assign = 0.0
 
                     _t0_stack = time.perf_counter() if _dynkv_profile else 0
                     _dynkv_stack: Optional[torch.Tensor] = None
@@ -2083,6 +2175,52 @@ class NPUModelRunner(GPUModelRunner):
                     # DynamicKV slot_remap runs (``enabled=false`` still uses PA graph).
                     _use_graph_slot_bufs = (
                         _graph_slot_bufs is not None and _slot_n_sm > 0)
+                    if (
+                        all_tmp_lens is not None
+                        and _graph_context_lens_bufs is not None
+                        and stacked_dyn_lens_t is not None
+                        and isinstance(attn_metadata_i.seq_lens, torch.Tensor)
+                    ):
+                        _t0_ctx_batch = (
+                            time.perf_counter() if _dynkv_profile else 0)
+                        try:
+                            dynkv_fill_all_graph_context_lens_bufs(
+                                layer_names=_dynkv_layer_names,
+                                context_lens_bufs=_graph_context_lens_bufs,
+                                stacked_dyn_lens_t=stacked_dyn_lens_t,
+                                seq_lens=attn_metadata_i.seq_lens,
+                                all_tmp_lens=all_tmp_lens,
+                                layer_idx_map=_layer_idx_map,
+                            )
+                        except Exception:
+                            pass
+                        if _dynkv_profile:
+                            _t_layer_ctx_fill_batch = (
+                                time.perf_counter() - _t0_ctx_batch) * 1000
+                    if (
+                        _slot_remap_done
+                        and _use_graph_slot_bufs
+                        and _dynkv_stack is not None
+                        and _slot_n_sm > 0
+                    ):
+                        _t0_slot_assign = (
+                            time.perf_counter() if _dynkv_profile else 0)
+                        try:
+                            for _dyn_li, layer_name in enumerate(
+                                    _dynkv_layer_names):
+                                _captured_sm = _graph_slot_bufs.get(layer_name)
+                                if _captured_sm is None:
+                                    continue
+                                _n_sm = min(int(_captured_sm.numel()),
+                                            _slot_n_sm)
+                                if _n_sm > 0:
+                                    _captured_sm[:_n_sm].copy_(
+                                        _dynkv_stack[_dyn_li, :_n_sm])
+                        except Exception:
+                            pass
+                        if _dynkv_profile:
+                            _t_layer_slot_assign = (
+                                time.perf_counter() - _t0_slot_assign) * 1000
                     for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
                         # vLLM will index attn_metadata by layer_name. We must ensure
                         # each layer sees its own metadata instance with `layer_name`
@@ -2118,7 +2256,7 @@ class NPUModelRunner(GPUModelRunner):
                         if _dynkv_profile:
                             _t_layer_copy_meta += (time.perf_counter() - _t0_cm) * 1000
                         if all_tmp_lens is not None and slot_jobs_all is not None:
-                            _t0_ot = time.perf_counter() if _dynkv_profile else 0
+                            _t0_ma = time.perf_counter() if _dynkv_profile else 0
                             layer_idx = _layer_idx_map.get(layer_name, -1)
                             tmp_lens_layer = all_tmp_lens[_dyn_li]
                             slot_remap_jobs = slot_jobs_all[_dyn_li]
@@ -2131,16 +2269,7 @@ class NPUModelRunner(GPUModelRunner):
                                     if _graph_context_lens_bufs is not None:
                                         _ctx_buf = _graph_context_lens_bufs.get(
                                             layer_name)
-                                    _row = (
-                                        stacked_dyn_lens_t[_dyn_li]
-                                        if stacked_dyn_lens_t is not None else
-                                        None)
                                     if _ctx_buf is not None:
-                                        dynkv_fill_graph_context_lens_buf(
-                                            meta_i,
-                                            _ctx_buf,
-                                            stacked_row=_row,
-                                        )
                                         setattr(meta_i,
                                                 "dynamic_kv_seq_lens_tensor",
                                                 _ctx_buf)
@@ -2169,15 +2298,9 @@ class NPUModelRunner(GPUModelRunner):
                                     except Exception:
                                         pass
                                 if _dynkv_profile:
-                                    _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
+                                    _t_layer_meta_assign += (
+                                        time.perf_counter() - _t0_ma) * 1000
 
-                                # Assign pre-computed slot_mapping from batched remap
-                                if _slot_remap_done and _slot_n_sm > 0:
-                                    _sm = meta_i.slot_mapping
-                                    _n_sm = min(int(_sm.numel()), _slot_n_sm)
-                                    if _n_sm > 0:
-                                        _sm[:_n_sm].copy_(
-                                            _dynkv_stack[_dyn_li, :_n_sm])
                                 elif (
                                     slot_remap_jobs
                                     and dynkv_decode_token_pos_t is not None
@@ -2236,9 +2359,6 @@ class NPUModelRunner(GPUModelRunner):
                                         pass
                                     if _dynkv_profile:
                                         _t_layer_slot_remap += (time.perf_counter() - _t0_sr_fb) * 1000
-                            else:
-                                if _dynkv_profile:
-                                    _t_layer_other += (time.perf_counter() - _t0_ot) * 1000
                         if (_use_graph_slot_bufs and not _slot_remap_done
                                 and _slot_n_sm > 0):
                             try:
@@ -2252,25 +2372,24 @@ class NPUModelRunner(GPUModelRunner):
                         attn_metadata[layer_name] = meta_i
                     # Print timing summary once per step (only layer 0 triggers print)
                     if _dynkv_profile and _dynkv_L > 0:
-                        logger.info(
-                            "[DynamicKV][prepare_profile] layers=%d stack_init=%.2fms "
-                            "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
-                            "stacked_tensor=%.2fms layer_copy_meta=%.2fms "
-                            "layer_slot_remap=%.2fms layer_other=%.2fms total_loop=%.2fms",
-                            _dynkv_L,
-                            _t_stack_init,
-                            _t_kv_list_build,
-                            _t_build_helper,
-                            _t_broadcast,
-                            _t_stacked_tensor,
-                            _t_layer_copy_meta,
-                            _t_layer_slot_remap,
-                            _t_layer_other,
-                            _t_layer_copy_meta + _t_layer_slot_remap + _t_layer_other,
+                        self._dynkv_log_prepare_profile_loop(
+                            layers=_dynkv_L,
+                            stack_init=_t_stack_init,
+                            kv_list_build=_t_kv_list_build,
+                            build_helper=_t_build_helper,
+                            broadcast=_t_broadcast,
+                            stacked_tensor=_t_stacked_tensor,
+                            layer_ctx_fill_batch=_t_layer_ctx_fill_batch,
+                            layer_slot_assign=_t_layer_slot_assign,
+                            layer_copy_meta=_t_layer_copy_meta,
+                            layer_slot_remap=_t_layer_slot_remap,
+                            layer_meta_assign=_t_layer_meta_assign,
                         )
 
         # update global cos, sin
         update_cos_sin(positions)
+
+        self._dynkv_log_prepare_profile_ext()
 
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
@@ -2705,7 +2824,14 @@ class NPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
 
         with ProfileExecuteDuration().capture_async("prepare input"):
+            self._dynkv_prepare_step_acc_reset()
+            _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
+            _t0_update_states = (time.perf_counter()
+                                 if isinstance(_prep_acc, dict) else 0)
             self._update_states(scheduler_output)
+            if isinstance(_prep_acc, dict):
+                self._dynkv_prepare_step_acc["update_states_ms"] = (
+                    time.perf_counter() - _t0_update_states) * 1000
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
                         scheduler_output,
