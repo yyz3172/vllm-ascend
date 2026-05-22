@@ -121,7 +121,11 @@ def dynkv_fill_all_graph_context_lens_bufs(
     all_tmp_lens: list[list[int]],
     layer_idx_map: dict[str, int],
 ) -> None:
-    """Batch-fill per-layer graph ``context_lens`` buffers (prepare P1)."""
+    """Batch-fill per-layer graph ``context_lens`` buffers (prepare P1'').
+
+    Vectorizes ``torch.where`` across active layers when possible, then one
+    ``copy_`` per layer (graph replay still needs distinct buffer addresses).
+    """
     if not context_lens_bufs or stacked_dyn_lens_t is None:
         return
     if not isinstance(seq_lens, torch.Tensor):
@@ -131,6 +135,14 @@ def dynkv_fill_all_graph_context_lens_bufs(
         int(stacked_dyn_lens_t.shape[0]),
         len(all_tmp_lens),
     )
+    if n_layers <= 0:
+        return
+    n_buf = int(seq_lens.numel())
+    if n_buf <= 0:
+        return
+
+    active_li: list[int] = []
+    active_bufs: list[torch.Tensor] = []
     for li in range(n_layers):
         layer_name = layer_names[li]
         buf = context_lens_bufs.get(layer_name)
@@ -142,22 +154,53 @@ def dynkv_fill_all_graph_context_lens_bufs(
                 or all(v < 0 for v in tmp_lens_layer)):
             continue
         row = stacked_dyn_lens_t[li]
-        n_buf = int(buf.numel())
-        n_row = int(row.numel())
-        if row.device != buf.device or row.dtype != buf.dtype:
+        if (row.device != buf.device or row.dtype != buf.dtype
+                or int(buf.numel()) != n_buf):
             continue
-        if n_row < n_buf and int(seq_lens.numel()) == n_buf:
+        active_li.append(li)
+        active_bufs.append(buf)
+
+    if not active_bufs:
+        return
+
+    rows = stacked_dyn_lens_t[active_li]
+    n_row = int(rows.shape[1])
+    if n_row <= 0:
+        return
+
+    has_neg = bool((rows < 0).any().item())
+    if n_row == n_buf:
+        if has_neg:
+            sl_row = seq_lens.unsqueeze(0).expand(rows.shape[0], -1)
+            merged = torch.where(rows >= 0, rows, sl_row)
+        else:
+            merged = rows
+        for i, buf in enumerate(active_bufs):
+            buf.copy_(merged[i])
+        return
+
+    if int(seq_lens.numel()) != n_buf:
+        for li, buf in zip(active_li, active_bufs):
+            row = stacked_dyn_lens_t[li]
+            n_r = int(row.numel())
+            if n_r == n_buf:
+                if (row < 0).any():
+                    buf.copy_(torch.where(row >= 0, row, seq_lens))
+                else:
+                    buf.copy_(row)
+        return
+
+    sl_prefix = seq_lens[:n_row]
+    if has_neg:
+        sl_exp = sl_prefix.unsqueeze(0).expand(rows.shape[0], -1)
+        merged_prefix = torch.where(rows >= 0, rows, sl_exp)
+    else:
+        merged_prefix = rows
+
+    for i, buf in enumerate(active_bufs):
+        if buf.data_ptr() != seq_lens.data_ptr():
             buf.copy_(seq_lens)
-            part = buf[:n_row]
-            if (row < 0).any():
-                part.copy_(torch.where(row >= 0, row, seq_lens[:n_row]))
-            else:
-                part.copy_(row)
-        elif n_row == n_buf:
-            if (row < 0).any():
-                buf.copy_(torch.where(row >= 0, row, seq_lens))
-            else:
-                buf.copy_(row)
+        buf[:n_row].copy_(merged_prefix[i])
 
 
 def dynkv_fill_graph_context_lens_buf(

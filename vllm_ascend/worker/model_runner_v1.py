@@ -1944,6 +1944,18 @@ class NPUModelRunner(GPUModelRunner):
 
                     _t0_stack = time.perf_counter() if _dynkv_profile else 0
                     _dynkv_stack: Optional[torch.Tensor] = None
+                    _slot_n_sm = 0
+                    try:
+                        _slot_n_sm = int(attn_metadata_i.slot_mapping.numel())
+                    except Exception:
+                        _slot_n_sm = 0
+                    _graph_slot_bufs = self._get_graph_slot_bufs_for_tokens(
+                        int(num_input_tokens))
+                    _graph_context_lens_bufs = (
+                        self._get_graph_context_lens_bufs_for_tokens(
+                            int(num_input_tokens)))
+                    _use_graph_slot_bufs = (
+                        _graph_slot_bufs is not None and _slot_n_sm > 0)
                     if _dynkv_L > 0 and _dynkv_n > 0:
                         _need_L = max(_dynkv_L, self._dynkv_slot_stack_cap_L)
                         _need_n = max(_dynkv_n, self._dynkv_slot_stack_cap_n)
@@ -2049,12 +2061,20 @@ class NPUModelRunner(GPUModelRunner):
 
                     bs_dyn = int(self.block_size)
 
+                    # Pre-build layer_name -> layer_idx map (used by ctx fill + remap)
+                    _layer_idx_map: dict[str, int] = {}
+                    for _ln in _dynkv_layer_names:
+                        try:
+                            _layer_idx_map[_ln] = int(
+                                extract_layer_index(_ln, num_attn_module=1))
+                        except Exception:
+                            _layer_idx_map[_ln] = -1
+
                     # ============================================================
-                    # Batched slot_remap: do all layers' slot remapping ONCE here,
-                    # outside the per-layer loop, to avoid 32x small NPU kernels.
+                    # Batched slot_remap on ``_dynkv_stack`` [L, n_sm] (one 2D kernel
+                    # per job). Graph capture buffers are filled in layer_slot_assign.
                     # ============================================================
                     _slot_remap_done = False
-                    _slot_n_sm = 0
                     if (
                         all_tmp_lens is not None
                         and slot_jobs_all is not None
@@ -2068,9 +2088,11 @@ class NPUModelRunner(GPUModelRunner):
                             base_sm = attn_metadata_i.slot_mapping
                             _slot_n_sm = int(base_sm.numel())
                             bt_dev = attn_metadata_i.block_tables
-                            if _slot_n_sm > 0 and _slot_n_sm <= _dynkv_stack.shape[1]:
+                            if (_slot_n_sm > 0
+                                    and _slot_n_sm <= _dynkv_stack.shape[1]):
                                 # 1. Broadcast base_sm to all layers at once
-                                _dynkv_stack[:_dynkv_L, :_slot_n_sm] = base_sm.unsqueeze(0)
+                                _dynkv_stack[:_dynkv_L, :_slot_n_sm] = (
+                                    base_sm.unsqueeze(0))
 
                                 # 2. Collect per-(req_idx, base_tokens) -> Li per layer
                                 # slot_jobs_all[li] = [(req_idx, base_tokens, Li), ...]
@@ -2132,13 +2154,12 @@ class NPUModelRunner(GPUModelRunner):
                                         block_ids_2d * bs_dyn + (tgt_pos_2d % bs_dyn)
                                     ).to(base_sm.dtype)  # [L, n_masked]
 
-                                    # Write to _dynkv_stack[:, mask] for valid layers in ONE op
-                                    stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
                                     base_masked = base_sm[mask]
                                     valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)
                                     final_vals = torch.where(
                                         valid_layer_mask_2d, new_slots_2d, base_masked
                                     )
+                                    stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
                                     stack_view[:, mask] = final_vals
 
                                 _slot_remap_done = True
@@ -2156,25 +2177,9 @@ class NPUModelRunner(GPUModelRunner):
                             _slot_n_sm = int(attn_metadata_i.slot_mapping.numel())
                         except Exception:
                             _slot_n_sm = 0
+                        _use_graph_slot_bufs = (
+                            _graph_slot_bufs is not None and _slot_n_sm > 0)
 
-                    # Pre-build layer_name -> layer_idx map to avoid repeated extract_layer_index calls
-                    _layer_idx_map: dict[str, int] = {}
-                    for _ln in _dynkv_layer_names:
-                        try:
-                            _layer_idx_map[_ln] = int(extract_layer_index(_ln, num_attn_module=1))
-                        except Exception:
-                            _layer_idx_map[_ln] = -1
-
-                    _graph_slot_bufs = self._get_graph_slot_bufs_for_tokens(
-                        int(num_input_tokens))
-                    _graph_context_lens_bufs = (
-                        self._get_graph_context_lens_bufs_for_tokens(
-                            int(num_input_tokens)))
-                    # FULL graph capture pins a distinct ``slot_mapping`` per layer.
-                    # Replay must write into those buffers every step, not only when
-                    # DynamicKV slot_remap runs (``enabled=false`` still uses PA graph).
-                    _use_graph_slot_bufs = (
-                        _graph_slot_bufs is not None and _slot_n_sm > 0)
                     if (
                         all_tmp_lens is not None
                         and _graph_context_lens_bufs is not None
