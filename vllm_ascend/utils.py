@@ -22,6 +22,7 @@ import functools
 import math
 import os
 import re
+import time
 from contextlib import contextmanager, nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -619,6 +620,9 @@ def dispose_tensor(x: torch.Tensor):
 class ProfileExecuteDuration:
     _instance = None
     _observations: List[Tuple[str, Event, Event]] = []
+    # CPU wall for tags where NPU Event timing is unreliable (e.g. prepare
+    # input vs update_stream graph replay overlap on Ascend).
+    _cpu_wall_observations: List[Tuple[str, float]] = []
     _lock = Lock()
 
     def __new__(cls):
@@ -631,6 +635,7 @@ class ProfileExecuteDuration:
     def destroy(self):
         with self._lock:
             self._observations.clear()
+            self._cpu_wall_observations.clear()
 
     @contextmanager
     def capture_async(self, duration_tag: str):
@@ -649,6 +654,20 @@ class ProfileExecuteDuration:
                 self._observations.append(
                     (duration_tag, observe_start, observe_end))
 
+    @contextmanager
+    def capture_cpu_wall(self, duration_tag: str):
+        """Wall-clock ms for stages that span multi-stream NPU work."""
+        if not envs_ascend.VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            ms = (time.perf_counter() - t0) * 1000
+            with self._lock:
+                self._cpu_wall_observations.append((duration_tag, ms))
+
     def pop_captured_sync(self) -> dict:
         """Pop and synchronize all events in the observation list"""
         durations: dict[str, float] = {}
@@ -660,6 +679,12 @@ class ProfileExecuteDuration:
                 tag, observe_start, observe_end = self._observations.pop()
             observe_end.synchronize()
             durations[tag] = observe_start.elapsed_time(observe_end)
+
+        with self._lock:
+            cpu_obs = list(self._cpu_wall_observations)
+            self._cpu_wall_observations.clear()
+        for tag, ms in cpu_obs:
+            durations[tag] = ms
 
         return durations
 

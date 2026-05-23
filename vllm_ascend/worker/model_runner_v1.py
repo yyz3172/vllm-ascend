@@ -3247,7 +3247,7 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
 
-        with ProfileExecuteDuration().capture_async("prepare input"):
+        with ProfileExecuteDuration().capture_cpu_wall("prepare input"):
             self._dynkv_prepare_step_acc_reset()
             _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
             _t0_update_states = (time.perf_counter()

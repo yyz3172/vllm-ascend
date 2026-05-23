@@ -253,6 +253,7 @@ class TestProfileExecuteDuration(TestBase):
     def setUp(self):
         utils.ProfileExecuteDuration._instance = None
         utils.ProfileExecuteDuration._observations = []
+        utils.ProfileExecuteDuration._cpu_wall_observations = []
         utils.ProfileExecuteDuration._lock = Lock()
 
     def test_singleton_creation(self):
