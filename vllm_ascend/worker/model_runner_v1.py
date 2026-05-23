@@ -779,6 +779,11 @@ class NPUModelRunner(GPUModelRunner):
         # layer's ``slot_mapping`` is a row view (see ``_build_dummy_attn_metadata``).
         self._dynkv_slot_workspace_bufs: dict[int, torch.Tensor] = {}
         self._dynkv_slot_workspace_layer_row: dict[int, dict[str, int]] = {}
+        # FULL-graph PA decode: [L, n_buf] parent tensor for ``context_lens`` row
+        # views at capture (mirrors slot workspace).
+        self._dynkv_context_lens_workspace_bufs: dict[int, torch.Tensor] = {}
+        self._dynkv_context_lens_workspace_layer_row: dict[int, dict[str, int]] = (
+            {})
         # Per-layer slot_mapping pinned during FULL ACL graph capture
         # ({num_tokens: {layer_name: Tensor}}). Required for all FULL-graph decode,
         # not only when DynamicKV is enabled.
@@ -1240,44 +1245,40 @@ class NPUModelRunner(GPUModelRunner):
         Must use tensors from graph capture (``attn_params[i][7]``), not pre-capture
         metadata clones, so prepare writes the same addresses replay reads.
         """
-        existing = self._get_graph_context_lens_bufs_for_tokens(num_input_tokens)
-        if existing is not None:
-            return existing
         from vllm_ascend.compilation.acl_graph import get_graph_params
 
         graph_params = get_graph_params()
-        if graph_params is None:
-            return None
         cap_key = int(num_input_tokens)
-        params_list = graph_params.attn_params.get(cap_key)
-        if params_list is None:
-            for cap_n in sorted(graph_params.attn_params.keys()):
-                if cap_n >= cap_key:
-                    cap_key = cap_n
-                    params_list = graph_params.attn_params[cap_n]
+        params_list = None
+        if graph_params is not None:
+            params_list = graph_params.attn_params.get(cap_key)
+            if params_list is None:
+                for cap_n in sorted(graph_params.attn_params.keys()):
+                    if cap_n >= cap_key:
+                        cap_key = cap_n
+                        params_list = graph_params.attn_params[cap_n]
+                        break
+        if params_list:
+            n_layers = len(layer_names)
+            if len(params_list) != n_layers:
+                logger.debug(
+                    "[DynamicKV][decode] context_lens_bufs layer count mismatch: "
+                    "attn_params=%d layer_names=%d (cap_key=%d)",
+                    len(params_list),
+                    n_layers,
+                    cap_key,
+                )
+            bufs: dict[str, torch.Tensor] = {}
+            for i, layer_name in enumerate(layer_names):
+                if i >= len(params_list):
                     break
-        if not params_list:
-            return None
-        n_layers = len(layer_names)
-        if len(params_list) != n_layers:
-            logger.debug(
-                "[DynamicKV][decode] context_lens_bufs layer count mismatch: "
-                "attn_params=%d layer_names=%d (cap_key=%d)",
-                len(params_list),
-                n_layers,
-                cap_key,
-            )
-        bufs: dict[str, torch.Tensor] = {}
-        for i, layer_name in enumerate(layer_names):
-            if i >= len(params_list):
-                break
-            param = params_list[i]
-            if len(param) > 7 and isinstance(param[7], torch.Tensor):
-                bufs[str(layer_name)] = param[7]
-        if not bufs:
-            return None
-        self._dynkv_graph_context_lens_bufs[cap_key] = bufs
-        return bufs
+                param = params_list[i]
+                if len(param) > 7 and isinstance(param[7], torch.Tensor):
+                    bufs[str(layer_name)] = param[7]
+            if bufs:
+                self._dynkv_graph_context_lens_bufs[cap_key] = bufs
+                return bufs
+        return self._get_graph_context_lens_bufs_for_tokens(num_input_tokens)
 
     def _resolve_slot_workspace_cap_key(self, num_input_tokens: int) -> int:
         cap_key = int(num_input_tokens)
@@ -1328,6 +1329,95 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_slot_stack_cap_L = int(ws.shape[0])
         self._dynkv_slot_stack_cap_n = int(ws.shape[1])
         return ws
+
+    def _resolve_context_lens_workspace_cap_key(self, num_input_tokens: int) -> int:
+        cap_key = int(num_input_tokens)
+        if cap_key in self._dynkv_context_lens_workspace_bufs:
+            return cap_key
+        for cap_n in sorted(self._dynkv_context_lens_workspace_bufs.keys()):
+            if cap_n >= cap_key:
+                return cap_n
+        return cap_key
+
+    def _get_context_lens_workspace_for_tokens(
+        self,
+        num_input_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        cap_key = self._resolve_context_lens_workspace_cap_key(num_input_tokens)
+        return self._dynkv_context_lens_workspace_bufs.get(cap_key)
+
+    def _get_context_lens_workspace_row_map(
+        self,
+        num_input_tokens: int,
+    ) -> Optional[dict[str, int]]:
+        cap_key = self._resolve_context_lens_workspace_cap_key(num_input_tokens)
+        row_map = self._dynkv_context_lens_workspace_layer_row.get(cap_key)
+        return row_map if row_map else None
+
+    def _get_or_create_context_lens_workspace(
+        self,
+        cap_n: int,
+        num_layers: int,
+        n_buf: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        cap_n = int(cap_n)
+        ws = self._dynkv_context_lens_workspace_bufs.get(cap_n)
+        need_L = max(int(num_layers), int(ws.shape[0]) if ws is not None else 0)
+        need_n = max(int(n_buf), int(ws.shape[1]) if ws is not None else 0)
+        if (
+            ws is None
+            or ws.shape[0] < need_L
+            or ws.shape[1] < need_n
+            or ws.device != device
+            or ws.dtype != dtype
+        ):
+            ws = torch.empty((need_L, need_n), device=device, dtype=dtype)
+            self._dynkv_context_lens_workspace_bufs[cap_n] = ws
+        return ws
+
+    def _resolve_dynkv_ctx_stack_from_workspace(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+        n_buf: int,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        """Return (ctx_stack_view [L,n_buf], graph_rows_alias_workspace)."""
+        ws = self._get_context_lens_workspace_for_tokens(num_input_tokens)
+        row_map = self._get_context_lens_workspace_row_map(num_input_tokens)
+        if ws is None or not row_map or n_buf <= 0 or not layer_names:
+            return None, False
+        rows = [row_map.get(str(ln)) for ln in layer_names]
+        if any(r is None for r in rows):
+            return None, False
+        rows_int = [int(r) for r in rows]
+        if not self._layer_rows_contiguous(rows_int):
+            return None, False
+        row0 = rows_int[0]
+        n_layers = len(layer_names)
+        if row0 + n_layers > int(ws.shape[0]) or n_buf > int(ws.shape[1]):
+            return None, False
+        stack = ws[row0:row0 + n_layers, :n_buf]
+        graph_bufs = self._get_graph_context_lens_bufs_for_tokens(
+            num_input_tokens)
+        if graph_bufs is None:
+            return stack, False
+        alias = True
+        for li, ln in enumerate(layer_names):
+            buf = graph_bufs.get(str(ln))
+            if buf is None:
+                alias = False
+                break
+            n_cmp = min(int(buf.numel()), n_buf)
+            if n_cmp <= 0:
+                continue
+            row_idx = rows_int[li]
+            expected = ws[row_idx, :n_cmp]
+            if buf.data_ptr() != expected.data_ptr():
+                alias = False
+                break
+        return stack, alias
 
     @staticmethod
     def _layer_rows_contiguous(rows: list[int]) -> bool:
@@ -2481,6 +2571,13 @@ class NPUModelRunner(GPUModelRunner):
                         _t0_ctx_batch = (
                             time.perf_counter() if _dynkv_profile else 0)
                         try:
+                            _n_ctx_buf = int(attn_metadata_i.seq_lens.numel())
+                            _ctx_stack, _ctx_workspace_alias = (
+                                self._resolve_dynkv_ctx_stack_from_workspace(
+                                    int(num_input_tokens),
+                                    _dynkv_layer_names,
+                                    _n_ctx_buf,
+                                ))
                             dynkv_fill_all_graph_context_lens_bufs(
                                 layer_names=_dynkv_layer_names,
                                 context_lens_bufs=_graph_context_lens_bufs,
@@ -2488,7 +2585,19 @@ class NPUModelRunner(GPUModelRunner):
                                 seq_lens=attn_metadata_i.seq_lens,
                                 all_tmp_lens=all_tmp_lens,
                                 layer_idx_map=_layer_idx_map,
+                                ctx_stack_view=_ctx_stack,
+                                ctx_workspace_alias=_ctx_workspace_alias,
                             )
+                            if not getattr(self, "_dynkv_ctx_alias_logged", False):
+                                logger.info(
+                                    "[DynamicKV][decode] ctx_fill workspace "
+                                    "alias=%s stack=%s n_buf=%d layers=%d",
+                                    _ctx_workspace_alias,
+                                    _ctx_stack is not None,
+                                    _n_ctx_buf,
+                                    _dynkv_L,
+                                )
+                                self._dynkv_ctx_alias_logged = True
                         except Exception:
                             pass
                         if _dynkv_profile:
@@ -3911,11 +4020,18 @@ class NPUModelRunner(GPUModelRunner):
             use_pa_slot_workspace = (
                 is_graph_capturing
                 and using_paged_attention(int(num_tokens), self.vllm_config))
+            use_pa_ctx_workspace = use_pa_slot_workspace
             _slot_workspace: Optional[torch.Tensor] = None
             _slot_workspace_row = 0
             _slot_workspace_cap_n = int(num_tokens)
+            _ctx_workspace: Optional[torch.Tensor] = None
+            _ctx_workspace_row = 0
+            _ctx_workspace_cap_n = int(num_tokens)
             if use_pa_slot_workspace:
                 self._dynkv_slot_workspace_layer_row[_slot_workspace_cap_n] = {}
+            if use_pa_ctx_workspace:
+                self._dynkv_context_lens_workspace_layer_row[
+                    _ctx_workspace_cap_n] = {}
 
             # The reason why we use a fixed seq_len rather than max_query_len is that
             # _npu_paged_attention_get_workspace only returns max workspace with specific
@@ -4057,7 +4173,41 @@ class NPUModelRunner(GPUModelRunner):
                             try:
                                 _sl_cap = meta_i.seq_lens
                                 if isinstance(_sl_cap, torch.Tensor):
-                                    meta_i.seq_lens = _sl_cap.clone()
+                                    if (
+                                        use_pa_ctx_workspace
+                                        and _ctx_workspace is None
+                                    ):
+                                        total_layers = sum(
+                                            len(g.layer_names)
+                                            for g in self.kv_cache_config.kv_cache_groups)
+                                        _ctx_workspace = (
+                                            self._get_or_create_context_lens_workspace(
+                                                _ctx_workspace_cap_n,
+                                                total_layers,
+                                                int(_sl_cap.numel()),
+                                                _sl_cap.device,
+                                                _sl_cap.dtype,
+                                            ))
+                                    if (
+                                        use_pa_ctx_workspace
+                                        and _ctx_workspace is not None
+                                    ):
+                                        n_buf = int(_sl_cap.numel())
+                                        if n_buf <= int(_ctx_workspace.shape[1]):
+                                            _ctx_workspace[
+                                                _ctx_workspace_row, :n_buf].copy_(
+                                                    _sl_cap)
+                                            meta_i.seq_lens = _ctx_workspace[
+                                                _ctx_workspace_row, :n_buf]
+                                            self._dynkv_context_lens_workspace_layer_row[
+                                                _ctx_workspace_cap_n][
+                                                    str(layer_name)] = (
+                                                        _ctx_workspace_row)
+                                            _ctx_workspace_row += 1
+                                        else:
+                                            meta_i.seq_lens = _sl_cap.clone()
+                                    else:
+                                        meta_i.seq_lens = _sl_cap.clone()
                             except Exception:
                                 pass
                         try:

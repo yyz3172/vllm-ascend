@@ -112,6 +112,14 @@ def dynkv_pa_kv_tokens_avg_from_attn_metadata(
     return sum(maxes) / len(maxes)
 
 
+def _dynkv_tmp_lens_has_negative(all_tmp_lens: list[list[int]]) -> bool:
+    for row in all_tmp_lens:
+        for v in row:
+            if v < 0:
+                return True
+    return False
+
+
 def dynkv_fill_all_graph_context_lens_bufs(
     *,
     layer_names: list[str],
@@ -120,11 +128,14 @@ def dynkv_fill_all_graph_context_lens_bufs(
     seq_lens: torch.Tensor,
     all_tmp_lens: list[list[int]],
     layer_idx_map: dict[str, int],
+    ctx_stack_view: torch.Tensor | None = None,
+    ctx_workspace_alias: bool = False,
 ) -> None:
-    """Batch-fill per-layer graph ``context_lens`` buffers (prepare P1'').
+    """Batch-fill per-layer graph ``context_lens`` buffers (prepare P1).
 
-    Vectorizes ``torch.where`` across active layers when possible, then one
-    ``copy_`` per layer (graph replay still needs distinct buffer addresses).
+    When ``ctx_workspace_alias`` is True, graph capture ``context_lens`` row
+    views alias ``ctx_stack_view``; one ``[L,:n_row]`` write replaces per-layer
+    ``copy_``. Requires FULL-graph re-capture after this workspace change.
     """
     if not context_lens_bufs or stacked_dyn_lens_t is None:
         return
@@ -139,6 +150,61 @@ def dynkv_fill_all_graph_context_lens_bufs(
         return
     n_buf = int(seq_lens.numel())
     if n_buf <= 0:
+        return
+    n_row = int(stacked_dyn_lens_t.shape[1])
+    if n_row <= 0:
+        return
+
+    has_neg = _dynkv_tmp_lens_has_negative(all_tmp_lens[:n_layers])
+
+    def _write_merged_to_stack(
+        stack: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        n_write: int,
+    ) -> None:
+        if has_neg:
+            sl_row = seq_lens[:n_write].unsqueeze(0).expand(
+                int(rows.shape[0]), -1)
+            stack[:, :n_write] = torch.where(rows[:, :n_write] >= 0,
+                                             rows[:, :n_write], sl_row)
+        else:
+            stack[:, :n_write] = rows[:, :n_write]
+
+    def _sync_stack_rows_to_bufs(
+        stack: torch.Tensor,
+        bufs: list[torch.Tensor],
+        *,
+        n_write: int,
+    ) -> None:
+        for i, buf in enumerate(bufs):
+            row = stack[i]
+            if buf.data_ptr() == row.data_ptr():
+                continue
+            if n_write == int(buf.numel()):
+                buf.copy_(row[:n_write])
+            else:
+                buf[:n_write].copy_(row[:n_write])
+
+    if (
+        ctx_stack_view is not None
+        and int(ctx_stack_view.shape[0]) >= n_layers
+        and int(ctx_stack_view.shape[1]) >= n_buf
+    ):
+        stack = ctx_stack_view[:n_layers, :n_buf]
+        rows = stacked_dyn_lens_t[:n_layers, :n_row]
+        n_write = min(n_row, n_buf)
+        _write_merged_to_stack(stack, rows, n_write=n_write)
+        if ctx_workspace_alias:
+            return
+        active_bufs = [
+            context_lens_bufs.get(str(layer_names[li]))
+            for li in range(n_layers)
+            if context_lens_bufs.get(str(layer_names[li])) is not None
+        ]
+        if active_bufs:
+            _sync_stack_rows_to_bufs(stack[:len(active_bufs)], active_bufs,
+                                     n_write=n_write)
         return
 
     active_li: list[int] = []
@@ -168,38 +234,33 @@ def dynkv_fill_all_graph_context_lens_bufs(
     if n_row <= 0:
         return
 
-    has_neg = bool((rows < 0).any().item())
     if n_row == n_buf:
         if has_neg:
             sl_row = seq_lens.unsqueeze(0).expand(rows.shape[0], -1)
             merged = torch.where(rows >= 0, rows, sl_row)
         else:
             merged = rows
-        for i, buf in enumerate(active_bufs):
-            buf.copy_(merged[i])
+        if (
+            ctx_stack_view is not None
+            and int(ctx_stack_view.shape[0]) >= len(active_li)
+            and int(ctx_stack_view.shape[1]) >= n_buf
+        ):
+            stack = ctx_stack_view[:len(active_li), :n_buf]
+            stack[:, :n_row] = merged
+            _sync_stack_rows_to_bufs(stack, active_bufs, n_write=n_row)
+        else:
+            for i, buf in enumerate(active_bufs):
+                buf.copy_(merged[i])
         return
 
-    if int(seq_lens.numel()) != n_buf:
-        for li, buf in zip(active_li, active_bufs):
-            row = stacked_dyn_lens_t[li]
-            n_r = int(row.numel())
-            if n_r == n_buf:
-                if (row < 0).any():
-                    buf.copy_(torch.where(row >= 0, row, seq_lens))
-                else:
-                    buf.copy_(row)
-        return
-
-    sl_prefix = seq_lens[:n_row]
     if has_neg:
-        sl_exp = sl_prefix.unsqueeze(0).expand(rows.shape[0], -1)
-        merged_prefix = torch.where(rows >= 0, rows, sl_exp)
+        sl_prefix = seq_lens[:n_row].unsqueeze(0).expand(rows.shape[0], -1)
+        merged_prefix = torch.where(rows >= 0, rows, sl_prefix)
     else:
         merged_prefix = rows
 
+    # Decode steady state: only dynamic prefix changes; skip full seq_lens copy.
     for i, buf in enumerate(active_bufs):
-        if buf.data_ptr() != seq_lens.data_ptr():
-            buf.copy_(seq_lens)
         buf[:n_row].copy_(merged_prefix[i])
 
 
