@@ -796,7 +796,6 @@ class NPUModelRunner(GPUModelRunner):
         # ``_apply_profile_prepare_input_duration``).
         self._profile_prepare_input_cpu_ms: Optional[float] = None
         self._profile_prepare_inputs_cpu_ms: Optional[float] = None
-        self._profile_prepare_cpu_wall_logged: bool = False
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
@@ -2753,12 +2752,13 @@ class NPUModelRunner(GPUModelRunner):
                                     _t_layer_meta_assign += (
                                         time.perf_counter() - _t0_ma) * 1000
 
-                                elif (
-                                    slot_remap_jobs
+                                if (
+                                    not _slot_remap_done
+                                    and slot_remap_jobs
                                     and dynkv_decode_token_pos_t is not None
                                     and dynkv_decode_req_idx_t is not None
                                 ):
-                                    # Fallback: per-layer remap (should not happen if batched succeeded)
+                                    # Fallback: per-layer remap (only if batched failed)
                                     _t0_sr_fb = time.perf_counter() if _dynkv_profile else 0
                                     try:
                                         base_sm = meta_i.slot_mapping
@@ -2856,19 +2856,18 @@ class NPUModelRunner(GPUModelRunner):
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
+        _pi_wall_ms = (time.perf_counter() - _t0_prepare_inputs) * 1000
         if isinstance(_prep_acc, dict):
             self._dynkv_prepare_step_acc_add(
                 "prepare_tail_ms",
                 (time.perf_counter() - _t0_tail) * 1000,
             )
-            self._dynkv_prepare_step_acc["prepare_inputs_wall_ms"] = (
-                (time.perf_counter() - _t0_prepare_inputs) * 1000)
+            self._dynkv_prepare_step_acc["prepare_inputs_wall_ms"] = _pi_wall_ms
             if self._dynkv_prepare_profile_enabled():
                 self._dynkv_log_prepare_profile_ext()
                 self._dynkv_log_prepare_profile_reconcile()
         elif _track_prepare_wall:
-            self._profile_prepare_inputs_cpu_ms = (
-                (time.perf_counter() - _t0_prepare_inputs) * 1000)
+            self._profile_prepare_inputs_cpu_ms = _pi_wall_ms
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
@@ -3299,11 +3298,6 @@ class NPUModelRunner(GPUModelRunner):
         _observe = self._profile_execute_observe_enabled()
         if _observe:
             ProfileExecuteDuration().discard_tag("prepare input")
-            if not self._profile_prepare_cpu_wall_logged:
-                logger.info(
-                    "[ProfileExecuteDuration] prepare input uses runner CPU "
-                    "wall (update_states+prepare_inputs), not NPU Event")
-                self._profile_prepare_cpu_wall_logged = True
         self._dynkv_prepare_step_acc_reset()
         _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
         _t0_update_states = (time.perf_counter()
