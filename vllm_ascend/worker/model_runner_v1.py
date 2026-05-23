@@ -792,6 +792,10 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_graph_context_lens_bufs: dict[int, dict[str, torch.Tensor]] = (
             {})
         self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
+        # CPU wall for Profile execute duration ``prepare input`` (see
+        # ``_apply_profile_prepare_input_duration``).
+        self._profile_prepare_input_cpu_ms: Optional[float] = None
+        self._profile_prepare_inputs_cpu_ms: Optional[float] = None
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
@@ -1075,6 +1079,29 @@ class NPUModelRunner(GPUModelRunner):
     def _dynkv_prepare_profile_enabled() -> bool:
         return os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
 
+    @staticmethod
+    def _profile_execute_observe_enabled() -> bool:
+        return ProfileExecuteDuration.observe_enabled()
+
+    def _apply_profile_prepare_input_duration(
+        self,
+        durations: dict[str, float],
+    ) -> dict[str, float]:
+        """Force ``prepare input`` from CPU wall (never NPU Event)."""
+        prep_ms = durations.get("prepare input")
+        if prep_ms is None:
+            prep_ms = getattr(self, "_profile_prepare_input_cpu_ms", None)
+        if prep_ms is None:
+            prep_ms = getattr(self, "_profile_prepare_inputs_cpu_ms", None)
+        if prep_ms is not None:
+            durations["prepare input"] = float(prep_ms)
+        else:
+            durations.pop("prepare input", None)
+        self._profile_prepare_input_cpu_ms = None
+        self._profile_prepare_inputs_cpu_ms = None
+        ProfileExecuteDuration().discard_tag("prepare input")
+        return durations
+
     def _dynkv_prepare_step_acc_reset(self) -> None:
         if self._dynkv_prepare_profile_enabled():
             self._dynkv_prepare_step_acc = {
@@ -1092,6 +1119,11 @@ class NPUModelRunner(GPUModelRunner):
                 "loop_stacked_tensor_ms": 0.0,
                 "loop_layer_ctx_fill_batch_ms": 0.0,
                 "loop_total_loop_ms": 0.0,
+            }
+        elif self._profile_execute_observe_enabled():
+            self._dynkv_prepare_step_acc = {
+                "update_states_ms": 0.0,
+                "prepare_inputs_wall_ms": 0.0,
             }
         else:
             self._dynkv_prepare_step_acc = None
@@ -1549,8 +1581,11 @@ class NPUModelRunner(GPUModelRunner):
         assert num_reqs > 0
 
         _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        _track_prepare_wall = (
+            isinstance(_prep_acc, dict)
+            or self._profile_execute_observe_enabled())
         _t0_prepare_inputs = (time.perf_counter()
-                              if isinstance(_prep_acc, dict) else 0)
+                              if _track_prepare_wall else 0)
         _t0_prepare_core = (time.perf_counter()
                             if isinstance(_prep_acc, dict) else 0)
 
@@ -2818,8 +2853,12 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._dynkv_prepare_step_acc["prepare_inputs_wall_ms"] = (
                 (time.perf_counter() - _t0_prepare_inputs) * 1000)
-            self._dynkv_log_prepare_profile_ext()
-            self._dynkv_log_prepare_profile_reconcile()
+            if self._dynkv_prepare_profile_enabled():
+                self._dynkv_log_prepare_profile_ext()
+                self._dynkv_log_prepare_profile_reconcile()
+        elif _track_prepare_wall:
+            self._profile_prepare_inputs_cpu_ms = (
+                (time.perf_counter() - _t0_prepare_inputs) * 1000)
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
@@ -3247,6 +3286,7 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
 
+        _observe = self._profile_execute_observe_enabled()
         with ProfileExecuteDuration().capture_cpu_wall("prepare input"):
             self._dynkv_prepare_step_acc_reset()
             _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
@@ -3287,6 +3327,14 @@ class NPUModelRunner(GPUModelRunner):
 
             if self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
+
+        # Store CPU wall fallback for sample_tokens (belt-and-suspenders).
+        if _observe:
+            acc = getattr(self, "_dynkv_prepare_step_acc", None)
+            if isinstance(acc, dict):
+                self._profile_prepare_input_cpu_ms = (
+                    float(acc.get("update_states_ms", 0.0))
+                    + float(acc.get("prepare_inputs_wall_ms", 0.0)))
 
         # prevent debugger is None
         if self.debugger is not None:
@@ -3817,6 +3865,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         durations = ProfileExecuteDuration().pop_captured_sync()
+        durations = self._apply_profile_prepare_input_duration(durations)
         if durations:
             dr_str = [
                 f"[{tag}]:{duration:.2f}ms"

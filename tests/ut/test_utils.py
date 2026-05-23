@@ -300,3 +300,26 @@ class TestProfileExecuteDuration(TestBase):
     def test_observations_initialization(self):
         instance = utils.ProfileExecuteDuration()
         self.assertEqual(instance._observations, [])
+
+    def test_pop_captured_sync_cpu_wall_only_tags(self):
+        from unittest import mock
+
+        instance = utils.ProfileExecuteDuration()
+        fake_start = mock.Mock()
+        fake_end = mock.Mock()
+        fake_end.synchronize = mock.Mock()
+        fake_start.elapsed_time.return_value = 21.0
+        instance._observations.append(
+            ("prepare input", fake_start, fake_end))
+        instance._cpu_wall_observations.append(("prepare input", 5.5))
+        instance._observations.append(("forward", fake_start, fake_end))
+
+        with mock.patch.object(utils.envs_ascend,
+                               "VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE",
+                               True):
+            durations = instance.pop_captured_sync()
+
+        self.assertEqual(durations["prepare input"], 5.5)
+        self.assertEqual(durations["forward"], 21.0)
+        self.assertEqual(instance._observations, [])
+        self.assertEqual(instance._cpu_wall_observations, [])
