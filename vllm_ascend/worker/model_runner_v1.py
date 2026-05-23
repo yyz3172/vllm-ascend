@@ -103,6 +103,7 @@ from vllm_ascend.attention.utils import (
     dynkv_fill_all_graph_context_lens_bufs,
     dynkv_fill_graph_context_lens_buf,
     dynkv_pa_kv_tokens_avg_from_attn_metadata,
+    sync_graph_pa_context_lens_bufs,
     using_paged_attention,
 )
 from vllm_ascend.worker.dynamic_kv_offload import (
@@ -2189,6 +2190,12 @@ class NPUModelRunner(GPUModelRunner):
                         self.query_start_loc.copy_to_gpu(num_reqs_padded + 1)
                         self.seq_lens.np[num_reqs:].fill(0)
                         self.seq_lens.copy_to_gpu(num_reqs_padded)
+                        # Match GPUModelRunner: padded batch slots must not reuse
+                        # stale block-table rows from a prior larger batch.
+                        try:
+                            blk_table_tensor[num_reqs:num_reqs_padded].fill_(-1)
+                        except Exception:
+                            pass
 
                     # So we are trying to simulate the behavior of GPUModelRunner's
                     # prepare_inputs for uniform decode mode by padding query_start_loc
@@ -2323,8 +2330,24 @@ class NPUModelRunner(GPUModelRunner):
                     _dynkv_profile_std = (
                         os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0")
                         == "1")
+                    self._register_dynkv_graph_context_lens_bufs_from_capture(
+                        int(num_input_tokens), list(attn_group.layer_names))
                     _graph_slot_bufs_std = self._get_graph_slot_bufs_for_tokens(
                         int(num_input_tokens))
+                    _graph_ctx_bufs_std = (
+                        self._get_graph_context_lens_bufs_for_tokens(
+                            int(num_input_tokens)))
+                    if (
+                        _graph_ctx_bufs_std is not None
+                        and isinstance(attn_metadata_i.seq_lens, torch.Tensor)
+                    ):
+                        try:
+                            sync_graph_pa_context_lens_bufs(
+                                context_lens_bufs=_graph_ctx_bufs_std,
+                                seq_lens=attn_metadata_i.seq_lens,
+                            )
+                        except Exception:
+                            pass
                     try:
                         _slot_n_std = int(attn_metadata_i.slot_mapping.numel())
                     except Exception:
@@ -2345,6 +2368,12 @@ class NPUModelRunner(GPUModelRunner):
                         attn_metadata_i.slot_mapping,
                         _slot_n_std,
                     )
+                    if (
+                        _graph_slot_bufs_std is not None
+                        and _slot_n_std > 0
+                    ):
+                        _dynkv_clear_graph_slot_mapping_tails(
+                            list(_graph_slot_bufs_std.values()), _slot_n_std)
                     if (_dynkv_profile_std and _std_ws_broadcast and _std_L > 0
                             and _std_profile_acc is not None):
                         _std_profile_acc["layer_slot_remap"] = (

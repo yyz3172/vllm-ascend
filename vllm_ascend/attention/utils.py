@@ -135,6 +135,32 @@ def _dynkv_clear_graph_slot_mapping_tails(
             buf[int(n_active):].fill_(-1)
 
 
+def sync_graph_pa_context_lens_bufs(
+    *,
+    context_lens_bufs: dict[str, torch.Tensor],
+    seq_lens: torch.Tensor,
+) -> None:
+    """Copy runtime ``seq_lens`` into captured PA graph buffers; clear stale tails.
+
+    Used on the standard (non-DynamicKV) decode path and as a safety net when the
+    captured buffer is larger than the current padded batch.
+    """
+    if not context_lens_bufs or not isinstance(seq_lens, torch.Tensor):
+        return
+    n_active = int(seq_lens.numel())
+    if n_active <= 0:
+        return
+    for buf in context_lens_bufs.values():
+        if buf is None or not isinstance(buf, torch.Tensor):
+            continue
+        if buf.device != seq_lens.device or buf.dtype != seq_lens.dtype:
+            continue
+        n_copy = min(n_active, int(buf.numel()))
+        if n_copy > 0 and buf.data_ptr() != seq_lens.data_ptr():
+            buf[:n_copy].copy_(seq_lens[:n_copy])
+        _dynkv_zero_graph_buf_tails([buf], n_active)
+
+
 def _dynkv_zero_graph_buf_tails(
     bufs: list[torch.Tensor],
     n_active: int,
@@ -339,10 +365,14 @@ def dynkv_fill_graph_context_lens_buf(
     ctx = pa_dynamic_kv_context_lens(attn_metadata)
     if (isinstance(ctx, torch.Tensor)
             and context_lens_buf.data_ptr() != ctx.data_ptr()
-            and int(ctx.numel()) == int(context_lens_buf.numel())
             and ctx.device == context_lens_buf.device
             and ctx.dtype == context_lens_buf.dtype):
-        context_lens_buf.copy_(ctx)
+        n_active = int(ctx.numel())
+        if n_active > 0:
+            n_copy = min(n_active, int(context_lens_buf.numel()))
+            if n_copy > 0:
+                context_lens_buf[:n_copy].copy_(ctx[:n_copy])
+            _dynkv_zero_graph_buf_tails([context_lens_buf], n_active)
 
 
 def pa_dynamic_kv_context_lens_for_graph_update(
@@ -370,11 +400,15 @@ def pa_dynamic_kv_context_lens_for_graph_update(
         and isinstance(context_lens_buf, torch.Tensor)
         and context_lens_buf.device == ctx.device
         and context_lens_buf.dtype == ctx.dtype
-        and int(context_lens_buf.numel()) == int(ctx.numel())
     ):
-        if context_lens_buf.data_ptr() != ctx.data_ptr():
-            context_lens_buf.copy_(ctx)
-        return context_lens_buf
+        n_active = int(ctx.numel())
+        n_buf = int(context_lens_buf.numel())
+        if n_buf > 0 and n_active > 0:
+            n_copy = min(n_active, n_buf)
+            if context_lens_buf.data_ptr() != ctx.data_ptr():
+                context_lens_buf[:n_copy].copy_(ctx[:n_copy])
+            _dynkv_zero_graph_buf_tails([context_lens_buf], n_active)
+            return context_lens_buf
     return ctx
 
 
