@@ -997,11 +997,92 @@ class NPUModelRunner(GPUModelRunner):
         if self._dynkv_prepare_profile_enabled():
             self._dynkv_prepare_step_acc = {
                 "update_states_ms": 0.0,
+                "prepare_inputs_wall_ms": 0.0,
                 "prepare_core_ms": 0.0,
+                "prepare_kv_setup_ms": 0.0,
                 "prepare_attn_build_ms": 0.0,
+                "prepare_cos_sin_ms": 0.0,
+                "prepare_tail_ms": 0.0,
+                "loop_stack_init_ms": 0.0,
+                "loop_kv_list_build_ms": 0.0,
+                "loop_build_helper_ms": 0.0,
+                "loop_broadcast_ms": 0.0,
+                "loop_stacked_tensor_ms": 0.0,
+                "loop_layer_ctx_fill_batch_ms": 0.0,
+                "loop_total_loop_ms": 0.0,
             }
         else:
             self._dynkv_prepare_step_acc = None
+
+    _DYNKV_PREPARE_LOOP_ACC: dict[str, str] = {
+        "stack_init": "loop_stack_init_ms",
+        "kv_list_build": "loop_kv_list_build_ms",
+        "build_helper": "loop_build_helper_ms",
+        "broadcast": "loop_broadcast_ms",
+        "stacked_tensor": "loop_stacked_tensor_ms",
+        "layer_ctx_fill_batch": "loop_layer_ctx_fill_batch_ms",
+        "total_loop": "loop_total_loop_ms",
+    }
+
+    def _dynkv_prepare_step_acc_add_loop_fields(
+        self,
+        *,
+        stack_init: float,
+        kv_list_build: float,
+        build_helper: float,
+        broadcast: float,
+        stacked_tensor: float,
+        layer_ctx_fill_batch: float,
+        total_loop: float,
+    ) -> None:
+        vals = {
+            "stack_init": stack_init,
+            "kv_list_build": kv_list_build,
+            "build_helper": build_helper,
+            "broadcast": broadcast,
+            "stacked_tensor": stacked_tensor,
+            "layer_ctx_fill_batch": layer_ctx_fill_batch,
+            "total_loop": total_loop,
+        }
+        for src, dst in self._DYNKV_PREPARE_LOOP_ACC.items():
+            self._dynkv_prepare_step_acc_add(dst, float(vals[src]))
+
+    def _dynkv_log_prepare_profile_reconcile(self) -> None:
+        acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        if not isinstance(acc, dict):
+            return
+        loop_sum = sum(
+            float(acc.get(k, 0.0)) for k in self._DYNKV_PREPARE_LOOP_ACC.values())
+        inner_sum = (
+            float(acc.get("prepare_core_ms", 0.0))
+            + float(acc.get("prepare_kv_setup_ms", 0.0))
+            + float(acc.get("prepare_attn_build_ms", 0.0))
+            + loop_sum
+            + float(acc.get("prepare_cos_sin_ms", 0.0))
+            + float(acc.get("prepare_tail_ms", 0.0))
+        )
+        wall = float(acc.get("prepare_inputs_wall_ms", 0.0))
+        gap = wall - inner_sum
+        update_states = float(acc.get("update_states_ms", 0.0))
+        profile_est = update_states + wall
+        logger.info(
+            "[DynamicKV][prepare_profile_reconcile] update_states=%.2fms "
+            "prepare_inputs_wall=%.2fms prepare_core=%.2fms "
+            "prepare_kv_setup=%.2fms prepare_attn_build=%.2fms loop_sum=%.2fms "
+            "prepare_cos_sin=%.2fms prepare_tail=%.2fms inner_sum=%.2fms "
+            "prepare_gap=%.2fms profile_prepare_est=%.2fms",
+            update_states,
+            wall,
+            float(acc.get("prepare_core_ms", 0.0)),
+            float(acc.get("prepare_kv_setup_ms", 0.0)),
+            float(acc.get("prepare_attn_build_ms", 0.0)),
+            loop_sum,
+            float(acc.get("prepare_cos_sin_ms", 0.0)),
+            float(acc.get("prepare_tail_ms", 0.0)),
+            inner_sum,
+            gap,
+            profile_est,
+        )
 
     def _dynkv_prepare_step_acc_add(self, key: str, ms: float) -> None:
         acc = getattr(self, "_dynkv_prepare_step_acc", None)
@@ -1014,14 +1095,18 @@ class NPUModelRunner(GPUModelRunner):
             return
         logger.info(
             "[DynamicKV][prepare_profile_ext] update_states=%.2fms "
-            "prepare_core=%.2fms prepare_attn_build=%.2fms",
+            "prepare_core=%.2fms prepare_kv_setup=%.2fms "
+            "prepare_attn_build=%.2fms prepare_cos_sin=%.2fms prepare_tail=%.2fms",
             float(acc.get("update_states_ms", 0.0)),
             float(acc.get("prepare_core_ms", 0.0)),
+            float(acc.get("prepare_kv_setup_ms", 0.0)),
             float(acc.get("prepare_attn_build_ms", 0.0)),
+            float(acc.get("prepare_cos_sin_ms", 0.0)),
+            float(acc.get("prepare_tail_ms", 0.0)),
         )
 
-    @staticmethod
     def _dynkv_log_prepare_profile_loop(
+        self,
         *,
         layers: int,
         stack_init: float,
@@ -1057,6 +1142,15 @@ class NPUModelRunner(GPUModelRunner):
             layer_meta_assign,
             layer_meta_assign,
             total_loop,
+        )
+        self._dynkv_prepare_step_acc_add_loop_fields(
+            stack_init=stack_init,
+            kv_list_build=kv_list_build,
+            build_helper=build_helper,
+            broadcast=broadcast,
+            stacked_tensor=stacked_tensor,
+            layer_ctx_fill_batch=layer_ctx_fill_batch,
+            total_loop=total_loop,
         )
 
     def _register_dynkv_graph_context_lens_bufs_from_capture(
@@ -1288,6 +1382,8 @@ class NPUModelRunner(GPUModelRunner):
         assert num_reqs > 0
 
         _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        _t0_prepare_inputs = (time.perf_counter()
+                              if isinstance(_prep_acc, dict) else 0)
         _t0_prepare_core = (time.perf_counter()
                             if isinstance(_prep_acc, dict) else 0)
 
@@ -1799,6 +1895,8 @@ class NPUModelRunner(GPUModelRunner):
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
+            _t0_kv_setup = (time.perf_counter()
+                            if isinstance(_prep_acc, dict) else 0)
             encoder_seq_lens, encoder_seq_lens_cpu = self._get_encoder_seq_lens(
                 scheduler_output.num_scheduled_tokens or {},
                 kv_cache_group_spec.kv_cache_spec,
@@ -1959,6 +2057,12 @@ class NPUModelRunner(GPUModelRunner):
                     self.spec_decode_common_attn_metadata = \
                         self.spec_decode_common_attn_metadata.unpadded(
                             total_num_scheduled_tokens, base_num_reqs)
+
+            if isinstance(_prep_acc, dict):
+                self._dynkv_prepare_step_acc_add(
+                    "prepare_kv_setup_ms",
+                    (time.perf_counter() - _t0_kv_setup) * 1000,
+                )
 
             for attn_group in self.attn_groups[kv_cache_group_id]:
                 common_prefix_len = 0
@@ -2562,15 +2666,32 @@ class NPUModelRunner(GPUModelRunner):
                         )
 
         # update global cos, sin
+        _t0_cos_sin = (time.perf_counter()
+                       if isinstance(_prep_acc, dict) else 0)
         update_cos_sin(positions)
+        if isinstance(_prep_acc, dict):
+            self._dynkv_prepare_step_acc_add(
+                "prepare_cos_sin_ms",
+                (time.perf_counter() - _t0_cos_sin) * 1000,
+            )
 
-        self._dynkv_log_prepare_profile_ext()
-
+        _t0_tail = (time.perf_counter()
+                    if isinstance(_prep_acc, dict) else 0)
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
+
+        if isinstance(_prep_acc, dict):
+            self._dynkv_prepare_step_acc_add(
+                "prepare_tail_ms",
+                (time.perf_counter() - _t0_tail) * 1000,
+            )
+            self._dynkv_prepare_step_acc["prepare_inputs_wall_ms"] = (
+                (time.perf_counter() - _t0_prepare_inputs) * 1000)
+            self._dynkv_log_prepare_profile_ext()
+            self._dynkv_log_prepare_profile_reconcile()
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
