@@ -698,6 +698,10 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_slot_stack_buf: Optional[torch.Tensor] = None
         self._dynkv_slot_stack_cap_L: int = 0
         self._dynkv_slot_stack_cap_n: int = 0
+        # FULL-graph PA decode: [L, n_sm] parent tensor pinned at capture; each
+        # layer's ``slot_mapping`` is a row view (see ``_build_dummy_attn_metadata``).
+        self._dynkv_slot_workspace_bufs: dict[int, torch.Tensor] = {}
+        self._dynkv_slot_workspace_layer_row: dict[int, dict[str, int]] = {}
         # Per-layer slot_mapping pinned during FULL ACL graph capture
         # ({num_tokens: {layer_name: Tensor}}). Required for all FULL-graph decode,
         # not only when DynamicKV is enabled.
@@ -1104,6 +1108,129 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_graph_context_lens_bufs[cap_key] = bufs
         return bufs
 
+    def _resolve_slot_workspace_cap_key(self, num_input_tokens: int) -> int:
+        cap_key = int(num_input_tokens)
+        if cap_key in self._dynkv_slot_workspace_bufs:
+            return cap_key
+        for cap_n in sorted(self._dynkv_slot_workspace_bufs.keys()):
+            if cap_n >= cap_key:
+                return cap_n
+        return cap_key
+
+    def _get_slot_workspace_for_tokens(
+        self,
+        num_input_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        cap_key = self._resolve_slot_workspace_cap_key(num_input_tokens)
+        return self._dynkv_slot_workspace_bufs.get(cap_key)
+
+    def _get_slot_workspace_row_map(
+        self,
+        num_input_tokens: int,
+    ) -> Optional[dict[str, int]]:
+        cap_key = self._resolve_slot_workspace_cap_key(num_input_tokens)
+        row_map = self._dynkv_slot_workspace_layer_row.get(cap_key)
+        return row_map if row_map else None
+
+    def _get_or_create_slot_workspace(
+        self,
+        cap_n: int,
+        num_layers: int,
+        n_sm: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        cap_n = int(cap_n)
+        ws = self._dynkv_slot_workspace_bufs.get(cap_n)
+        need_L = max(int(num_layers), int(ws.shape[0]) if ws is not None else 0)
+        need_n = max(int(n_sm), int(ws.shape[1]) if ws is not None else 0)
+        if (
+            ws is None
+            or ws.shape[0] < need_L
+            or ws.shape[1] < need_n
+            or ws.device != device
+            or ws.dtype != dtype
+        ):
+            ws = torch.empty((need_L, need_n), device=device, dtype=dtype)
+            self._dynkv_slot_workspace_bufs[cap_n] = ws
+        self._dynkv_slot_stack_buf = ws
+        self._dynkv_slot_stack_cap_L = int(ws.shape[0])
+        self._dynkv_slot_stack_cap_n = int(ws.shape[1])
+        return ws
+
+    @staticmethod
+    def _layer_rows_contiguous(rows: list[int]) -> bool:
+        if not rows:
+            return False
+        start = int(rows[0])
+        return rows == list(range(start, start + len(rows)))
+
+    def _resolve_dynkv_stack_from_workspace(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+        n_sm: int,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        """Return (stack_view, graph_rows_alias_workspace)."""
+        ws = self._get_slot_workspace_for_tokens(num_input_tokens)
+        row_map = self._get_slot_workspace_row_map(num_input_tokens)
+        if ws is None or not row_map or n_sm <= 0 or not layer_names:
+            return None, False
+        rows = [row_map.get(str(ln)) for ln in layer_names]
+        if any(r is None for r in rows):
+            return None, False
+        rows_int = [int(r) for r in rows]
+        if not self._layer_rows_contiguous(rows_int):
+            return None, False
+        row0 = rows_int[0]
+        n_layers = len(layer_names)
+        if row0 + n_layers > int(ws.shape[0]) or n_sm > int(ws.shape[1]):
+            return None, False
+        stack = ws[row0:row0 + n_layers, :n_sm]
+        graph_bufs = self._get_graph_slot_bufs_for_tokens(num_input_tokens)
+        if graph_bufs is None:
+            return stack, False
+        alias = True
+        for li, ln in enumerate(layer_names):
+            buf = graph_bufs.get(str(ln))
+            if buf is None:
+                alias = False
+                break
+            n_buf = min(int(buf.numel()), n_sm)
+            if n_buf <= 0:
+                continue
+            expected = ws[row0 + li, :n_buf]
+            if buf.data_ptr() != expected.data_ptr():
+                alias = False
+                break
+        return stack, alias
+
+    def _broadcast_base_sm_to_workspace_layers(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+        base_sm: torch.Tensor,
+        slot_n: int,
+    ) -> bool:
+        ws = self._get_slot_workspace_for_tokens(num_input_tokens)
+        row_map = self._get_slot_workspace_row_map(num_input_tokens)
+        if ws is None or not row_map or slot_n <= 0 or not layer_names:
+            return False
+        rows = [row_map.get(str(ln)) for ln in layer_names]
+        if any(r is None for r in rows):
+            return False
+        rows_int = [int(r) for r in rows]
+        n_sm = min(int(slot_n), int(base_sm.numel()))
+        if n_sm <= 0:
+            return False
+        if self._layer_rows_contiguous(rows_int):
+            row0 = rows_int[0]
+            ws[row0:row0 + len(rows_int), :n_sm] = base_sm[:n_sm].unsqueeze(0)
+        else:
+            for row in rows_int:
+                ws[row, :n_sm].copy_(base_sm[:n_sm])
+        return True
+
     def _prepare_standard_layer_attn_metadata(
         self,
         base_meta: Any,
@@ -1111,6 +1238,8 @@ class NPUModelRunner(GPUModelRunner):
         graph_slot_bufs: Optional[dict[str, torch.Tensor]],
         slot_n: int,
         profile_acc: Optional[dict[str, float]] = None,
+        *,
+        skip_slot_remap_copy: bool = False,
     ) -> Any:
         """Default per-layer metadata (vLLM-style); pins FULL-graph slot buffers."""
         _t0_cm = time.perf_counter() if profile_acc is not None else 0
@@ -1131,13 +1260,14 @@ class NPUModelRunner(GPUModelRunner):
             captured_sm = graph_slot_bufs.get(layer_name)
             if captured_sm is not None:
                 meta_i.slot_mapping = captured_sm
-                try:
-                    n_sm = min(int(captured_sm.numel()), slot_n)
-                    if n_sm > 0:
-                        meta_i.slot_mapping[:n_sm].copy_(
-                            base_meta.slot_mapping[:n_sm])
-                except Exception:
-                    pass
+                if not skip_slot_remap_copy:
+                    try:
+                        n_sm = min(int(captured_sm.numel()), slot_n)
+                        if n_sm > 0:
+                            meta_i.slot_mapping[:n_sm].copy_(
+                                base_meta.slot_mapping[:n_sm])
+                    except Exception:
+                        pass
             if profile_acc is not None:
                 profile_acc["layer_slot_remap"] = profile_acc.get(
                     "layer_slot_remap", 0.0) + (
@@ -1888,6 +2018,19 @@ class NPUModelRunner(GPUModelRunner):
                             "layer_copy_meta": 0.0,
                             "layer_slot_remap": 0.0,
                         }
+                    _t0_sr_std = (time.perf_counter()
+                                  if (_dynkv_profile_std and _std_L > 0)
+                                  else 0)
+                    _std_ws_broadcast = self._broadcast_base_sm_to_workspace_layers(
+                        int(num_input_tokens),
+                        list(attn_group.layer_names),
+                        attn_metadata_i.slot_mapping,
+                        _slot_n_std,
+                    )
+                    if (_dynkv_profile_std and _std_ws_broadcast and _std_L > 0
+                            and _std_profile_acc is not None):
+                        _std_profile_acc["layer_slot_remap"] = (
+                            (time.perf_counter() - _t0_sr_std) * 1000)
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = (
                             self._prepare_standard_layer_attn_metadata(
@@ -1896,6 +2039,7 @@ class NPUModelRunner(GPUModelRunner):
                                 _graph_slot_bufs_std,
                                 _slot_n_std,
                                 profile_acc=_std_profile_acc,
+                                skip_slot_remap_copy=_std_ws_broadcast,
                             ))
                     if _dynkv_profile_std and _std_L > 0:
                         _t_cm = float(
@@ -1944,6 +2088,7 @@ class NPUModelRunner(GPUModelRunner):
 
                     _t0_stack = time.perf_counter() if _dynkv_profile else 0
                     _dynkv_stack: Optional[torch.Tensor] = None
+                    _slot_workspace_alias = False
                     _slot_n_sm = 0
                     try:
                         _slot_n_sm = int(attn_metadata_i.slot_mapping.numel())
@@ -1957,25 +2102,37 @@ class NPUModelRunner(GPUModelRunner):
                     _use_graph_slot_bufs = (
                         _graph_slot_bufs is not None and _slot_n_sm > 0)
                     if _dynkv_L > 0 and _dynkv_n > 0:
-                        _need_L = max(_dynkv_L, self._dynkv_slot_stack_cap_L)
-                        _need_n = max(_dynkv_n, self._dynkv_slot_stack_cap_n)
-                        _sb = self._dynkv_slot_stack_buf
-                        if (
-                            _sb is None
-                            or _sb.shape[0] < _need_L
-                            or _sb.shape[1] < _need_n
-                            or _sb.device != attn_metadata_i.slot_mapping.device
-                            or _sb.dtype != attn_metadata_i.slot_mapping.dtype
-                        ):
-                            self._dynkv_slot_stack_buf = torch.empty(
-                                (_need_L, _need_n),
-                                device=attn_metadata_i.slot_mapping.device,
-                                dtype=attn_metadata_i.slot_mapping.dtype,
-                            )
-                            self._dynkv_slot_stack_cap_L = _need_L
-                            self._dynkv_slot_stack_cap_n = _need_n
+                        _dynkv_stack, _slot_workspace_alias = (
+                            self._resolve_dynkv_stack_from_workspace(
+                                int(num_input_tokens),
+                                _dynkv_layer_names,
+                                min(_slot_n_sm, _dynkv_n),
+                            ))
+                        if _dynkv_stack is None:
+                            _need_L = max(_dynkv_L,
+                                          self._dynkv_slot_stack_cap_L)
+                            _need_n = max(_dynkv_n,
+                                          self._dynkv_slot_stack_cap_n)
                             _sb = self._dynkv_slot_stack_buf
-                        _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
+                            if (
+                                _sb is None
+                                or _sb.shape[0] < _need_L
+                                or _sb.shape[1] < _need_n
+                                or _sb.device
+                                != attn_metadata_i.slot_mapping.device
+                                or _sb.dtype
+                                != attn_metadata_i.slot_mapping.dtype
+                            ):
+                                self._dynkv_slot_stack_buf = torch.empty(
+                                    (_need_L, _need_n),
+                                    device=attn_metadata_i.slot_mapping.device,
+                                    dtype=attn_metadata_i.slot_mapping.dtype,
+                                )
+                                self._dynkv_slot_stack_cap_L = _need_L
+                                self._dynkv_slot_stack_cap_n = _need_n
+                                _sb = self._dynkv_slot_stack_buf
+                            _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
+                            _slot_workspace_alias = False
                     if _dynkv_profile:
                         _t_stack_init = (time.perf_counter() - _t0_stack) * 1000
 
@@ -2172,6 +2329,18 @@ class NPUModelRunner(GPUModelRunner):
                         if _dynkv_profile:
                             _t_layer_slot_remap = (time.perf_counter() - _t0_sr) * 1000
 
+                    if (
+                        _slot_workspace_alias
+                        and not _slot_remap_done
+                        and _slot_n_sm > 0
+                    ):
+                        self._broadcast_base_sm_to_workspace_layers(
+                            int(num_input_tokens),
+                            _dynkv_layer_names,
+                            attn_metadata_i.slot_mapping,
+                            _slot_n_sm,
+                        )
+
                     if _slot_n_sm == 0 and _dynkv_L > 0:
                         try:
                             _slot_n_sm = int(attn_metadata_i.slot_mapping.numel())
@@ -2207,6 +2376,7 @@ class NPUModelRunner(GPUModelRunner):
                         and _use_graph_slot_bufs
                         and _dynkv_stack is not None
                         and _slot_n_sm > 0
+                        and not _slot_workspace_alias
                     ):
                         _t0_slot_assign = (
                             time.perf_counter() if _dynkv_profile else 0)
@@ -2365,7 +2535,7 @@ class NPUModelRunner(GPUModelRunner):
                                     if _dynkv_profile:
                                         _t_layer_slot_remap += (time.perf_counter() - _t0_sr_fb) * 1000
                         if (_use_graph_slot_bufs and not _slot_remap_done
-                                and _slot_n_sm > 0):
+                                and _slot_n_sm > 0 and not _slot_workspace_alias):
                             try:
                                 _sm = meta_i.slot_mapping
                                 _n_sm = min(int(_sm.numel()), _slot_n_sm)
@@ -3598,6 +3768,15 @@ class NPUModelRunner(GPUModelRunner):
 
             attn_metadata = {}
 
+            use_pa_slot_workspace = (
+                is_graph_capturing
+                and using_paged_attention(int(num_tokens), self.vllm_config))
+            _slot_workspace: Optional[torch.Tensor] = None
+            _slot_workspace_row = 0
+            _slot_workspace_cap_n = int(num_tokens)
+            if use_pa_slot_workspace:
+                self._dynkv_slot_workspace_layer_row[_slot_workspace_cap_n] = {}
+
             # The reason why we use a fixed seq_len rather than max_query_len is that
             # _npu_paged_attention_get_workspace only returns max workspace with specific
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
@@ -3625,6 +3804,20 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache_group_id].get_device_tensor()
                 slot_mapping = self.input_batch.block_table[
                     kv_cache_group_id].slot_mapping
+                if (
+                    use_pa_slot_workspace
+                    and _slot_workspace is None
+                ):
+                    total_layers = sum(
+                        len(g.layer_names)
+                        for g in self.kv_cache_config.kv_cache_groups)
+                    _slot_workspace = self._get_or_create_slot_workspace(
+                        _slot_workspace_cap_n,
+                        total_layers,
+                        int(slot_mapping.gpu.numel()),
+                        slot_mapping.gpu.device,
+                        slot_mapping.gpu.dtype,
+                    )
                 long_seq_metadata = None if self.pcp_size * self.dcp_size == 1 else self.pcp_manager.generate_pcp_metadata(
                     num_tokens, self.query_lens, self.input_batch,
                     num_scheduled_tokens)
@@ -3700,10 +3893,22 @@ class NPUModelRunner(GPUModelRunner):
                             meta_i = _copy.copy(meta_src)
                         except Exception:
                             meta_i = meta_src
-                        # Each layer must own ``slot_mapping`` storage so FULL-graph
-                        # reshape_and_cache pins distinct addresses per layer.
+                        # FULL-graph reshape_and_cache pins distinct addresses per layer.
+                        # PA decode: use one [L, n_sm] workspace row view per layer so
+                        # runtime remap writes the same memory graph captured.
                         try:
-                            meta_i.slot_mapping = meta_i.slot_mapping.clone()
+                            if (
+                                use_pa_slot_workspace
+                                and _slot_workspace is not None
+                            ):
+                                meta_i.slot_mapping = _slot_workspace[
+                                    _slot_workspace_row]
+                                self._dynkv_slot_workspace_layer_row[
+                                    _slot_workspace_cap_n][str(layer_name)] = (
+                                        _slot_workspace_row)
+                                _slot_workspace_row += 1
+                            else:
+                                meta_i.slot_mapping = meta_i.slot_mapping.clone()
                         except Exception:
                             pass
                         if (is_graph_capturing
