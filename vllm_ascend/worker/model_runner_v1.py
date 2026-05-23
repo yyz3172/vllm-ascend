@@ -796,6 +796,7 @@ class NPUModelRunner(GPUModelRunner):
         # ``_apply_profile_prepare_input_duration``).
         self._profile_prepare_input_cpu_ms: Optional[float] = None
         self._profile_prepare_inputs_cpu_ms: Optional[float] = None
+        self._profile_prepare_cpu_wall_logged: bool = False
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
@@ -1083,14 +1084,23 @@ class NPUModelRunner(GPUModelRunner):
     def _profile_execute_observe_enabled() -> bool:
         return ProfileExecuteDuration.observe_enabled()
 
+    def _store_profile_prepare_input_cpu_ms(self) -> None:
+        """Record prepare CPU wall for Profile execute duration logging."""
+        acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        if isinstance(acc, dict):
+            self._profile_prepare_input_cpu_ms = (
+                float(acc.get("update_states_ms", 0.0))
+                + float(acc.get("prepare_inputs_wall_ms", 0.0)))
+        elif getattr(self, "_profile_prepare_inputs_cpu_ms", None) is not None:
+            self._profile_prepare_input_cpu_ms = (
+                self._profile_prepare_inputs_cpu_ms)
+
     def _apply_profile_prepare_input_duration(
         self,
         durations: dict[str, float],
     ) -> dict[str, float]:
-        """Force ``prepare input`` from CPU wall (never NPU Event)."""
-        prep_ms = durations.get("prepare input")
-        if prep_ms is None:
-            prep_ms = getattr(self, "_profile_prepare_input_cpu_ms", None)
+        """Force ``prepare input`` from runner CPU wall (never NPU Event)."""
+        prep_ms = getattr(self, "_profile_prepare_input_cpu_ms", None)
         if prep_ms is None:
             prep_ms = getattr(self, "_profile_prepare_inputs_cpu_ms", None)
         if prep_ms is not None:
@@ -3287,54 +3297,61 @@ class NPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
 
         _observe = self._profile_execute_observe_enabled()
-        with ProfileExecuteDuration().capture_cpu_wall("prepare input"):
-            self._dynkv_prepare_step_acc_reset()
-            _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
-            _t0_update_states = (time.perf_counter()
-                                 if isinstance(_prep_acc, dict) else 0)
-            self._update_states(scheduler_output)
-            if isinstance(_prep_acc, dict):
-                self._dynkv_prepare_step_acc["update_states_ms"] = (
-                    time.perf_counter() - _t0_update_states) * 1000
-            if has_ec_transfer() and get_ec_transfer().is_producer:
-                with self.maybe_get_ec_connector_output(
-                        scheduler_output,
-                        encoder_cache=self.encoder_cache,
-                ):
-                    self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(
-                        scheduler_output)
-
-            if not scheduler_output.total_num_scheduled_tokens:
-                if not has_kv_transfer_group():
-                    logger.debug(
-                        "skip this step for we receive the data from remote disaggregate prefill node"
-                    )
-                    # Return empty ModelRunnerOuptut if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output,
-                                                    self.vllm_config)
-
-            if self.dynamic_eplb:
-                self.eplb_updator.forward_before()
-
-            (attn_metadata, positions, num_scheduled_tokens_np,
-             num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
-             logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
-             intermediate_tensors, max_query_len, synced_cudagraph_mode,
-             model_kwargs) = (self._prepare_inputs(scheduler_output,
-                                                   intermediate_tensors))
-
-            if self.dynamic_eplb:
-                self.eplb_updator.take_update_info_from_eplb_process()
-
-        # Store CPU wall fallback for sample_tokens (belt-and-suspenders).
         if _observe:
-            acc = getattr(self, "_dynkv_prepare_step_acc", None)
-            if isinstance(acc, dict):
-                self._profile_prepare_input_cpu_ms = (
-                    float(acc.get("update_states_ms", 0.0))
-                    + float(acc.get("prepare_inputs_wall_ms", 0.0)))
+            ProfileExecuteDuration().discard_tag("prepare input")
+            if not self._profile_prepare_cpu_wall_logged:
+                logger.info(
+                    "[ProfileExecuteDuration] prepare input uses runner CPU "
+                    "wall (update_states+prepare_inputs), not NPU Event")
+                self._profile_prepare_cpu_wall_logged = True
+        self._dynkv_prepare_step_acc_reset()
+        _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        _t0_update_states = (time.perf_counter()
+                             if isinstance(_prep_acc, dict) else 0)
+        self._update_states(scheduler_output)
+        if isinstance(_prep_acc, dict):
+            self._dynkv_prepare_step_acc["update_states_ms"] = (
+                time.perf_counter() - _t0_update_states) * 1000
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+            ):
+                self._execute_mm_encoder(scheduler_output)
+                if _observe:
+                    self._store_profile_prepare_input_cpu_ms()
+                return make_empty_encoder_model_runner_output(
+                    scheduler_output)
+
+        if not scheduler_output.total_num_scheduled_tokens:
+            if not has_kv_transfer_group():
+                logger.debug(
+                    "skip this step for we receive the data from remote disaggregate prefill node"
+                )
+                # Return empty ModelRunnerOuptut if there's no work to do.
+                if _observe:
+                    self._store_profile_prepare_input_cpu_ms()
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            if _observe:
+                self._store_profile_prepare_input_cpu_ms()
+            return self.kv_connector_no_forward(scheduler_output,
+                                                self.vllm_config)
+
+        if self.dynamic_eplb:
+            self.eplb_updator.forward_before()
+
+        (attn_metadata, positions, num_scheduled_tokens_np,
+         num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
+         logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
+         intermediate_tensors, max_query_len, synced_cudagraph_mode,
+         model_kwargs) = (self._prepare_inputs(scheduler_output,
+                                               intermediate_tensors))
+
+        if self.dynamic_eplb:
+            self.eplb_updator.take_update_info_from_eplb_process()
+
+        if _observe:
+            self._store_profile_prepare_input_cpu_ms()
 
         # prevent debugger is None
         if self.debugger is not None:
