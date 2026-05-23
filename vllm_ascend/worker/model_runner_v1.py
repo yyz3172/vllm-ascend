@@ -337,6 +337,83 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
     return all_tmp_lens, slot_jobs_all
 
 
+def _dynkv_build_job_key_to_Li_per_layer(
+    slot_jobs_all: list[list[tuple[int, int, int]]],
+    n_layers: int,
+) -> dict[tuple[int, int], list[int]]:
+    job_key_to_Li: dict[tuple[int, int], list[int]] = defaultdict(
+        lambda: [-1] * n_layers)
+    for li in range(n_layers):
+        for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[li]:
+            key = (int(job_req_idx), int(job_base_tokens))
+            job_key_to_Li[key][li] = int(job_Li)
+    return job_key_to_Li
+
+
+def _dynkv_perjob_slot_remap_to_stack(
+    *,
+    stack_view: torch.Tensor,
+    base_sm: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_pos_t: torch.Tensor,
+    req_idx_t: torch.Tensor,
+    slot_jobs_all: list[list[tuple[int, int, int]]],
+    n_layers: int,
+    block_size: int,
+    mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+) -> int:
+    """Per-(req,base) job loop; each job writes [L, n_masked] (not full [L,n_sm]).
+
+    On Ascend, sparse per-job advanced indexing beats one full-matrix gather+expand.
+    """
+    n_sm = int(base_sm.numel())
+    if n_sm <= 0 or n_layers <= 0:
+        return 0
+    job_key_to_Li = _dynkv_build_job_key_to_Li_per_layer(slot_jobs_all, n_layers)
+    job_keys_list = list(job_key_to_Li.keys())
+    n_jobs = len(job_keys_list)
+    if n_jobs <= 0:
+        return 0
+
+    all_Li_lists = [job_key_to_Li[k] for k in job_keys_list]
+    li_device = token_pos_t.device
+    li_dtype = token_pos_t.dtype
+    all_Li_tensor = torch.tensor(
+        all_Li_lists, device=li_device, dtype=li_dtype)  # [N_jobs, L]
+
+    max_blocks = int(block_tables.shape[1]) - 1
+    for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
+        _ck = (int(job_req_idx), int(job_base_tokens))
+        _cached = mask_rel_cache.get(_ck)
+        if _cached is None:
+            mask = req_idx_t == int(job_req_idx)
+            rel = token_pos_t[mask] - (int(job_base_tokens) - 1)
+            mask_rel_cache[_ck] = (mask, rel)
+        else:
+            mask, rel = _cached
+        if rel.numel() == 0:
+            continue
+
+        Li_tensor = all_Li_tensor[_job_i].unsqueeze(1)  # [L, 1]
+        tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # [L, n_masked]
+        valid_layer_mask = Li_tensor.squeeze(1) >= 0  # [L]
+
+        bt_row = block_tables[int(job_req_idx)]
+        idx_2d = (tgt_pos_2d // int(block_size)).clamp(min=0, max=max_blocks)
+        block_ids_2d = bt_row[idx_2d].to(torch.int64)
+        new_slots_2d = (
+            block_ids_2d * int(block_size) + (tgt_pos_2d % int(block_size))
+        ).to(base_sm.dtype)
+        base_masked = base_sm[mask]
+        final_vals = torch.where(
+            valid_layer_mask.unsqueeze(1),
+            new_slots_2d,
+            base_masked,
+        )
+        stack_view[:, mask] = final_vals
+    return n_jobs
+
+
 # Per-step accumulators for VLLM_DYNKV_PROFILE_FORWARD model breakdown (perf_counter).
 _DYNKV_FWD_MODEL_PROFILE_HOOKS: list[Any] = []
 _DYNKV_FWD_MODEL_ACC: dict[str, float] = {
@@ -2332,8 +2409,8 @@ class NPUModelRunner(GPUModelRunner):
                             _layer_idx_map[_ln] = -1
 
                     # ============================================================
-                    # Batched slot_remap on ``_dynkv_stack`` [L, n_sm] (one 2D kernel
-                    # per job). Graph capture buffers are filled in layer_slot_assign.
+                    # Batched slot_remap on ``_dynkv_stack`` [L, n_sm]: broadcast
+                    # base_sm then per-(req,base) job writes [L, n_masked].
                     # ============================================================
                     _slot_remap_done = False
                     if (
@@ -2351,82 +2428,24 @@ class NPUModelRunner(GPUModelRunner):
                             bt_dev = attn_metadata_i.block_tables
                             if (_slot_n_sm > 0
                                     and _slot_n_sm <= _dynkv_stack.shape[1]):
-                                # 1. Broadcast base_sm to all layers at once
-                                _dynkv_stack[:_dynkv_L, :_slot_n_sm] = (
-                                    base_sm.unsqueeze(0))
-
-                                # 2. Collect per-(req_idx, base_tokens) -> Li per layer
-                                # slot_jobs_all[li] = [(req_idx, base_tokens, Li), ...]
-                                # Group by (req_idx, base_tokens), collect Li for each layer
-                                job_key_to_Li_per_layer: dict[
-                                    tuple[int, int], list[int]
-                                ] = defaultdict(lambda: [-1] * _dynkv_L)
-                                for li in range(_dynkv_L):
-                                    for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[li]:
-                                        key = (int(job_req_idx), int(job_base_tokens))
-                                        job_key_to_Li_per_layer[key][li] = int(job_Li)
-
-                                # 2.5 Batch build all Li tensors in ONE CPU->NPU transfer
-                                job_keys_list = list(job_key_to_Li_per_layer.keys())
-                                n_jobs = len(job_keys_list)
-                                if n_jobs > 0:
-                                    all_Li_lists = [job_key_to_Li_per_layer[k] for k in job_keys_list]
-                                    # Single CPU->NPU transfer for all requests
-                                    _Li_device = dynkv_decode_token_pos_t.device
-                                    _Li_dtype = dynkv_decode_token_pos_t.dtype
-                                    all_Li_tensor = torch.tensor(
-                                        all_Li_lists, device=_Li_device, dtype=_Li_dtype
-                                    )  # [N_jobs, L]
-
-                                # 3. For each (req_idx, base_tokens), batch compute new_slots
-                                for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
-                                    _ck = (job_req_idx, job_base_tokens)
-                                    _cached = dynkv_mask_rel_cache.get(_ck)
-                                    if _cached is None:
-                                        mask = (dynkv_decode_req_idx_t == job_req_idx)
-                                        # token_pos starts at transferred-1 on first decode;
-                                        # subtract (base-1) so rel=0 maps to slot Li.
-                                        rel = (
-                                            dynkv_decode_token_pos_t[mask]
-                                            - (job_base_tokens - 1)
-                                        )
-                                        dynkv_mask_rel_cache[_ck] = (mask, rel)
-                                    else:
-                                        mask, rel = _cached
-
-                                    n_masked = int(rel.numel())
-                                    if n_masked == 0:
-                                        continue
-
-                                    # Li_tensor: use pre-built tensor slice (no CPU->NPU here)
-                                    Li_tensor = all_Li_tensor[_job_i].unsqueeze(1)  # [L, 1]
-
-                                    # tgt_pos_2d: [L, n_masked]
-                                    tgt_pos_2d = Li_tensor + rel.unsqueeze(0)  # broadcast
-
-                                    # For layers where Li == -1, we skip (handled by original base_sm)
-                                    valid_layer_mask = (Li_tensor.squeeze(1) >= 0)  # [L,]
-
-                                    bt_row = bt_dev[job_req_idx]  # [max_blocks,]
-                                    idx_2d = tgt_pos_2d // bs_dyn  # [L, n_masked]
-                                    idx_2d = idx_2d.clamp(min=0, max=bt_row.shape[0] - 1)
-                                    block_ids_2d = bt_row[idx_2d].to(torch.int64)  # [L, n_masked]
-                                    new_slots_2d = (
-                                        block_ids_2d * bs_dyn + (tgt_pos_2d % bs_dyn)
-                                    ).to(base_sm.dtype)  # [L, n_masked]
-
-                                    base_masked = base_sm[mask]
-                                    valid_layer_mask_2d = valid_layer_mask.unsqueeze(1)
-                                    final_vals = torch.where(
-                                        valid_layer_mask_2d, new_slots_2d, base_masked
-                                    )
-                                    stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
-                                    stack_view[:, mask] = final_vals
-
+                                stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
+                                stack_view[:] = base_sm.unsqueeze(0)
+                                n_jobs = _dynkv_perjob_slot_remap_to_stack(
+                                    stack_view=stack_view,
+                                    base_sm=base_sm,
+                                    block_tables=bt_dev,
+                                    token_pos_t=dynkv_decode_token_pos_t,
+                                    req_idx_t=dynkv_decode_req_idx_t,
+                                    slot_jobs_all=slot_jobs_all,
+                                    n_layers=_dynkv_L,
+                                    block_size=bs_dyn,
+                                    mask_rel_cache=dynkv_mask_rel_cache,
+                                )
                                 _slot_remap_done = True
                                 logger.debug(
-                                    "[DynamicKV][decode] batched slot_remap for %d layers, %d job_keys",
-                                    _dynkv_L, len(job_key_to_Li_per_layer),
+                                    "[DynamicKV][decode] perjob slot_remap "
+                                    "layers=%d job_keys=%d n_sm=%d",
+                                    _dynkv_L, n_jobs, _slot_n_sm,
                                 )
                         except Exception:
                             _slot_remap_done = False
