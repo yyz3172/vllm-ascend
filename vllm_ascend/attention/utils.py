@@ -120,6 +120,43 @@ def _dynkv_tmp_lens_has_negative(all_tmp_lens: list[list[int]]) -> bool:
     return False
 
 
+def _dynkv_clear_graph_slot_mapping_tails(
+    bufs: list[torch.Tensor],
+    n_active: int,
+) -> None:
+    """Mark inactive tail slots invalid when runtime batch < capture size."""
+    if n_active <= 0:
+        return
+    for buf in bufs:
+        if buf is None or not isinstance(buf, torch.Tensor):
+            continue
+        tail = int(buf.numel()) - int(n_active)
+        if tail > 0:
+            buf[int(n_active):].fill_(-1)
+
+
+def _dynkv_zero_graph_buf_tails(
+    bufs: list[torch.Tensor],
+    n_active: int,
+) -> None:
+    """Zero inactive slots when runtime batch is smaller than graph capture size.
+
+    Captured ``context_lens`` / ``slot_mapping`` buffers are sized for the
+    largest cudagraph bucket (e.g. 8). A later step with fewer active requests
+    only overwrites the prefix; stale tail values (large compressed kv lens from
+    a prior batch) can make paged-attention read past valid KV and trigger MTE
+    DDR out-of-range on Ascend.
+    """
+    if n_active <= 0:
+        return
+    for buf in bufs:
+        if buf is None or not isinstance(buf, torch.Tensor):
+            continue
+        tail = int(buf.numel()) - int(n_active)
+        if tail > 0:
+            buf[int(n_active):].zero_()
+
+
 def dynkv_fill_all_graph_context_lens_bufs(
     *,
     layer_names: list[str],
@@ -195,16 +232,16 @@ def dynkv_fill_all_graph_context_lens_bufs(
         rows = stacked_dyn_lens_t[:n_layers, :n_row]
         n_write = min(n_row, n_buf)
         _write_merged_to_stack(stack, rows, n_write=n_write)
-        if ctx_workspace_alias:
-            return
         active_bufs = [
             context_lens_bufs.get(str(layer_names[li]))
             for li in range(n_layers)
             if context_lens_bufs.get(str(layer_names[li])) is not None
         ]
         if active_bufs:
-            _sync_stack_rows_to_bufs(stack[:len(active_bufs)], active_bufs,
-                                     n_write=n_write)
+            if not ctx_workspace_alias:
+                _sync_stack_rows_to_bufs(stack[:len(active_bufs)], active_bufs,
+                                         n_write=n_write)
+            _dynkv_zero_graph_buf_tails(active_bufs, n_write)
         return
 
     active_li: list[int] = []
@@ -221,7 +258,7 @@ def dynkv_fill_all_graph_context_lens_bufs(
             continue
         row = stacked_dyn_lens_t[li]
         if (row.device != buf.device or row.dtype != buf.dtype
-                or int(buf.numel()) != n_buf):
+                or int(buf.numel()) < n_buf):
             continue
         active_li.append(li)
         active_bufs.append(buf)
@@ -248,9 +285,11 @@ def dynkv_fill_all_graph_context_lens_bufs(
             stack = ctx_stack_view[:len(active_li), :n_buf]
             stack[:, :n_row] = merged
             _sync_stack_rows_to_bufs(stack, active_bufs, n_write=n_row)
+            _dynkv_zero_graph_buf_tails(active_bufs, n_row)
         else:
             for i, buf in enumerate(active_bufs):
                 buf.copy_(merged[i])
+            _dynkv_zero_graph_buf_tails(active_bufs, n_row)
         return
 
     if has_neg:
@@ -262,6 +301,7 @@ def dynkv_fill_all_graph_context_lens_bufs(
     # Decode steady state: only dynamic prefix changes; skip full seq_lens copy.
     for i, buf in enumerate(active_bufs):
         buf[:n_row].copy_(merged_prefix[i])
+    _dynkv_zero_graph_buf_tails(active_bufs, n_row)
 
 
 def dynkv_fill_graph_context_lens_buf(

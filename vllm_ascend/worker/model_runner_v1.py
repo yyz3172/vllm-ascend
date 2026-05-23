@@ -99,6 +99,7 @@ from vllm_ascend.attention.dynamic_kv import (
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    _dynkv_clear_graph_slot_mapping_tails,
     dynkv_fill_all_graph_context_lens_bufs,
     dynkv_fill_graph_context_lens_buf,
     dynkv_pa_kv_tokens_avg_from_attn_metadata,
@@ -1568,6 +1569,8 @@ class NPUModelRunner(GPUModelRunner):
                         if n_sm > 0:
                             meta_i.slot_mapping[:n_sm].copy_(
                                 base_meta.slot_mapping[:n_sm])
+                            _dynkv_clear_graph_slot_mapping_tails(
+                                [captured_sm], n_sm)
                     except Exception:
                         pass
             if profile_acc is not None:
@@ -2585,6 +2588,14 @@ class NPUModelRunner(GPUModelRunner):
                             _slot_remap_done = False
                         if _dynkv_profile:
                             _t_layer_slot_remap = (time.perf_counter() - _t0_sr) * 1000
+                    if (
+                        _slot_remap_done
+                        and _use_graph_slot_bufs
+                        and _graph_slot_bufs
+                        and _slot_n_sm > 0
+                    ):
+                        _dynkv_clear_graph_slot_mapping_tails(
+                            list(_graph_slot_bufs.values()), _slot_n_sm)
 
                     if (
                         _slot_workspace_alias
@@ -2819,6 +2830,8 @@ class NPUModelRunner(GPUModelRunner):
                                 if _n_sm > 0:
                                     _sm[:_n_sm].copy_(
                                         attn_metadata_i.slot_mapping[:_n_sm])
+                                    _dynkv_clear_graph_slot_mapping_tails(
+                                        [_sm], _n_sm)
                             except Exception:
                                 pass
                         attn_metadata[layer_name] = meta_i
