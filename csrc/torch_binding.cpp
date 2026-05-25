@@ -558,11 +558,13 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
     int64_t slot_w_v) {
     const uint32_t debug_blocks =
         std::getenv("VLLM_ASCEND_TURBOQUANT_DEBUG_BLOCKS") != nullptr ? 1U : 0U;
+    const bool no_kfc = std::getenv("VLLM_ASCEND_TURBOQUANT_NO_KFC") != nullptr;
     if (debug_blocks != 0U) {
         std::printf(
-            "[TQ_PACK] enter key_dim=%ld value_dim=%ld bits_key=%ld bits_value=%ld slot_w_k=%ld slot_w_v=%ld\n",
+            "[TQ_PACK] enter key_dim=%ld value_dim=%ld bits_key=%ld bits_value=%ld slot_w_k=%ld slot_w_v=%ld no_kfc=%d\n",
             static_cast<long>(key.dim()), static_cast<long>(value.dim()), static_cast<long>(bits_key),
-            static_cast<long>(bits_value), static_cast<long>(slot_w_k), static_cast<long>(slot_w_v));
+            static_cast<long>(bits_value), static_cast<long>(slot_w_k), static_cast<long>(slot_w_v),
+            no_kfc ? 1 : 0);
         std::fflush(stdout);
     }
     TORCH_CHECK(key.is_privateuseone(), "key must be on NPU");
@@ -666,48 +668,71 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
         }
     }
     const uint32_t block_dim = static_cast<uint32_t>((n_vec + vec_per_core - 1) / vec_per_core);
-    const std::vector<uint8_t> rotate_tiling_host =
-        GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, vec_per_core);
-    TORCH_CHECK(
-        rotate_tiling_host.size() >= sizeof(TCubeTiling),
-        "TurboQuant rotate tiling buffer is too small, got ", rotate_tiling_host.size(),
-        " expected at least ", sizeof(TCubeTiling));
-    at::Tensor rotate_tiling = at::empty(
-        {static_cast<int64_t>(rotate_tiling_host.size())},
-        at::TensorOptions().dtype(at::kByte).device(key_c.device()));
-    const aclError copy_ret = aclrtMemcpy(
-        rotate_tiling.data_ptr(),
-        rotate_tiling_host.size(),
-        rotate_tiling_host.data(),
-        rotate_tiling_host.size(),
-        ACL_MEMCPY_HOST_TO_DEVICE);
-    TORCH_CHECK(copy_ret == ACL_SUCCESS, "failed to copy TurboQuant rotate tiling to NPU, ret=", copy_ret);
-    if (debug_blocks != 0U) {
-        const auto* rotate_tiling =
-            reinterpret_cast<const TCubeTiling*>(rotate_tiling_host.data());
-        std::printf(
-            "[TQ_PACK] launch blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld "
-            "workspace=%u tiling=%zu usedCore=%d M=%d N=%d singleN=%d\n",
-            block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
-            static_cast<long>(slot_w_v), workspace_size, rotate_tiling_host.size(),
-            rotate_tiling->usedCoreNum, rotate_tiling->M, rotate_tiling->N, rotate_tiling->singleCoreN);
-        std::fflush(stdout);
+    if (no_kfc) {
+        if (debug_blocks != 0U) {
+            std::printf(
+                "[TQ_PACK] launch no_kfc blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld\n",
+                block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
+                static_cast<long>(slot_w_v));
+            std::fflush(stdout);
+        }
+        turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc_impl(
+            static_cast<void *>(stream),
+            const_cast<void *>(key_c.data_ptr()),
+            const_cast<void *>(value_c.data_ptr()),
+            const_cast<void *>(codebook_c.data_ptr()),
+            const_cast<void *>(rot_c.data_ptr()),
+            packed_k.data_ptr(),
+            packed_v.data_ptr(),
+            static_cast<uint32_t>(n_vec),
+            static_cast<uint32_t>(slot_w_k),
+            static_cast<uint32_t>(slot_w_v),
+            vec_per_core,
+            debug_blocks);
+    } else {
+        const std::vector<uint8_t> rotate_tiling_host =
+            GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, vec_per_core);
+        TORCH_CHECK(
+            rotate_tiling_host.size() >= sizeof(TCubeTiling),
+            "TurboQuant rotate tiling buffer is too small, got ", rotate_tiling_host.size(),
+            " expected at least ", sizeof(TCubeTiling));
+        at::Tensor rotate_tiling = at::empty(
+            {static_cast<int64_t>(rotate_tiling_host.size())},
+            at::TensorOptions().dtype(at::kByte).device(key_c.device()));
+        const aclError copy_ret = aclrtMemcpy(
+            rotate_tiling.data_ptr(),
+            rotate_tiling_host.size(),
+            rotate_tiling_host.data(),
+            rotate_tiling_host.size(),
+            ACL_MEMCPY_HOST_TO_DEVICE);
+        TORCH_CHECK(copy_ret == ACL_SUCCESS, "failed to copy TurboQuant rotate tiling to NPU, ret=", copy_ret);
+        if (debug_blocks != 0U) {
+            const auto* rotate_tiling =
+                reinterpret_cast<const TCubeTiling*>(rotate_tiling_host.data());
+            std::printf(
+                "[TQ_PACK] launch blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld "
+                "workspace=%u tiling=%zu usedCore=%d M=%d N=%d singleN=%d\n",
+                block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
+                static_cast<long>(slot_w_v), workspace_size, rotate_tiling_host.size(),
+                rotate_tiling->usedCoreNum, rotate_tiling->M, rotate_tiling->N, rotate_tiling->singleCoreN);
+            std::fflush(stdout);
+        }
+        turboquant_pack_kv_for_cache_fused_fp16_8bit_128_impl(
+            static_cast<void *>(stream),
+            const_cast<void *>(key_c.data_ptr()),
+            const_cast<void *>(value_c.data_ptr()),
+            const_cast<void *>(codebook_c.data_ptr()),
+            const_cast<void *>(rot_c.data_ptr()),
+            packed_k.data_ptr(),
+            packed_v.data_ptr(),
+            static_cast<uint32_t>(n_vec),
+            static_cast<uint32_t>(slot_w_k),
+            static_cast<uint32_t>(slot_w_v),
+            vec_per_core,
+            debug_blocks,
+            workspace.data_ptr(),
+            rotate_tiling.data_ptr());
     }
-    turboquant_pack_kv_for_cache_fused_fp16_8bit_128_impl(
-        static_cast<void *>(stream),
-        const_cast<void *>(key_c.data_ptr()),
-        const_cast<void *>(value_c.data_ptr()),
-        const_cast<void *>(codebook_c.data_ptr()),
-        const_cast<void *>(rot_c.data_ptr()),
-        packed_k.data_ptr(),
-        packed_v.data_ptr(),
-        static_cast<uint32_t>(n_vec),
-        static_cast<uint32_t>(slot_w_k),
-        static_cast<uint32_t>(slot_w_v),
-        vec_per_core,
-        debug_blocks,
-        workspace.data_ptr(),
-        rotate_tiling.data_ptr());
 
     std::vector<int64_t> shape_k(key.sizes().begin(), key.sizes().end());
     std::vector<int64_t> shape_v(value.sizes().begin(), value.sizes().end());

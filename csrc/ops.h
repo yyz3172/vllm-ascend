@@ -80,6 +80,20 @@ namespace vllm_ascend {
     void *workspace,
     void *rotate_tiling);
 
+  extern void turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc_impl(
+    void *stream,
+    void *key,
+    void *value,
+    void *codebook,
+    void *rotation_t,
+    void *packed_k,
+    void *packed_v,
+    uint32_t nVec,
+    uint32_t slot_w_k,
+    uint32_t slot_w_v,
+    uint32_t vecPerCore,
+    uint32_t debugLog);
+
   extern void get_masked_input_and_mask_impl(
     void* stream,
     void* input,
