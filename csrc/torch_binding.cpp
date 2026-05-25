@@ -60,6 +60,12 @@
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
+#include "moe_combine_normal/moe_combine_normal_torch_adpt.h"
+#include "moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
+#include "moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
+#include "sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
+#include "turboquant_rotate_matmul_probe/op_host/aclnn_turboquant_rotate_matmul_probe.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -254,6 +260,8 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     }
 }
 namespace {
+
+constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
 
 std::vector<uint8_t> GenerateTurboQuantRotateTiling(
     platform_ascendc::PlatformAscendC* ascendc_platform,
@@ -542,6 +550,35 @@ at::Tensor turboquant_pad_packed_row_to_slot(const at::Tensor &packed, int64_t s
 
 }  // namespace
 
+// Minimal standard custom-op Cube matmul probe: C = A @ B.
+at::Tensor turboquant_rotate_matmul_probe(
+    const at::Tensor &a,
+    const at::Tensor &b,
+    int64_t probe_mode) {
+    TORCH_CHECK(a.is_privateuseone() && b.is_privateuseone(), "inputs must be on NPU");
+    TORCH_CHECK(a.scalar_type() == at::kHalf && b.scalar_type() == at::kHalf, "fp16 only");
+    TORCH_CHECK(a.dim() == 2 && a.size(1) == 128, "a must be [M, 128]");
+    TORCH_CHECK(b.dim() == 2 && b.size(0) == 128 && b.size(1) == 128, "b must be [128, 128]");
+    TORCH_CHECK(probe_mode == 0 || probe_mode == 1, "probe_mode must be 0 (regist only) or 1 (matmul)");
+
+    const at::Tensor a_c = a.contiguous();
+    const at::Tensor b_c = b.contiguous();
+    const int64_t m = a_c.size(0);
+    TORCH_CHECK(m >= 1 && m <= 128, "M must be in [1, 128]");
+
+    const uint32_t m_pad = static_cast<uint32_t>(((m + 15) / 16) * 16);
+    at::Tensor a_mat = a_c;
+    if (static_cast<uint32_t>(m) != m_pad) {
+        a_mat = at::zeros({static_cast<int64_t>(m_pad), 128}, a.options());
+        a_mat.slice(0, 0, m).copy_(a_c);
+    }
+    at::Tensor c_pad = at::zeros({static_cast<int64_t>(m_pad), 128}, a.options());
+
+    EXEC_NPU_CMD(aclnnTurboquantRotateMatmulProbe, a_mat, b_c, probe_mode, m, c_pad);
+
+    return c_pad.slice(0, 0, m).contiguous();
+}
+
 // TurboQuant pack K/V for paged cache: norm + rotate + nearest-neighbor encode.
 // When bits_key == bits_value, K and V are encoded in one batched kernel launch.
 // key/value: [T, H, D] fp16/bf16 on NPU; codebook_*: [2^bits] fp16; rotation_t_*: [D, D] fp16 (R^T).
@@ -669,11 +706,32 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
     }
     const uint32_t block_dim = static_cast<uint32_t>((n_vec + vec_per_core - 1) / vec_per_core);
     if (no_kfc) {
+        const std::vector<uint8_t> rotate_tiling_host =
+            GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, TQ_SINGLE_ROT_M_PAD);
+        TORCH_CHECK(
+            rotate_tiling_host.size() >= sizeof(TCubeTiling),
+            "TurboQuant rotate tiling buffer is too small, got ", rotate_tiling_host.size(),
+            " expected at least ", sizeof(TCubeTiling));
+        at::Tensor rotate_tiling = at::empty(
+            {static_cast<int64_t>(rotate_tiling_host.size())},
+            at::TensorOptions().dtype(at::kByte).device(key_c.device()));
+        const aclError copy_ret = aclrtMemcpy(
+            rotate_tiling.data_ptr(),
+            rotate_tiling_host.size(),
+            rotate_tiling_host.data(),
+            rotate_tiling_host.size(),
+            ACL_MEMCPY_HOST_TO_DEVICE);
+        TORCH_CHECK(copy_ret == ACL_SUCCESS, "failed to copy TurboQuant rotate tiling to NPU, ret=", copy_ret);
         if (debug_blocks != 0U) {
+            const auto* rotate_tiling_debug =
+                reinterpret_cast<const TCubeTiling*>(rotate_tiling_host.data());
             std::printf(
-                "[TQ_PACK] launch no_kfc blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld\n",
+                "[TQ_PACK] launch no_kfc blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld "
+                "workspace=%u tiling=%zu usedCore=%d M=%d N=%d singleN=%d\n",
                 block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
-                static_cast<long>(slot_w_v));
+                static_cast<long>(slot_w_v), workspace_size, rotate_tiling_host.size(),
+                rotate_tiling_debug->usedCoreNum, rotate_tiling_debug->M, rotate_tiling_debug->N,
+                rotate_tiling_debug->singleCoreN);
             std::fflush(stdout);
         }
         turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc_impl(
@@ -688,7 +746,9 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
             static_cast<uint32_t>(slot_w_k),
             static_cast<uint32_t>(slot_w_v),
             vec_per_core,
-            debug_blocks);
+            debug_blocks,
+            workspace.data_ptr(),
+            rotate_tiling.data_ptr());
     } else {
         const std::vector<uint8_t> rotate_tiling_host =
             GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, vec_per_core);
@@ -2866,6 +2926,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor, Tensor)");
     ops.impl("turboquant_pack_kv_for_cache", torch::kPrivateUse1,
              &vllm_ascend::turboquant_pack_kv_for_cache);
+
+    ops.def(
+        "turboquant_rotate_matmul_probe(Tensor a, Tensor b, int probe_mode) -> Tensor");
+    ops.impl("turboquant_rotate_matmul_probe", torch::kPrivateUse1,
+             &vllm_ascend::turboquant_rotate_matmul_probe);
 
     ops.def(
         "grouped_matmul_swiglu_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor x_scale,"
