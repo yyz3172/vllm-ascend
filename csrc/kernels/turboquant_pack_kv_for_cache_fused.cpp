@@ -44,6 +44,7 @@ static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
 static constexpr uint32_t TQ_ROT_N_PER_SUB = TQ_ROT_N / TQ_AIV_SUB_BLOCKS;
+static constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
 // Broadcast tile: [D, K_TILE] = [128, 128] fits in 32 KiB UB (half).
 static constexpr uint32_t TQ_ARGMIN_K_TILE = 128;
 static constexpr uint32_t TQ_TILE_DIFF_ELEMS = TQ_PACK_D * TQ_ARGMIN_K_TILE;
@@ -411,7 +412,8 @@ private:
 
 class TurboquantPackKVForCacheNoKfc {
 public:
-    __aicore__ inline explicit TurboquantPackKVForCacheNoKfc(AscendC::TPipe* pipe) : pipe_(pipe) {}
+    __aicore__ inline explicit TurboquantPackKVForCacheNoKfc(AscendC::TPipe* pipe, TqRotateMatmulOp* rotateMm)
+        : pipe_(pipe), rotateMm_(rotateMm) {}
 
     __aicore__ inline void Init(
         __gm__ half* key,
@@ -438,17 +440,22 @@ public:
         packedKGm_.SetGlobalBuffer(packed_k, (uint64_t)nVec_ * slot_w_k_);
         packedVGm_.SetGlobalBuffer(packed_v, (uint64_t)nVec_ * slot_w_v_);
 
-        pipe_->InitBuffer(xBuf_, TQ_PACK_D * sizeof(half));
-        pipe_->InitBuffer(yBuf_, TQ_PACK_D * sizeof(half));
+        pipe_->InitBuffer(xQue_, 1, TQ_SINGLE_ROT_M_PAD * TQ_PACK_D * sizeof(half));
+        pipe_->InitBuffer(yQue_, 1, TQ_SINGLE_ROT_M_PAD * TQ_ROT_N * sizeof(half));
         pipe_->InitBuffer(sqBuf_, TQ_PACK_D * sizeof(half));
         pipe_->InitBuffer(reduceWorkBuf_, TQ_PACK_D * sizeof(half));
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
-        pipe_->InitBuffer(rotationBuf_, TQ_PACK_D * TQ_PACK_D * sizeof(half));
+        pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
+
+        matmulReady_ = GetSysWorkSpacePtr() != nullptr;
     }
 
     __aicore__ inline void Process() {
-        const uint32_t core = AscendC::GetBlockIdx();
+        if (!matmulReady_) {
+            return;
+        }
+        const uint32_t core = AscendC::GetBlockIdx() / TQ_AIV_SUB_BLOCKS;
         const uint32_t start = core * vecPerCore_;
         uint32_t end = start + vecPerCore_;
         if (end > nVec_) {
@@ -459,9 +466,7 @@ public:
         }
 
         auto codebookLocal = codebookBuf_.Get<half>();
-        auto rotationLocal = rotationBuf_.Get<half>();
         AscendC::DataCopy(codebookLocal, codebookGm_[0], TQ_PACK_K);
-        AscendC::DataCopy(rotationLocal, rotationTGm_[0], TQ_PACK_D * TQ_PACK_D);
         TqSyncMte2ToV();
 
         if (TqDebugEnabled(debugLog_)) {
@@ -469,9 +474,11 @@ public:
                             core, start, end, vecPerCore_, nVec_);
         }
 
+        const uint32_t subIdx = AscendC::GetSubBlockIdx() % TQ_AIV_SUB_BLOCKS;
+        const uint32_t dBase = subIdx * TQ_ROT_N_PER_SUB;
         for (uint32_t row = start; row < end; ++row) {
-            PackOneRow(keyGm_, packedKGm_, codebookLocal, rotationLocal, row, slot_w_k_);
-            PackOneRow(valueGm_, packedVGm_, codebookLocal, rotationLocal, row, slot_w_v_);
+            PackOneRow(keyGm_, packedKGm_, codebookLocal, row, slot_w_k_, dBase, TQ_ROT_N_PER_SUB, subIdx == 0);
+            PackOneRow(valueGm_, packedVGm_, codebookLocal, row, slot_w_v_, dBase, TQ_ROT_N_PER_SUB, subIdx == 0);
         }
     }
 
@@ -502,26 +509,31 @@ private:
         return normH;
     }
 
-    __aicore__ inline void RotateRowScalar(
-        const AscendC::LocalTensor<half>& xLocal,
-        AscendC::LocalTensor<half>& yLocal,
-        const AscendC::LocalTensor<half>& rotationLocal) {
-        for (uint32_t n = 0; n < TQ_PACK_D; ++n) {
-            float acc = 0.0f;
-            for (uint32_t k = 0; k < TQ_PACK_D; ++k) {
-                acc += static_cast<float>(xLocal.GetValue(k)) *
-                       static_cast<float>(rotationLocal.GetValue(k * TQ_PACK_D + n));
-            }
-            yLocal.SetValue(n, static_cast<half>(acc));
+    __aicore__ inline void RotateRowMatmul(
+        AscendC::LocalTensor<half>& xLocal,
+        AscendC::LocalTensor<half>& yLocal) {
+        AscendC::Duplicate(xLocal[TQ_PACK_D], (half)0, (TQ_SINGLE_ROT_M_PAD - 1) * TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        rotateMm_->SetOrgShape(TQ_SINGLE_ROT_M_PAD, TQ_ROT_N, TQ_ROT_K);
+        rotateMm_->SetTensorA(xLocal, false);
+        rotateMm_->SetTensorB(rotationTGm_, false);
+        auto rotateWorkspace = rotateWorkBuf_.Get<uint8_t>();
+        rotateMm_->SetLocalWorkspace(rotateWorkspace);
+        while (rotateMm_->template Iterate<true>()) {
+            rotateMm_->template GetTensorC<true>(yLocal, false, true);
         }
+        rotateMm_->End();
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void QuantizeAndWrite(
         const AscendC::LocalTensor<half>& yLocal,
         const AscendC::LocalTensor<half>& codebookLocal,
         AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint64_t outBase) {
-        for (uint32_t d = 0; d < TQ_PACK_D; ++d) {
+        uint64_t outBase,
+        uint32_t dBase,
+        uint32_t dCount) {
+        for (uint32_t d = 0; d < dCount; ++d) {
             const float y = static_cast<float>(yLocal.GetValue(d));
             float bestDist = 3.402823466e38f;
             uint8_t bestIdx = 0;
@@ -533,7 +545,7 @@ private:
                     bestIdx = static_cast<uint8_t>(c);
                 }
             }
-            packedGm.SetValue(outBase + d, bestIdx);
+            packedGm.SetValue(outBase + dBase + d, bestIdx);
         }
     }
 
@@ -541,37 +553,45 @@ private:
         const AscendC::GlobalTensor<half>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const AscendC::LocalTensor<half>& codebookLocal,
-        const AscendC::LocalTensor<half>& rotationLocal,
         uint32_t row,
-        uint32_t slot_w) {
-        auto xLocal = xBuf_.Get<half>();
-        auto yLocal = yBuf_.Get<half>();
+        uint32_t slot_w,
+        uint32_t dBase,
+        uint32_t dCount,
+        bool writeMeta) {
+        auto xLocal = xQue_.AllocTensor<half>();
+        auto yLocal = yQue_.AllocTensor<half>();
         const half normH = LoadAndNormalizeRow(xGm, xLocal, row);
-        RotateRowScalar(xLocal, yLocal, rotationLocal);
+        RotateRowMatmul(xLocal, yLocal);
 
         const uint64_t outBase = (uint64_t)row * slot_w;
-        QuantizeAndWrite(yLocal, codebookLocal, packedGm, outBase);
-        write_norm_fp16_le(packedGm, outBase, normH);
-        for (uint32_t k = (uint32_t)TQ_PACK_D + 2; k < slot_w; ++k) {
-            packedGm.SetValue(outBase + k, (uint8_t)0);
+        QuantizeAndWrite(yLocal, codebookLocal, packedGm, outBase, dBase, dCount);
+        if (writeMeta) {
+            write_norm_fp16_le(packedGm, outBase, normH);
+            for (uint32_t k = (uint32_t)TQ_PACK_D + 2; k < slot_w; ++k) {
+                packedGm.SetValue(outBase + k, (uint8_t)0);
+            }
         }
+        yQue_.FreeTensor(yLocal);
+        xQue_.FreeTensor(xLocal);
     }
 
 private:
     AscendC::TPipe* pipe_ = nullptr;
+    TqRotateMatmulOp* rotateMm_ = nullptr;
     uint32_t nVec_ = 0;
     uint32_t slot_w_k_ = 0;
     uint32_t slot_w_v_ = 0;
     uint32_t vecPerCore_ = 1;
     uint32_t debugLog_ = 0;
+    bool matmulReady_ = false;
 
-    AscendC::TBuf<AscendC::TPosition::VECCALC> xBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> yBuf_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> xQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> yQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> sqBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> rotationBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
 
     AscendC::GlobalTensor<half> keyGm_;
     AscendC::GlobalTensor<half> valueGm_;
@@ -659,13 +679,20 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused_fp16_8b
     uint32_t slot_w_k,
     uint32_t slot_w_v,
     uint32_t vecPerCore,
-    uint32_t debugLog) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if (g_coreType == AIC) {
+    uint32_t debugLog,
+    GM_ADDR workspace,
+    __gm__ uint8_t* rotate_tiling) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::SetSysWorkspace(workspace);
+    AscendC::TPipe pipe;
+    TqRotateMatmulOp rotateMm;
+    if (GetSysWorkSpacePtr() == nullptr) {
         return;
     }
-    AscendC::TPipe pipe;
-    TurboquantPackKVForCacheNoKfc op(&pipe);
+    TCubeTiling tiling;
+    CopyTqRotateTiling(&tiling, rotate_tiling);
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &tiling);
+    TurboquantPackKVForCacheNoKfc op(&pipe, &rotateMm);
     op.Init(key, value, codebook, rotation_t, packed_k, packed_v, nVec, slot_w_k, slot_w_v, vecPerCore, debugLog);
     op.Process();
 }
@@ -716,7 +743,9 @@ extern void turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc_impl(
     uint32_t slot_w_k,
     uint32_t slot_w_v,
     uint32_t vecPerCore,
-    uint32_t debugLog) {
+    uint32_t debugLog,
+    void* workspace,
+    void* rotate_tiling) {
     uint32_t blockDim = (nVec + vecPerCore - 1) / vecPerCore;
     turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc<<<blockDim, nullptr, stream>>>(
         reinterpret_cast<__gm__ half*>(key),
@@ -729,7 +758,9 @@ extern void turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc_impl(
         slot_w_k,
         slot_w_v,
         vecPerCore,
-        debugLog);
+        debugLog,
+        reinterpret_cast<uint8_t*>(workspace),
+        reinterpret_cast<__gm__ uint8_t*>(rotate_tiling));
 }
 
 }  // namespace vllm_ascend

@@ -92,7 +92,9 @@ namespace vllm_ascend {
     uint32_t slot_w_k,
     uint32_t slot_w_v,
     uint32_t vecPerCore,
-    uint32_t debugLog);
+    uint32_t debugLog,
+    void *workspace,
+    void *rotate_tiling);
 
   extern void get_masked_input_and_mask_impl(
     void* stream,
