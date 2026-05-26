@@ -114,6 +114,11 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 
 - **P0 decode prepare**（代码内恒开，无 yaml 开关）：active-only 上传/拷贝、稳态标量 slot_remap、uniform 时 row0 广播 slot_assign、优先 slot workspace alias、复用 layer metadata 壳。
 
+- **Prepare profile 收口**（``VLLM_DYNKV_PROFILE_PREPARE=1``）：
+  - ``[prepare_profile_ext]``：`prepare_core_*`` 五段（slots / rope / dispatch / batch / dynkv_upload）、``prepare_kv_loop``、``prepare_dynkv_branch`` / ``misc``。
+  - ``[prepare_profile_reconcile]``：`inner_sum`` 含 ``loop_sum + prepare_dynkv_misc + prepare_kv_loop_gap``；``prepare_gap`` 应接近 0。
+  - 解析：`parse_dynkv_prepare_profile.py``。
+
 ### 2.2 与 PD（Mooncake）的关系
 
 一句话：PD 场景下，prefill 会把“**每层该看多少 KV**”以及（可选）“**要传哪些 KV blocks**”打包到 `kv_transfer_params.dynamic_kv`，随请求传给 decode。

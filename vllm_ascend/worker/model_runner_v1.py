@@ -1769,8 +1769,17 @@ class NPUModelRunner(GPUModelRunner):
                 "update_states_ms": 0.0,
                 "prepare_inputs_wall_ms": 0.0,
                 "prepare_core_ms": 0.0,
+                "prepare_core_slots_ms": 0.0,
+                "prepare_core_rope_ms": 0.0,
+                "prepare_core_dispatch_ms": 0.0,
+                "prepare_core_batch_ms": 0.0,
+                "prepare_core_dynkv_upload_ms": 0.0,
+                "prepare_kv_loop_ms": 0.0,
+                "prepare_kv_loop_gap_ms": 0.0,
                 "prepare_kv_setup_ms": 0.0,
                 "prepare_attn_build_ms": 0.0,
+                "prepare_dynkv_branch_ms": 0.0,
+                "prepare_dynkv_misc_ms": 0.0,
                 "prepare_cos_sin_ms": 0.0,
                 "prepare_tail_ms": 0.0,
                 "loop_stack_init_ms": 0.0,
@@ -1833,11 +1842,15 @@ class NPUModelRunner(GPUModelRunner):
             return
         loop_sum = sum(
             float(acc.get(k, 0.0)) for k in self._DYNKV_PREPARE_LOOP_ACC.values())
+        dynkv_misc = float(acc.get("prepare_dynkv_misc_ms", 0.0))
+        kv_loop_gap = float(acc.get("prepare_kv_loop_gap_ms", 0.0))
         inner_sum = (
             float(acc.get("prepare_core_ms", 0.0))
             + float(acc.get("prepare_kv_setup_ms", 0.0))
             + float(acc.get("prepare_attn_build_ms", 0.0))
             + loop_sum
+            + dynkv_misc
+            + kv_loop_gap
             + float(acc.get("prepare_cos_sin_ms", 0.0))
             + float(acc.get("prepare_tail_ms", 0.0))
         )
@@ -1850,6 +1863,7 @@ class NPUModelRunner(GPUModelRunner):
             "update_states=%.2fms "
             "prepare_inputs_wall=%.2fms prepare_core=%.2fms "
             "prepare_kv_setup=%.2fms prepare_attn_build=%.2fms loop_sum=%.2fms "
+            "prepare_dynkv_misc=%.2fms prepare_kv_loop_gap=%.2fms "
             "prepare_cos_sin=%.2fms prepare_tail=%.2fms inner_sum=%.2fms "
             "prepare_gap=%.2fms profile_prepare_est=%.2fms",
             int(self._is_dynamic_kv_enabled()),
@@ -1859,6 +1873,8 @@ class NPUModelRunner(GPUModelRunner):
             float(acc.get("prepare_kv_setup_ms", 0.0)),
             float(acc.get("prepare_attn_build_ms", 0.0)),
             loop_sum,
+            dynkv_misc,
+            kv_loop_gap,
             float(acc.get("prepare_cos_sin_ms", 0.0)),
             float(acc.get("prepare_tail_ms", 0.0)),
             inner_sum,
@@ -1877,13 +1893,25 @@ class NPUModelRunner(GPUModelRunner):
             return
         logger.info(
             "[DynamicKV][prepare_profile_ext] dynkv=%d update_states=%.2fms "
-            "prepare_core=%.2fms prepare_kv_setup=%.2fms "
-            "prepare_attn_build=%.2fms prepare_cos_sin=%.2fms prepare_tail=%.2fms",
+            "prepare_core=%.2fms prepare_core_slots=%.2fms prepare_core_rope=%.2fms "
+            "prepare_core_dispatch=%.2fms prepare_core_batch=%.2fms "
+            "prepare_core_dynkv_upload=%.2fms prepare_kv_loop=%.2fms "
+            "prepare_kv_setup=%.2fms prepare_attn_build=%.2fms "
+            "prepare_dynkv_branch=%.2fms prepare_dynkv_misc=%.2fms "
+            "prepare_cos_sin=%.2fms prepare_tail=%.2fms",
             int(self._is_dynamic_kv_enabled()),
             float(acc.get("update_states_ms", 0.0)),
             float(acc.get("prepare_core_ms", 0.0)),
+            float(acc.get("prepare_core_slots_ms", 0.0)),
+            float(acc.get("prepare_core_rope_ms", 0.0)),
+            float(acc.get("prepare_core_dispatch_ms", 0.0)),
+            float(acc.get("prepare_core_batch_ms", 0.0)),
+            float(acc.get("prepare_core_dynkv_upload_ms", 0.0)),
+            float(acc.get("prepare_kv_loop_ms", 0.0)),
             float(acc.get("prepare_kv_setup_ms", 0.0)),
             float(acc.get("prepare_attn_build_ms", 0.0)),
+            float(acc.get("prepare_dynkv_branch_ms", 0.0)),
+            float(acc.get("prepare_dynkv_misc_ms", 0.0)),
             float(acc.get("prepare_cos_sin_ms", 0.0)),
             float(acc.get("prepare_tail_ms", 0.0)),
         )
@@ -2417,6 +2445,7 @@ class NPUModelRunner(GPUModelRunner):
                               if _track_prepare_wall else 0)
         _t0_prepare_core = (time.perf_counter()
                             if _prep_phase_timing else 0)
+        _t_core_seg = _t0_prepare_core
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -2460,6 +2489,12 @@ class NPUModelRunner(GPUModelRunner):
             req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
+        if _prep_phase_timing:
+            self._dynkv_prepare_step_acc_add(
+                "prepare_core_slots_ms",
+                (time.perf_counter() - _t_core_seg) * 1000,
+            )
+            _t_core_seg = time.perf_counter()
         # for pcp, prefill mtp should use origin scheduleroutput ,
         if self.speculative_config and self.pcp_size * self.dcp_size > 1:
             self.pcp_manager.generate_pcp_mtp_input(
@@ -2541,6 +2576,12 @@ class NPUModelRunner(GPUModelRunner):
             except Exception as e:
                 logger.warning(
                     "[DynamicKV][decode] RoPE offset apply failed: %s", e)
+        if _prep_phase_timing:
+            self._dynkv_prepare_step_acc_add(
+                "prepare_core_rope_ms",
+                (time.perf_counter() - _t_core_seg) * 1000,
+            )
+            _t_core_seg = time.perf_counter()
         max_num_scheduled_tokens = max(tokens)
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
             and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
@@ -2595,6 +2636,12 @@ class NPUModelRunner(GPUModelRunner):
         else:
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
+        if _prep_phase_timing:
+            self._dynkv_prepare_step_acc_add(
+                "prepare_core_dispatch_ms",
+                (time.perf_counter() - _t_core_seg) * 1000,
+            )
+            _t_core_seg = time.perf_counter()
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -2884,6 +2931,12 @@ class NPUModelRunner(GPUModelRunner):
             self.num_decode_draft_tokens.copy_to_gpu()
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
+        if _prep_phase_timing:
+            self._dynkv_prepare_step_acc_add(
+                "prepare_core_batch_ms",
+                (time.perf_counter() - _t_core_seg) * 1000,
+            )
+            _t_core_seg = time.perf_counter()
 
         # Used in the below loop.
         self.spec_decode_common_attn_metadata = None
@@ -2918,8 +2971,12 @@ class NPUModelRunner(GPUModelRunner):
             except Exception:
                 dynkv_decode_token_pos_t = None
                 dynkv_decode_req_idx_t = None
-
         if _prep_phase_timing:
+            self._dynkv_prepare_step_acc_add(
+                "prepare_core_dynkv_upload_ms",
+                (time.perf_counter() - _t_core_seg) * 1000,
+            )
+            _t_core_seg = time.perf_counter()
             self._dynkv_prepare_step_acc_add(
                 "prepare_core_ms",
                 (time.perf_counter() - _t0_prepare_core) * 1000,
@@ -2927,6 +2984,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        _t0_kv_loop = (time.perf_counter() if _prep_phase_timing else 0)
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
             _t0_kv_setup = (time.perf_counter()
@@ -3238,6 +3296,8 @@ class NPUModelRunner(GPUModelRunner):
                     # DynamicKV PD decode: compressed context_lens + slot_remap.
                     # Scheme 1: (req_idx, base_tokens) -> (mask, rel); rel does not depend
                     # on layer ``Li``, reused across ``layer_names`` in this attn_group.
+                    _t0_dynkv_branch = (
+                        time.perf_counter() if _prep_phase_timing else 0)
                     dynkv_mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor,
                                                                       torch.Tensor]] = {}
                     dynkv_slot_lut_cache: dict[int, torch.Tensor] = {}
@@ -3761,6 +3821,33 @@ class NPUModelRunner(GPUModelRunner):
                             layer_slot_remap=_t_layer_slot_remap,
                             layer_meta_assign=_t_layer_meta_assign,
                         )
+                    if _prep_phase_timing:
+                        _dynkv_measured = (
+                            _t_stack_init + _t_kv_list_build + _t_build_helper
+                            + _t_broadcast + _t_stacked_tensor
+                            + _t_layer_ctx_fill_batch + _t_layer_copy_meta
+                            + _t_layer_slot_remap + _t_layer_meta_assign
+                            + _t_layer_slot_assign)
+                        _branch_ms = (
+                            time.perf_counter() - _t0_dynkv_branch) * 1000
+                        self._dynkv_prepare_step_acc_add(
+                            "prepare_dynkv_branch_ms", _branch_ms)
+                        self._dynkv_prepare_step_acc_add(
+                            "prepare_dynkv_misc_ms",
+                            max(0.0, _branch_ms - _dynkv_measured),
+                        )
+
+        if _prep_phase_timing:
+            _kv_loop_ms = (time.perf_counter() - _t0_kv_loop) * 1000
+            self._dynkv_prepare_step_acc_add("prepare_kv_loop_ms", _kv_loop_ms)
+            _kv_accounted = (
+                float(self._dynkv_prepare_step_acc.get("prepare_kv_setup_ms", 0.0))
+                + float(self._dynkv_prepare_step_acc.get(
+                    "prepare_attn_build_ms", 0.0))
+                + float(self._dynkv_prepare_step_acc.get(
+                    "prepare_dynkv_branch_ms", 0.0)))
+            self._dynkv_prepare_step_acc["prepare_kv_loop_gap_ms"] = max(
+                0.0, _kv_loop_ms - _kv_accounted)
 
         # update global cos, sin
         _t0_cos_sin = (time.perf_counter()
