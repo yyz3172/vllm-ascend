@@ -852,22 +852,30 @@ def _dynkv_log_forward_profile(
     t_fwd_dynkv_post: float,
     t_fwd_total: float,
     pa_kv_tokens: float,
+    dynkv_enabled: bool = False,
 ) -> None:
-    """Emit forward_profile line; PA graph omits always-zero FIA/eager-PA fields."""
+    """Emit forward_profile line; PA graph omits always-zero FIA/eager-PA fields.
+
+    The ``dynkv=<0|1>`` prefix lets log parsers quickly distinguish
+    DynamicKV-on vs disabled runs (matches ``[prepare_profile]`` lines).
+    """
     model_acl = float(mp.get("model_acl", 0.0))
     model_core = float(mp.get("model_core", t_fwd_model))
     graph_replay_wall = float(mp.get("model_graph_replay", 0.0))
     graph_npu_ms = float(mp.get("graph_npu_ms", 0.0))
     model_npu_ms = float(mp.get("model_npu_ms", 0.0))
     fwd_block_npu_ms = float(mp.get("fwd_block_npu_ms", 0.0))
+    _dk = int(bool(dynkv_enabled))
 
     if pa_decode:
         logger.info(
-            "[DynamicKV][forward_profile][pa] ctx_setup=%.2fms kv_setup=%.2fms "
+            "[DynamicKV][forward_profile][pa] dynkv=%d ctx_setup=%.2fms "
+            "kv_setup=%.2fms "
             "dynkv_pre=%.2fms model_cpu=%.2fms model_acl=%.2fms "
             "graph_replay_wall=%.2fms graph_npu_ms=%.3f model_npu_ms=%.3f "
             "fwd_block_npu_ms=%.3f pa_kv_tokens_avg=%.1f dynkv_post=%.2fms "
             "profile_cpu_total=%.2fms",
+            _dk,
             ctx_setup,
             kv_setup,
             dynkv_pre,
@@ -885,13 +893,15 @@ def _dynkv_log_forward_profile(
 
     if pa_prof:
         logger.info(
-            "[DynamicKV][forward_profile] ctx_setup=%.2fms kv_setup=%.2fms "
+            "[DynamicKV][forward_profile] dynkv=%d ctx_setup=%.2fms "
+            "kv_setup=%.2fms "
             "dynkv_pre=%.2fms model=%.2fms model_acl=%.2fms model_core=%.2fms "
             "graph_replay_wall=%.2fms graph_npu_ms=%.3f model_npu_ms=%.3f "
             "fwd_block_npu_ms=%.3f model_embed=%.2fms model_norm=%.2fms "
             "model_attn=%.2fms model_attn_op=%.2fms%s%s model_mlp=%.2fms "
             "model_layer_rms=%.2fms model_sp_pcp=%.2fms dynkv_post=%.2fms "
             "profile_cpu_total=%.2fms",
+            _dk,
             ctx_setup,
             kv_setup,
             dynkv_pre,
@@ -928,12 +938,14 @@ def _dynkv_log_forward_profile(
 
     if fia_prof:
         logger.info(
-            "[DynamicKV][forward_profile] ctx_setup=%.2fms kv_setup=%.2fms "
+            "[DynamicKV][forward_profile] dynkv=%d ctx_setup=%.2fms "
+            "kv_setup=%.2fms "
             "dynkv_pre=%.2fms model=%.2fms model_acl=%.2fms model_core=%.2fms "
             "model_embed=%.2fms model_norm=%.2fms model_attn=%.2fms "
             "model_attn_op=%.2fms fia_ms_total=%.3f fia_kv_tokens_avg=%.1f "
             "model_mlp=%.2fms model_layer_rms=%.2fms model_sp_pcp=%.2fms "
             "dynkv_post=%.2fms profile_cpu_total=%.2fms",
+            _dk,
             ctx_setup,
             kv_setup,
             dynkv_pre,
@@ -956,11 +968,12 @@ def _dynkv_log_forward_profile(
         return
 
     logger.info(
-        "[DynamicKV][forward_profile] ctx_setup=%.2fms kv_setup=%.2fms "
+        "[DynamicKV][forward_profile] dynkv=%d ctx_setup=%.2fms kv_setup=%.2fms "
         "dynkv_pre=%.2fms model=%.2fms model_acl=%.2fms model_core=%.2fms "
         "model_embed=%.2fms model_norm=%.2fms model_attn=%.2fms "
         "model_attn_op=%.2fms model_mlp=%.2fms model_layer_rms=%.2fms "
         "model_sp_pcp=%.2fms dynkv_post=%.2fms profile_cpu_total=%.2fms",
+        _dk,
         ctx_setup,
         kv_setup,
         dynkv_pre,
@@ -1134,6 +1147,10 @@ class NPUModelRunner(GPUModelRunner):
         # TP rank 0 (other ranks receive build results via broadcast).
         self._dynkv_decode_lens_cache: dict[str, dict] = {}
         self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
+        # One-shot status banner: emit DynamicKV config + which profile knobs
+        # are on (PREPARE / FORWARD / MODEL_ACL / FIA / PA) once any profile is
+        # enabled. Avoids per-step verbosity but makes the run reproducible.
+        self._dynkv_profile_status_logged: bool = False
         # CPU wall for Profile execute duration ``prepare input`` (see
         # ``_apply_profile_prepare_input_duration``).
         self._profile_prepare_input_cpu_ms: Optional[float] = None
@@ -1422,6 +1439,75 @@ class NPUModelRunner(GPUModelRunner):
         return os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
 
     @staticmethod
+    def _dynkv_forward_profile_enabled() -> bool:
+        return os.environ.get("VLLM_DYNKV_PROFILE_FORWARD", "0") == "1"
+
+    @staticmethod
+    def _dynkv_any_profile_enabled() -> bool:
+        for k in (
+            "VLLM_DYNKV_PROFILE_PREPARE",
+            "VLLM_DYNKV_PROFILE_FORWARD",
+            "VLLM_DYNKV_PROFILE_MODEL_ACL",
+            "VLLM_DYNKV_PROFILE_FIA",
+            "VLLM_DYNKV_PROFILE_PA",
+        ):
+            if os.environ.get(k, "0") == "1":
+                return True
+        return False
+
+    def _dynkv_log_profile_status_once(self) -> None:
+        """Emit a single DynamicKV configuration + profile-knob banner.
+
+        Helps verify (1) DynamicKV is actually enabled, (2) which profile
+        knobs are on (PREPARE / FORWARD / MODEL_ACL / FIA / PA), and (3) what
+        the runtime configuration looks like. Triggered the first time *any*
+        DynamicKV profile env var is set.
+        """
+        if getattr(self, "_dynkv_profile_status_logged", False):
+            return
+        if not self._dynkv_any_profile_enabled():
+            return
+        cfg = getattr(self, "ascend_config", None)
+        if cfg is None:
+            return
+        prep = os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
+        fwd = os.environ.get("VLLM_DYNKV_PROFILE_FORWARD", "0") == "1"
+        model_acl = os.environ.get("VLLM_DYNKV_PROFILE_MODEL_ACL", "0") == "1"
+        fia = os.environ.get("VLLM_DYNKV_PROFILE_FIA", "0") == "1"
+        pa = os.environ.get("VLLM_DYNKV_PROFILE_PA", "0") == "1"
+        observe = self._profile_execute_observe_enabled()
+        try:
+            tp_rank = int(get_tensor_model_parallel_rank())
+        except Exception:
+            tp_rank = -1
+        logger.info(
+            "[DynamicKV][profile_status] dynkv_enabled=%s impl=%s "
+            "uniform_kv_budget=%s uniform_decode_fast_path=%s "
+            "window=%d prompt_kv_len_budget=%d min_rewrite_delta=%d "
+            "radio_max=%.2f radio_min=%.2f validation_mode=%s tp_rank=%d "
+            "OBSERVE=%d PROFILE: PREPARE=%d FORWARD=%d "
+            "MODEL_ACL=%d FIA=%d PA=%d",
+            bool(getattr(cfg, "dynamic_kv_enabled", False)),
+            str(getattr(cfg, "dynamic_kv_impl", "offload")),
+            str(getattr(cfg, "dynamic_kv_uniform_kv_budget", "off")),
+            bool(getattr(cfg, "dynamic_kv_uniform_decode_fast_path", False)),
+            int(getattr(cfg, "dynamic_kv_window_size", 16)),
+            int(getattr(cfg, "dynamic_kv_prompt_kv_len_budget", 512)),
+            int(getattr(cfg, "dynamic_kv_min_rewrite_delta", 128)),
+            float(getattr(cfg, "dynamic_kv_radio_max", 10.0)),
+            float(getattr(cfg, "dynamic_kv_radio_min", 0.1)),
+            str(getattr(cfg, "dynamic_kv_validation_mode", "none")),
+            tp_rank,
+            int(observe),
+            int(prep),
+            int(fwd),
+            int(model_acl),
+            int(fia),
+            int(pa),
+        )
+        self._dynkv_profile_status_logged = True
+
+    @staticmethod
     def _profile_execute_observe_enabled() -> bool:
         return ProfileExecuteDuration.observe_enabled()
 
@@ -1541,11 +1627,13 @@ class NPUModelRunner(GPUModelRunner):
         update_states = float(acc.get("update_states_ms", 0.0))
         profile_est = update_states + wall
         logger.info(
-            "[DynamicKV][prepare_profile_reconcile] update_states=%.2fms "
+            "[DynamicKV][prepare_profile_reconcile] dynkv=%d "
+            "update_states=%.2fms "
             "prepare_inputs_wall=%.2fms prepare_core=%.2fms "
             "prepare_kv_setup=%.2fms prepare_attn_build=%.2fms loop_sum=%.2fms "
             "prepare_cos_sin=%.2fms prepare_tail=%.2fms inner_sum=%.2fms "
             "prepare_gap=%.2fms profile_prepare_est=%.2fms",
+            int(self._is_dynamic_kv_enabled()),
             update_states,
             wall,
             float(acc.get("prepare_core_ms", 0.0)),
@@ -1569,9 +1657,10 @@ class NPUModelRunner(GPUModelRunner):
         if not isinstance(acc, dict):
             return
         logger.info(
-            "[DynamicKV][prepare_profile_ext] update_states=%.2fms "
+            "[DynamicKV][prepare_profile_ext] dynkv=%d update_states=%.2fms "
             "prepare_core=%.2fms prepare_kv_setup=%.2fms "
             "prepare_attn_build=%.2fms prepare_cos_sin=%.2fms prepare_tail=%.2fms",
+            int(self._is_dynamic_kv_enabled()),
             float(acc.get("update_states_ms", 0.0)),
             float(acc.get("prepare_core_ms", 0.0)),
             float(acc.get("prepare_kv_setup_ms", 0.0)),
@@ -1598,12 +1687,13 @@ class NPUModelRunner(GPUModelRunner):
         total_loop = (layer_copy_meta + layer_slot_remap + layer_meta_assign
                       + layer_slot_assign)
         logger.info(
-            "[DynamicKV][prepare_profile] layers=%d stack_init=%.2fms "
+            "[DynamicKV][prepare_profile] dynkv=%d layers=%d stack_init=%.2fms "
             "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
             "stacked_tensor=%.2fms layer_ctx_fill_batch=%.2fms "
             "layer_slot_assign=%.2fms layer_copy_meta=%.2fms "
             "layer_slot_remap=%.2fms layer_meta_assign=%.2fms "
             "layer_other=%.2fms total_loop=%.2fms",
+            int(self._is_dynamic_kv_enabled()),
             layers,
             stack_init,
             kv_list_build,
@@ -3759,6 +3849,7 @@ class NPUModelRunner(GPUModelRunner):
         if _observe:
             ProfileExecuteDuration().discard_tag("prepare input")
         self._dynkv_prepare_step_acc_reset()
+        self._dynkv_log_profile_status_once()
         _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
         _time_update_states = (
             isinstance(_prep_acc, dict) or _observe)
@@ -3842,6 +3933,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         _fwd_profile = os.environ.get("VLLM_DYNKV_PROFILE_FORWARD", "0") == "1"
+        if _fwd_profile:
+            self._dynkv_log_profile_status_once()
         _fia_prof = dynkv_fia_profile_enabled()
         _pa_prof = dynkv_pa_profile_enabled()
         _pa_decode = using_paged_attention(num_input_tokens, self.vllm_config)
@@ -4112,12 +4205,14 @@ class NPUModelRunner(GPUModelRunner):
                         t_fwd_dynkv_post=_t_fwd_dynkv_post,
                         t_fwd_total=_t_fwd_total,
                         pa_kv_tokens=_pa_kv_tokens,
+                        dynkv_enabled=self._is_dynamic_kv_enabled(),
                     )
                 else:
                     logger.info(
-                        "[DynamicKV][forward_profile] ctx_setup=%.2fms "
-                        "kv_setup=%.2fms dynkv_pre=%.2fms model=%.2fms "
-                        "dynkv_post=%.2fms total=%.2fms",
+                        "[DynamicKV][forward_profile] dynkv=%d "
+                        "ctx_setup=%.2fms kv_setup=%.2fms dynkv_pre=%.2fms "
+                        "model=%.2fms dynkv_post=%.2fms total=%.2fms",
+                        int(self._is_dynamic_kv_enabled()),
                         _t_fwd_ctx_setup,
                         _t_fwd_kv_setup,
                         _t_fwd_dynkv_pre,
