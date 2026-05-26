@@ -490,9 +490,21 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
 def _dynkv_build_job_key_to_Li_per_layer(
     slot_jobs_all: list[list[tuple[int, int, int]]],
     n_layers: int,
+    *,
+    uniform_lens: bool = False,
 ) -> dict[tuple[int, int], list[int]]:
+    """Aggregate (req_idx, base_tokens) -> per-layer Li (with ``-1`` for missing layers).
+
+    B8 (Phase B+): ``uniform_lens`` skips the L-level loop because layer 0's
+    jobs list is shared by all layers; one pass writes the same Li to all L slots.
+    """
     job_key_to_Li: dict[tuple[int, int], list[int]] = defaultdict(
         lambda: [-1] * n_layers)
+    if uniform_lens and slot_jobs_all:
+        for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[0]:
+            key = (int(job_req_idx), int(job_base_tokens))
+            job_key_to_Li[key] = [int(job_Li)] * n_layers
+        return job_key_to_Li
     for li in range(n_layers):
         for (job_req_idx, job_base_tokens, job_Li) in slot_jobs_all[li]:
             key = (int(job_req_idx), int(job_base_tokens))
@@ -511,27 +523,77 @@ def _dynkv_perjob_slot_remap_to_stack(
     n_layers: int,
     block_size: int,
     mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+    uniform_lens: bool = False,
 ) -> int:
     """Per-(req,base) job loop; each job writes [L, n_masked] (not full [L,n_sm]).
 
     On Ascend, sparse per-job advanced indexing beats one full-matrix gather+expand.
+
+    B8 (Phase B+): when ``uniform_lens`` is True, Li is the same across all
+    layers, so we upload a 1D Li tensor ``[N_jobs]`` (saves L-fold H2D) and run
+    per-job indexing on 1D shapes ``[n_masked]`` instead of ``[L, n_masked]``
+    (saves L-fold NPU gather/mod/multiply). The final write broadcasts the 1D
+    slots row into the ``[L, n_masked]`` slice of ``stack_view``.
     """
     n_sm = int(base_sm.numel())
     if n_sm <= 0 or n_layers <= 0:
         return 0
-    job_key_to_Li = _dynkv_build_job_key_to_Li_per_layer(slot_jobs_all, n_layers)
+    job_key_to_Li = _dynkv_build_job_key_to_Li_per_layer(
+        slot_jobs_all, n_layers, uniform_lens=uniform_lens)
     job_keys_list = list(job_key_to_Li.keys())
     n_jobs = len(job_keys_list)
     if n_jobs <= 0:
         return 0
 
-    all_Li_lists = [job_key_to_Li[k] for k in job_keys_list]
     li_device = token_pos_t.device
     li_dtype = token_pos_t.dtype
+    max_blocks = int(block_tables.shape[1]) - 1
+
+    if uniform_lens:
+        # All layers share the same Li per job; build a [N_jobs] tensor and
+        # broadcast on write. Drop jobs with Li < 0 (layer missing).
+        valid_pairs: list[tuple[tuple[int, int], int]] = []
+        for k in job_keys_list:
+            v_list = job_key_to_Li[k]
+            v0 = int(v_list[0]) if v_list else -1
+            if v0 >= 0:
+                valid_pairs.append((k, v0))
+        if not valid_pairs:
+            return 0
+        job_keys_list = [p[0] for p in valid_pairs]
+        all_Li_scalars = [p[1] for p in valid_pairs]
+        all_Li_tensor = torch.tensor(
+            all_Li_scalars, device=li_device, dtype=li_dtype)  # [N_jobs]
+
+        for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
+            _ck = (int(job_req_idx), int(job_base_tokens))
+            _cached = mask_rel_cache.get(_ck)
+            if _cached is None:
+                mask = req_idx_t == int(job_req_idx)
+                rel = token_pos_t[mask] - (int(job_base_tokens) - 1)
+                mask_rel_cache[_ck] = (mask, rel)
+            else:
+                mask, rel = _cached
+            if rel.numel() == 0:
+                continue
+
+            tgt_pos_1d = all_Li_tensor[_job_i] + rel  # [n_masked]
+            bt_row = block_tables[int(job_req_idx)]
+            idx_1d = (tgt_pos_1d // int(block_size)).clamp(
+                min=0, max=max_blocks)
+            block_ids_1d = bt_row[idx_1d].to(torch.int64)
+            new_slots_1d = (
+                block_ids_1d * int(block_size)
+                + (tgt_pos_1d % int(block_size))
+            ).to(base_sm.dtype)  # [n_masked]
+            # Broadcast write [n_masked] -> [L, n_masked]
+            stack_view[:, mask] = new_slots_1d
+        return len(job_keys_list)
+
+    all_Li_lists = [job_key_to_Li[k] for k in job_keys_list]
     all_Li_tensor = torch.tensor(
         all_Li_lists, device=li_device, dtype=li_dtype)  # [N_jobs, L]
 
-    max_blocks = int(block_tables.shape[1]) - 1
     for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
         _ck = (int(job_req_idx), int(job_base_tokens))
         _cached = mask_rel_cache.get(_ck)
@@ -2820,6 +2882,7 @@ class NPUModelRunner(GPUModelRunner):
                                     n_layers=_dynkv_L,
                                     block_size=bs_dyn,
                                     mask_rel_cache=dynkv_mask_rel_cache,
+                                    uniform_lens=bool(_dynkv_uniform_lens),
                                 )
                                 _slot_remap_done = True
                                 logger.debug(
