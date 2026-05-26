@@ -24,6 +24,7 @@ from vllm.platforms import current_platform
 from vllm_ascend.attention.utils import (
     dynkv_profile_pa_enabled,
     fia_dynamic_kv_seq_lens_list,
+    is_dynamic_kv_enabled,
     pa_dynamic_kv_context_lens_for_graph_update,
     using_paged_attention,
 )
@@ -370,12 +371,15 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 output,
             ) = param
             meta = attn_metadata[key]
-            # PD DynamicKV: must use compressed per-layer kv lens, not logical
-            # seq_lens (block-aligned transferred footprint).
+            # PD DynamicKV: compressed per-layer kv lens; when disabled, use
+            # ``seq_lens`` directly (pre-DynamicKV graph update path).
             if _prof:
                 _t0_ctx = time.perf_counter()
-            context_lens = pa_dynamic_kv_context_lens_for_graph_update(
-                meta, context_lens_buf)
+            if is_dynamic_kv_enabled():
+                context_lens = pa_dynamic_kv_context_lens_for_graph_update(
+                    meta, context_lens_buf)
+            else:
+                context_lens = meta.seq_lens
             if _prof:
                 _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"] += (
                     time.perf_counter() - _t0_ctx) * 1000

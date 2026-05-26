@@ -787,8 +787,9 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_context_lens_workspace_layer_row: dict[int, dict[str, int]] = (
             {})
         # Per-layer slot_mapping pinned during FULL ACL graph capture
-        # ({num_tokens: {layer_name: Tensor}}). Required for all FULL-graph decode,
-        # not only when DynamicKV is enabled.
+        # ({num_tokens: {layer_name: Tensor}}). Used when DynamicKV is enabled;
+        # when disabled, decode prepare shares one metadata object per group
+        # (pre-DynamicKV behavior).
         self._dynkv_graph_slot_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Per-layer context_lens pinned during FULL PA graph capture.
         self._dynkv_graph_context_lens_bufs: dict[int, dict[str, torch.Tensor]] = (
@@ -2226,12 +2227,11 @@ class NPUModelRunner(GPUModelRunner):
                 encoder_seq_lens=encoder_seq_lens,
                 encoder_seq_lens_cpu=encoder_seq_lens_cpu)
             # DynamicKV: carry request ids through to attention metadata.
-            # AscendCommonAttentionMetadata may not accept this as a ctor kwarg
-            # across versions, so attach it dynamically.
-            try:
-                setattr(common_attn_metadata, "req_ids", list(req_ids))
-            except Exception:
-                pass
+            if self._is_dynamic_kv_enabled():
+                try:
+                    setattr(common_attn_metadata, "req_ids", list(req_ids))
+                except Exception:
+                    pass
 
             if self.speculative_config and self.pcp_size * self.dcp_size > 1:
                 # For pcp + spec decode, we flatten block_table
@@ -2327,87 +2327,95 @@ class NPUModelRunner(GPUModelRunner):
                     self._is_dynamic_kv_enabled()
                     and getattr(self, "is_kv_consumer", False))
                 if not _run_dynkv_decode_prepare:
-                    _dynkv_profile_std = (
-                        os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0")
-                        == "1")
-                    self._register_dynkv_graph_context_lens_bufs_from_capture(
-                        int(num_input_tokens), list(attn_group.layer_names))
-                    _graph_slot_bufs_std = self._get_graph_slot_bufs_for_tokens(
-                        int(num_input_tokens))
-                    _graph_ctx_bufs_std = (
-                        self._get_graph_context_lens_bufs_for_tokens(
-                            int(num_input_tokens)))
-                    if (
-                        _graph_ctx_bufs_std is not None
-                        and isinstance(attn_metadata_i.seq_lens, torch.Tensor)
-                    ):
+                    if not self._is_dynamic_kv_enabled():
+                        # Pre-DynamicKV: all layers in the group share one metadata
+                        # object; PA graph update reads ``seq_lens`` in-place.
+                        for layer_name in attn_group.layer_names:
+                            attn_metadata[layer_name] = attn_metadata_i
+                    else:
+                        # DynamicKV on prefill / non-consumer: per-layer graph
+                        # buffers without compressed lens rewrite.
+                        _dynkv_profile_std = (
+                            os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0")
+                            == "1")
+                        self._register_dynkv_graph_context_lens_bufs_from_capture(
+                            int(num_input_tokens), list(attn_group.layer_names))
+                        _graph_slot_bufs_std = self._get_graph_slot_bufs_for_tokens(
+                            int(num_input_tokens))
+                        _graph_ctx_bufs_std = (
+                            self._get_graph_context_lens_bufs_for_tokens(
+                                int(num_input_tokens)))
+                        if (
+                            _graph_ctx_bufs_std is not None
+                            and isinstance(attn_metadata_i.seq_lens, torch.Tensor)
+                        ):
+                            try:
+                                sync_graph_pa_context_lens_bufs(
+                                    context_lens_bufs=_graph_ctx_bufs_std,
+                                    seq_lens=attn_metadata_i.seq_lens,
+                                )
+                            except Exception:
+                                pass
                         try:
-                            sync_graph_pa_context_lens_bufs(
-                                context_lens_bufs=_graph_ctx_bufs_std,
-                                seq_lens=attn_metadata_i.seq_lens,
-                            )
+                            _slot_n_std = int(attn_metadata_i.slot_mapping.numel())
                         except Exception:
-                            pass
-                    try:
-                        _slot_n_std = int(attn_metadata_i.slot_mapping.numel())
-                    except Exception:
-                        _slot_n_std = 0
-                    _std_L = len(attn_group.layer_names)
-                    _std_profile_acc: Optional[dict[str, float]] = None
-                    if _dynkv_profile_std and _std_L > 0:
-                        _std_profile_acc = {
-                            "layer_copy_meta": 0.0,
-                            "layer_slot_remap": 0.0,
-                        }
-                    _t0_sr_std = (time.perf_counter()
-                                  if (_dynkv_profile_std and _std_L > 0)
-                                  else 0)
-                    _std_ws_broadcast = self._broadcast_base_sm_to_workspace_layers(
-                        int(num_input_tokens),
-                        list(attn_group.layer_names),
-                        attn_metadata_i.slot_mapping,
-                        _slot_n_std,
-                    )
-                    if (
-                        _graph_slot_bufs_std is not None
-                        and _slot_n_std > 0
-                    ):
-                        _dynkv_clear_graph_slot_mapping_tails(
-                            list(_graph_slot_bufs_std.values()), _slot_n_std)
-                    if (_dynkv_profile_std and _std_ws_broadcast and _std_L > 0
-                            and _std_profile_acc is not None):
-                        _std_profile_acc["layer_slot_remap"] = (
-                            (time.perf_counter() - _t0_sr_std) * 1000)
-                    for layer_name in attn_group.layer_names:
-                        attn_metadata[layer_name] = (
-                            self._prepare_standard_layer_attn_metadata(
-                                attn_metadata_i,
-                                layer_name,
-                                _graph_slot_bufs_std,
-                                _slot_n_std,
-                                profile_acc=_std_profile_acc,
-                                skip_slot_remap_copy=_std_ws_broadcast,
-                            ))
-                    if _dynkv_profile_std and _std_L > 0:
-                        _t_cm = float(
-                            _std_profile_acc.get("layer_copy_meta", 0.0)
-                            if _std_profile_acc else 0.0)
-                        _t_sr = float(
-                            _std_profile_acc.get("layer_slot_remap", 0.0)
-                            if _std_profile_acc else 0.0)
-                        self._dynkv_log_prepare_profile_loop(
-                            layers=_std_L,
-                            stack_init=0.0,
-                            kv_list_build=0.0,
-                            build_helper=0.0,
-                            broadcast=0.0,
-                            stacked_tensor=0.0,
-                            layer_ctx_fill_batch=0.0,
-                            layer_slot_assign=0.0,
-                            layer_copy_meta=_t_cm,
-                            layer_slot_remap=_t_sr,
-                            layer_meta_assign=0.0,
+                            _slot_n_std = 0
+                        _std_L = len(attn_group.layer_names)
+                        _std_profile_acc: Optional[dict[str, float]] = None
+                        if _dynkv_profile_std and _std_L > 0:
+                            _std_profile_acc = {
+                                "layer_copy_meta": 0.0,
+                                "layer_slot_remap": 0.0,
+                            }
+                        _t0_sr_std = (time.perf_counter()
+                                      if (_dynkv_profile_std and _std_L > 0)
+                                      else 0)
+                        _std_ws_broadcast = self._broadcast_base_sm_to_workspace_layers(
+                            int(num_input_tokens),
+                            list(attn_group.layer_names),
+                            attn_metadata_i.slot_mapping,
+                            _slot_n_std,
                         )
+                        if (
+                            _graph_slot_bufs_std is not None
+                            and _slot_n_std > 0
+                        ):
+                            _dynkv_clear_graph_slot_mapping_tails(
+                                list(_graph_slot_bufs_std.values()), _slot_n_std)
+                        if (_dynkv_profile_std and _std_ws_broadcast and _std_L > 0
+                                and _std_profile_acc is not None):
+                            _std_profile_acc["layer_slot_remap"] = (
+                                (time.perf_counter() - _t0_sr_std) * 1000)
+                        for layer_name in attn_group.layer_names:
+                            attn_metadata[layer_name] = (
+                                self._prepare_standard_layer_attn_metadata(
+                                    attn_metadata_i,
+                                    layer_name,
+                                    _graph_slot_bufs_std,
+                                    _slot_n_std,
+                                    profile_acc=_std_profile_acc,
+                                    skip_slot_remap_copy=_std_ws_broadcast,
+                                ))
+                        if _dynkv_profile_std and _std_L > 0:
+                            _t_cm = float(
+                                _std_profile_acc.get("layer_copy_meta", 0.0)
+                                if _std_profile_acc else 0.0)
+                            _t_sr = float(
+                                _std_profile_acc.get("layer_slot_remap", 0.0)
+                                if _std_profile_acc else 0.0)
+                            self._dynkv_log_prepare_profile_loop(
+                                layers=_std_L,
+                                stack_init=0.0,
+                                kv_list_build=0.0,
+                                build_helper=0.0,
+                                broadcast=0.0,
+                                stacked_tensor=0.0,
+                                layer_ctx_fill_batch=0.0,
+                                layer_slot_assign=0.0,
+                                layer_copy_meta=_t_cm,
+                                layer_slot_remap=_t_sr,
+                                layer_meta_assign=0.0,
+                            )
                 else:
                     # DynamicKV PD decode: compressed context_lens + slot_remap.
                     # Scheme 1: (req_idx, base_tokens) -> (mask, rel); rel does not depend
@@ -4120,7 +4128,8 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata = {}
 
             use_pa_slot_workspace = (
-                is_graph_capturing
+                self._is_dynamic_kv_enabled()
+                and is_graph_capturing
                 and using_paged_attention(int(num_tokens), self.vllm_config))
             use_pa_ctx_workspace = use_pa_slot_workspace
             _slot_workspace: Optional[torch.Tensor] = None
@@ -4240,85 +4249,98 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         attn_metadata_full_attention = builder.build_for_graph_capture(
                             common_attn_metadata, attn_state)
-                    for layer_name in kv_cache_group_spec.layer_names:
-                        if "linear_attn" in layer_name:
-                            meta_src = attn_metadata_gdn_attention
-                        else:
-                            meta_src = attn_metadata_full_attention
-                        try:
-                            import copy as _copy
-
-                            meta_i = _copy.copy(meta_src)
-                        except Exception:
-                            meta_i = meta_src
-                        # FULL-graph reshape_and_cache pins distinct addresses per layer.
-                        # PA decode: use one [L, n_sm] workspace row view per layer so
-                        # runtime remap writes the same memory graph captured.
-                        try:
-                            if (
-                                use_pa_slot_workspace
-                                and _slot_workspace is not None
-                            ):
-                                meta_i.slot_mapping = _slot_workspace[
-                                    _slot_workspace_row]
-                                self._dynkv_slot_workspace_layer_row[
-                                    _slot_workspace_cap_n][str(layer_name)] = (
-                                        _slot_workspace_row)
-                                _slot_workspace_row += 1
+                    if self._is_dynamic_kv_enabled():
+                        for layer_name in kv_cache_group_spec.layer_names:
+                            if "linear_attn" in layer_name:
+                                meta_src = attn_metadata_gdn_attention
                             else:
-                                meta_i.slot_mapping = meta_i.slot_mapping.clone()
-                        except Exception:
-                            pass
-                        if (is_graph_capturing
-                                and using_paged_attention(
-                                    int(num_tokens), self.vllm_config)):
+                                meta_src = attn_metadata_full_attention
                             try:
-                                _sl_cap = meta_i.seq_lens
-                                if isinstance(_sl_cap, torch.Tensor):
-                                    if (
-                                        use_pa_ctx_workspace
-                                        and _ctx_workspace is None
-                                    ):
-                                        total_layers = sum(
-                                            len(g.layer_names)
-                                            for g in self.kv_cache_config.kv_cache_groups)
-                                        _ctx_workspace = (
-                                            self._get_or_create_context_lens_workspace(
-                                                _ctx_workspace_cap_n,
-                                                total_layers,
-                                                int(_sl_cap.numel()),
-                                                _sl_cap.device,
-                                                _sl_cap.dtype,
-                                            ))
-                                    if (
-                                        use_pa_ctx_workspace
-                                        and _ctx_workspace is not None
-                                    ):
-                                        n_buf = int(_sl_cap.numel())
-                                        if n_buf <= int(_ctx_workspace.shape[1]):
-                                            _ctx_workspace[
-                                                _ctx_workspace_row, :n_buf].copy_(
-                                                    _sl_cap)
-                                            meta_i.seq_lens = _ctx_workspace[
-                                                _ctx_workspace_row, :n_buf]
-                                            self._dynkv_context_lens_workspace_layer_row[
-                                                _ctx_workspace_cap_n][
-                                                    str(layer_name)] = (
-                                                        _ctx_workspace_row)
-                                            _ctx_workspace_row += 1
-                                        else:
-                                            meta_i.seq_lens = _sl_cap.clone()
-                                    else:
-                                        meta_i.seq_lens = _sl_cap.clone()
+                                import copy as _copy
+
+                                meta_i = _copy.copy(meta_src)
+                            except Exception:
+                                meta_i = meta_src
+                            # FULL-graph reshape_and_cache pins distinct addresses per layer.
+                            # PA decode: use one [L, n_sm] workspace row view per layer so
+                            # runtime remap writes the same memory graph captured.
+                            try:
+                                if (
+                                    use_pa_slot_workspace
+                                    and _slot_workspace is not None
+                                ):
+                                    meta_i.slot_mapping = _slot_workspace[
+                                        _slot_workspace_row]
+                                    self._dynkv_slot_workspace_layer_row[
+                                        _slot_workspace_cap_n][str(layer_name)] = (
+                                            _slot_workspace_row)
+                                    _slot_workspace_row += 1
+                                else:
+                                    meta_i.slot_mapping = meta_i.slot_mapping.clone()
                             except Exception:
                                 pass
-                        try:
-                            setattr(meta_i, "layer_name", layer_name)
-                        except Exception:
-                            pass
-                        attn_metadata[layer_name] = meta_i
+                            if (is_graph_capturing
+                                    and using_paged_attention(
+                                        int(num_tokens), self.vllm_config)):
+                                try:
+                                    _sl_cap = meta_i.seq_lens
+                                    if isinstance(_sl_cap, torch.Tensor):
+                                        if (
+                                            use_pa_ctx_workspace
+                                            and _ctx_workspace is None
+                                        ):
+                                            total_layers = sum(
+                                                len(g.layer_names)
+                                                for g in self.kv_cache_config.kv_cache_groups)
+                                            _ctx_workspace = (
+                                                self._get_or_create_context_lens_workspace(
+                                                    _ctx_workspace_cap_n,
+                                                    total_layers,
+                                                    int(_sl_cap.numel()),
+                                                    _sl_cap.device,
+                                                    _sl_cap.dtype,
+                                                ))
+                                        if (
+                                            use_pa_ctx_workspace
+                                            and _ctx_workspace is not None
+                                        ):
+                                            n_buf = int(_sl_cap.numel())
+                                            if n_buf <= int(_ctx_workspace.shape[1]):
+                                                _ctx_workspace[
+                                                    _ctx_workspace_row, :n_buf].copy_(
+                                                        _sl_cap)
+                                                meta_i.seq_lens = _ctx_workspace[
+                                                    _ctx_workspace_row, :n_buf]
+                                                self._dynkv_context_lens_workspace_layer_row[
+                                                    _ctx_workspace_cap_n][
+                                                        str(layer_name)] = (
+                                                            _ctx_workspace_row)
+                                                _ctx_workspace_row += 1
+                                            else:
+                                                meta_i.seq_lens = _sl_cap.clone()
+                                        else:
+                                            meta_i.seq_lens = _sl_cap.clone()
+                                except Exception:
+                                    pass
+                            try:
+                                setattr(meta_i, "layer_name", layer_name)
+                            except Exception:
+                                pass
+                            attn_metadata[layer_name] = meta_i
+                    else:
+                        for layer_name in kv_cache_group_spec.layer_names:
+                            if "linear_attn" in layer_name:
+                                attn_metadata[
+                                    layer_name] = attn_metadata_gdn_attention
+                            else:
+                                attn_metadata[
+                                    layer_name] = attn_metadata_full_attention
 
-            if is_graph_capturing and attn_metadata:
+            if (
+                is_graph_capturing
+                and attn_metadata
+                and self._is_dynamic_kv_enabled()
+            ):
                 self._dynkv_graph_slot_bufs[int(num_tokens)] = {
                     str(ln): attn_metadata[ln].slot_mapping
                     for ln in attn_metadata

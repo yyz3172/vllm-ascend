@@ -15,6 +15,13 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
                                get_ascend_device_type)
 
+
+def is_dynamic_kv_enabled() -> bool:
+    """Whether ``additional_config.dynamic_kv.enabled`` is true."""
+    from vllm_ascend.ascend_config import dynamic_kv_enabled_safe
+    return dynamic_kv_enabled_safe()
+
+
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
     from vllm.config.compilation import CUDAGraphMode
 
@@ -45,6 +52,8 @@ def _merge_dynamic_kv_lens_list(
 
 def fia_dynamic_kv_seq_lens_list(attn_metadata: Any) -> list[int] | None:
     """FIA ``actual_seq_lengths_kv`` for PD DynamicKV decode graph updates."""
+    if not is_dynamic_kv_enabled():
+        return getattr(attn_metadata, "seq_lens_list", None)
     return _merge_dynamic_kv_lens_list(
         getattr(attn_metadata, "dynamic_kv_seq_lens_list", None),
         getattr(attn_metadata, "seq_lens_list", None),
@@ -57,6 +66,8 @@ def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
     Prefer ``dynamic_kv_seq_lens_tensor`` when set. For entries with negative
     lens (e.g. padded batch slots), fall back to ``seq_lens``.
     """
+    if not is_dynamic_kv_enabled():
+        return attn_metadata.seq_lens
     dl = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
     if dl is None:
         return attn_metadata.seq_lens
@@ -384,7 +395,18 @@ def pa_dynamic_kv_context_lens_for_graph_update(
     Reuse the tensor captured into ``attn_params`` and copy runtime values
     in-place when shapes match. Passing a fresh tensor each step can leave the
     replayed op reading stale lengths on some Ascend builds.
+
+    When DynamicKV is disabled, return ``seq_lens`` directly (pre-DynamicKV).
     """
+    if not is_dynamic_kv_enabled():
+        sl = getattr(attn_metadata, "seq_lens", None)
+        if isinstance(sl, torch.Tensor):
+            return sl
+    if getattr(attn_metadata, "dynamic_kv_seq_lens_list", None) is None:
+        if getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None) is None:
+            sl = getattr(attn_metadata, "seq_lens", None)
+            if isinstance(sl, torch.Tensor):
+                return sl
     pinned = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
     if (
         context_lens_buf is not None
