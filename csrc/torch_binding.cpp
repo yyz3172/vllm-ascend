@@ -28,9 +28,6 @@
 #include <torch_npu/csrc/npu/Module.h>
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
-#include "kernel_tiling/kernel_tiling.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "tiling/tiling_api.h"
 #include "ops.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
@@ -56,55 +53,6 @@
 #include <c10/util/Logging.h>
 
 namespace vllm_ascend {
-namespace {
-
-constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
-
-std::vector<uint8_t> GenerateTurboQuantRotateTiling(
-    platform_ascendc::PlatformAscendC* ascendc_platform,
-    uint32_t block_dim,
-    uint32_t vec_per_core) {
-    std::vector<uint8_t> tiling_buf(sizeof(TCubeTiling), 0);
-    optiling::TCubeTiling tiling_data;
-    matmul_tiling::MultiCoreMatmulTiling tiling_api(*ascendc_platform);
-
-    // SetDim is the number of AIV clients participating in the KFC matmul handshake.
-    // One MIX launch block expands to AIV-0/AIV-1 plus AIC-0, so keep this local
-    // matmul at two AIV participants. Do not scale it by <<<blockDim>>>.
-    (void)block_dim;
-    tiling_api.SetDim(2);
-    tiling_api.SetAType(
-        matmul_tiling::TPosition::VECOUT,
-        matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_FLOAT16,
-        false);
-    tiling_api.SetBType(
-        matmul_tiling::TPosition::GM,
-        matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_FLOAT16,
-        false);
-    tiling_api.SetCType(
-        matmul_tiling::TPosition::VECIN,
-        matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_FLOAT16);
-    tiling_api.SetBiasType(
-        matmul_tiling::TPosition::GM,
-        matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_FLOAT16);
-    tiling_api.SetOrgShape(vec_per_core, 128, 128);
-    tiling_api.SetShape(vec_per_core, 128, 128);
-    tiling_api.EnableBias(false);
-    tiling_api.SetBufferSpace(-1, -1, -1);
-
-    const int64_t ret = tiling_api.GetTiling(tiling_data);
-    TORCH_CHECK(ret != -1, "failed to generate TurboQuant rotate matmul tiling");
-    const uint32_t tiling_size = tiling_data.GetDataSize();
-    TORCH_CHECK(tiling_size <= tiling_buf.size(), "TurboQuant rotate tiling buffer is too small");
-    tiling_data.SaveToBuffer(tiling_buf.data(), tiling_size);
-    return tiling_buf;
-}
-
-}  // namespace
 
 // TurboQuant decode (packed uint8 -> fp16/bf16).
 // Two-stage implementation:

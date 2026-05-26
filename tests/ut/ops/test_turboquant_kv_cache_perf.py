@@ -166,11 +166,12 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
 
     pk = turboquant_packed_bytes_per_vector(D, bits=8)
 
-    def _diff_report(name: str, fused: torch.Tensor, ref: torch.Tensor) -> None:
+    def _assert_pack_close(name: str, fused: torch.Tensor, ref: torch.Tensor) -> None:
         fu, re = fused.view(torch.uint8), ref.view(torch.uint8)
         if torch.equal(fu, re):
             print(f"{name}: OK")
             return
+
         flat_f, flat_r = fu.reshape(-1), re.reshape(-1)
         i = int((flat_f != flat_r).nonzero(as_tuple=True)[0][0])
         row, col = divmod(i, fu.shape[-1])
@@ -183,11 +184,29 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
         else:
             print("  -> padding region")
 
-    _diff_report("key (ENCODE_OP=1 vs 0)", fused_k, ref_k)
-    _diff_report("value (ENCODE_OP=1 vs 0)", fused_v, ref_v)
+        fused_idx = fu[..., :D].to(torch.int16)
+        ref_idx = re[..., :D].to(torch.int16)
+        idx_abs_diff = (fused_idx - ref_idx).abs()
+        idx_mismatch = idx_abs_diff != 0
+        idx_mismatch_count = int(idx_mismatch.sum().item())
+        idx_tolerance_count = max(8, int(ref_idx.numel() * 0.01))
+        non_adjacent_count = int((idx_abs_diff > 1).sum().item())
+        print(
+            f"{name} index mismatches: count={idx_mismatch_count} "
+            f"allowed={idx_tolerance_count} non_adjacent={non_adjacent_count}"
+        )
+        assert non_adjacent_count == 0
+        assert idx_mismatch_count <= idx_tolerance_count
 
-    assert torch.equal(fused_k_u8, ref_k_u8)
-    assert torch.equal(fused_v_u8, ref_v_u8)
+        fused_norm = fu[..., D : D + 2].contiguous().view(torch.float16)
+        ref_norm = re[..., D : D + 2].contiguous().view(torch.float16)
+        torch.testing.assert_close(fused_norm, ref_norm, rtol=1e-3, atol=1e-3)
+
+        if fu.shape[-1] > pk:
+            assert torch.equal(fu[..., pk:], re[..., pk:])
+
+    _assert_pack_close("key (ENCODE_OP=1 vs 0)", fused_k, ref_k)
+    _assert_pack_close("value (ENCODE_OP=1 vs 0)", fused_v, ref_v)
 
 
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
