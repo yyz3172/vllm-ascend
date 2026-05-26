@@ -1094,8 +1094,13 @@ class NPUModelRunner(GPUModelRunner):
                 float(acc.get("update_states_ms", 0.0))
                 + float(acc.get("prepare_inputs_wall_ms", 0.0)))
         elif getattr(self, "_profile_prepare_inputs_cpu_ms", None) is not None:
+            upd_ms = float(
+                getattr(self, "_profile_execute_update_states_ms", 0.0))
             self._profile_prepare_input_cpu_ms = (
-                self._profile_prepare_inputs_cpu_ms)
+                upd_ms + float(self._profile_prepare_inputs_cpu_ms))
+        elif getattr(self, "_profile_execute_update_states_ms", None) is not None:
+            self._profile_prepare_input_cpu_ms = float(
+                self._profile_execute_update_states_ms)
 
     def _apply_profile_prepare_input_duration(
         self,
@@ -1132,12 +1137,17 @@ class NPUModelRunner(GPUModelRunner):
                 "loop_layer_ctx_fill_batch_ms": 0.0,
                 "loop_total_loop_ms": 0.0,
             }
-        elif self._profile_execute_observe_enabled():
+        elif (
+            self._profile_execute_observe_enabled()
+            and self._is_dynamic_kv_enabled()
+        ):
             self._dynkv_prepare_step_acc = {
                 "update_states_ms": 0.0,
                 "prepare_inputs_wall_ms": 0.0,
             }
         else:
+            # Observe with DynamicKV off: wall time only (see ``_prepare_inputs`` /
+            # ``_store_profile_prepare_input_cpu_ms``), no per-phase perf_counter.
             self._dynkv_prepare_step_acc = None
 
     _DYNKV_PREPARE_LOOP_ACC: dict[str, str] = {
@@ -1598,10 +1608,16 @@ class NPUModelRunner(GPUModelRunner):
         _track_prepare_wall = (
             isinstance(_prep_acc, dict)
             or self._profile_execute_observe_enabled())
+        _prep_phase_timing = (
+            self._dynkv_prepare_profile_enabled()
+            or (
+                self._is_dynamic_kv_enabled()
+                and isinstance(_prep_acc, dict)
+            ))
         _t0_prepare_inputs = (time.perf_counter()
                               if _track_prepare_wall else 0)
         _t0_prepare_core = (time.perf_counter()
-                            if isinstance(_prep_acc, dict) else 0)
+                            if _prep_phase_timing else 0)
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -2101,7 +2117,7 @@ class NPUModelRunner(GPUModelRunner):
                 dynkv_decode_token_pos_t = None
                 dynkv_decode_req_idx_t = None
 
-        if isinstance(_prep_acc, dict):
+        if _prep_phase_timing:
             self._dynkv_prepare_step_acc_add(
                 "prepare_core_ms",
                 (time.perf_counter() - _t0_prepare_core) * 1000,
@@ -2112,7 +2128,7 @@ class NPUModelRunner(GPUModelRunner):
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
             _t0_kv_setup = (time.perf_counter()
-                            if isinstance(_prep_acc, dict) else 0)
+                            if _prep_phase_timing else 0)
             encoder_seq_lens, encoder_seq_lens_cpu = self._get_encoder_seq_lens(
                 scheduler_output.num_scheduled_tokens or {},
                 kv_cache_group_spec.kv_cache_spec,
@@ -2279,7 +2295,7 @@ class NPUModelRunner(GPUModelRunner):
                         self.spec_decode_common_attn_metadata.unpadded(
                             total_num_scheduled_tokens, base_num_reqs)
 
-            if isinstance(_prep_acc, dict):
+            if _prep_phase_timing:
                 self._dynkv_prepare_step_acc_add(
                     "prepare_kv_setup_ms",
                     (time.perf_counter() - _t0_kv_setup) * 1000,
@@ -2299,12 +2315,12 @@ class NPUModelRunner(GPUModelRunner):
                             num_decode_draft_tokens.cpu[:num_reqs],
                         )
                 _t0_attn_build = (time.perf_counter()
-                                 if isinstance(_prep_acc, dict) else 0)
+                                 if _prep_phase_timing else 0)
                 attn_metadata_i = builder.build(
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args)
-                if isinstance(_prep_acc, dict):
+                if _prep_phase_timing:
                     self._dynkv_prepare_step_acc_add(
                         "prepare_attn_build_ms",
                         (time.perf_counter() - _t0_attn_build) * 1000,
@@ -2890,16 +2906,16 @@ class NPUModelRunner(GPUModelRunner):
 
         # update global cos, sin
         _t0_cos_sin = (time.perf_counter()
-                       if isinstance(_prep_acc, dict) else 0)
+                       if _prep_phase_timing else 0)
         update_cos_sin(positions)
-        if isinstance(_prep_acc, dict):
+        if _prep_phase_timing:
             self._dynkv_prepare_step_acc_add(
                 "prepare_cos_sin_ms",
                 (time.perf_counter() - _t0_cos_sin) * 1000,
             )
 
         _t0_tail = (time.perf_counter()
-                    if isinstance(_prep_acc, dict) else 0)
+                    if _prep_phase_timing else 0)
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(
@@ -2997,7 +3013,9 @@ class NPUModelRunner(GPUModelRunner):
             if _pa_prof:
                 dynkv_pa_profile_reset()
             _t0_acl = time.perf_counter()
-        self._update_aclgraph_attn_params(maybe_padded_num_tokens)
+        _dynkv_update_before_replay = self._is_dynamic_kv_enabled()
+        if _dynkv_update_before_replay:
+            self._update_aclgraph_attn_params(maybe_padded_num_tokens)
         if _prof:
             _t_model_acl = (time.perf_counter() - _t0_acl) * 1000
             _t0_core = time.perf_counter()
@@ -3010,6 +3028,8 @@ class NPUModelRunner(GPUModelRunner):
                                    intermediate_tensors=intermediate_tensors,
                                    inputs_embeds=inputs_embeds,
                                    **model_kwargs)
+        if not _dynkv_update_before_replay:
+            self._update_aclgraph_attn_params(maybe_padded_num_tokens)
         if _prof:
             _t_model_core = (time.perf_counter() - _t0_core) * 1000
             _model_acc = _dynkv_fwd_model_profile_snapshot()
@@ -3350,12 +3370,17 @@ class NPUModelRunner(GPUModelRunner):
             ProfileExecuteDuration().discard_tag("prepare input")
         self._dynkv_prepare_step_acc_reset()
         _prep_acc = getattr(self, "_dynkv_prepare_step_acc", None)
+        _time_update_states = (
+            isinstance(_prep_acc, dict) or _observe)
         _t0_update_states = (time.perf_counter()
-                             if isinstance(_prep_acc, dict) else 0)
+                             if _time_update_states else 0)
         self._update_states(scheduler_output)
         if isinstance(_prep_acc, dict):
             self._dynkv_prepare_step_acc["update_states_ms"] = (
                 time.perf_counter() - _t0_update_states) * 1000
+        elif _observe:
+            self._profile_execute_update_states_ms = (
+                (time.perf_counter() - _t0_update_states) * 1000)
         if has_ec_transfer() and get_ec_transfer().is_producer:
             with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -4363,14 +4388,27 @@ class NPUModelRunner(GPUModelRunner):
                                           inputs_embeds):
         forward_context = get_forward_context()
         assert forward_context is not None
-        if (forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-                and not forward_context.capturing and not self.use_sparse
-                and hasattr(self, "update_stream")):
+        _dynkv_update_before_replay = self._is_dynamic_kv_enabled()
+        if (
+            _dynkv_update_before_replay
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and not self.use_sparse
+            and hasattr(self, "update_stream")
+        ):
             self._update_aclgraph_attn_params(num_tokens)
         hidden_states = self.model(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
                                    inputs_embeds=inputs_embeds)
+        if (
+            not _dynkv_update_before_replay
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and not self.use_sparse
+            and hasattr(self, "update_stream")
+        ):
+            self._update_aclgraph_attn_params(num_tokens)
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, _ = hidden_states

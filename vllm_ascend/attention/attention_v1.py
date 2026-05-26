@@ -58,6 +58,7 @@ from vllm_ascend.attention.dynamic_kv import (
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          dynkv_profile_pa_enabled,
                                          enable_cp,
+                                         is_dynamic_kv_enabled,
                                          pa_dynamic_kv_context_lens,
                                          split_decodes_and_prefills,
                                          using_paged_attention)
@@ -624,6 +625,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
     @staticmethod
     def _pa_dynamic_kv_context_lens(
             attn_metadata: AscendMetadata) -> torch.Tensor:
+        if not is_dynamic_kv_enabled():
+            return attn_metadata.seq_lens
         return pa_dynamic_kv_context_lens(attn_metadata)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
@@ -1001,17 +1004,30 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 output=output,
             )
 
-        _dynkv_npu_paged_attention(
-            query=query,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            num_kv_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
-            scale_value=self.scale,
-            block_table=attn_metadata.block_tables,
-            context_lens=context_lens,
-            out=output,
-        )
+        if is_dynamic_kv_enabled():
+            _dynkv_npu_paged_attention(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale_value=self.scale,
+                block_table=attn_metadata.block_tables,
+                context_lens=context_lens,
+                out=output,
+            )
+        else:
+            torch_npu._npu_paged_attention(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale_value=self.scale,
+                block_table=attn_metadata.block_tables,
+                context_lens=context_lens,
+                out=output,
+            )
         return output
 
     def _forward_decode_with_mask_validation(

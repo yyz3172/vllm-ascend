@@ -345,16 +345,16 @@ def weak_ref_workspaces(params):
 def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
     graph_params = get_graph_params()
     attn_metadata = forward_context.attn_metadata
-    attn_keys = list(attn_metadata.keys())
     _prof = dynkv_model_acl_profile_enabled()
     if _prof:
         dynkv_model_acl_profile_reset()
         _t0_total = time.perf_counter()
+    _dynkv_on = is_dynamic_kv_enabled()
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
-                attn_keys,
+                attn_metadata,
                 graph_params.attn_params[runtime_shape],
                 graph_params.handles[runtime_shape],
                 graph_params.events[runtime_shape],
@@ -370,30 +370,30 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape):
                 context_lens_buf,
                 output,
             ) = param
-            meta = attn_metadata[key]
-            # PD DynamicKV: compressed per-layer kv lens; when disabled, use
-            # ``seq_lens`` directly (pre-DynamicKV graph update path).
-            if _prof:
-                _t0_ctx = time.perf_counter()
-            if is_dynamic_kv_enabled():
+            if _dynkv_on:
+                meta = attn_metadata[key]
+                if _prof:
+                    _t0_ctx = time.perf_counter()
                 context_lens = pa_dynamic_kv_context_lens_for_graph_update(
                     meta, context_lens_buf)
+                if _prof:
+                    _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"] += (
+                        time.perf_counter() - _t0_ctx) * 1000
+                    _t0_bt = time.perf_counter()
+                meta_block_table = getattr(meta, "block_tables", None)
+                if meta_block_table is not None:
+                    if (_prof and isinstance(block_table, torch.Tensor)
+                            and isinstance(meta_block_table, torch.Tensor)
+                            and block_table.data_ptr()
+                            != meta_block_table.data_ptr()):
+                        _DYNKV_MODEL_ACL_ACC["block_table_swap"] += 1.0
+                    block_table = meta_block_table
+                if _prof:
+                    _DYNKV_MODEL_ACL_ACC["block_table_ms"] += (
+                        time.perf_counter() - _t0_bt) * 1000
             else:
-                context_lens = meta.seq_lens
+                context_lens = attn_metadata[key].seq_lens
             if _prof:
-                _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"] += (
-                    time.perf_counter() - _t0_ctx) * 1000
-                _t0_bt = time.perf_counter()
-            meta_block_table = getattr(meta, "block_tables", None)
-            if meta_block_table is not None:
-                if (_prof and isinstance(block_table, torch.Tensor)
-                        and isinstance(meta_block_table, torch.Tensor)
-                        and block_table.data_ptr() != meta_block_table.data_ptr()):
-                    _DYNKV_MODEL_ACL_ACC["block_table_swap"] += 1.0
-                block_table = meta_block_table
-            if _prof:
-                _DYNKV_MODEL_ACL_ACC["block_table_ms"] += (
-                    time.perf_counter() - _t0_bt) * 1000
                 _t0_gu = time.perf_counter()
             torch.npu.graph_task_update_begin(update_stream, handle)
             if _prof:
