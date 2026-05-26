@@ -194,6 +194,12 @@ class AscendConfig:
                 )
             self.dynamic_kv_uniform_kv_budget = "off"
         # Optional: share per-request lens list across layers in decode prepare.
+        # B3: packed-prefix slot LUT (only wins when many tokens remap per step).
+        self.dynamic_kv_slot_remap_prefix_lut = bool(
+            dyn.get("slot_remap_prefix_lut", False))
+        self.dynamic_kv_slot_remap_lut_min_tokens = max(
+            0, int(dyn.get("slot_remap_lut_min_tokens", 64)))
+
         # Default false; uniform_kv_budget already shares lens without this flag.
         self.dynamic_kv_uniform_decode_fast_path = bool(
             dyn.get("uniform_decode_fast_path", False)

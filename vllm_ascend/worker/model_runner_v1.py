@@ -636,6 +636,55 @@ def _dynkv_build_job_key_to_Li_per_layer(
     return job_key_to_Li
 
 
+def _dynkv_build_packed_prefix_slot_lut(
+    bt_row: torch.Tensor,
+    block_size: int,
+    max_pos: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Linear logical positions -> physical slots via ``block_table`` (pack 0..kv_len-1).
+
+    B3: one vectorized build per request per step; remap jobs index with ``lut[tgt_pos]``
+    instead of per-job ``bt_row[tgt_pos // block_size]`` gather chains.
+    """
+    n = max(0, int(max_pos))
+    if n <= 0:
+        return torch.empty(0, device=device, dtype=dtype)
+    bs = int(block_size)
+    pos = torch.arange(n, device=device, dtype=torch.int64)
+    max_blocks = max(0, int(bt_row.shape[0]) - 1)
+    blk_idx = (pos // bs).clamp(min=0, max=max_blocks)
+    block_ids = bt_row[blk_idx].to(torch.int64)
+    slots = block_ids * bs + (pos % bs)
+    return slots.to(dtype=dtype)
+
+
+def _dynkv_get_or_grow_req_slot_lut(
+    req_idx: int,
+    bt_row: torch.Tensor,
+    block_size: int,
+    needed_max_pos: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    lut_cache: dict[int, torch.Tensor],
+) -> torch.Tensor:
+    need = max(0, int(needed_max_pos)) + 1
+    lut = lut_cache.get(int(req_idx))
+    if lut is None or int(lut.numel()) < need:
+        lut = _dynkv_build_packed_prefix_slot_lut(
+            bt_row,
+            block_size,
+            need,
+            device=device,
+            dtype=dtype,
+        )
+        lut_cache[int(req_idx)] = lut
+    return lut
+
+
 def _dynkv_perjob_slot_remap_to_stack(
     *,
     stack_view: torch.Tensor,
@@ -648,6 +697,9 @@ def _dynkv_perjob_slot_remap_to_stack(
     block_size: int,
     mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
     uniform_lens: bool = False,
+    slot_lut_cache: Optional[dict[int, torch.Tensor]] = None,
+    use_prefix_lut: bool = False,
+    lut_min_tokens: int = 64,
 ) -> int:
     """Per-(req,base) job loop; each job writes [L, n_masked] (not full [L,n_sm]).
 
@@ -658,6 +710,11 @@ def _dynkv_perjob_slot_remap_to_stack(
     per-job indexing on 1D shapes ``[n_masked]`` instead of ``[L, n_masked]``
     (saves L-fold NPU gather/mod/multiply). The final write broadcasts the 1D
     slots row into the ``[L, n_masked]`` slice of ``stack_view``.
+
+    B3 (Phase B+): optional packed-prefix slot LUT when ``remap_tokens >=
+    lut_min_tokens`` (default 64). Steady decode (1 token/step) stays on the
+    direct ``bt_row[tgt_pos // block_size]`` path — building a full LUT to
+    Li+decode_pos each step is slower than a few gathers.
     """
     n_sm = int(base_sm.numel())
     if n_sm <= 0 or n_layers <= 0:
@@ -672,6 +729,42 @@ def _dynkv_perjob_slot_remap_to_stack(
     li_device = token_pos_t.device
     li_dtype = token_pos_t.dtype
     max_blocks = int(block_tables.shape[1]) - 1
+    _lut_ok = (
+        use_prefix_lut
+        and slot_lut_cache is not None
+        and int(block_size) > 0
+        and int(lut_min_tokens) > 0
+    )
+
+    def _maybe_disable_lut(job_keys: list[tuple[int, int]]) -> None:
+        nonlocal _lut_ok
+        if not _lut_ok:
+            return
+        _remap_tok = 0
+        for job_req_idx, job_base_tokens in job_keys:
+            _ck = (int(job_req_idx), int(job_base_tokens))
+            _cached = mask_rel_cache.get(_ck)
+            if _cached is None:
+                mask = req_idx_t == int(job_req_idx)
+                rel = token_pos_t[mask] - (int(job_base_tokens) - 1)
+                mask_rel_cache[_ck] = (mask, rel)
+            else:
+                mask, rel = _cached
+            _remap_tok += int(rel.numel())
+        if _remap_tok < int(lut_min_tokens):
+            _lut_ok = False
+
+    def _slots_from_tgt_pos(
+        tgt_pos: torch.Tensor,
+        bt_row: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        idx = (tgt_pos // int(block_size)).clamp(min=0, max=max_blocks)
+        block_ids = bt_row[idx].to(torch.int64)
+        return (
+            block_ids * int(block_size) + (tgt_pos % int(block_size))
+        ).to(dtype=dtype)
 
     if uniform_lens:
         # All layers share the same Li per job; build a [N_jobs] tensor and
@@ -688,6 +781,7 @@ def _dynkv_perjob_slot_remap_to_stack(
         all_Li_scalars = [p[1] for p in valid_pairs]
         all_Li_tensor = torch.tensor(
             all_Li_scalars, device=li_device, dtype=li_dtype)  # [N_jobs]
+        _maybe_disable_lut(job_keys_list)
 
         for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
             _ck = (int(job_req_idx), int(job_base_tokens))
@@ -703,13 +797,25 @@ def _dynkv_perjob_slot_remap_to_stack(
 
             tgt_pos_1d = all_Li_tensor[_job_i] + rel  # [n_masked]
             bt_row = block_tables[int(job_req_idx)]
-            idx_1d = (tgt_pos_1d // int(block_size)).clamp(
-                min=0, max=max_blocks)
-            block_ids_1d = bt_row[idx_1d].to(torch.int64)
-            new_slots_1d = (
-                block_ids_1d * int(block_size)
-                + (tgt_pos_1d % int(block_size))
-            ).to(base_sm.dtype)  # [n_masked]
+            if _lut_ok:
+                _li_i = int(all_Li_scalars[_job_i])
+                _max_p = _li_i + (
+                    int(rel.max().item()) if rel.numel() else 0)
+                lut = _dynkv_get_or_grow_req_slot_lut(
+                    int(job_req_idx),
+                    bt_row,
+                    int(block_size),
+                    _max_p,
+                    device=li_device,
+                    dtype=base_sm.dtype,
+                    lut_cache=slot_lut_cache,
+                )
+                _idx = tgt_pos_1d.to(torch.long).clamp(
+                    min=0, max=int(lut.numel()) - 1)
+                new_slots_1d = lut[_idx]
+            else:
+                new_slots_1d = _slots_from_tgt_pos(
+                    tgt_pos_1d, bt_row, dtype=base_sm.dtype)
             # Broadcast write [n_masked] -> [L, n_masked]
             stack_view[:, mask] = new_slots_1d
         return len(job_keys_list)
@@ -717,6 +823,7 @@ def _dynkv_perjob_slot_remap_to_stack(
     all_Li_lists = [job_key_to_Li[k] for k in job_keys_list]
     all_Li_tensor = torch.tensor(
         all_Li_lists, device=li_device, dtype=li_dtype)  # [N_jobs, L]
+    _maybe_disable_lut(job_keys_list)
 
     for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
         _ck = (int(job_req_idx), int(job_base_tokens))
@@ -735,11 +842,28 @@ def _dynkv_perjob_slot_remap_to_stack(
         valid_layer_mask = Li_tensor.squeeze(1) >= 0  # [L]
 
         bt_row = block_tables[int(job_req_idx)]
-        idx_2d = (tgt_pos_2d // int(block_size)).clamp(min=0, max=max_blocks)
-        block_ids_2d = bt_row[idx_2d].to(torch.int64)
-        new_slots_2d = (
-            block_ids_2d * int(block_size) + (tgt_pos_2d % int(block_size))
-        ).to(base_sm.dtype)
+        if _lut_ok:
+            _li_max = int(tgt_pos_2d.max().item()) if tgt_pos_2d.numel() else 0
+            lut = _dynkv_get_or_grow_req_slot_lut(
+                int(job_req_idx),
+                bt_row,
+                int(block_size),
+                _li_max,
+                device=li_device,
+                dtype=base_sm.dtype,
+                lut_cache=slot_lut_cache,
+            )
+            _idx2 = tgt_pos_2d.to(torch.long).clamp(
+                min=0, max=int(lut.numel()) - 1)
+            new_slots_2d = lut[_idx2]
+        else:
+            idx_2d = (tgt_pos_2d // int(block_size)).clamp(
+                min=0, max=max_blocks)
+            block_ids_2d = bt_row[idx_2d].to(torch.int64)
+            new_slots_2d = (
+                block_ids_2d * int(block_size)
+                + (tgt_pos_2d % int(block_size))
+            ).to(base_sm.dtype)
         base_masked = base_sm[mask]
         final_vals = torch.where(
             valid_layer_mask.unsqueeze(1),
@@ -1483,6 +1607,7 @@ class NPUModelRunner(GPUModelRunner):
         logger.info(
             "[DynamicKV][profile_status] dynkv_enabled=%s impl=%s "
             "uniform_kv_budget=%s uniform_decode_fast_path=%s "
+            "slot_remap_prefix_lut=%s slot_remap_lut_min_tokens=%d "
             "window=%d prompt_kv_len_budget=%d min_rewrite_delta=%d "
             "radio_max=%.2f radio_min=%.2f validation_mode=%s tp_rank=%d "
             "OBSERVE=%d PROFILE: PREPARE=%d FORWARD=%d "
@@ -1491,6 +1616,8 @@ class NPUModelRunner(GPUModelRunner):
             str(getattr(cfg, "dynamic_kv_impl", "offload")),
             str(getattr(cfg, "dynamic_kv_uniform_kv_budget", "off")),
             bool(getattr(cfg, "dynamic_kv_uniform_decode_fast_path", False)),
+            bool(getattr(cfg, "dynamic_kv_slot_remap_prefix_lut", False)),
+            int(getattr(cfg, "dynamic_kv_slot_remap_lut_min_tokens", 64)),
             int(getattr(cfg, "dynamic_kv_window_size", 16)),
             int(getattr(cfg, "dynamic_kv_prompt_kv_len_budget", 512)),
             int(getattr(cfg, "dynamic_kv_min_rewrite_delta", 128)),
@@ -2867,6 +2994,13 @@ class NPUModelRunner(GPUModelRunner):
                     # on layer ``Li``, reused across ``layer_names`` in this attn_group.
                     dynkv_mask_rel_cache: dict[tuple[int, int], tuple[torch.Tensor,
                                                                       torch.Tensor]] = {}
+                    dynkv_slot_lut_cache: dict[int, torch.Tensor] = {}
+                    _dynkv_slot_remap_lut = bool(
+                        getattr(self.ascend_config,
+                                "dynamic_kv_slot_remap_prefix_lut", False))
+                    _dynkv_slot_remap_lut_min = int(
+                        getattr(self.ascend_config,
+                                "dynamic_kv_slot_remap_lut_min_tokens", 64))
                     _dynkv_layer_names = list(attn_group.layer_names)
                     _dynkv_L = len(_dynkv_layer_names)
                     self._register_dynkv_graph_context_lens_bufs_from_capture(
@@ -3057,10 +3191,12 @@ class NPUModelRunner(GPUModelRunner):
                         if not getattr(self, "_dynkv_uniform_lens_logged", False):
                             logger.info(
                                 "[DynamicKV][decode] Phase B uniform_lens=%s "
-                                "(uniform_kv_budget=%s, layers=%d, n_r=%d)",
+                                "(uniform_kv_budget=%s, slot_remap_lut=%s, "
+                                "layers=%d, n_r=%d)",
                                 _dynkv_uniform_lens,
                                 str(getattr(self.ascend_config,
                                             "dynamic_kv_uniform_kv_budget", "off")),
+                                _dynkv_slot_remap_lut,
                                 _dynkv_L,
                                 n_r_dyn,
                             )
@@ -3098,7 +3234,13 @@ class NPUModelRunner(GPUModelRunner):
                             if (_slot_n_sm > 0
                                     and _slot_n_sm <= _dynkv_stack.shape[1]):
                                 stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
-                                stack_view[:] = base_sm.unsqueeze(0)
+                                if _dynkv_uniform_lens:
+                                    stack_view[0].copy_(base_sm)
+                                    if _dynkv_L > 1:
+                                        stack_view[1:_dynkv_L].copy_(
+                                            stack_view[0:1])
+                                else:
+                                    stack_view[:] = base_sm.unsqueeze(0)
                                 n_jobs = _dynkv_perjob_slot_remap_to_stack(
                                     stack_view=stack_view,
                                     base_sm=base_sm,
@@ -3110,6 +3252,9 @@ class NPUModelRunner(GPUModelRunner):
                                     block_size=bs_dyn,
                                     mask_rel_cache=dynkv_mask_rel_cache,
                                     uniform_lens=bool(_dynkv_uniform_lens),
+                                    slot_lut_cache=dynkv_slot_lut_cache,
+                                    use_prefix_lut=_dynkv_slot_remap_lut,
+                                    lut_min_tokens=_dynkv_slot_remap_lut_min,
                                 )
                                 _slot_remap_done = True
                                 logger.debug(

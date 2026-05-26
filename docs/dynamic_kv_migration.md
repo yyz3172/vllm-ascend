@@ -110,6 +110,8 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
   - 旧版「32 路 ctx 广播 + replace 快路径」已移除（实测 TPOT 回退）。
   - 显式设 ``uniform_decode_fast_path: true`` 时，在运行时检测到各层 ``tmp_lens`` 相同也会共享 list（非 uniform budget 场景）。
 
+- **slot_remap_prefix_lut**（Phase B3，默认 `false`）：仅当单步 remap token 数 ≥ ``slot_remap_lut_min_tokens``（默认 64）时，才用 packed-prefix LUT；稳态 decode（每步 1 token）走直接 gather，避免每步构建 ``Li+pos`` 长度 LUT。``uniform_lens`` 时 stack 仍仅 ``copy_`` 首行再广播。大批量 prefill/chunk 可显式 ``slot_remap_prefix_lut: true`` 试验。
+
 ### 2.2 与 PD（Mooncake）的关系
 
 一句话：PD 场景下，prefill 会把“**每层该看多少 KV**”以及（可选）“**要传哪些 KV blocks**”打包到 `kv_transfer_params.dynamic_kv`，随请求传给 decode。
