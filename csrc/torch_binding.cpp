@@ -66,6 +66,7 @@
 #include "sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "turboquant_rotate_matmul_probe/op_host/aclnn_turboquant_rotate_matmul_probe.h"
+#include "turboquant_pack_kv_for_cache_fused/op_host/aclnn_turboquant_pack_kv_for_cache_fused.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -683,20 +684,8 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
     at::Tensor packed_v = at::empty({n_vec, slot_w_v}, key.options().dtype(at::kByte));
 
     const c10_npu::OptionalNPUGuard npuGuard(key_c.device());
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
-    TORCH_CHECK(ascendc_platform != nullptr, "failed to get AscendC platform info");
-    const uint32_t workspace_size = ascendc_platform->GetLibApiWorkSpaceSize();
-    at::Tensor workspace = at::empty(
-        {static_cast<int64_t>(workspace_size)},
-        at::TensorOptions().dtype(at::kByte).device(key_c.device()));
-    if (debug_blocks != 0U) {
-        std::printf("[TQ_PACK] workspace allocated size=%u\n", workspace_size);
-        std::fflush(stdout);
-    }
 
     // Batch rows per core for one [M,128]@[128,128] matmul (Cube M aligned to 16).
-    // Small n_vec still uses one core with M padded to 16, not n_vec separate M=1 matmuls.
     uint32_t vec_per_core = 128;
     if (n_vec < 128) {
         vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
@@ -704,95 +693,31 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
             vec_per_core = 16;
         }
     }
-    const uint32_t block_dim = static_cast<uint32_t>((n_vec + vec_per_core - 1) / vec_per_core);
-    if (no_kfc) {
-        const std::vector<uint8_t> rotate_tiling_host =
-            GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, TQ_SINGLE_ROT_M_PAD);
-        TORCH_CHECK(
-            rotate_tiling_host.size() >= sizeof(TCubeTiling),
-            "TurboQuant rotate tiling buffer is too small, got ", rotate_tiling_host.size(),
-            " expected at least ", sizeof(TCubeTiling));
-        at::Tensor rotate_tiling = at::empty(
-            {static_cast<int64_t>(rotate_tiling_host.size())},
-            at::TensorOptions().dtype(at::kByte).device(key_c.device()));
-        const aclError copy_ret = aclrtMemcpy(
-            rotate_tiling.data_ptr(),
-            rotate_tiling_host.size(),
-            rotate_tiling_host.data(),
-            rotate_tiling_host.size(),
-            ACL_MEMCPY_HOST_TO_DEVICE);
-        TORCH_CHECK(copy_ret == ACL_SUCCESS, "failed to copy TurboQuant rotate tiling to NPU, ret=", copy_ret);
-        if (debug_blocks != 0U) {
-            const auto* rotate_tiling_debug =
-                reinterpret_cast<const TCubeTiling*>(rotate_tiling_host.data());
-            std::printf(
-                "[TQ_PACK] launch no_kfc blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld "
-                "workspace=%u tiling=%zu usedCore=%d M=%d N=%d singleN=%d\n",
-                block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
-                static_cast<long>(slot_w_v), workspace_size, rotate_tiling_host.size(),
-                rotate_tiling_debug->usedCoreNum, rotate_tiling_debug->M, rotate_tiling_debug->N,
-                rotate_tiling_debug->singleCoreN);
-            std::fflush(stdout);
-        }
-        turboquant_pack_kv_for_cache_fused_fp16_8bit_128_nokfc_impl(
-            static_cast<void *>(stream),
-            const_cast<void *>(key_c.data_ptr()),
-            const_cast<void *>(value_c.data_ptr()),
-            const_cast<void *>(codebook_c.data_ptr()),
-            const_cast<void *>(rot_c.data_ptr()),
-            packed_k.data_ptr(),
-            packed_v.data_ptr(),
-            static_cast<uint32_t>(n_vec),
-            static_cast<uint32_t>(slot_w_k),
-            static_cast<uint32_t>(slot_w_v),
-            vec_per_core,
-            debug_blocks,
-            workspace.data_ptr(),
-            rotate_tiling.data_ptr());
-    } else {
-        const std::vector<uint8_t> rotate_tiling_host =
-            GenerateTurboQuantRotateTiling(ascendc_platform, block_dim, vec_per_core);
-        TORCH_CHECK(
-            rotate_tiling_host.size() >= sizeof(TCubeTiling),
-            "TurboQuant rotate tiling buffer is too small, got ", rotate_tiling_host.size(),
-            " expected at least ", sizeof(TCubeTiling));
-        at::Tensor rotate_tiling = at::empty(
-            {static_cast<int64_t>(rotate_tiling_host.size())},
-            at::TensorOptions().dtype(at::kByte).device(key_c.device()));
-        const aclError copy_ret = aclrtMemcpy(
-            rotate_tiling.data_ptr(),
-            rotate_tiling_host.size(),
-            rotate_tiling_host.data(),
-            rotate_tiling_host.size(),
-            ACL_MEMCPY_HOST_TO_DEVICE);
-        TORCH_CHECK(copy_ret == ACL_SUCCESS, "failed to copy TurboQuant rotate tiling to NPU, ret=", copy_ret);
-        if (debug_blocks != 0U) {
-            const auto* rotate_tiling =
-                reinterpret_cast<const TCubeTiling*>(rotate_tiling_host.data());
-            std::printf(
-                "[TQ_PACK] launch blockDim=%u nVec=%ld vecPerCore=%u slot_w_k=%ld slot_w_v=%ld "
-                "workspace=%u tiling=%zu usedCore=%d M=%d N=%d singleN=%d\n",
-                block_dim, static_cast<long>(n_vec), vec_per_core, static_cast<long>(slot_w_k),
-                static_cast<long>(slot_w_v), workspace_size, rotate_tiling_host.size(),
-                rotate_tiling->usedCoreNum, rotate_tiling->M, rotate_tiling->N, rotate_tiling->singleCoreN);
-            std::fflush(stdout);
-        }
-        turboquant_pack_kv_for_cache_fused_fp16_8bit_128_impl(
-            static_cast<void *>(stream),
-            const_cast<void *>(key_c.data_ptr()),
-            const_cast<void *>(value_c.data_ptr()),
-            const_cast<void *>(codebook_c.data_ptr()),
-            const_cast<void *>(rot_c.data_ptr()),
-            packed_k.data_ptr(),
-            packed_v.data_ptr(),
-            static_cast<uint32_t>(n_vec),
-            static_cast<uint32_t>(slot_w_k),
-            static_cast<uint32_t>(slot_w_v),
-            vec_per_core,
-            debug_blocks,
-            workspace.data_ptr(),
-            rotate_tiling.data_ptr());
+    const int64_t pack_mode = no_kfc ? 1 : 0;
+    const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
+    if (debug_blocks != 0U) {
+        std::printf(
+            "[TQ_PACK] launch aclnn pack_mode=%ld nVec=%ld vecPerCore=%ld slot_w_k=%ld slot_w_v=%ld\n",
+            static_cast<long>(pack_mode), static_cast<long>(n_vec), static_cast<long>(vec_per_core_i64),
+            static_cast<long>(slot_w_k), static_cast<long>(slot_w_v));
+        std::fflush(stdout);
     }
+
+    // Same launch path as turboquant_rotate_matmul_probe: aclnn custom op + SetTilingKey +
+    // KERNEL_TASK_TYPE(pack_mode, MIX or AIC_ONLY). Avoids <<<>>> direct launch REGIST hang.
+    EXEC_NPU_CMD(
+        aclnnTurboquantPackKvForCacheFused,
+        key_c,
+        value_c,
+        codebook_c,
+        rot_c,
+        pack_mode,
+        n_vec,
+        slot_w_k,
+        slot_w_v,
+        vec_per_core_i64,
+        packed_k,
+        packed_v);
 
     std::vector<int64_t> shape_k(key.sizes().begin(), key.sizes().end());
     std::vector<int64_t> shape_v(value.sizes().begin(), value.sizes().end());
