@@ -3618,6 +3618,9 @@ class NPUModelRunner(GPUModelRunner):
                                     min_rewrite_delta=int(
                                         getattr(ascend_cfg, "dynamic_kv_min_rewrite_delta", 128)
                                     ),
+                                    uniform_kv_budget=str(
+                                        getattr(ascend_cfg, "dynamic_kv_uniform_kv_budget", "off")
+                                    ),
                                 )
                                 # Attach block_table-ordered prefix physical blocks for PD shrink.
                                 # NOTE: Do NOT use allocator-ordered `block_ids[:n]` to shrink:

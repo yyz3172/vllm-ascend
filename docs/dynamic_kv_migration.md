@@ -97,6 +97,19 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
   - 直觉：设大一些更保守（更少触发 pack），设小一些更激进（更容易触发 pack）。
   - **offload 什么时候会真的做物理 pack（压缩写回 KV）**：仅当 `prompt_len > prompt_kv_len_budget` 且 `prompt_len - prompt_kv_len_budget >= min_rewrite_delta`，并且各层 `q_last` 捕获完整，同时 `validation_mode=none`。
 
+- **uniform_kv_budget**（L1 / algo-2 Phase A，默认 `off`）：跨层预算再分配之后，强制各层 **`old_budget_L` 相同**；每层打分与 pack 的 **keep 集合仍独立**。
+  - `off`：保持自适应分层预算（现状）。
+  - `fixed_base`：各层 `old_budget_L = prompt_kv_len_budget - window_size`（推荐先 A/B）。
+  - `mean` / `min`：在自适应结果上取均值或最小值再拉平。
+  - 日志：`[DynamicKV][offload] uniform_kv_budget=... old_budget uniform=...`；pack 后仍看 `kv_len min/max`（`cap_keep` 并集可能导致层间 `kv_len` 仍有小幅差异）。
+
+- **uniform_decode_fast_path**（Phase B 轻量，默认 `false`）：与 ``uniform_kv_budget`` 联用时推荐保持默认即可（已自动共享 lens 行）：
+  - ``uniform_kv_budget != off`` 时用单次 Python 循环构建 ``tmp_lens``（``_dynkv_decode_build_shared_tmp_lens_and_jobs``）；
+  - decode 各层共享同一 ``dynamic_kv_seq_lens_list`` 引用，``context_lens`` 仍走 workspace 批量 fill；
+  - ``model_acl`` 在 prepare 已写 graph buffer 后跳过二次 merge（``dynkv_graph_context_lens_prepared``）。
+  - 旧版「32 路 ctx 广播 + replace 快路径」已移除（实测 TPOT 回退）。
+  - 显式设 ``uniform_decode_fast_path: true`` 时，在运行时检测到各层 ``tmp_lens`` 相同也会共享 list（非 uniform budget 场景）。
+
 ### 2.2 与 PD（Mooncake）的关系
 
 一句话：PD 场景下，prefill 会把“**每层该看多少 KV**”以及（可选）“**要传哪些 KV blocks**”打包到 `kv_transfer_params.dynamic_kv`，随请求传给 decode。

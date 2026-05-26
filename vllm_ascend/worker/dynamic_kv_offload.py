@@ -22,6 +22,7 @@ from vllm.logger import logger
 from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
+                                              apply_uniform_per_layer_old_budget,
                                               cap_keep_indices_chronological,
                                               clear_dynkv_softmax_scratch,
                                               gather_kv_from_paged_cache_batched,
@@ -242,6 +243,7 @@ def run_offload_rewrite_and_build_updates(
     num_layers: int,
     validation_mode: str = "none",
     min_rewrite_delta: int = 128,
+    uniform_kv_budget: str = "off",
 ) -> dict[str, dict[str, Any]]:
     """
     Returns kv_transfer_params_updates payload:
@@ -449,6 +451,39 @@ def run_offload_rewrite_and_build_updates(
         if len(per_layer_old_budget) != num_layers:
             # Fallback: uniform.
             per_layer_old_budget = [cand_old] * num_layers
+
+        if str(uniform_kv_budget) != "off":
+            pre_uniform = [int(x) for x in per_layer_old_budget]
+            per_layer_max_old = [
+                int(s.shape[-1]) if isinstance(s, torch.Tensor) and s.dim() >= 1 else 0
+                for s in per_layer_scores_old
+            ]
+            per_layer_old_budget = apply_uniform_per_layer_old_budget(
+                per_layer_old_budget,
+                cfg=cfg,
+                mode=str(uniform_kv_budget),
+                per_layer_max_old=per_layer_max_old,
+            )
+            _do_uniform_log = True
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+
+                _do_uniform_log = int(get_tensor_model_parallel_rank()) == 0
+            except Exception:
+                pass
+            if _do_uniform_log and pre_uniform:
+                logger.info(
+                    "[DynamicKV][offload] uniform_kv_budget=%s request_id=%s "
+                    "old_budget uniform=%d (adaptive min=%d max=%d mean=%.2f)",
+                    str(uniform_kv_budget),
+                    rid,
+                    int(per_layer_old_budget[0]),
+                    min(pre_uniform),
+                    max(pre_uniform),
+                    float(sum(pre_uniform)) / float(len(pre_uniform)),
+                )
 
         # ``mask``: full KV + sparse indices for decode ``npu_fusion_attention`` mask.
         # ``zero``: physically zero unimportant K/V in paged cache on this worker; decode
@@ -698,7 +733,7 @@ def run_offload_rewrite_and_build_updates(
             if _do_log:
                 logger.info(
                     "[DynamicKV][offload] rewrite request_id=%s L=%d C=%d W=%d "
-                    "kv_len min=%d max=%d mean=%.2f cap_truncated=%s",
+                    "kv_len min=%d max=%d mean=%.2f unique=%d cap_truncated=%s",
                     rid,
                     L,
                     C,
@@ -706,6 +741,7 @@ def run_offload_rewrite_and_build_updates(
                     min(pos_lens),
                     max(pos_lens),
                     float(sum(pos_lens)) / float(len(pos_lens)),
+                    len(set(pos_lens)),
                     cap_trunc_any,
                 )
         updates[rid] = {

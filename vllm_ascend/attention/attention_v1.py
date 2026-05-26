@@ -52,6 +52,7 @@ from vllm_ascend.attention.dynamic_kv import (
     save_validation_mask,
     scores_and_indices_old,
     scores_and_indices_old_perhead_aggregated,
+    apply_uniform_per_layer_old_budget,
     update_and_reset_budget,
     update_and_reset_budget_per_kv_head,
 )
@@ -615,6 +616,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._dynamickv_radio_max = float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0))
         self._dynamickv_radio_min = float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1))
         self._dynamickv_validation_mode = str(getattr(ascend_cfg, "dynamic_kv_validation_mode", "none"))
+        # L1 (algo-2 Phase A): cross-layer uniform old-token budget; per-layer keep sets unchanged.
+        self._dynamickv_uniform_kv_budget = str(
+            getattr(ascend_cfg, "dynamic_kv_uniform_kv_budget", "off")
+        )
         self._dynamickv_model_types = set(getattr(ascend_cfg, "dynamic_kv_model_types", ["mistral"]) or [])
         try:
             model_type = getattr(self.vllm_config.model_config.hf_config, "model_type", "")
@@ -1553,6 +1558,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                         cfg=cfg_sub,
                                         budget_size=budget_size,
                                     )
+                                    if self._dynamickv_uniform_kv_budget != "off":
+                                        per_layer_max_old = [
+                                            int(s.shape[-1])
+                                            if isinstance(s, torch.Tensor) and s.dim() >= 1
+                                            else 0
+                                            for s in scores_layers
+                                        ]
+                                        budgets_sub = apply_uniform_per_layer_old_budget(
+                                            budgets_sub,
+                                            cfg=cfg_sub,
+                                            mode=self._dynamickv_uniform_kv_budget,
+                                            per_layer_max_old=per_layer_max_old,
+                                        )
                                     # Expand budgets to full num_layers length so the final writeback
                                     # can directly consume it.
                                     full = [int(cfg_sub.base)] * int(num_layers)
@@ -1802,6 +1820,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     per_layer_v_budget=dummy,
                                     cfg=dynkv_cfg,
                                     budget_size=budget_size,
+                                )
+                            if self._dynamickv_uniform_kv_budget != "off":
+                                per_layer_max_old = [
+                                    int(s.shape[-1])
+                                    if isinstance(s, torch.Tensor) and s.dim() >= 1
+                                    else 0
+                                    for s in per_layer_scores
+                                ]
+                                per_layer_old_budget = apply_uniform_per_layer_old_budget(
+                                    per_layer_old_budget,
+                                    cfg=dynkv_cfg,
+                                    mode=self._dynamickv_uniform_kv_budget,
+                                    per_layer_max_old=per_layer_max_old,
                                 )
 
                             per_layer_kv_lens: list[int] = []

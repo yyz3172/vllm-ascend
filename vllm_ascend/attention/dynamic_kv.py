@@ -776,6 +776,62 @@ def update_and_reset_budget_per_kv_head(
     return out
 
 
+# L1 (algo-2 Phase A): cross-layer uniform old-token budget; keep sets stay per-layer.
+_UNIFORM_KV_BUDGET_MODES = frozenset({"off", "fixed_base", "mean", "min"})
+
+
+def normalize_uniform_kv_budget_mode(mode: str | None) -> str:
+    """Normalize ``additional_config.dynamic_kv.uniform_kv_budget``."""
+    m = str(mode or "off").strip().lower()
+    if m in ("false", "0", "none", ""):
+        return "off"
+    if m not in _UNIFORM_KV_BUDGET_MODES:
+        return "off"
+    return m
+
+
+def apply_uniform_per_layer_old_budget(
+    per_layer_old_budget: List[int],
+    *,
+    cfg: DynamicKVConfig,
+    mode: str,
+    per_layer_max_old: Optional[List[int]] = None,
+) -> List[int]:
+    """L1: force identical ``old_budget_L`` across layers (keep/pack still per-layer).
+
+    Modes:
+    - ``off``: no change
+    - ``fixed_base``: each layer uses ``cfg.base`` (= prompt_kv_len_budget - window_size)
+    - ``mean``: round(mean(adaptive budgets))
+    - ``min``: min(adaptive budgets), conservative compression
+    """
+    mode_n = normalize_uniform_kv_budget_mode(mode)
+    if mode_n == "off" or not per_layer_old_budget:
+        return [int(x) for x in per_layer_old_budget]
+
+    num_layers = len(per_layer_old_budget)
+    base = int(cfg.base)
+    min_budget = int(cfg.radio_min * base)
+    budgets = [int(x) for x in per_layer_old_budget]
+
+    if mode_n == "fixed_base":
+        u = base
+    elif mode_n == "mean":
+        u = int(round(sum(budgets) / float(len(budgets))))
+    elif mode_n == "min":
+        u = min(budgets)
+    else:
+        return budgets
+
+    u = max(min_budget, u)
+    if per_layer_max_old is not None and len(per_layer_max_old) == num_layers:
+        caps = [int(x) for x in per_layer_max_old]
+        if caps:
+            u = min(u, min(caps))
+
+    return [int(u)] * num_layers
+
+
 def scores_and_indices_old(
     *,
     query_last: torch.Tensor,  # [W, Hq, D]

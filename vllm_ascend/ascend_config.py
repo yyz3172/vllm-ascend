@@ -178,6 +178,26 @@ class AscendConfig:
         # Offload only: skip packed-prefix rewrite when (prompt_len - budget) is
         # below this many tokens (avoids fragile pack for tiny over-budget deltas).
         self.dynamic_kv_min_rewrite_delta = max(0, int(dyn.get("min_rewrite_delta", 128)))
+        # L1 (algo-2 Phase A): uniform per-layer old-token budget after cross-layer
+        # reallocation. Keep token sets remain per-layer (scores + pack unchanged).
+        # off | fixed_base | mean | min
+        _ukb = str(dyn.get("uniform_kv_budget", "off")).strip().lower()
+        if _ukb in ("false", "0", "none", ""):
+            self.dynamic_kv_uniform_kv_budget = "off"
+        elif _ukb in ("fixed_base", "mean", "min"):
+            self.dynamic_kv_uniform_kv_budget = _ukb
+        else:
+            if _ukb != "off":
+                logger.warning_once(
+                    "Unknown dynamic_kv.uniform_kv_budget=%r; using off.",
+                    dyn.get("uniform_kv_budget"),
+                )
+            self.dynamic_kv_uniform_kv_budget = "off"
+        # Optional: share per-request lens list across layers in decode prepare.
+        # Default false; uniform_kv_budget already shares lens without this flag.
+        self.dynamic_kv_uniform_decode_fast_path = bool(
+            dyn.get("uniform_decode_fast_path", False)
+        )
         # DynamicKV validation mode for verifying token selection effectiveness.
         # - "none": normal compression (default)
         # - "mask": decode uses full KV + attention mask (npu_fusion_attention)
