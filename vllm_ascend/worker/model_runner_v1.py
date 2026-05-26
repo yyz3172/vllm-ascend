@@ -685,6 +685,63 @@ def _dynkv_get_or_grow_req_slot_lut(
     return lut
 
 
+def _dynkv_slot_scalar_from_tgt(
+    bt_row: torch.Tensor,
+    tgt_pos: int,
+    block_size: int,
+    max_blocks: int,
+) -> int:
+    """CPU scalar: logical position -> physical slot (packed-prefix layout)."""
+    bs = int(block_size)
+    if bs <= 0:
+        return 0
+    tp = max(0, int(tgt_pos))
+    blk_idx = min(tp // bs, max(0, int(max_blocks)))
+    blk = int(bt_row[blk_idx].item())
+    return int(blk * bs + (tp % bs))
+
+
+def _dynkv_try_uniform_scalar_slot_remap(
+    *,
+    stack_view: torch.Tensor,
+    base_sm: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_pos_t: torch.Tensor,
+    req_idx_t: torch.Tensor,
+    job_req_idx: int,
+    job_base_tokens: int,
+    job_Li: int,
+    n_layers: int,
+    block_size: int,
+    n_active: int,
+    steady_skip: bool,
+) -> bool:
+    """P0-1: one active token + one job — scalar remap on CPU; optional skip if equal.
+
+    Returns True when the caller can skip the full batched remap path.
+    """
+    if n_active != 1 or int(job_Li) < 0:
+        return False
+    if int(token_pos_t.numel()) < 1 or int(req_idx_t.numel()) < 1:
+        return False
+    if int(req_idx_t[0].item()) != int(job_req_idx):
+        return False
+    rel = int(token_pos_t[0].item()) - (int(job_base_tokens) - 1)
+    tgt = int(job_Li) + rel
+    max_blocks = int(block_tables.shape[1]) - 1
+    bt_row = block_tables[int(job_req_idx)]
+    new_slot = _dynkv_slot_scalar_from_tgt(
+        bt_row, tgt, int(block_size), max_blocks)
+    cur_slot = int(base_sm[0].item())
+    if steady_skip and new_slot == cur_slot:
+        return True
+    slot_v = base_sm.new_tensor([new_slot], dtype=base_sm.dtype)
+    stack_view[0, 0] = slot_v[0]
+    if n_layers > 1:
+        stack_view[1:n_layers, 0] = slot_v[0]
+    return True
+
+
 def _dynkv_perjob_slot_remap_to_stack(
     *,
     stack_view: torch.Tensor,
@@ -700,6 +757,8 @@ def _dynkv_perjob_slot_remap_to_stack(
     slot_lut_cache: Optional[dict[int, torch.Tensor]] = None,
     use_prefix_lut: bool = False,
     lut_min_tokens: int = 64,
+    n_active_tokens: int = 0,
+    steady_scalar_skip: bool = True,
 ) -> int:
     """Per-(req,base) job loop; each job writes [L, n_masked] (not full [L,n_sm]).
 
@@ -719,6 +778,14 @@ def _dynkv_perjob_slot_remap_to_stack(
     n_sm = int(base_sm.numel())
     if n_sm <= 0 or n_layers <= 0:
         return 0
+    n_active = int(n_active_tokens)
+    if n_active <= 0:
+        n_active = n_sm
+    n_active = min(n_active, n_sm, int(token_pos_t.numel()),
+                   int(req_idx_t.numel()))
+    if n_active < n_sm:
+        token_pos_t = token_pos_t[:n_active]
+        req_idx_t = req_idx_t[:n_active]
     job_key_to_Li = _dynkv_build_job_key_to_Li_per_layer(
         slot_jobs_all, n_layers, uniform_lens=uniform_lens)
     job_keys_list = list(job_key_to_Li.keys())
@@ -782,6 +849,29 @@ def _dynkv_perjob_slot_remap_to_stack(
         all_Li_tensor = torch.tensor(
             all_Li_scalars, device=li_device, dtype=li_dtype)  # [N_jobs]
         _maybe_disable_lut(job_keys_list)
+
+        if (
+            steady_scalar_skip
+            and len(job_keys_list) == 1
+            and n_active == 1
+        ):
+            _jr, _jb = job_keys_list[0]
+            _Li0 = int(all_Li_scalars[0])
+            if _dynkv_try_uniform_scalar_slot_remap(
+                stack_view=stack_view,
+                base_sm=base_sm,
+                block_tables=block_tables,
+                token_pos_t=token_pos_t,
+                req_idx_t=req_idx_t,
+                job_req_idx=int(_jr),
+                job_base_tokens=int(_jb),
+                job_Li=_Li0,
+                n_layers=n_layers,
+                block_size=int(block_size),
+                n_active=n_active,
+                steady_skip=True,
+            ):
+                return len(job_keys_list)
 
         for _job_i, (job_req_idx, job_base_tokens) in enumerate(job_keys_list):
             _ck = (int(job_req_idx), int(job_base_tokens))
@@ -1262,6 +1352,8 @@ class NPUModelRunner(GPUModelRunner):
         # when disabled, decode prepare shares one metadata object per group
         # (pre-DynamicKV behavior).
         self._dynkv_graph_slot_bufs: dict[int, dict[str, torch.Tensor]] = {}
+        # P0-4: reuse per-layer metadata shells across decode steps (per capture bucket).
+        self._dynkv_layer_meta_cache: dict[int, dict[str, Any]] = {}
         # Per-layer context_lens pinned during FULL PA graph capture.
         self._dynkv_graph_context_lens_bufs: dict[int, dict[str, torch.Tensor]] = (
             {})
@@ -2102,6 +2194,157 @@ class NPUModelRunner(GPUModelRunner):
                 ws[row, :n_sm].copy_(base_sm[:n_sm])
         return True
 
+    def _dynkv_ensure_slot_stack_for_prepare(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+        n_sm: int,
+        base_sm: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        """P0-3: prefer captured slot workspace so graph_slot_bufs can alias stack rows."""
+        if n_sm <= 0 or not layer_names:
+            return None, False
+        stack: Optional[torch.Tensor] = None
+        alias = False
+        cap_key = self._resolve_slot_workspace_cap_key(int(num_input_tokens))
+        row_map = self._dynkv_slot_workspace_layer_row.get(cap_key)
+        if row_map is None:
+            row_map = {}
+            self._dynkv_slot_workspace_layer_row[cap_key] = row_map
+        row_next = max((int(v) for v in row_map.values()), default=-1) + 1
+        for ln in layer_names:
+            if str(ln) not in row_map:
+                row_map[str(ln)] = row_next
+                row_next += 1
+        self._get_or_create_slot_workspace(
+            cap_key,
+            max(row_next, len(layer_names)),
+            int(n_sm),
+            base_sm.device,
+            base_sm.dtype,
+        )
+        stack, alias = self._resolve_dynkv_stack_from_workspace(
+            int(num_input_tokens), layer_names, int(n_sm))
+        if stack is None:
+            need_L = max(len(layer_names), self._dynkv_slot_stack_cap_L)
+            need_n = max(int(n_sm), self._dynkv_slot_stack_cap_n)
+            sb = self._dynkv_slot_stack_buf
+            if (
+                sb is None
+                or sb.shape[0] < need_L
+                or sb.shape[1] < need_n
+                or sb.device != base_sm.device
+                or sb.dtype != base_sm.dtype
+            ):
+                self._dynkv_slot_stack_buf = torch.empty(
+                    (need_L, need_n),
+                    device=base_sm.device,
+                    dtype=base_sm.dtype,
+                )
+                self._dynkv_slot_stack_cap_L = need_L
+                self._dynkv_slot_stack_cap_n = need_n
+                sb = self._dynkv_slot_stack_buf
+            stack = sb[:len(layer_names), :int(n_sm)]
+        return stack, alias
+
+    @staticmethod
+    def _dynkv_copy_active_sm_to_stack(
+        stack_view: torch.Tensor,
+        base_sm: torch.Tensor,
+        *,
+        n_active: int,
+        uniform_lens: bool,
+    ) -> None:
+        """P0-1: copy only scheduled (active) slots, not full padded capture width."""
+        n_sm = min(int(base_sm.numel()), int(stack_view.shape[1]))
+        n_copy = min(max(0, int(n_active)), n_sm)
+        if n_copy <= 0:
+            return
+        if uniform_lens:
+            stack_view[0, :n_copy].copy_(base_sm[:n_copy])
+            if stack_view.shape[0] > 1:
+                stack_view[1:, :n_copy].copy_(stack_view[0:1, :n_copy])
+        else:
+            stack_view[:, :n_copy] = base_sm[:n_copy].unsqueeze(0)
+
+    def _dynkv_assign_graph_slots_from_stack(
+        self,
+        graph_slot_bufs: dict[str, torch.Tensor],
+        layer_names: list[str],
+        stack_view: torch.Tensor,
+        *,
+        n_active: int,
+        uniform_row0_broadcast: bool,
+    ) -> None:
+        """P0-2: uniform decode — copy stack row0 to every graph slot buffer once."""
+        n_sm = int(stack_view.shape[1])
+        n_copy = min(max(0, int(n_active)), n_sm)
+        if n_copy <= 0:
+            return
+        row0 = stack_view[0, :n_copy]
+        if uniform_row0_broadcast and int(stack_view.shape[0]) > 1:
+            for layer_name in layer_names:
+                buf = graph_slot_bufs.get(layer_name)
+                if buf is None:
+                    continue
+                n_buf = min(int(buf.numel()), n_copy)
+                if n_buf > 0 and buf.data_ptr() != row0[:n_buf].data_ptr():
+                    buf[:n_buf].copy_(row0[:n_buf])
+            return
+        for li, layer_name in enumerate(layer_names):
+            if li >= stack_view.shape[0]:
+                break
+            buf = graph_slot_bufs.get(layer_name)
+            if buf is None:
+                continue
+            n_buf = min(int(buf.numel()), n_copy)
+            if n_buf > 0:
+                row = stack_view[li, :n_buf]
+                if buf.data_ptr() != row.data_ptr():
+                    buf[:n_buf].copy_(row)
+
+    _DYNKV_META_REFRESH_ATTRS: tuple[str, ...] = (
+        "block_tables",
+        "seq_lens",
+        "query_start_loc",
+        "query_start_loc_cpu",
+        "num_reqs",
+        "num_actual_tokens",
+        "num_input_tokens",
+        "slot_mapping",
+    )
+
+    def _dynkv_get_decode_layer_meta(
+        self,
+        *,
+        cap_key: int,
+        layer_name: str,
+        attn_metadata_i: Any,
+        reuse_cache: bool,
+    ) -> Any:
+        """P0-4: reuse metadata shell; refresh shared tensors from common metadata."""
+        if not reuse_cache:
+            try:
+                return copy(attn_metadata_i)
+            except Exception:
+                return attn_metadata_i
+        bucket = self._dynkv_layer_meta_cache.setdefault(int(cap_key), {})
+        meta_i = bucket.get(str(layer_name))
+        if meta_i is None:
+            try:
+                meta_i = copy(attn_metadata_i)
+            except Exception:
+                meta_i = attn_metadata_i
+            bucket[str(layer_name)] = meta_i
+            return meta_i
+        for attr in self._DYNKV_META_REFRESH_ATTRS:
+            try:
+                if hasattr(attn_metadata_i, attr):
+                    setattr(meta_i, attr, getattr(attn_metadata_i, attr))
+            except Exception:
+                pass
+        return meta_i
+
     def _prepare_standard_layer_attn_metadata(
         self,
         base_meta: Any,
@@ -2659,13 +2902,16 @@ class NPUModelRunner(GPUModelRunner):
             try:
                 _ac_dyn = get_ascend_config()
                 if self._is_dynamic_kv_enabled():
+                    _n_dynkv_active = int(total_num_scheduled_tokens)
+                    _pos_np = token_positions_np[:_n_dynkv_active]
+                    _req_np = req_indices[:_n_dynkv_active]
                     dynkv_decode_token_pos_t = torch.as_tensor(
-                        token_positions_np,
+                        _pos_np,
                         device=self.device,
                         dtype=torch.int64,
                     )
                     dynkv_decode_req_idx_t = torch.as_tensor(
-                        req_indices,
+                        _req_np,
                         device=self.device,
                         dtype=torch.int64,
                     )
@@ -3001,6 +3247,9 @@ class NPUModelRunner(GPUModelRunner):
                     _dynkv_slot_remap_lut_min = int(
                         getattr(self.ascend_config,
                                 "dynamic_kv_slot_remap_lut_min_tokens", 64))
+                    _dynkv_n_active = int(total_num_scheduled_tokens)
+                    _dynkv_meta_cap = self._resolve_slot_workspace_cap_key(
+                        int(num_input_tokens))
                     _dynkv_layer_names = list(attn_group.layer_names)
                     _dynkv_L = len(_dynkv_layer_names)
                     self._register_dynkv_graph_context_lens_bufs_from_capture(
@@ -3037,36 +3286,12 @@ class NPUModelRunner(GPUModelRunner):
                         _graph_slot_bufs is not None and _slot_n_sm > 0)
                     if _dynkv_L > 0 and _dynkv_n > 0:
                         _dynkv_stack, _slot_workspace_alias = (
-                            self._resolve_dynkv_stack_from_workspace(
+                            self._dynkv_ensure_slot_stack_for_prepare(
                                 int(num_input_tokens),
                                 _dynkv_layer_names,
                                 min(_slot_n_sm, _dynkv_n),
+                                attn_metadata_i.slot_mapping,
                             ))
-                        if _dynkv_stack is None:
-                            _need_L = max(_dynkv_L,
-                                          self._dynkv_slot_stack_cap_L)
-                            _need_n = max(_dynkv_n,
-                                          self._dynkv_slot_stack_cap_n)
-                            _sb = self._dynkv_slot_stack_buf
-                            if (
-                                _sb is None
-                                or _sb.shape[0] < _need_L
-                                or _sb.shape[1] < _need_n
-                                or _sb.device
-                                != attn_metadata_i.slot_mapping.device
-                                or _sb.dtype
-                                != attn_metadata_i.slot_mapping.dtype
-                            ):
-                                self._dynkv_slot_stack_buf = torch.empty(
-                                    (_need_L, _need_n),
-                                    device=attn_metadata_i.slot_mapping.device,
-                                    dtype=attn_metadata_i.slot_mapping.dtype,
-                                )
-                                self._dynkv_slot_stack_cap_L = _need_L
-                                self._dynkv_slot_stack_cap_n = _need_n
-                                _sb = self._dynkv_slot_stack_buf
-                            _dynkv_stack = _sb[:_dynkv_L, :_dynkv_n]
-                            _slot_workspace_alias = False
                     if _dynkv_profile:
                         _t_stack_init = (time.perf_counter() - _t0_stack) * 1000
 
@@ -3234,13 +3459,12 @@ class NPUModelRunner(GPUModelRunner):
                             if (_slot_n_sm > 0
                                     and _slot_n_sm <= _dynkv_stack.shape[1]):
                                 stack_view = _dynkv_stack[:_dynkv_L, :_slot_n_sm]
-                                if _dynkv_uniform_lens:
-                                    stack_view[0].copy_(base_sm)
-                                    if _dynkv_L > 1:
-                                        stack_view[1:_dynkv_L].copy_(
-                                            stack_view[0:1])
-                                else:
-                                    stack_view[:] = base_sm.unsqueeze(0)
+                                self._dynkv_copy_active_sm_to_stack(
+                                    stack_view,
+                                    base_sm,
+                                    n_active=_dynkv_n_active,
+                                    uniform_lens=bool(_dynkv_uniform_lens),
+                                )
                                 n_jobs = _dynkv_perjob_slot_remap_to_stack(
                                     stack_view=stack_view,
                                     base_sm=base_sm,
@@ -3255,6 +3479,8 @@ class NPUModelRunner(GPUModelRunner):
                                     slot_lut_cache=dynkv_slot_lut_cache,
                                     use_prefix_lut=_dynkv_slot_remap_lut,
                                     lut_min_tokens=_dynkv_slot_remap_lut_min,
+                                    n_active_tokens=_dynkv_n_active,
+                                    steady_scalar_skip=True,
                                 )
                                 _slot_remap_done = True
                                 logger.debug(
@@ -3346,16 +3572,13 @@ class NPUModelRunner(GPUModelRunner):
                         _t0_slot_assign = (
                             time.perf_counter() if _dynkv_profile else 0)
                         try:
-                            for _dyn_li, layer_name in enumerate(
-                                    _dynkv_layer_names):
-                                _captured_sm = _graph_slot_bufs.get(layer_name)
-                                if _captured_sm is None:
-                                    continue
-                                _n_sm = min(int(_captured_sm.numel()),
-                                            _slot_n_sm)
-                                if _n_sm > 0:
-                                    _captured_sm[:_n_sm].copy_(
-                                        _dynkv_stack[_dyn_li, :_n_sm])
+                            self._dynkv_assign_graph_slots_from_stack(
+                                _graph_slot_bufs,
+                                _dynkv_layer_names,
+                                _dynkv_stack[:_dynkv_L, :_slot_n_sm],
+                                n_active=_dynkv_n_active,
+                                uniform_row0_broadcast=bool(_dynkv_uniform_lens),
+                            )
                         except Exception:
                             pass
                         if _dynkv_profile:
@@ -3366,10 +3589,12 @@ class NPUModelRunner(GPUModelRunner):
                         # each layer sees its own metadata instance with `layer_name`
                         # populated, otherwise DynamicKV cannot resolve layer_idx.
                         _t0_cm = time.perf_counter() if _dynkv_profile else 0
-                        try:
-                            meta_i = copy(attn_metadata_i)
-                        except Exception:
-                            meta_i = attn_metadata_i
+                        meta_i = self._dynkv_get_decode_layer_meta(
+                            cap_key=_dynkv_meta_cap,
+                            layer_name=layer_name,
+                            attn_metadata_i=attn_metadata_i,
+                            reuse_cache=True,
+                        )
                         # FULL graph replay uses slot_mapping addresses from capture.
                         # Reuse those buffers and copy runtime slots in-place each step.
                         if _use_graph_slot_bufs:
@@ -3404,6 +3629,14 @@ class NPUModelRunner(GPUModelRunner):
                                     and not all(v < 0 for v in tmp_lens_layer)):
                                 setattr(meta_i, "dynamic_kv_seq_lens_list",
                                         tmp_lens_layer)
+                                try:
+                                    setattr(
+                                        meta_i,
+                                        "dynamic_kv_lens_has_negative",
+                                        any(int(v) < 0 for v in tmp_lens_layer),
+                                    )
+                                except Exception:
+                                    pass
                                 try:
                                     _ctx_buf = None
                                     if _graph_context_lens_bufs is not None:

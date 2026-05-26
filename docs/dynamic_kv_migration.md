@@ -112,6 +112,8 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 
 - **slot_remap_prefix_lut**（Phase B3，默认 `false`）：仅当单步 remap token 数 ≥ ``slot_remap_lut_min_tokens``（默认 64）时，才用 packed-prefix LUT；稳态 decode（每步 1 token）走直接 gather，避免每步构建 ``Li+pos`` 长度 LUT。``uniform_lens`` 时 stack 仍仅 ``copy_`` 首行再广播。大批量 prefill/chunk 可显式 ``slot_remap_prefix_lut: true`` 试验。
 
+- **P0 decode prepare**（代码内恒开，无 yaml 开关）：active-only 上传/拷贝、稳态标量 slot_remap、uniform 时 row0 广播 slot_assign、优先 slot workspace alias、复用 layer metadata 壳。
+
 ### 2.2 与 PD（Mooncake）的关系
 
 一句话：PD 场景下，prefill 会把“**每层该看多少 KV**”以及（可选）“**要传哪些 KV blocks**”打包到 `kv_transfer_params.dynamic_kv`，随请求传给 decode。

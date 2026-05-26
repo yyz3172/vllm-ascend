@@ -78,6 +78,9 @@ def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
         if (t.device == sl.device and t.dtype == sl.dtype
                 and int(t.numel()) == int(sl.numel()) and int(t.numel()) >= n_dl):
             # FULL-graph pinned buffer (prepare-filled); avoid torch.tensor(dl).
+            if getattr(attn_metadata, "dynamic_kv_lens_has_negative",
+                        None) is False:
+                return t
             if not (t < 0).any():
                 return t
             return torch.where(t >= 0, t, sl)
