@@ -31,9 +31,6 @@
 #include <torch_npu/csrc/npu/Module.h>
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
-#include "kernel_tiling/kernel_tiling.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "tiling/tiling_api.h"
 #include "ops.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"

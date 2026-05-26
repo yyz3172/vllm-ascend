@@ -36,7 +36,7 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
         // 0 = MIX KFC batched pack (same as probe_mode=0 REGIST path)
-        // 1 = AIC-only GM matmul per row (no REGIST; debug / NO_KFC)
+        // 1 = AIV-only reference pack (manual rotate; debug / NO_KFC)
         this->Attr("pack_mode").Int();
         this->Attr("n_vec").Int();
         this->Attr("slot_w_k").Int();

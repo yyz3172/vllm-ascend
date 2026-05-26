@@ -701,9 +701,13 @@ def turboquant_pack_kv_for_cache(
             cb_v = codebook_value.to(device=key.device, dtype=torch.float16)
             rot_v = rotation_value.to(device=key.device, dtype=torch.float16)
 
+        # The fused AscendC kernel currently accepts fp16 K/V only. Cast here so
+        # callers with bf16/fp32 KV tensors still use the fused path consistently.
+        key_fused = key.to(dtype=torch.float16).contiguous()
+        value_fused = value.to(dtype=torch.float16).contiguous()
         packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
-            key.contiguous(),
-            value.contiguous(),
+            key_fused,
+            value_fused,
             cb_k,
             rot_k,
             cb_v,
