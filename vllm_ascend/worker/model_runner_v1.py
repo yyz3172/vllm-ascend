@@ -268,8 +268,14 @@ def _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
     n_r: int,
     input_batch: Any,
     block_size: int,
+    cache_to_populate: dict[str, dict] | None = None,
 ) -> tuple[list[int], list[tuple[int, int, int]]]:
-    """Per-layer kernel of the original build helper; extracted for Phase B uniform reuse."""
+    """Per-layer kernel of the original build helper; extracted for Phase B uniform reuse.
+
+    B4 (Phase B+): when ``cache_to_populate`` is provided, write per-request
+    state (last_ncomp, last_value, Li, base_tokens, use_dyn_base, has_pii) so
+    subsequent steady-state decode steps can skip this loop entirely.
+    """
     tmp_row = [-1] * n_r
     jobs: list[tuple[int, int, int]] = []
     if layer_idx < 0:
@@ -298,6 +304,14 @@ def _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
         if use_dyn_base:
             base_tokens = int(transferred)
         decode_extra = max(0, ncomp - base_tokens + 2)
+        rid_here = (
+            rid_list[req_idx] if req_idx < len(rid_list) else None
+        )
+        has_pii_here = (
+            isinstance(pii, list)
+            and layer_idx < len(pii)
+            and isinstance(pii[layer_idx], list)
+        )
         if isinstance(per_layer, list) and layer_idx < len(per_layer):
             try:
                 Li = int(per_layer[layer_idx])
@@ -307,10 +321,16 @@ def _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
                 tmp_row[req_idx] = Li + decode_extra
                 if use_dyn_base and bs_dyn > 0:
                     jobs.append((req_idx, int(base_tokens), int(Li)))
+                if cache_to_populate is not None and rid_here is not None:
+                    cache_to_populate[rid_here] = {
+                        "last_ncomp": int(ncomp),
+                        "last_value": int(Li + decode_extra),
+                        "Li": int(Li),
+                        "base_tokens": int(base_tokens),
+                        "use_dyn_base": bool(use_dyn_base and bs_dyn > 0),
+                        "has_pii": bool(has_pii_here),
+                    }
                 try:
-                    rid_here = (
-                        rid_list[req_idx] if req_idx < len(rid_list) else None
-                    )
                     if (
                         rid_here
                         and isinstance(pii, list)
@@ -335,9 +355,74 @@ def _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
                     pass
             else:
                 tmp_row[req_idx] = -1
+                if cache_to_populate is not None and rid_here is not None:
+                    cache_to_populate.pop(rid_here, None)
         else:
             tmp_row[req_idx] = -1
+            if cache_to_populate is not None and rid_here is not None:
+                cache_to_populate.pop(rid_here, None)
     return tmp_row, jobs
+
+
+def _dynkv_decode_try_incremental_uniform_row(
+    *,
+    rid_list: list[str],
+    kv_list: list[dict[str, Any]],
+    n_r: int,
+    input_batch: Any,
+    block_size: int,
+    decode_state_cache: dict[str, dict],
+) -> tuple[list[int], list[tuple[int, int, int]]] | None:
+    """B4: try fast steady-state ``+1`` build path.
+
+    Returns ``(row, jobs)`` only when EVERY active request hits the cache with
+    ``cur_ncomp == last_ncomp + 1`` and has no validation pii mask path. The
+    cache is mutated in place (per-request ``last_ncomp`` / ``last_value``)
+    only when the full check succeeds, so a partial miss leaves cache intact.
+    """
+    if not decode_state_cache or n_r <= 0:
+        return None
+    bs_dyn = int(block_size)
+    kv_len = len(kv_list)
+    # First pass (dry-run): verify cache hits without mutating.
+    plan: list[tuple[int, dict, int, int]] = []  # (req_idx, cached, cur_ncomp, new_value)
+    for req_idx in range(n_r):
+        if req_idx >= kv_len:
+            continue
+        kvp = kv_list[req_idx]
+        if not kvp:
+            continue
+        rid_here = rid_list[req_idx] if req_idx < len(rid_list) else None
+        if rid_here is None:
+            return None
+        cached = decode_state_cache.get(rid_here)
+        if cached is None or cached.get("has_pii"):
+            return None
+        try:
+            cur_ncomp = int(input_batch.num_computed_tokens_cpu[req_idx])
+        except Exception:
+            return None
+        last_ncomp = int(cached.get("last_ncomp", -1))
+        if cur_ncomp != last_ncomp + 1:
+            return None
+        Li = int(cached.get("Li", -1))
+        if Li <= 0:
+            continue
+        new_value = int(cached.get("last_value", 0)) + 1
+        plan.append((req_idx, cached, cur_ncomp, new_value))
+    if not plan:
+        return None
+    # Second pass: apply.
+    row: list[int] = [-1] * n_r
+    jobs: list[tuple[int, int, int]] = []
+    for req_idx, cached, cur_ncomp, new_value in plan:
+        Li = int(cached["Li"])
+        row[req_idx] = new_value
+        if cached.get("use_dyn_base") and bs_dyn > 0:
+            jobs.append((req_idx, int(cached["base_tokens"]), Li))
+        cached["last_ncomp"] = cur_ncomp
+        cached["last_value"] = new_value
+    return row, jobs
 
 
 def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
@@ -349,12 +434,17 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
     input_batch: Any,
     block_size: int,
     uniform_lens: bool = False,
+    decode_state_cache: dict[str, dict] | None = None,
 ) -> tuple[list[list[int]], list[list[tuple[int, int, int]]]]:
     """Build per-layer ``tmp_lens`` (length ``n_r``) and slot remap jobs on TP rank0.
 
     Phase B: when ``uniform_lens`` is True, build only layer 0 and share its
     list references across layers (sanity-probed against layer 1). The non-
     uniform path stays unchanged (32 layers built independently).
+
+    B4: when ``decode_state_cache`` is provided and every active request hits
+    the cache with ``ncomp == last_ncomp + 1``, skip the per-layer kernel
+    entirely and increment cached lens by 1.
     """
     if not dyn_layer_names:
         return [], []
@@ -365,7 +455,10 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
         except Exception:
             return -1
 
-    def _build_for(layer_name: str) -> tuple[list[int], list[tuple[int, int, int]]]:
+    def _build_for(
+        layer_name: str,
+        cache_to_populate: dict[str, dict] | None = None,
+    ) -> tuple[list[int], list[tuple[int, int, int]]]:
         return _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
             layer_idx=_extract_layer_idx(layer_name),
             rid_list=rid_list,
@@ -373,17 +466,48 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
             n_r=n_r,
             input_batch=input_batch,
             block_size=block_size,
+            cache_to_populate=cache_to_populate,
         )
 
     L = len(dyn_layer_names)
     if uniform_lens and L >= 1:
-        row0, jobs0 = _build_for(dyn_layer_names[0])
+        # B4 fast path: steady-state +1 reuse.
+        if decode_state_cache is not None:
+            fast = _dynkv_decode_try_incremental_uniform_row(
+                rid_list=rid_list,
+                kv_list=kv_list,
+                n_r=n_r,
+                input_batch=input_batch,
+                block_size=block_size,
+                decode_state_cache=decode_state_cache,
+            )
+            if fast is not None:
+                row, jobs = fast
+                # Periodic prune: drop cache entries for requests that exited
+                # the batch (allocator may reuse rids; bounded ~4x batch keeps
+                # turnover noise low).
+                if len(decode_state_cache) > max(16, 4 * n_r):
+                    active = set(rid_list[:n_r])
+                    for k in list(decode_state_cache.keys()):
+                        if k not in active:
+                            del decode_state_cache[k]
+                return [row] * L, [jobs] * L
+        # Full path: layer 0 populates cache; layer 1 sanity probe does not.
+        row0, jobs0 = _build_for(
+            dyn_layer_names[0],
+            cache_to_populate=decode_state_cache,
+        )
         if L >= 2:
             row1, jobs1 = _build_for(dyn_layer_names[1])
             if row1 != row0:
                 # Sanity probe failed: per_layer_kv_lens claimed uniform but
                 # tmp_lens row 0 != row 1 (cap_keep union or transferred_tokens
                 # mismatch). Fall back to full per-layer build for correctness.
+                # Invalidate cache populated from layer 0 - the data is not
+                # actually uniform; trying to use it next step would corrupt
+                # the slot map.
+                if decode_state_cache is not None:
+                    decode_state_cache.clear()
                 all_tmp_lens: list[list[int]] = [row0, row1]
                 slot_jobs_all: list[list[tuple[int, int, int]]] = [jobs0, jobs1]
                 for layer_name in dyn_layer_names[2:]:
@@ -1004,6 +1128,11 @@ class NPUModelRunner(GPUModelRunner):
         # Per-layer context_lens pinned during FULL PA graph capture.
         self._dynkv_graph_context_lens_bufs: dict[int, dict[str, torch.Tensor]] = (
             {})
+        # B4: steady-state decode lens cache (req_id -> {last_ncomp, last_value,
+        # Li, base_tokens, use_dyn_base, has_pii}). Only populated under
+        # ``uniform_kv_budget != off`` and the runtime uniform check. Stays on
+        # TP rank 0 (other ranks receive build results via broadcast).
+        self._dynkv_decode_lens_cache: dict[str, dict] = {}
         self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
         # CPU wall for Profile execute duration ``prepare input`` (see
         # ``_apply_profile_prepare_input_duration``).
@@ -2762,6 +2891,10 @@ class NPUModelRunner(GPUModelRunner):
                                             input_batch=self.input_batch,
                                             block_size=int(self.block_size),
                                             uniform_lens=_dynkv_uniform_lens,
+                                            decode_state_cache=(
+                                                self._dynkv_decode_lens_cache
+                                                if _dynkv_uniform_lens else None
+                                            ),
                                         ))
                                     if _dynkv_profile:
                                         _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
@@ -2784,6 +2917,10 @@ class NPUModelRunner(GPUModelRunner):
                                         input_batch=self.input_batch,
                                         block_size=int(self.block_size),
                                         uniform_lens=_dynkv_uniform_lens,
+                                        decode_state_cache=(
+                                            self._dynkv_decode_lens_cache
+                                            if _dynkv_uniform_lens else None
+                                        ),
                                     ))
                                 if _dynkv_profile:
                                     _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
