@@ -230,6 +230,116 @@ def _merge_kv_xfer_updates_drain(
     return merged
 
 
+def _dynkv_decode_check_uniform_lens_runtime(
+    kv_list: list[dict[str, Any]],
+    n_layers: int,
+) -> bool:
+    """Phase B: per-batch check that every request has uniform per_layer_kv_lens.
+
+    Returns True only if every request in ``kv_list`` carries a non-empty
+    ``per_layer_kv_lens`` whose first ``n_layers`` entries are all equal. With
+    ``uniform_kv_budget`` enabled, this is the expected case; ``cap_keep`` union
+    on a small fraction of layers may still break it, so we always verify.
+    """
+    if not kv_list or n_layers <= 0:
+        return False
+    for kvp in kv_list:
+        if not kvp:
+            return False
+        dyn = kvp.get("dynamic_kv") if isinstance(kvp, dict) else None
+        pl = dyn.get("per_layer_kv_lens") if isinstance(dyn, dict) else None
+        if not isinstance(pl, list) or len(pl) < n_layers:
+            return False
+        try:
+            first = int(pl[0])
+            for x in pl[1:n_layers]:
+                if int(x) != first:
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
+    *,
+    layer_idx: int,
+    rid_list: list[str],
+    kv_list: list[dict[str, Any]],
+    n_r: int,
+    input_batch: Any,
+    block_size: int,
+) -> tuple[list[int], list[tuple[int, int, int]]]:
+    """Per-layer kernel of the original build helper; extracted for Phase B uniform reuse."""
+    tmp_row = [-1] * n_r
+    jobs: list[tuple[int, int, int]] = []
+    if layer_idx < 0:
+        return tmp_row, jobs
+    bs_dyn = int(block_size)
+    kv_len = len(kv_list)
+    for req_idx in range(n_r):
+        if req_idx >= kv_len:
+            tmp_row[req_idx] = -1
+            continue
+        kvp = kv_list[req_idx]
+        if not kvp:
+            tmp_row[req_idx] = -1
+            continue
+        dyn = kvp.get("dynamic_kv") or {}
+        per_layer = dyn.get("per_layer_kv_lens")
+        pii = dyn.get("per_layer_important_indices")
+        try:
+            npt = int(input_batch.num_prompt_tokens[req_idx])
+            ncomp = int(input_batch.num_computed_tokens_cpu[req_idx])
+        except Exception:
+            npt, ncomp = 0, 0
+        base_tokens = npt
+        transferred = dyn.get("transferred_tokens")
+        use_dyn_base = isinstance(transferred, int) and transferred > 0
+        if use_dyn_base:
+            base_tokens = int(transferred)
+        decode_extra = max(0, ncomp - base_tokens + 2)
+        if isinstance(per_layer, list) and layer_idx < len(per_layer):
+            try:
+                Li = int(per_layer[layer_idx])
+            except Exception:
+                Li = -1
+            if Li > 0:
+                tmp_row[req_idx] = Li + decode_extra
+                if use_dyn_base and bs_dyn > 0:
+                    jobs.append((req_idx, int(base_tokens), int(Li)))
+                try:
+                    rid_here = (
+                        rid_list[req_idx] if req_idx < len(rid_list) else None
+                    )
+                    if (
+                        rid_here
+                        and isinstance(pii, list)
+                        and layer_idx < len(pii)
+                    ):
+                        idxs_layer = pii[layer_idx]
+                        if isinstance(idxs_layer, list):
+                            li_tot = int(Li) + int(decode_extra)
+                            mcpu = torch.zeros(li_tot, dtype=torch.bool)
+                            for t in idxs_layer:
+                                ti = int(t)
+                                if 0 <= ti < int(Li):
+                                    mcpu[ti] = True
+                            if decode_extra > 0 and li_tot > int(Li):
+                                mcpu[int(Li):li_tot] = True
+                            save_validation_mask(
+                                str(rid_here),
+                                int(layer_idx),
+                                mcpu,
+                            )
+                except Exception:
+                    pass
+            else:
+                tmp_row[req_idx] = -1
+        else:
+            tmp_row[req_idx] = -1
+    return tmp_row, jobs
+
+
 def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
     *,
     dyn_layer_names: list[str],
@@ -238,13 +348,51 @@ def _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
     n_r: int,
     input_batch: Any,
     block_size: int,
+    uniform_lens: bool = False,
 ) -> tuple[list[list[int]], list[list[tuple[int, int, int]]]]:
     """Build per-layer ``tmp_lens`` (length ``n_r``) and slot remap jobs on TP rank0.
 
-    Mirrors the per-request loop previously executed once per layer inside
-    ``_prepare_inputs``; factored out so TP can ``broadcast_object`` once per
-    KV group instead of once per layer.
+    Phase B: when ``uniform_lens`` is True, build only layer 0 and share its
+    list references across layers (sanity-probed against layer 1). The non-
+    uniform path stays unchanged (32 layers built independently).
     """
+    if not dyn_layer_names:
+        return [], []
+
+    def _extract_layer_idx(layer_name: str) -> int:
+        try:
+            return int(extract_layer_index(layer_name, num_attn_module=1))
+        except Exception:
+            return -1
+
+    def _build_for(layer_name: str) -> tuple[list[int], list[tuple[int, int, int]]]:
+        return _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
+            layer_idx=_extract_layer_idx(layer_name),
+            rid_list=rid_list,
+            kv_list=kv_list,
+            n_r=n_r,
+            input_batch=input_batch,
+            block_size=block_size,
+        )
+
+    L = len(dyn_layer_names)
+    if uniform_lens and L >= 1:
+        row0, jobs0 = _build_for(dyn_layer_names[0])
+        if L >= 2:
+            row1, jobs1 = _build_for(dyn_layer_names[1])
+            if row1 != row0:
+                # Sanity probe failed: per_layer_kv_lens claimed uniform but
+                # tmp_lens row 0 != row 1 (cap_keep union or transferred_tokens
+                # mismatch). Fall back to full per-layer build for correctness.
+                all_tmp_lens: list[list[int]] = [row0, row1]
+                slot_jobs_all: list[list[tuple[int, int, int]]] = [jobs0, jobs1]
+                for layer_name in dyn_layer_names[2:]:
+                    r, j = _build_for(layer_name)
+                    all_tmp_lens.append(r)
+                    slot_jobs_all.append(j)
+                return all_tmp_lens, slot_jobs_all
+        return [row0] * L, [jobs0] * L
+
     all_tmp_lens: list[list[int]] = []
     slot_jobs_all: list[list[tuple[int, int, int]]] = []
     bs_dyn = int(block_size)
@@ -2525,6 +2673,15 @@ class NPUModelRunner(GPUModelRunner):
                         ]
                         if _dynkv_profile:
                             _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
+                        # Phase B: detect uniform per_layer_kv_lens (requires
+                        # uniform_kv_budget != off and runtime verification).
+                        _dynkv_uniform_lens = (
+                            str(getattr(self.ascend_config,
+                                        "dynamic_kv_uniform_kv_budget",
+                                        "off")) != "off"
+                            and _dynkv_decode_check_uniform_lens_runtime(
+                                kv_list_dyn, _dynkv_L)
+                        )
                         if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
                             tg_pre = get_tp_group()
                             built_dyn: tuple[
@@ -2542,6 +2699,7 @@ class NPUModelRunner(GPUModelRunner):
                                             n_r=n_r_dyn,
                                             input_batch=self.input_batch,
                                             block_size=int(self.block_size),
+                                            uniform_lens=_dynkv_uniform_lens,
                                         ))
                                     if _dynkv_profile:
                                         _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
@@ -2563,6 +2721,7 @@ class NPUModelRunner(GPUModelRunner):
                                         n_r=n_r_dyn,
                                         input_batch=self.input_batch,
                                         block_size=int(self.block_size),
+                                        uniform_lens=_dynkv_uniform_lens,
                                     ))
                                 if _dynkv_profile:
                                     _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
@@ -2572,20 +2731,51 @@ class NPUModelRunner(GPUModelRunner):
                             all_tmp_lens = [[-1] * n_r_dyn
                                             for _ in range(_dynkv_L)]
                             slot_jobs_all = [[] for _ in range(_dynkv_L)]
+                        # Confirm builder kept the uniform fast-path
+                        # (sanity probe may have flipped to per-layer).
+                        if _dynkv_uniform_lens and all_tmp_lens is not None and len(all_tmp_lens) >= 2:
+                            if all_tmp_lens[0] is not all_tmp_lens[1]:
+                                _dynkv_uniform_lens = False
                         if all_tmp_lens is not None:
                             try:
                                 _sl0 = attn_metadata_i.seq_lens
                                 if isinstance(_sl0, torch.Tensor):
                                     _t0_st = time.perf_counter() if _dynkv_profile else 0
-                                    stacked_dyn_lens_t = torch.tensor(
-                                        all_tmp_lens,
-                                        device=_sl0.device,
-                                        dtype=_sl0.dtype,
-                                    )
+                                    if _dynkv_uniform_lens and all_tmp_lens:
+                                        # Phase B: upload only one row (n_r ints)
+                                        # then expand to [L, n_r] view for the
+                                        # downstream graph buffer fill / per-layer
+                                        # setattr (broadcasted, zero-copy).
+                                        _row1d = torch.tensor(
+                                            all_tmp_lens[0],
+                                            device=_sl0.device,
+                                            dtype=_sl0.dtype,
+                                        )
+                                        stacked_dyn_lens_t = (
+                                            _row1d.unsqueeze(0).expand(
+                                                len(all_tmp_lens), -1)
+                                        )
+                                    else:
+                                        stacked_dyn_lens_t = torch.tensor(
+                                            all_tmp_lens,
+                                            device=_sl0.device,
+                                            dtype=_sl0.dtype,
+                                        )
                                     if _dynkv_profile:
                                         _t_stacked_tensor = (time.perf_counter() - _t0_st) * 1000
                             except Exception:
                                 stacked_dyn_lens_t = None
+                        if not getattr(self, "_dynkv_uniform_lens_logged", False):
+                            logger.info(
+                                "[DynamicKV][decode] Phase B uniform_lens=%s "
+                                "(uniform_kv_budget=%s, layers=%d, n_r=%d)",
+                                _dynkv_uniform_lens,
+                                str(getattr(self.ascend_config,
+                                            "dynamic_kv_uniform_kv_budget", "off")),
+                                _dynkv_L,
+                                n_r_dyn,
+                            )
+                            self._dynkv_uniform_lens_logged = True
 
                     bs_dyn = int(self.block_size)
 
