@@ -74,6 +74,12 @@ __aicore__ inline void TqSyncSToV() {
     WaitFlag<HardEvent::S_V>(e);
 }
 
+__aicore__ inline void TqSyncVToMte3() {
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
+    SetFlag<HardEvent::V_MTE3>(e);
+    WaitFlag<HardEvent::V_MTE3>(e);
+}
+
 __aicore__ inline bool TqDebugEnabled(uint32_t debugLog) {
     if ASCEND_IS_AIV {
         return debugLog != 0;
@@ -113,15 +119,26 @@ __aicore__ inline uint8_t ArgminAbsL1Scalar(float yf, const AscendC::LocalTensor
     return bestIdx;
 }
 
-__aicore__ inline void write_norm_fp16_le(
-    AscendC::GlobalTensor<uint8_t>& packedGm, uint64_t out_base, half norm_h) {
+__aicore__ inline void write_norm_fp16_le_local(
+    AscendC::LocalTensor<uint8_t>& packedLocal, uint32_t out_offset, half norm_h) {
     union {
         half h;
         uint16_t u;
     } normBits {};
     normBits.h = norm_h;
-    packedGm.SetValue(out_base + (uint32_t)TQ_PACK_D, (uint8_t)(normBits.u & 0xFFu));
-    packedGm.SetValue(out_base + (uint32_t)TQ_PACK_D + 1, (uint8_t)((normBits.u >> 8) & 0xFFu));
+    packedLocal.SetValue(out_offset + (uint32_t)TQ_PACK_D, (uint8_t)(normBits.u & 0xFFu));
+    packedLocal.SetValue(out_offset + (uint32_t)TQ_PACK_D + 1, (uint8_t)((normBits.u >> 8) & 0xFFu));
+}
+
+// slot_w (e.g. 130) is not 32B-aligned; use DataCopyPad for GM writes.
+__aicore__ inline void copy_packed_ub_to_gm(
+    AscendC::GlobalTensor<uint8_t>& packedGm,
+    uint64_t gm_offset,
+    AscendC::LocalTensor<uint8_t>& packedLocal,
+    uint32_t nbytes) {
+    TqSyncVToMte3();
+    AscendC::DataCopyExtParams copyParams{1, nbytes, 0, 0, 0};
+    AscendC::DataCopyPad(packedGm[gm_offset], packedLocal, copyParams);
 }
 
 using TqRotateAT = MatmulType<TPosition::VECOUT, CubeFormat::ND, half>;
@@ -179,6 +196,8 @@ public:
         pipe_->InitBuffer(argminWorkBuf_, TQ_REDUCE_MIN_WORK * sizeof(half));
         pipe_->InitBuffer(idxBuf_, TQ_PACK_D * sizeof(uint8_t));
         pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
+        const uint32_t maxSlotW = slot_w_k_ > slot_w_v_ ? slot_w_k_ : slot_w_v_;
+        pipe_->InitBuffer(packedRowBuf_, maxSlotW * sizeof(uint8_t));
 
         matmulReady_ = GetSysWorkSpacePtr() != nullptr;
     }
@@ -208,7 +227,12 @@ public:
         if (!matmulReady_ || !TqIsAiv()) {
             return;
         }
-        const uint32_t subIdx = AscendC::GetSubBlockIdx() % TQ_AIV_SUB_BLOCKS;
+        // MIX 1C2V: Cube split-B via rotation_t[dBase] does not match R^T[:, dBase:dBase+N]
+        // in ND row-major GM. Use primary AIV only with the same manual rotate + full-row
+        // pack as pack_mode=1 (REGIST_MATMUL_OBJ still satisfies MIX handshake).
+        if (!TqIsPrimaryAivSub()) {
+            return;
+        }
         const uint32_t core = AscendC::GetBlockIdx() / TQ_AIV_SUB_BLOCKS;
         const uint32_t start = core * vecPerCore_;
         uint32_t end = start + vecPerCore_;
@@ -227,10 +251,8 @@ public:
             }
         }
 
-        const uint32_t dBase = subIdx * TQ_ROT_N_PER_SUB;
-        const bool writeMeta = subIdx == 0;
-        PackBatch(keyGm_, packedKGm_, start, end, slot_w_k_, dBase, TQ_ROT_N_PER_SUB, writeMeta, false);
-        PackBatch(valueGm_, packedVGm_, start, end, slot_w_v_, dBase, TQ_ROT_N_PER_SUB, writeMeta, false);
+        PackBatch(keyGm_, packedKGm_, start, end, slot_w_k_, 0, TQ_PACK_D, true, true);
+        PackBatch(valueGm_, packedVGm_, start, end, slot_w_v_, 0, TQ_PACK_D, true, true);
     }
 
 private:
@@ -327,27 +349,25 @@ private:
         TqSyncMte2ToV();
 
         auto idxLocal = idxBuf_.Get<uint8_t>();
+        auto packedRow = packedRowBuf_.Get<uint8_t>();
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t vecIdx = start + i;
             const uint64_t out_base = (uint64_t)vecIdx * slot_w;
-            // KFC cube tiling still uses baseN=128. Even when one AIV sub-block
-            // only encodes a 64-column slice, GetTensorC lays rows out with the
-            // original 128-column stride in local UB.
             const uint32_t yOff = i * TQ_ROT_N;
 
             EncodeRowBroadcast(yBatch[yOff], codebookLocal, idxLocal, dCount);
 
+            for (uint32_t k = 0; k < slot_w; ++k) {
+                packedRow.SetValue(k, (uint8_t)0);
+            }
             for (uint32_t j = 0; j < dCount; ++j) {
-                packedGm.SetValue(out_base + dBase + j, idxLocal.GetValue(j));
+                packedRow.SetValue(j, idxLocal.GetValue(j));
             }
             if (writeMeta) {
-                write_norm_fp16_le(packedGm, out_base, norms.GetValue(i));
-
-                for (uint32_t k = (uint32_t)TQ_PACK_D + 2; k < slot_w; ++k) {
-                    packedGm.SetValue(out_base + k, (uint8_t)0);
-                }
+                write_norm_fp16_le_local(packedRow, 0, norms.GetValue(i));
             }
+            copy_packed_ub_to_gm(packedGm, out_base, packedRow, slot_w);
         }
     }
 
@@ -433,6 +453,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> idxBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> packedRowBuf_;
 
     AscendC::GlobalTensor<half> keyGm_;
     AscendC::GlobalTensor<half> valueGm_;
