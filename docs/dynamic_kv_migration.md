@@ -20,17 +20,19 @@ DynamicKV 的核心思想是：**不必保留所有历史 token 的 KV**。对�
 - **新 token（cur/window）**：最近 `window_size` 个 token， 在 **每一层** 都全保留
 
 第 \(L\) 层逻辑 KV 长度（该层参与注意的有效 prompt token 数）为：`kv_len_L = old_budget_L + window_size`
-#### 1.2.1 Per-Head打分 + 并集保留
-先说明一个实现约束：vLLM 的 Paged KV Cache 是 **token-level** 的布局——每个 token 在 KV cache 里对应一个“槽位”（slot，可以理解为“这个 token 的 KV 记录位置”），并且同一个 token 的所有 KV heads 都共用这一条记录。因此，不能像开源参考那样做到“**每个 head 保留一套不同的 token 集合**”并在物理上分别压缩；一旦某个 token 被丢弃，就意味着该 token 的所有 heads 都一起丢弃。
+#### 1.2.1 Token 选择：`head_aggregation`（默认 `sum`）
 
-为尽量贴近开源语义（不丢掉任何 head 认为重要的 token），这里采用 **per-head 打分 + 并集保留**：
-1. **每个 head 各自“打分”**：把旧段里的每个 token 都看作一个候选，让每个 KV head 分别算一遍“它有多重要”。
-2. **每个 head 先各自“挑一份”**：每个 head 从旧段里先挑出自己最认可的 top-k 个 token。
-3. **把大家挑的合在一起**：把所有 head 选中的 token 取并集，得到最终要保留的 token 集合（保证任何一个 head 觉得重要的 token 都不会被丢掉）。
+先说明一个实现约束：vLLM 的 Paged KV Cache 是 **token-level** 的布局——每个 token 在 KV cache 里对应一个“槽位”，并且同一个 token 的所有 KV heads 都共用这一条记录。因此不能像开源参考那样做到“每个 head 保留一套不同的 token 集合”。
 
-**与开源的对比**：
-- 开源（按 head 压缩）：每个 head 各保留 `budget_size` 个（各 head 的集合可不同）。
-- 本实现（token-level 并集）：每个 head 先各自选出一份 top-k，再把所有 head 的结果取并集，形成最终的 token 保留集合。直观上：不同 head 选中的 token 越重合，并集越小、压缩越强；不同 head 的选择越分散，并集越大、压缩越弱。
+配置项 **`dynamic_kv.head_aggregation`**（默认 **`sum`**）控制如何把 per-head 分数合成 token 级分数，再选一组**所有 head 共用**的保留 token：
+
+| 模式 | 行为 | 适用 |
+|------|------|------|
+| **`sum`**（默认） | 各 head 分数求和后 top-k | 压缩更强、kv_len 更稳定，利于 decode/PD |
+| **`max`** | 各 head 分数取 max 后 top-k | 更保守，接近“任一 head 重要则保留” |
+| **`union`** | 各 head 各自 top-k 再并集（旧逻辑） | 兼容/对照 |
+
+**与开源的对比**：开源按 head 各保留 `budget_size` 个；本实现在 token 粒度上选一组共享 token，压缩率与质量需用业务用例验证。
 
 **保留位置（keep indices）的两种顺序**：
 - **重要性顺序（中间态）**：在算法内部，会把“要保留的旧 token 位置”按重要性从高到低排好（可理解为一个 `keep_indices` 列表）。这样当预算从 `budget_size` 收敛到 `old_budget_L` 时，只需要取前 `old_budget_L` 个即可。
@@ -87,6 +89,10 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
   - `avgpool`：让分数更平滑，减少“单点尖峰”。
   - `maxpool`：更偏向“邻域内只要有高响应就抬高”。
   - `none`：不做平滑。
+
+- **head_aggregation**（默认 `sum`）：per-head 分数如何合成 token 级分数并选保留 token（见 §1.2.1）。
+  - `sum` / `max`：所有 head 共用一组 token（推荐 decode 性能）。
+  - `union`：legacy 并集逻辑。
 
 - **validation_mode**：验证/对照模式（默认 `none`）。
   - `none`：正常压缩（可能改写/pack KV，并导出 `per_layer_kv_lens` 等）。
@@ -281,5 +287,20 @@ vLLM 的 Paged KV Cache 以 **token** 为最小管理粒度（一个 token 对�
 
 - **分层结果需要跨进程传递**：prefill 侧算出的 `per_layer_kv_lens` 等，需要通过 `kv_transfer_params` 传给 decode 侧才能生效。
 - **物理传输/显存收缩（可选）**：在 offload + PD 场景下，可以进一步只传输/只占用“压缩后前缀”所需的 blocks，以降低 decode 侧 KV 占用。
+
+### 6.4 Decode 路径：PA vs PIA（FIA）
+
+| 路径 | 判定 | Attention 算子 | DynamicKV lens 注入 |
+|------|------|----------------|---------------------|
+| **PA** | `runtime_shape ∈ pa_shape_list` 且 FULL graph | `_npu_paged_attention` | `pa_dynamic_kv_context_lens` → `context_lens` |
+| **PIA** | 否则（含 `--enforce-eager` 或 shape 不在 list） | `npu_fusion_attention`（FIA） | `fia_dynamic_kv_actual_seq_lengths_kv_list` → `actual_seq_lengths_kv` |
+
+**prepare**（`dynkv_branch`、uniform 缓存、`stacked_dyn_lens`）对 PA/PIA **共用**。
+
+**forward / model_acl** 已对齐的 PA→PIA 迁移项：
+
+- FIA graph `graph_task_update`：与 PA 相同，从 metadata 刷新 `block_tables`、优先 `dynamic_kv_seq_lens_tensor`
+- 图 capture 注册：除 PA 的 `attn_params[..][7]` 外，支持 FIA 的 `attn_params[..][6]` 作为 pinned lens buffer
+- `VLLM_DYNKV_PROFILE_MODEL_ACL=1`：FIA 路径同样输出 `ctx_lens` / `block_table` / `gu_fia` 细分
 
 ---

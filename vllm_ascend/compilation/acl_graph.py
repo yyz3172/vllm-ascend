@@ -23,7 +23,7 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.attention.utils import (
     dynkv_profile_pa_enabled,
-    fia_dynamic_kv_seq_lens_list,
+    fia_dynamic_kv_seq_lens_for_graph_update,
     is_dynamic_kv_enabled,
     pa_dynamic_kv_context_lens_for_graph_update,
     using_paged_attention,
@@ -44,6 +44,7 @@ _DYNKV_MODEL_ACL_ACC: dict[str, float] = {
     "graph_update_ms": 0.0,
     "gu_begin_ms": 0.0,
     "gu_pa_ms": 0.0,
+    "gu_fia_ms": 0.0,
     "gu_end_ms": 0.0,
     "event_record_ms": 0.0,
     "loop_other_ms": 0.0,
@@ -74,12 +75,13 @@ def dynkv_model_acl_profile_log() -> None:
     other = float(_DYNKV_MODEL_ACL_ACC["loop_other_ms"])
     gu_begin = float(_DYNKV_MODEL_ACL_ACC["gu_begin_ms"])
     gu_pa = float(_DYNKV_MODEL_ACL_ACC["gu_pa_ms"])
+    gu_fia = float(_DYNKV_MODEL_ACL_ACC["gu_fia_ms"])
     gu_end = float(_DYNKV_MODEL_ACL_ACC["gu_end_ms"])
     bt_swap = int(_DYNKV_MODEL_ACL_ACC["block_table_swap"])
     logger.info(
         "[DynamicKV][model_acl_profile] layers=%d ctx_lens=%.2fms "
         "block_table=%.2fms block_table_swap=%d graph_update=%.2fms "
-        "gu_begin=%.2fms gu_pa=%.2fms gu_end=%.2fms event_record=%.2fms "
+        "gu_begin=%.2fms gu_pa=%.2fms gu_fia=%.2fms gu_end=%.2fms event_record=%.2fms "
         "loop_other=%.2fms total=%.2fms "
         "per_layer_ctx=%.3fms per_layer_graph_update=%.3fms",
         layers,
@@ -89,6 +91,7 @@ def dynkv_model_acl_profile_log() -> None:
         gu,
         gu_begin,
         gu_pa,
+        gu_fia,
         gu_end,
         ev,
         other,
@@ -476,6 +479,11 @@ def _update_attn_fia_params(update_stream,
         attn_keys = attn_keys * (
             len(graph_params.attn_params[runtime_shape]) // num_layers)
     attn_count = 0
+    _prof = dynkv_model_acl_profile_enabled()
+    _dynkv_on = is_dynamic_kv_enabled()
+    if _prof:
+        dynkv_model_acl_profile_reset()
+        _t0_total = time.perf_counter()
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
                 attn_keys,
@@ -489,18 +497,45 @@ def _update_attn_fia_params(update_stream,
 
             if forward_context.is_draft_model:
                 draft_step = attn_count // num_layers
-                seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                actual_seq_lengths_q = attn_metadata[draft_step][
-                    key].actual_seq_lengths_q
+                meta = attn_metadata[draft_step][key]
+                seq_lens = meta.seq_lens_list
+                actual_seq_lengths_q = meta.actual_seq_lengths_q
                 attn_count = attn_count + 1
             else:
                 meta = attn_metadata[key]
-                seq_lens = fia_dynamic_kv_seq_lens_list(meta)
+                if _dynkv_on:
+                    if _prof:
+                        _t0_ctx = time.perf_counter()
+                    seq_lens = fia_dynamic_kv_seq_lens_for_graph_update(
+                        meta, seq_lens)
+                    if _prof:
+                        _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"] += (
+                            time.perf_counter() - _t0_ctx) * 1000
+                        _t0_bt = time.perf_counter()
+                    meta_block_table = getattr(meta, "block_tables", None)
+                    if meta_block_table is not None:
+                        if (_prof and isinstance(block_tables, torch.Tensor)
+                                and isinstance(meta_block_table, torch.Tensor)
+                                and block_tables.data_ptr()
+                                != meta_block_table.data_ptr()):
+                            _DYNKV_MODEL_ACL_ACC["block_table_swap"] += 1.0
+                        block_tables = meta_block_table
+                    if _prof:
+                        _DYNKV_MODEL_ACL_ACC["block_table_ms"] += (
+                            time.perf_counter() - _t0_bt) * 1000
+                else:
+                    seq_lens = meta.seq_lens_list
                 if seq_lens is None:
                     seq_lens = meta.seq_lens_list
                 actual_seq_lengths_q = meta.actual_seq_lengths_q
 
+            if _prof:
+                _t0_gu = time.perf_counter()
             torch.npu.graph_task_update_begin(update_stream, handle)
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["gu_begin_ms"] += (
+                    time.perf_counter() - _t0_gu) * 1000
+                _t0_fia = time.perf_counter()
             torch_npu.npu_fused_infer_attention_score.out(
                 query=query,
                 key=key_cache,
@@ -518,9 +553,36 @@ def _update_attn_fia_params(update_stream,
                 workspace=graph_params.workspaces.get(runtime_shape),
                 out=[attn_output, softmax_lse],
             )
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["gu_fia_ms"] += (
+                    time.perf_counter() - _t0_fia) * 1000
+                _t0_gu_end = time.perf_counter()
             torch.npu.graph_task_update_end(update_stream)
-
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["gu_end_ms"] += (
+                    time.perf_counter() - _t0_gu_end) * 1000
+                _DYNKV_MODEL_ACL_ACC["graph_update_ms"] += (
+                    time.perf_counter() - _t0_gu) * 1000
+                _t0_ev = time.perf_counter()
             event.record(update_stream)
+            if _prof:
+                _DYNKV_MODEL_ACL_ACC["event_record_ms"] += (
+                    time.perf_counter() - _t0_ev) * 1000
+                _DYNKV_MODEL_ACL_ACC["layers"] += 1.0
+    if _prof:
+        _DYNKV_MODEL_ACL_ACC["total_ms"] = (
+            time.perf_counter() - _t0_total) * 1000
+        _sum_parts = (
+            _DYNKV_MODEL_ACL_ACC["ctx_lens_ms"]
+            + _DYNKV_MODEL_ACL_ACC["block_table_ms"]
+            + _DYNKV_MODEL_ACL_ACC["graph_update_ms"]
+            + _DYNKV_MODEL_ACL_ACC["event_record_ms"]
+        )
+        _DYNKV_MODEL_ACL_ACC["loop_other_ms"] = max(
+            0.0,
+            _DYNKV_MODEL_ACL_ACC["total_ms"] - _sum_parts,
+        )
+        dynkv_model_acl_profile_log()
 
 
 def update_attn_params(update_stream,

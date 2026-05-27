@@ -60,6 +60,71 @@ def fia_dynamic_kv_seq_lens_list(attn_metadata: Any) -> list[int] | None:
     )
 
 
+def fia_dynamic_kv_actual_seq_lengths_kv_list(
+    attn_metadata: Any,
+) -> list[int] | None:
+    """Per-request KV lengths for eager FIA (``actual_seq_lengths_kv``).
+
+    Mirrors ``pa_dynamic_kv_context_lens`` but returns a Python list for the
+    FIA API. Uses ``dynamic_kv_seq_lens_list`` / tensor from prepare when set.
+    """
+    if not is_dynamic_kv_enabled():
+        sl = getattr(attn_metadata, "seq_lens_list", None)
+        if sl is not None:
+            return list(sl)
+        seq = getattr(attn_metadata, "seq_lens", None)
+        if isinstance(seq, torch.Tensor):
+            return seq.tolist()
+        return None
+    merged = fia_dynamic_kv_seq_lens_list(attn_metadata)
+    if merged is not None:
+        return merged
+    sl = getattr(attn_metadata, "seq_lens_list", None)
+    if sl is not None:
+        return list(sl)
+    seq = getattr(attn_metadata, "seq_lens", None)
+    if isinstance(seq, torch.Tensor):
+        return seq.tolist()
+    return None
+
+
+def fia_dynamic_kv_seq_lens_for_graph_update(
+    attn_metadata: Any,
+    seq_lens_buf: object | None,
+) -> list[int] | None:
+    """FIA graph ``actual_seq_lengths_kv`` for ``graph_task_update`` (PIA path).
+
+    When the captured buffer is a pinned tensor (prepare-filled), refresh it
+    in-place from ``dynamic_kv_seq_lens_tensor`` before building the list passed
+    to ``graph_task_update`` (FIA still expects a list at the API boundary).
+    """
+    if not is_dynamic_kv_enabled():
+        sl = getattr(attn_metadata, "seq_lens_list", None)
+        return list(sl) if sl is not None else None
+    pinned = getattr(attn_metadata, "dynamic_kv_seq_lens_tensor", None)
+    sl = getattr(attn_metadata, "seq_lens", None)
+    if (
+        isinstance(seq_lens_buf, torch.Tensor)
+        and isinstance(pinned, torch.Tensor)
+        and pinned.data_ptr() == seq_lens_buf.data_ptr()
+        and isinstance(sl, torch.Tensor)
+        and pinned.device == sl.device
+        and pinned.dtype == sl.dtype
+    ):
+        n_active = int(sl.numel())
+        n_copy = min(n_active, int(seq_lens_buf.numel()))
+        if n_copy > 0 and seq_lens_buf.data_ptr() != pinned.data_ptr():
+            if getattr(attn_metadata, "dynamic_kv_lens_has_negative", None) is False:
+                seq_lens_buf[:n_copy].copy_(pinned[:n_copy])
+            elif not (pinned < 0).any():
+                seq_lens_buf[:n_copy].copy_(pinned[:n_copy])
+            else:
+                seq_lens_buf[:n_copy].copy_(
+                    torch.where(pinned[:n_copy] >= 0, pinned[:n_copy], sl[:n_copy]))
+        _dynkv_zero_graph_buf_tails([seq_lens_buf], n_active)
+    return fia_dynamic_kv_actual_seq_lengths_kv_list(attn_metadata)
+
+
 def pa_dynamic_kv_context_lens(attn_metadata: Any) -> torch.Tensor:
     """Paged-attention ``context_lens`` for PD DynamicKV decode.
 

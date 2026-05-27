@@ -2128,8 +2128,15 @@ class NPUModelRunner(GPUModelRunner):
                 if i >= len(params_list):
                     break
                 param = params_list[i]
+                # PA FULL graph: context_lens at index 7.
+                # FIA FULL graph (PIA): actual_seq_lengths_kv at index 6.
+                buf = None
                 if len(param) > 7 and isinstance(param[7], torch.Tensor):
-                    bufs[str(layer_name)] = param[7]
+                    buf = param[7]
+                elif len(param) > 6 and isinstance(param[6], torch.Tensor):
+                    buf = param[6]
+                if buf is not None:
+                    bufs[str(layer_name)] = buf
             if bufs:
                 self._dynkv_graph_context_lens_bufs[cap_key] = bufs
                 return bufs
@@ -5667,14 +5674,14 @@ class NPUModelRunner(GPUModelRunner):
                     if getattr(attn_metadata[ln], "slot_mapping", None)
                     is not None
                 }
-                if using_paged_attention(int(num_tokens), self.vllm_config):
-                    self._dynkv_graph_context_lens_bufs[int(num_tokens)] = {
-                        str(ln): attn_metadata[ln].seq_lens
-                        for ln in attn_metadata
-                        if isinstance(
-                            getattr(attn_metadata[ln], "seq_lens", None),
-                            torch.Tensor)
-                    }
+                # PA: seq_lens tensor per layer; FIA (PIA): same field when captured.
+                self._dynkv_graph_context_lens_bufs[int(num_tokens)] = {
+                    str(ln): attn_metadata[ln].seq_lens
+                    for ln in attn_metadata
+                    if isinstance(
+                        getattr(attn_metadata[ln], "seq_lens", None),
+                        torch.Tensor)
+                }
 
         return attn_metadata
 

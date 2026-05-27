@@ -59,6 +59,7 @@ from vllm_ascend.attention.dynamic_kv import (
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          dynkv_profile_pa_enabled,
                                          enable_cp,
+                                         fia_dynamic_kv_actual_seq_lengths_kv_list,
                                          is_dynamic_kv_enabled,
                                          pa_dynamic_kv_context_lens,
                                          split_decodes_and_prefills,
@@ -804,7 +805,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor,
                         attn_metadata: AscendMetadata):
-        dyn_lens_list = getattr(attn_metadata, "dynamic_kv_seq_lens_list", None)
+        def _decode_kv_lens() -> list[int] | None:
+            return fia_dynamic_kv_actual_seq_lengths_kv_list(attn_metadata)
 
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             block_size = 128
@@ -826,8 +828,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_block, block_size, -1)
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1)
-            actual_seq_lengths_kv = self._merge_seq_lens_with_fallback(
-                dyn_lens_list, attn_metadata.seq_lens_list)
+            actual_seq_lengths_kv = _decode_kv_lens()
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
             key = self.key_cache.view(  # type: ignore
@@ -835,8 +836,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1)
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = self._merge_seq_lens_with_fallback(
-                dyn_lens_list, attn_metadata.seq_lens_list)
+            actual_seq_lengths_kv = _decode_kv_lens()
         # chunked prefill.
         else:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
@@ -845,8 +845,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = self.value_cache.view(  # type: ignore
                 num_block, block_size, -1)
             block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = self._merge_seq_lens_with_fallback(
-                dyn_lens_list, attn_metadata.seq_lens_list)
+            actual_seq_lengths_kv = _decode_kv_lens()
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor,
@@ -874,7 +873,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             scale=self.scale,
             block_table=attn_metadata.block_tables,
             actual_seq_lengths=[1] * len(attn_metadata.seq_lens),
-            actual_seq_lengths_kv=attn_metadata.seq_lens,
+            actual_seq_lengths_kv=(
+                fia_dynamic_kv_actual_seq_lengths_kv_list(attn_metadata)
+                or attn_metadata.seq_lens.tolist()),
         )
 
         output = output.view(batch_size, self.num_heads, self.head_size)
