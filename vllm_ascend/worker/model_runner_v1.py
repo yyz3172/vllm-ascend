@@ -1418,8 +1418,12 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_decode_uniform_lens_state: Optional[bool] = None
         self._dynkv_layer_idx_map_by_names: dict[tuple[str, ...], dict[str, int]] = (
             {})
-        # P2: reuse ``req_idx_t == r`` masks across steady decode steps.
-        self._dynkv_decode_slot_mask_cache: dict[int, torch.Tensor] = {}
+        # P3: cache workspace-backed views for decode prepare hot-path.
+        # Keyed by (cap_key, tuple(layer_names), n_sm, device, dtype) / (cap_key, tuple(layer_names), n_buf, device, dtype).
+        self._dynkv_prepare_slot_stack_cache_key: Optional[tuple] = None
+        self._dynkv_prepare_slot_stack_cache_val: Optional[tuple[torch.Tensor, bool]] = None
+        self._dynkv_prepare_ctx_stack_cache_key: Optional[tuple] = None
+        self._dynkv_prepare_ctx_stack_cache_val: Optional[tuple[torch.Tensor, bool]] = None
         self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
         # One-shot status banner: emit DynamicKV config + which profile knobs
         # are on (PREPARE / FORWARD / MODEL_ACL / FIA / PA) once any profile is
@@ -2224,6 +2228,48 @@ class NPUModelRunner(GPUModelRunner):
                 break
         return stack, alias
 
+    def _resolve_dynkv_ctx_stack_from_workspace_cached(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+        n_buf: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        """P3: cache ctx_stack view/alias across decode steps."""
+        try:
+            cap_key = self._resolve_context_lens_workspace_cap_key(int(num_input_tokens))
+        except Exception:
+            cap_key = int(num_input_tokens)
+        key = (
+            int(cap_key),
+            tuple(layer_names),
+            int(n_buf),
+            str(device),
+            str(dtype),
+        )
+        if (
+            getattr(self, "_dynkv_prepare_ctx_stack_cache_key", None) == key
+            and getattr(self, "_dynkv_prepare_ctx_stack_cache_val", None) is not None
+        ):
+            stack, alias = self._dynkv_prepare_ctx_stack_cache_val  # type: ignore[misc]
+            if (
+                isinstance(stack, torch.Tensor)
+                and int(stack.shape[0]) >= len(layer_names)
+                and int(stack.shape[1]) >= int(n_buf)
+                and stack.device == device
+                and stack.dtype == dtype
+            ):
+                return stack, bool(alias)
+        stack, alias = self._resolve_dynkv_ctx_stack_from_workspace(
+            int(num_input_tokens), layer_names, int(n_buf)
+        )
+        if stack is not None:
+            self._dynkv_prepare_ctx_stack_cache_key = key
+            self._dynkv_prepare_ctx_stack_cache_val = (stack, bool(alias))
+        return stack, bool(alias)
+
     @staticmethod
     def _layer_rows_contiguous(rows: list[int]) -> bool:
         if not rows:
@@ -2349,6 +2395,46 @@ class NPUModelRunner(GPUModelRunner):
                 sb = self._dynkv_slot_stack_buf
             stack = sb[:len(layer_names), :int(n_sm)]
         return stack, alias
+
+    def _dynkv_get_slot_stack_for_prepare_cached(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+        n_sm: int,
+        base_sm: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        """P3: cache slot stack view/alias across decode steps."""
+        try:
+            cap_key = self._resolve_slot_workspace_cap_key(int(num_input_tokens))
+        except Exception:
+            cap_key = int(num_input_tokens)
+        key = (
+            int(cap_key),
+            tuple(layer_names),
+            int(n_sm),
+            str(base_sm.device),
+            str(base_sm.dtype),
+        )
+        if (
+            getattr(self, "_dynkv_prepare_slot_stack_cache_key", None) == key
+            and getattr(self, "_dynkv_prepare_slot_stack_cache_val", None) is not None
+        ):
+            stack, alias = self._dynkv_prepare_slot_stack_cache_val  # type: ignore[misc]
+            if (
+                isinstance(stack, torch.Tensor)
+                and int(stack.shape[0]) >= len(layer_names)
+                and int(stack.shape[1]) >= int(n_sm)
+                and stack.device == base_sm.device
+                and stack.dtype == base_sm.dtype
+            ):
+                return stack, bool(alias)
+        stack, alias = self._dynkv_ensure_slot_stack_for_prepare(
+            int(num_input_tokens), layer_names, int(n_sm), base_sm
+        )
+        if stack is not None:
+            self._dynkv_prepare_slot_stack_cache_key = key
+            self._dynkv_prepare_slot_stack_cache_val = (stack, bool(alias))
+        return stack, bool(alias)
 
     @staticmethod
     def _dynkv_copy_active_sm_to_stack(
@@ -3427,7 +3513,7 @@ class NPUModelRunner(GPUModelRunner):
                         _graph_slot_bufs is not None and _slot_n_sm > 0)
                     if _dynkv_L > 0 and _dynkv_n > 0:
                         _dynkv_stack, _slot_workspace_alias = (
-                            self._dynkv_ensure_slot_stack_for_prepare(
+                            self._dynkv_get_slot_stack_for_prepare_cached(
                                 int(num_input_tokens),
                                 _dynkv_layer_names,
                                 min(_slot_n_sm, _dynkv_n),
@@ -3689,10 +3775,12 @@ class NPUModelRunner(GPUModelRunner):
                         try:
                             _n_ctx_buf = int(attn_metadata_i.seq_lens.numel())
                             _ctx_stack, _ctx_workspace_alias = (
-                                self._resolve_dynkv_ctx_stack_from_workspace(
+                                self._resolve_dynkv_ctx_stack_from_workspace_cached(
                                     int(num_input_tokens),
                                     _dynkv_layer_names,
                                     _n_ctx_buf,
+                                    device=attn_metadata_i.seq_lens.device,
+                                    dtype=attn_metadata_i.seq_lens.dtype,
                                 ))
                             dynkv_fill_all_graph_context_lens_bufs(
                                 layer_names=_dynkv_layer_names,

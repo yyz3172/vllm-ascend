@@ -115,6 +115,7 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **P0 decode prepare**（代码内恒开，无 yaml 开关）：active-only 上传/拷贝、稳态标量 slot_remap、uniform 时 row0 广播 slot_assign、优先 slot workspace alias、复用 layer metadata 壳。
 - **P1 decode prepare**（代码内恒开）：``fixed_base`` 下 uniform 检测首步缓存；``context_lens`` graph buf 按 capture bucket 只 register 一次；``layer_idx_map`` 按 ``layer_names`` 缓存；uniform 时 ``dynamic_kv_lens_has_negative`` 每步只算一次。
 - **P2 decode slot_remap**（回滚）：稳态 slot 每步都变（tgt = Li + decode_step），skip 不命中；前置标量与函数内 P0 scalar 路径重复，整体略变慢，已回滚至 P0 基线。辅助函数 ``_dynkv_uniform_single_job`` / ``_dynkv_compute_phys_slot_scalar`` 保留供后续扩展。
+- **P3 decode prepare**（代码内恒开）：缓存 decode prepare 热路径的 workspace view（slot stack / ctx stack）的解析结果，按 capture bucket + layer_names + shape + dtype/device 复用，减少每步 `_resolve_*_from_workspace` 的行映射/alias 校验与切片开销；目标字段为 `branch_setup = stack_init + ctx_fill_batch`。
 
 - **Prepare profile**（``VLLM_DYNKV_PROFILE_PREPARE=1``）：每步一行 ``[prepare_profile]``（含 ``profile_prepare_est`` 等决策字段）。
   - 解析：`parse_dynkv_prepare_profile.py``（默认）；旧版 ext/reconcile/loop 用 ``--view legacy``。
