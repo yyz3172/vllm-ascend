@@ -615,6 +615,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._dynamickv_softmax_chunk_size = int(getattr(ascend_cfg, "dynamic_kv_softmax_chunk_size", 1024) or 1024)
         self._dynamickv_radio_max = float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0))
         self._dynamickv_radio_min = float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1))
+        self._dynamickv_head_aggregation = str(
+            getattr(ascend_cfg, "dynamic_kv_head_aggregation", "sum")
+        )
         self._dynamickv_validation_mode = str(getattr(ascend_cfg, "dynamic_kv_validation_mode", "none"))
         # L1 (algo-2 Phase A): cross-layer uniform old-token budget; per-layer keep sets unchanged.
         self._dynamickv_uniform_kv_budget = str(
@@ -1420,6 +1423,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 num_hidden_layers=num_layers,
                                 window_size=int(self._dynamickv_window_size),
                                 max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
+                                head_aggregation=str(self._dynamickv_head_aggregation),
                                 pooling=(
                                     "avgpool"
                                     if self._dynamickv_pooling == "avgpool"
@@ -1530,6 +1534,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                         num_hidden_layers=len(scores_layers),
                                         window_size=int(self._dynamickv_window_size),
                                         max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
+                                        head_aggregation=str(self._dynamickv_head_aggregation),
                                         pooling="none",
                                         kernel_size=1,
                                         softmax_chunk_size=int(self._dynamickv_softmax_chunk_size),
@@ -1653,6 +1658,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             num_hidden_layers=num_layers,
                             window_size=int(self._dynamickv_window_size),
                             max_capacity_prompt=int(self._dynamickv_prompt_kv_len_budget),
+                            head_aggregation=str(self._dynamickv_head_aggregation),
                             pooling=(
                                 "avgpool"
                                 if self._dynamickv_pooling == "avgpool"

@@ -4891,6 +4891,7 @@ class NPUModelRunner(GPUModelRunner):
                                     radio_max=float(getattr(ascend_cfg, "dynamic_kv_radio_max", 10.0)),
                                     radio_min=float(getattr(ascend_cfg, "dynamic_kv_radio_min", 0.1)),
                                     num_layers=num_layers,
+                                    head_aggregation=str(getattr(ascend_cfg, "dynamic_kv_head_aggregation", "sum")),
                                     validation_mode=str(
                                         getattr(ascend_cfg, "dynamic_kv_validation_mode", "none")
                                     ),

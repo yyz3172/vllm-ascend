@@ -175,6 +175,21 @@ class AscendConfig:
         # DynamicKV knobs (optional; radio_* match upstream reference).
         self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
         self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
+        # DynamicKV head aggregation strategy when selecting old tokens.
+        # This controls how per-head token scores are aggregated into a single
+        # token-level score before top-k selection:
+        # - "sum": aggregate by sum across KV heads (default; faster/more stable kv_len).
+        # - "max": aggregate by max across KV heads (more conservative; closer to union).
+        # - "union": legacy behavior: per-head top-k then union (token preserved if any head selects it).
+        _ha = str(dyn.get("head_aggregation", "sum")).strip().lower()
+        if _ha in ("sum", "max", "union"):
+            self.dynamic_kv_head_aggregation = _ha
+        else:
+            logger.warning_once(
+                "Unknown dynamic_kv.head_aggregation=%r; using sum.",
+                dyn.get("head_aggregation"),
+            )
+            self.dynamic_kv_head_aggregation = "sum"
         # Offload only: skip packed-prefix rewrite when (prompt_len - budget) is
         # below this many tokens (avoids fragile pack for tiny over-budget deltas).
         self.dynamic_kv_min_rewrite_delta = max(0, int(dyn.get("min_rewrite_delta", 128)))

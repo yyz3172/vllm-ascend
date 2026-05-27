@@ -457,13 +457,21 @@ def scores_and_indices_old_perhead_aggregated_paged_cache(
     if budget_size <= 0:
         return scores_old, key_cache.new_zeros((0,), dtype=torch.long)
 
-    indices_per_head = torch.topk(scores_old, k=budget_size, dim=-1).indices
-    flat_indices = indices_per_head.flatten()
-    union_indices = torch.unique(flat_indices)
-    # Importance for union: max over heads
-    union_scores = scores_old.index_select(1, union_indices).amax(dim=0)
-    union_order = torch.topk(union_scores, k=int(union_scores.numel()), dim=0).indices
-    indices_old = union_indices.index_select(0, union_order)
+    ha = str(getattr(cfg, "head_aggregation", "sum")).strip().lower()
+    if ha in ("sum", "max"):
+        # Token-level selection: all KV heads share the same kept-token set.
+        # This avoids per-head topk + union, and tends to reduce kv_len inflation.
+        token_scores = scores_old.sum(dim=0) if ha == "sum" else scores_old.amax(dim=0)
+        indices_old = torch.topk(token_scores, k=budget_size, dim=-1).indices.to(torch.long)
+    else:
+        # Legacy: per-head top-k, then union across heads (token kept if ANY head selects it).
+        indices_per_head = torch.topk(scores_old, k=budget_size, dim=-1).indices
+        flat_indices = indices_per_head.flatten()
+        union_indices = torch.unique(flat_indices)
+        # Importance for union: max over heads
+        union_scores = scores_old.index_select(1, union_indices).amax(dim=0)
+        union_order = torch.topk(union_scores, k=int(union_scores.numel()), dim=0).indices
+        indices_old = union_indices.index_select(0, union_order)
     return scores_old, indices_old
 
 
@@ -478,6 +486,9 @@ class DynamicKVConfig:
     num_hidden_layers: int
     window_size: int
     max_capacity_prompt: int
+    # How to aggregate per-head token scores into token-level scores when
+    # selecting old tokens: sum|max|union (legacy).
+    head_aggregation: str = "sum"
     pooling: str = "avgpool"  # avgpool|maxpool|none
     kernel_size: int = 7
     # Chunk size (in tokens) for chunked softmax in token score computation.
