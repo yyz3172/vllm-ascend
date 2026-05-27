@@ -701,6 +701,110 @@ def _dynkv_slot_scalar_from_tgt(
     return int(blk * bs + (tp % bs))
 
 
+def _dynkv_uniform_single_job(
+    slot_jobs_all: list[list[tuple[int, int, int]]],
+) -> Optional[tuple[int, int, int]]:
+    """First-layer job list when uniform_lens shares jobs across layers."""
+    if not slot_jobs_all or not slot_jobs_all[0]:
+        return None
+    jobs0 = slot_jobs_all[0]
+    if len(jobs0) != 1:
+        return None
+    return jobs0[0]
+
+
+def _dynkv_compute_phys_slot_scalar(
+    *,
+    block_tables: torch.Tensor,
+    token_pos_t: torch.Tensor,
+    req_idx_t: torch.Tensor,
+    job_req_idx: int,
+    job_base_tokens: int,
+    job_Li: int,
+    block_size: int,
+) -> Optional[int]:
+    """CPU scalar: physical slot for one active decode token (or None)."""
+    if int(job_Li) < 0:
+        return None
+    if int(token_pos_t.numel()) < 1 or int(req_idx_t.numel()) < 1:
+        return None
+    if int(req_idx_t[0].item()) != int(job_req_idx):
+        return None
+    rel = int(token_pos_t[0].item()) - (int(job_base_tokens) - 1)
+    tgt = int(job_Li) + rel
+    max_blocks = int(block_tables.shape[1]) - 1
+    bt_row = block_tables[int(job_req_idx)]
+    return _dynkv_slot_scalar_from_tgt(
+        bt_row, tgt, int(block_size), max_blocks)
+
+
+def _dynkv_get_req_slot_mask(
+    job_req_idx: int,
+    req_idx_t: torch.Tensor,
+    mask_cache: Optional[dict[int, torch.Tensor]],
+) -> torch.Tensor:
+    """P2: reuse boolean mask ``req_idx_t == job_req_idx`` across decode steps."""
+    if mask_cache is None:
+        return req_idx_t == int(job_req_idx)
+    key = int(job_req_idx)
+    hit = mask_cache.get(key)
+    if hit is not None:
+        return hit
+    hit = req_idx_t == key
+    mask_cache[key] = hit
+    return hit
+
+
+def _dynkv_try_steady_decode_slot_remap_skip(
+    *,
+    base_sm: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_pos_t: torch.Tensor,
+    req_idx_t: torch.Tensor,
+    slot_jobs_all: list[list[tuple[int, int, int]]],
+    n_active: int,
+    uniform_lens: bool,
+    block_size: int,
+    decode_state_cache: Optional[dict[str, dict]] = None,
+    rid_list: Optional[list[str]] = None,
+) -> bool:
+    """P2: skip ``copy_active`` + batched remap when physical slot is unchanged.
+
+    Steady PD decode (1 active token, 1 remap job, uniform lens): if the packed
+    physical slot equals ``base_sm[0]``, graph slot buffers already match and
+    no stack write is needed.
+    """
+    if not uniform_lens or int(n_active) != 1:
+        return False
+    job = _dynkv_uniform_single_job(slot_jobs_all)
+    if job is None:
+        return False
+    job_req_idx, job_base_tokens, job_Li = job
+    new_slot = _dynkv_compute_phys_slot_scalar(
+        block_tables=block_tables,
+        token_pos_t=token_pos_t,
+        req_idx_t=req_idx_t,
+        job_req_idx=int(job_req_idx),
+        job_base_tokens=int(job_base_tokens),
+        job_Li=int(job_Li),
+        block_size=int(block_size),
+    )
+    if new_slot is None:
+        return False
+    if int(base_sm[0].item()) != int(new_slot):
+        return False
+    if decode_state_cache is not None and rid_list is not None:
+        rid_here = (
+            rid_list[int(job_req_idx)]
+            if int(job_req_idx) < len(rid_list) else None
+        )
+        if rid_here is not None:
+            ent = decode_state_cache.get(rid_here)
+            if ent is not None:
+                ent["last_phys_slot"] = int(new_slot)
+    return True
+
+
 def _dynkv_try_uniform_scalar_slot_remap(
     *,
     stack_view: torch.Tensor,
@@ -715,6 +819,8 @@ def _dynkv_try_uniform_scalar_slot_remap(
     block_size: int,
     n_active: int,
     steady_skip: bool,
+    decode_state_cache: Optional[dict[str, dict]] = None,
+    rid_list: Optional[list[str]] = None,
 ) -> bool:
     """P0-1: one active token + one job — scalar remap on CPU; optional skip if equal.
 
@@ -724,21 +830,42 @@ def _dynkv_try_uniform_scalar_slot_remap(
         return False
     if int(token_pos_t.numel()) < 1 or int(req_idx_t.numel()) < 1:
         return False
-    if int(req_idx_t[0].item()) != int(job_req_idx):
+    new_slot = _dynkv_compute_phys_slot_scalar(
+        block_tables=block_tables,
+        token_pos_t=token_pos_t,
+        req_idx_t=req_idx_t,
+        job_req_idx=int(job_req_idx),
+        job_base_tokens=int(job_base_tokens),
+        job_Li=int(job_Li),
+        block_size=int(block_size),
+    )
+    if new_slot is None:
         return False
-    rel = int(token_pos_t[0].item()) - (int(job_base_tokens) - 1)
-    tgt = int(job_Li) + rel
-    max_blocks = int(block_tables.shape[1]) - 1
-    bt_row = block_tables[int(job_req_idx)]
-    new_slot = _dynkv_slot_scalar_from_tgt(
-        bt_row, tgt, int(block_size), max_blocks)
     cur_slot = int(base_sm[0].item())
-    if steady_skip and new_slot == cur_slot:
+    if steady_skip and int(new_slot) == cur_slot:
+        if decode_state_cache is not None and rid_list is not None:
+            rid_here = (
+                rid_list[int(job_req_idx)]
+                if int(job_req_idx) < len(rid_list) else None
+            )
+            if rid_here is not None:
+                ent = decode_state_cache.get(rid_here)
+                if ent is not None:
+                    ent["last_phys_slot"] = int(new_slot)
         return True
     slot_v = base_sm.new_tensor([new_slot], dtype=base_sm.dtype)
     stack_view[0, 0] = slot_v[0]
     if n_layers > 1:
         stack_view[1:n_layers, 0] = slot_v[0]
+    if decode_state_cache is not None and rid_list is not None:
+        rid_here = (
+            rid_list[int(job_req_idx)]
+            if int(job_req_idx) < len(rid_list) else None
+        )
+        if rid_here is not None:
+            ent = decode_state_cache.get(rid_here)
+            if ent is not None:
+                ent["last_phys_slot"] = int(new_slot)
     return True
 
 
@@ -786,6 +913,7 @@ def _dynkv_perjob_slot_remap_to_stack(
     if n_active < n_sm:
         token_pos_t = token_pos_t[:n_active]
         req_idx_t = req_idx_t[:n_active]
+
     job_key_to_Li = _dynkv_build_job_key_to_Li_per_layer(
         slot_jobs_all, n_layers, uniform_lens=uniform_lens)
     job_keys_list = list(job_key_to_Li.keys())
@@ -1290,6 +1418,8 @@ class NPUModelRunner(GPUModelRunner):
         self._dynkv_decode_uniform_lens_state: Optional[bool] = None
         self._dynkv_layer_idx_map_by_names: dict[tuple[str, ...], dict[str, int]] = (
             {})
+        # P2: reuse ``req_idx_t == r`` masks across steady decode steps.
+        self._dynkv_decode_slot_mask_cache: dict[int, torch.Tensor] = {}
         self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
         # One-shot status banner: emit DynamicKV config + which profile knobs
         # are on (PREPARE / FORWARD / MODEL_ACL / FIA / PA) once any profile is
