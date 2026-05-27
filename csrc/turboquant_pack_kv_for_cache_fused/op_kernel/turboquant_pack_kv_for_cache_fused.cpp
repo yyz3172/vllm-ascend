@@ -185,14 +185,13 @@ public:
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
         pipe_->InitBuffer(xBatchQue_, 1, batchElems * sizeof(half));
         pipe_->InitBuffer(yBatchQue_, 1, batchElems * sizeof(half));
-        pipe_->InitBuffer(sqBuf_, TQ_PACK_D * sizeof(half));
-        pipe_->InitBuffer(reduceWorkBuf_, TQ_PACK_D * sizeof(half));
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * sizeof(half));
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
         pipe_->InitBuffer(diffTileBuf_, TQ_TILE_DIFF_ELEMS * sizeof(half));
         pipe_->InitBuffer(cbTileBuf_, TQ_TILE_DIFF_ELEMS * sizeof(half));
-        pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(half));
+        // NormalizeBatch: fp32 row + fp32 ReduceSum tmp (2 * TQ_PACK_D floats).
+        pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
         pipe_->InitBuffer(argminWorkBuf_, TQ_REDUCE_MIN_WORK * sizeof(half));
         pipe_->InitBuffer(idxBuf_, TQ_PACK_D * sizeof(uint8_t));
         pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
@@ -257,26 +256,27 @@ public:
 
 private:
     // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
+    // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids fp16 overflow.
     __aicore__ inline void NormalizeBatch(
         AscendC::LocalTensor<half>& xBatch, AscendC::LocalTensor<half>& norms, uint32_t m) {
-        auto sqLocal = sqBuf_.Get<half>();
-        auto reduceWork = reduceWorkBuf_.Get<half>();
-        auto normLocal = normScalarBuf_.Get<half>();
+        auto fp32Row = reduceOutBuf_.Get<float>();
+        auto fp32Tmp = reduceOutBuf_.Get<float>()[TQ_PACK_D];
+        auto normAcc = normScalarBuf_.Get<float>();
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t rowOff = i * TQ_PACK_D;
-            AscendC::Mul(sqLocal, xBatch[rowOff], xBatch[rowOff], TQ_PACK_D);
+
+            AscendC::Cast(fp32Row, xBatch[rowOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            TqSyncMte2ToV();
+            AscendC::Mul(fp32Row, fp32Row, fp32Row, TQ_PACK_D);
+            AscendC::ReduceSum<float>(normAcc, fp32Row, fp32Tmp, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ReduceSum(normLocal, sqLocal, reduceWork, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sqrt(normLocal, normLocal, 1);
-            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sqrt(normAcc, normAcc, 1);
             TqSyncVToS();
-            // Scalar half arithmetic is disallowed on AIC; use float on S-pipe then vector Muls.
-            const float normF = static_cast<float>(normLocal.GetValue(0));
+            const float normF = normAcc.GetValue(0);
             TqSyncSToV();
 
-            norms.SetValue(i, normLocal.GetValue(0));
+            norms.SetValue(i, static_cast<half>(normF));
             const half invH = static_cast<half>(1.0f / (normF + TQ_NORM_EPS_F));
             AscendC::Muls(xBatch[rowOff], xBatch[rowOff], invH, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -442,8 +442,6 @@ private:
 
     AscendC::TQue<AscendC::TPosition::VECOUT, 1> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, 1> yBatchQue_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> sqBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> reduceWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
