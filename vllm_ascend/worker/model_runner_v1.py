@@ -1286,6 +1286,10 @@ class NPUModelRunner(GPUModelRunner):
         # ``uniform_kv_budget != off`` and the runtime uniform check. Stays on
         # TP rank 0 (other ranks receive build results via broadcast).
         self._dynkv_decode_lens_cache: dict[str, dict] = {}
+        # P1: skip per-step uniform runtime scan after first fixed_base success.
+        self._dynkv_decode_uniform_lens_state: Optional[bool] = None
+        self._dynkv_layer_idx_map_by_names: dict[tuple[str, ...], dict[str, int]] = (
+            {})
         self._dynkv_prepare_step_acc: Optional[dict[str, float]] = None
         # One-shot status banner: emit DynamicKV config + which profile knobs
         # are on (PREPARE / FORWARD / MODEL_ACL / FIA / PA) once any profile is
@@ -1851,6 +1855,60 @@ class NPUModelRunner(GPUModelRunner):
             layer_ctx_fill_batch=layer_ctx_fill_batch,
             total_loop=total_loop,
         )
+
+    def _ensure_dynkv_graph_context_lens_bufs(
+        self,
+        num_input_tokens: int,
+        layer_names: list[str],
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Register graph context_lens bufs once per capture bucket (P1)."""
+        bufs = self._get_graph_context_lens_bufs_for_tokens(num_input_tokens)
+        if bufs is not None:
+            return bufs
+        return self._register_dynkv_graph_context_lens_bufs_from_capture(
+            num_input_tokens, layer_names)
+
+    def _resolve_dynkv_decode_uniform_lens(
+        self,
+        kv_list_dyn: list[dict[str, Any]],
+        n_layers: int,
+    ) -> bool:
+        """Phase B uniform_lens with steady-state cache (P1).
+
+        Under ``fixed_base``, after the first successful runtime check we skip
+        the per-step Python scan over ``per_layer_kv_lens`` (512 decode steps).
+        """
+        budget = str(
+            getattr(self.ascend_config, "dynamic_kv_uniform_kv_budget", "off"))
+        if budget == "off":
+            return False
+        if (
+            budget == "fixed_base"
+            and getattr(self, "_dynkv_decode_uniform_lens_state", None) is True
+        ):
+            return True
+        uniform = _dynkv_decode_check_uniform_lens_runtime(kv_list_dyn, n_layers)
+        if budget == "fixed_base":
+            self._dynkv_decode_uniform_lens_state = bool(uniform)
+        return uniform
+
+    def _get_dynkv_layer_idx_map(
+        self,
+        layer_names: list[str],
+    ) -> dict[str, int]:
+        """Cache layer_name -> layer_idx for static model graphs (P1)."""
+        key = tuple(layer_names)
+        hit = self._dynkv_layer_idx_map_by_names.get(key)
+        if hit is not None:
+            return hit
+        out: dict[str, int] = {}
+        for ln in layer_names:
+            try:
+                out[ln] = int(extract_layer_index(ln, num_attn_module=1))
+            except Exception:
+                out[ln] = -1
+        self._dynkv_layer_idx_map_by_names[key] = out
+        return out
 
     def _register_dynkv_graph_context_lens_bufs_from_capture(
         self,
@@ -3101,7 +3159,7 @@ class NPUModelRunner(GPUModelRunner):
                         _dynkv_profile_std = (
                             os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0")
                             == "1")
-                        self._register_dynkv_graph_context_lens_bufs_from_capture(
+                        self._ensure_dynkv_graph_context_lens_bufs(
                             int(num_input_tokens), list(attn_group.layer_names))
                         _graph_slot_bufs_std = self._get_graph_slot_bufs_for_tokens(
                             int(num_input_tokens))
@@ -3204,8 +3262,9 @@ class NPUModelRunner(GPUModelRunner):
                     # Timing accumulators (only used when VLLM_DYNKV_PROFILE_PREPARE=1)
                     _dynkv_profile = os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
                     _t0_reg = time.perf_counter() if _dynkv_profile else 0
-                    self._register_dynkv_graph_context_lens_bufs_from_capture(
-                        int(num_input_tokens), _dynkv_layer_names)
+                    _graph_context_lens_bufs = (
+                        self._ensure_dynkv_graph_context_lens_bufs(
+                            int(num_input_tokens), _dynkv_layer_names))
                     _t_register_bufs = (
                         (time.perf_counter() - _t0_reg) * 1000
                         if _dynkv_profile else 0.0
@@ -3234,9 +3293,6 @@ class NPUModelRunner(GPUModelRunner):
                         _slot_n_sm = 0
                     _graph_slot_bufs = self._get_graph_slot_bufs_for_tokens(
                         int(num_input_tokens))
-                    _graph_context_lens_bufs = (
-                        self._get_graph_context_lens_bufs_for_tokens(
-                            int(num_input_tokens)))
                     _use_graph_slot_bufs = (
                         _graph_slot_bufs is not None and _slot_n_sm > 0)
                     if _dynkv_L > 0 and _dynkv_n > 0:
@@ -3271,13 +3327,8 @@ class NPUModelRunner(GPUModelRunner):
                         # Phase B: detect uniform per_layer_kv_lens (requires
                         # uniform_kv_budget != off and runtime verification).
                         _t0_uc = time.perf_counter() if _dynkv_profile else 0
-                        _dynkv_uniform_lens = (
-                            str(getattr(self.ascend_config,
-                                        "dynamic_kv_uniform_kv_budget",
-                                        "off")) != "off"
-                            and _dynkv_decode_check_uniform_lens_runtime(
-                                kv_list_dyn, _dynkv_L)
-                        )
+                        _dynkv_uniform_lens = self._resolve_dynkv_decode_uniform_lens(
+                            kv_list_dyn, _dynkv_L)
                         if _dynkv_profile:
                             _t_uniform_check = (time.perf_counter() - _t0_uc) * 1000
                         if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
@@ -3339,9 +3390,23 @@ class NPUModelRunner(GPUModelRunner):
                             slot_jobs_all = [[] for _ in range(_dynkv_L)]
                         # Confirm builder kept the uniform fast-path
                         # (sanity probe may have flipped to per-layer).
-                        if _dynkv_uniform_lens and all_tmp_lens is not None and len(all_tmp_lens) >= 2:
-                            if all_tmp_lens[0] is not all_tmp_lens[1]:
-                                _dynkv_uniform_lens = False
+                        if (
+                            _dynkv_uniform_lens
+                            and all_tmp_lens is not None
+                            and len(all_tmp_lens) >= 2
+                        ):
+                            _row0 = all_tmp_lens[0]
+                            for _row in all_tmp_lens[1:]:
+                                if _row != _row0:
+                                    _dynkv_uniform_lens = False
+                                    if (
+                                        str(getattr(
+                                            self.ascend_config,
+                                            "dynamic_kv_uniform_kv_budget",
+                                            "off")) == "fixed_base"
+                                    ):
+                                        self._dynkv_decode_uniform_lens_state = False
+                                    break
                         if all_tmp_lens is not None:
                             try:
                                 _sl0 = attn_metadata_i.seq_lens
@@ -3387,14 +3452,18 @@ class NPUModelRunner(GPUModelRunner):
 
                     bs_dyn = int(self.block_size)
 
-                    # Pre-build layer_name -> layer_idx map (used by ctx fill + remap)
-                    _layer_idx_map: dict[str, int] = {}
-                    for _ln in _dynkv_layer_names:
-                        try:
-                            _layer_idx_map[_ln] = int(
-                                extract_layer_index(_ln, num_attn_module=1))
-                        except Exception:
-                            _layer_idx_map[_ln] = -1
+                    _layer_idx_map = self._get_dynkv_layer_idx_map(
+                        _dynkv_layer_names)
+                    _dynkv_lens_has_negative = False
+                    if all_tmp_lens:
+                        if _dynkv_uniform_lens:
+                            _dynkv_lens_has_negative = any(
+                                int(v) < 0 for v in all_tmp_lens[0])
+                        else:
+                            for _row in all_tmp_lens:
+                                if any(int(v) < 0 for v in _row):
+                                    _dynkv_lens_has_negative = True
+                                    break
 
                     # ============================================================
                     # Batched slot_remap on ``_dynkv_stack`` [L, n_sm]: broadcast
@@ -3592,7 +3661,7 @@ class NPUModelRunner(GPUModelRunner):
                                     setattr(
                                         meta_i,
                                         "dynamic_kv_lens_has_negative",
-                                        any(int(v) < 0 for v in tmp_lens_layer),
+                                        _dynkv_lens_has_negative,
                                     )
                                 except Exception:
                                     pass
