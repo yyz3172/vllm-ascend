@@ -260,6 +260,17 @@ def _dynkv_decode_check_uniform_lens_runtime(
     return True
 
 
+# Placeholder kv_transfer_params for steady decode +1 fast path (non-empty dict).
+_DYNKV_STUB_KVP_ROW: dict[str, Any] = {"dynamic_kv": {}}
+
+
+def _dynkv_stub_kv_list(n_r: int) -> list[dict[str, Any]]:
+    """Reuse stub entries so steady decode skips per-step ``requests`` scans."""
+    if n_r <= 0:
+        return []
+    return [_DYNKV_STUB_KVP_ROW for _ in range(int(n_r))]
+
+
 def _dynkv_decode_build_one_layer_tmp_lens_and_jobs(
     *,
     layer_idx: int,
@@ -1414,6 +1425,9 @@ class NPUModelRunner(GPUModelRunner):
         # ``uniform_kv_budget != off`` and the runtime uniform check. Stays on
         # TP rank 0 (other ranks receive build results via broadcast).
         self._dynkv_decode_lens_cache: dict[str, dict] = {}
+        # B4+: reusable [L, n_r] upload buffer for uniform stacked_dyn_lens.
+        self._dynkv_stacked_lens_buf: Optional[torch.Tensor] = None
+        self._dynkv_stacked_lens_buf_key: Optional[tuple[Any, ...]] = None
         # P1: skip per-step uniform runtime scan after first fixed_base success.
         self._dynkv_decode_uniform_lens_state: Optional[bool] = None
         self._dynkv_layer_idx_map_by_names: dict[tuple[str, ...], dict[str, int]] = (
@@ -2043,6 +2057,31 @@ class NPUModelRunner(GPUModelRunner):
                 out[ln] = -1
         self._dynkv_layer_idx_map_by_names[key] = out
         return out
+
+    def _dynkv_make_stacked_dyn_lens_uniform(
+        self,
+        row: list[int],
+        n_layers: int,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Upload uniform ``tmp_lens`` row to ``[L, n_r]`` without per-step alloc."""
+        n_r = len(row)
+        dev, dt = seq_lens.device, seq_lens.dtype
+        key = (dev.type, int(dev.index) if dev.index is not None else -1,
+               str(dt), int(n_layers), int(n_r))
+        buf = self._dynkv_stacked_lens_buf
+        if self._dynkv_stacked_lens_buf_key != key or buf is None:
+            buf = torch.empty((max(1, n_layers), max(1, n_r)),
+                              device=dev,
+                              dtype=dt)
+            self._dynkv_stacked_lens_buf = buf
+            self._dynkv_stacked_lens_buf_key = key
+        if n_r > 0:
+            buf[0, :n_r].copy_(
+                torch.as_tensor(row, device=dev, dtype=dt))
+        if n_layers <= 1:
+            return buf[:1, :n_r]
+        return buf[0:1, :n_r].expand(n_layers, -1)
 
     def _register_dynkv_graph_context_lens_bufs_from_capture(
         self,
@@ -3529,33 +3568,137 @@ class NPUModelRunner(GPUModelRunner):
                     slot_jobs_all: list[list[tuple[int, int, int]]] | None = None
                     stacked_dyn_lens_t: Optional[torch.Tensor] = None
                     if _dynkv_L > 0:
-                        _t0_kvlist = time.perf_counter() if _dynkv_profile else 0
                         n_r_dyn = int(num_reqs)
                         rid_list_dyn = list(req_ids[:n_r_dyn])
-                        kv_list_dyn: list[dict[str, Any]] = [
-                            (lambda r: r if isinstance(r, dict) else {})(
-                                getattr(self.requests.get(rid), "kv_transfer_params", None)
-                            )
-                            for rid in rid_list_dyn
-                        ]
-                        if _dynkv_profile:
-                            _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
-                        # Phase B: detect uniform per_layer_kv_lens (requires
-                        # uniform_kv_budget != off and runtime verification).
-                        _t0_uc = time.perf_counter() if _dynkv_profile else 0
-                        _dynkv_uniform_lens = self._resolve_dynkv_decode_uniform_lens(
-                            kv_list_dyn, _dynkv_L)
-                        if _dynkv_profile:
-                            _t_uniform_check = (time.perf_counter() - _t0_uc) * 1000
-                        if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
+                        built_dyn: tuple[
+                            list[list[int]],
+                            list[list[tuple[int, int, int]]],
+                        ] | None = None
+                        _dynkv_uniform_lens = False
+                        _t_kv_list_build = 0.0
+                        _t_uniform_check = 0.0
+                        # B4+ steady path: +1 cache hit before scanning requests.
+                        if (
+                            getattr(self, "_dynkv_decode_uniform_lens_state",
+                                    None) is True
+                            and self._dynkv_decode_lens_cache
+                            and n_r_dyn > 0
+                        ):
+                            _dynkv_uniform_lens = True
                             tg_pre = get_tp_group()
-                            built_dyn: tuple[
-                                list[list[int]],
-                                list[list[tuple[int, int, int]]],
-                            ] | None = None
                             if tg_pre.world_size > 1:
                                 if get_tensor_model_parallel_rank() == 0:
-                                    _t0_bh = time.perf_counter() if _dynkv_profile else 0
+                                    _t0_bh = (
+                                        time.perf_counter()
+                                        if _dynkv_profile else 0)
+                                    _fast = (
+                                        _dynkv_decode_try_incremental_uniform_row(
+                                            rid_list=rid_list_dyn,
+                                            kv_list=_dynkv_stub_kv_list(n_r_dyn),
+                                            n_r=n_r_dyn,
+                                            input_batch=self.input_batch,
+                                            block_size=int(self.block_size),
+                                            decode_state_cache=(
+                                                self._dynkv_decode_lens_cache),
+                                        ))
+                                    if _fast is not None:
+                                        _row, _jobs = _fast
+                                        built_dyn = ([_row] * _dynkv_L,
+                                                     [_jobs] * _dynkv_L)
+                                    if _dynkv_profile:
+                                        _t_build_helper = (
+                                            time.perf_counter() - _t0_bh) * 1000
+                                _t0_bc = (
+                                    time.perf_counter() if _dynkv_profile else 0)
+                                built_dyn = tg_pre.broadcast_object(
+                                    built_dyn
+                                    if get_tensor_model_parallel_rank() == 0
+                                    else None,
+                                    src=0,
+                                )
+                                if _dynkv_profile:
+                                    _t_broadcast = (
+                                        time.perf_counter() - _t0_bc) * 1000
+                            else:
+                                _t0_bh = (
+                                    time.perf_counter() if _dynkv_profile else 0)
+                                _fast = _dynkv_decode_try_incremental_uniform_row(
+                                    rid_list=rid_list_dyn,
+                                    kv_list=_dynkv_stub_kv_list(n_r_dyn),
+                                    n_r=n_r_dyn,
+                                    input_batch=self.input_batch,
+                                    block_size=int(self.block_size),
+                                    decode_state_cache=self._dynkv_decode_lens_cache,
+                                )
+                                if _fast is not None:
+                                    _row, _jobs = _fast
+                                    built_dyn = ([_row] * _dynkv_L,
+                                                 [_jobs] * _dynkv_L)
+                                if _dynkv_profile:
+                                    _t_build_helper = (
+                                        time.perf_counter() - _t0_bh) * 1000
+                        if built_dyn is None:
+                            _t0_kvlist = (
+                                time.perf_counter() if _dynkv_profile else 0)
+                            kv_list_dyn: list[dict[str, Any]] = [
+                                (lambda r: r if isinstance(r, dict) else {})(
+                                    getattr(self.requests.get(rid),
+                                            "kv_transfer_params", None))
+                                for rid in rid_list_dyn
+                            ]
+                            if _dynkv_profile:
+                                _t_kv_list_build = (
+                                    time.perf_counter() - _t0_kvlist) * 1000
+                            _t0_uc = (
+                                time.perf_counter() if _dynkv_profile else 0)
+                            _dynkv_uniform_lens = (
+                                self._resolve_dynkv_decode_uniform_lens(
+                                    kv_list_dyn, _dynkv_L))
+                            if _dynkv_profile:
+                                _t_uniform_check = (
+                                    time.perf_counter() - _t0_uc) * 1000
+                            if (kv_list_dyn
+                                    and len(kv_list_dyn) == len(rid_list_dyn)):
+                                tg_pre = get_tp_group()
+                                if tg_pre.world_size > 1:
+                                    if get_tensor_model_parallel_rank() == 0:
+                                        _t0_bh = (
+                                            time.perf_counter()
+                                            if _dynkv_profile else 0)
+                                        built_dyn = (
+                                            _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
+                                                dyn_layer_names=_dynkv_layer_names,
+                                                rid_list=rid_list_dyn,
+                                                kv_list=kv_list_dyn,
+                                                n_r=n_r_dyn,
+                                                input_batch=self.input_batch,
+                                                block_size=int(self.block_size),
+                                                uniform_lens=_dynkv_uniform_lens,
+                                                decode_state_cache=(
+                                                    self._dynkv_decode_lens_cache
+                                                    if _dynkv_uniform_lens
+                                                    else None),
+                                            ))
+                                        if _dynkv_profile:
+                                            _t_build_helper = (
+                                                time.perf_counter() - _t0_bh
+                                            ) * 1000
+                                    _t0_bc = (
+                                        time.perf_counter()
+                                        if _dynkv_profile else 0)
+                                    built_dyn = tg_pre.broadcast_object(
+                                        built_dyn
+                                        if get_tensor_model_parallel_rank() == 0
+                                        else None,
+                                        src=0,
+                                    )
+                                    if _dynkv_profile:
+                                        _t_broadcast = (
+                                            time.perf_counter() - _t0_bc) * 1000
+                                else:
+                                    _t0_bh = (
+                                        time.perf_counter()
+                                        if _dynkv_profile else 0)
                                     built_dyn = (
                                         _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
                                             dyn_layer_names=_dynkv_layer_names,
@@ -3571,43 +3714,22 @@ class NPUModelRunner(GPUModelRunner):
                                             ),
                                         ))
                                     if _dynkv_profile:
-                                        _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
-                                _t0_bc = time.perf_counter() if _dynkv_profile else 0
-                                built_dyn = tg_pre.broadcast_object(
-                                    built_dyn
-                                    if get_tensor_model_parallel_rank() == 0 else None,
-                                    src=0,
-                                )
-                                if _dynkv_profile:
-                                    _t_broadcast = (time.perf_counter() - _t0_bc) * 1000
+                                        _t_build_helper = (
+                                            time.perf_counter() - _t0_bh) * 1000
                             else:
-                                _t0_bh = time.perf_counter() if _dynkv_profile else 0
-                                built_dyn = (
-                                    _dynkv_decode_build_per_layer_tmp_lens_and_jobs(
-                                        dyn_layer_names=_dynkv_layer_names,
-                                        rid_list=rid_list_dyn,
-                                        kv_list=kv_list_dyn,
-                                        n_r=n_r_dyn,
-                                        input_batch=self.input_batch,
-                                        block_size=int(self.block_size),
-                                        uniform_lens=_dynkv_uniform_lens,
-                                        decode_state_cache=(
-                                            self._dynkv_decode_lens_cache
-                                            if _dynkv_uniform_lens else None
-                                        ),
-                                    ))
-                                if _dynkv_profile:
-                                    _t_build_helper = (time.perf_counter() - _t0_bh) * 1000
-                            if built_dyn is not None:
-                                all_tmp_lens, slot_jobs_all = built_dyn
+                                built_dyn = ([[-1] * n_r_dyn for _ in range(_dynkv_L)],
+                                             [[] for _ in range(_dynkv_L)])
+                        if built_dyn is not None:
+                            all_tmp_lens, slot_jobs_all = built_dyn
                         else:
                             all_tmp_lens = [[-1] * n_r_dyn
                                             for _ in range(_dynkv_L)]
                             slot_jobs_all = [[] for _ in range(_dynkv_L)]
-                        # Confirm builder kept the uniform fast-path
-                        # (sanity probe may have flipped to per-layer).
+                        # Sanity probe only until fixed_base uniform is cached.
                         if (
                             _dynkv_uniform_lens
+                            and getattr(self, "_dynkv_decode_uniform_lens_state",
+                                        None) is not True
                             and all_tmp_lens is not None
                             and len(all_tmp_lens) >= 2
                         ):
@@ -3629,19 +3751,13 @@ class NPUModelRunner(GPUModelRunner):
                                 if isinstance(_sl0, torch.Tensor):
                                     _t0_st = time.perf_counter() if _dynkv_profile else 0
                                     if _dynkv_uniform_lens and all_tmp_lens:
-                                        # Phase B: upload only one row (n_r ints)
-                                        # then expand to [L, n_r] view for the
-                                        # downstream graph buffer fill / per-layer
-                                        # setattr (broadcasted, zero-copy).
-                                        _row1d = torch.tensor(
-                                            all_tmp_lens[0],
-                                            device=_sl0.device,
-                                            dtype=_sl0.dtype,
-                                        )
+                                        # Phase B: upload one row -> [L, n_r] view.
                                         stacked_dyn_lens_t = (
-                                            _row1d.unsqueeze(0).expand(
-                                                len(all_tmp_lens), -1)
-                                        )
+                                            self._dynkv_make_stacked_dyn_lens_uniform(
+                                                all_tmp_lens[0],
+                                                len(all_tmp_lens),
+                                                _sl0,
+                                            ))
                                     else:
                                         stacked_dyn_lens_t = torch.tensor(
                                             all_tmp_lens,
@@ -4758,6 +4874,9 @@ class NPUModelRunner(GPUModelRunner):
                                 req_ids_done = [ctx.req_ids[i] for i in done_idx]
                                 _dynkv_offload_q_cleanup_rids = list(req_ids_done)
                                 seq_lens_done = [ctx.seq_lens[i] for i in done_idx]
+                                _t0_offload_rewrite = (
+                                    time.perf_counter()
+                                    if _fwd_profile else 0)
                                 dynkv_updates = run_offload_rewrite_and_build_updates(
                                     req_ids=req_ids_done,
                                     seq_lens=seq_lens_done,
@@ -4782,6 +4901,14 @@ class NPUModelRunner(GPUModelRunner):
                                         getattr(ascend_cfg, "dynamic_kv_uniform_kv_budget", "off")
                                     ),
                                 )
+                                if _fwd_profile:
+                                    logger.info(
+                                        "[DynamicKV][offload_profile] "
+                                        "rewrite_ms=%.2f finished_reqs=%d",
+                                        (time.perf_counter() - _t0_offload_rewrite)
+                                        * 1000,
+                                        len(req_ids_done),
+                                    )
                                 # Attach block_table-ordered prefix physical blocks for PD shrink.
                                 # NOTE: Do NOT use allocator-ordered `block_ids[:n]` to shrink:
                                 # only `block_tables` represents logical prefix order.

@@ -106,7 +106,7 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **uniform_decode_fast_path**（Phase B 轻量，默认 `false`）：与 ``uniform_kv_budget`` 联用时推荐保持默认即可（已自动共享 lens 行）：
   - ``uniform_kv_budget != off`` 时用单次 Python 循环构建 ``tmp_lens``（``_dynkv_decode_build_shared_tmp_lens_and_jobs``）；
   - decode 各层共享同一 ``dynamic_kv_seq_lens_list`` 引用，``context_lens`` 仍走 workspace 批量 fill；
-  - ``model_acl`` 在 prepare 已写 graph buffer 后跳过二次 merge（``dynkv_graph_context_lens_prepared``）。
+  - prepare 已写 graph ``context_lens`` 时，``pa_dynamic_kv_context_lens_for_graph_update`` 可同址零 ``copy_``，但 **每步仍须** 完整 ``graph_task_update``（跳过 update 会导致 decode 乱码，P4 skip 已回滚）。
   - 旧版「32 路 ctx 广播 + replace 快路径」已移除（实测 TPOT 回退）。
   - 显式设 ``uniform_decode_fast_path: true`` 时，在运行时检测到各层 ``tmp_lens`` 相同也会共享 list（非 uniform budget 场景）。
 
@@ -116,6 +116,8 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **P1 decode prepare**（代码内恒开）：``fixed_base`` 下 uniform 检测首步缓存；``context_lens`` graph buf 按 capture bucket 只 register 一次；``layer_idx_map`` 按 ``layer_names`` 缓存；uniform 时 ``dynamic_kv_lens_has_negative`` 每步只算一次。
 - **P2 decode slot_remap**（回滚）：稳态 slot 每步都变（tgt = Li + decode_step），skip 不命中；前置标量与函数内 P0 scalar 路径重复，整体略变慢，已回滚至 P0 基线。辅助函数 ``_dynkv_uniform_single_job`` / ``_dynkv_compute_phys_slot_scalar`` 保留供后续扩展。
 - **P3 decode prepare**（代码内恒开）：缓存 decode prepare 热路径的 workspace view（slot stack / ctx stack）的解析结果，按 capture bucket + layer_names + shape + dtype/device 复用，减少每步 `_resolve_*_from_workspace` 的行映射/alias 校验与切片开销；目标字段为 `branch_setup = stack_init + ctx_fill_batch`。
+- **B4+ decode prepare**（代码内恒开，`fixed_base` 稳态）：在 ``_dynkv_decode_uniform_lens_state`` 已成立后，每步 **先** 走 ``+1`` 增量缓存（跳过 ``requests`` 上扫 ``kv_transfer_params``）；``stacked_dyn_lens`` 用复用 buffer ``copy_`` 替代 ``torch.tensor``；``fixed_base`` 稳态跳过 layer0/layer1 sanity 二次探测。
+- **P5 TTFT / offload**（诊断先行）：``VLLM_DYNKV_PROFILE_FORWARD=1`` 时 prefill 结束打印 ``[DynamicKV][offload_profile] rewrite_ms=...``，用于拆分 TTFT 里 rewrite 占比；真正异步 rewrite（与 ``wait_for_kv_save``/传输重叠）仍待单独设计。
 
 - **`VLLM_DYNKV_PROFILE_PA=1`（仅诊断，勿用于性能基线）**：每步在 graph `replay()` 前后做 NPU Event + 全设备同步，日志里 `model_replay_est` / `graph_npu_ms` 会接近真实 NPU，但 **TPOT 会虚高 ~1.5–2.5 ms**（你 1432 数据约 +3.3 ms）。OFF（`dynkv=0`）必须与 ON 一样在 replay 前做 `model_acl` 更新；已修复旧路径下 OFF+PA 可能 RPC 超时挂死。性能对比请保持 `PROFILE_PA=0`。
 
