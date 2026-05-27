@@ -4166,7 +4166,11 @@ class NPUModelRunner(GPUModelRunner):
             if _pa_prof:
                 dynkv_pa_profile_reset()
             _t0_acl = time.perf_counter()
-        _dynkv_update_before_replay = self._is_dynamic_kv_enabled()
+        # DynamicKV: ctx_lens must be on graph buffers before replay.
+        # PROFILE_PA: OFF (dynkv=0) used to update after replay; combined with
+        # replay-time ``torch.npu.synchronize()`` + Event sync this deadlocked.
+        _dynkv_update_before_replay = (
+            self._is_dynamic_kv_enabled() or _pa_prof)
         if _dynkv_update_before_replay:
             self._update_aclgraph_attn_params(maybe_padded_num_tokens)
         if _prof:

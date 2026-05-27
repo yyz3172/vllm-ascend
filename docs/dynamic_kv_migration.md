@@ -117,6 +117,8 @@ DynamicKV 通过 vLLM 的 `additional_config["dynamic_kv"]` 下发（由 vLLM-As
 - **P2 decode slot_remap**（回滚）：稳态 slot 每步都变（tgt = Li + decode_step），skip 不命中；前置标量与函数内 P0 scalar 路径重复，整体略变慢，已回滚至 P0 基线。辅助函数 ``_dynkv_uniform_single_job`` / ``_dynkv_compute_phys_slot_scalar`` 保留供后续扩展。
 - **P3 decode prepare**（代码内恒开）：缓存 decode prepare 热路径的 workspace view（slot stack / ctx stack）的解析结果，按 capture bucket + layer_names + shape + dtype/device 复用，减少每步 `_resolve_*_from_workspace` 的行映射/alias 校验与切片开销；目标字段为 `branch_setup = stack_init + ctx_fill_batch`。
 
+- **`VLLM_DYNKV_PROFILE_PA=1`（仅诊断，勿用于性能基线）**：每步在 graph `replay()` 前后做 NPU Event + 全设备同步，日志里 `model_replay_est` / `graph_npu_ms` 会接近真实 NPU，但 **TPOT 会虚高 ~1.5–2.5 ms**（你 1432 数据约 +3.3 ms）。OFF（`dynkv=0`）必须与 ON 一样在 replay 前做 `model_acl` 更新；已修复旧路径下 OFF+PA 可能 RPC 超时挂死。性能对比请保持 `PROFILE_PA=0`。
+
 - **Prepare profile**（``VLLM_DYNKV_PROFILE_PREPARE=1``）：每步一行 ``[prepare_profile]``（含 ``profile_prepare_est`` 等决策字段）。
   - 解析：`parse_dynkv_prepare_profile.py``（默认）；旧版 ext/reconcile/loop 用 ``--view legacy``。
 - **Forward profile**（``VLLM_DYNKV_PROFILE_FORWARD=1``）：每步一行 ``[forward_profile]``（PA 为 ``[forward_profile][pa]``）。

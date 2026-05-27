@@ -310,10 +310,16 @@ class ACLGraphWrapper:
         use_eagle = (self.vllm_config.speculative_config.method in ("eagle",
                                                                     "eagle3")
                      if self.vllm_config.speculative_config else False)
-        if self.runtime_mode != CUDAGraphMode.FULL or not forward_context.is_draft_model or not use_eagle:
-            torch.npu.synchronize()
         _prof_replay_wall = dynkv_graph_replay_profile_enabled()
         _prof_replay_npu = dynkv_graph_npu_profile_enabled()
+        # PROFILE_PA already ends with Event synchronize on replay(); a second
+        # full-device sync here can hang OFF decode (dynkv=0, update-after-replay).
+        if (
+            self.runtime_mode != CUDAGraphMode.FULL
+            or not forward_context.is_draft_model
+            or not use_eagle
+        ) and not _prof_replay_npu:
+            torch.npu.synchronize()
         if _prof_replay_wall:
             _t0_replay = time.perf_counter()
         _ev0 = None
