@@ -58,7 +58,6 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.turboquant_kv_cache import (
-    turboquant_decode_kv_cache,
     turboquant_decode_kv_cache_compact,
     turboquant_pack_kv_for_cache,
     turboquant_packed_bytes_per_vector,

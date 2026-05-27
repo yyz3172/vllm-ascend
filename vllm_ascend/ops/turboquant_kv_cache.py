@@ -516,33 +516,6 @@ def turboquant_quantize_to_packed_bytes(x: torch.Tensor, *, bits: int = 4) -> to
     quantizer = _get_quantizer(head_size, bits, str(x.device), _current_mse_impl())
 
     x_flat = x.reshape(-1, head_size)
-    if (
-        envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP
-    ):
-        x_fc = x_flat.contiguous()
-        x_f32 = x_fc.float()
-        norms = torch.linalg.vector_norm(x_f32, dim=-1, keepdim=True)
-        x_unit = x_f32 / (norms + 1e-10)
-        if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != x.device:
-            quantizer._codebook_fp16 = quantizer.codebook.to(
-                device=x.device, dtype=torch.float16
-            )
-        # Match ``quantizer.quantize`` rotated unit vectors in fp32, then cast to fp16 for the
-        # custom kernel (kernel contract: y is half). fp16 matmul here skewed argmin vs PyTorch.
-        rotation_t_f32 = quantizer.rotation_t.to(device=x.device, dtype=torch.float32)
-        y = torch.matmul(x_unit, rotation_t_f32).to(dtype=torch.float16)
-        norms_fp16 = norms.to(dtype=torch.float16)
-        packed = torch.ops._C_ascend.turboquant_encode_packed_blocks(
-            y,
-            quantizer._codebook_fp16,
-            norms_fp16,
-            head_size,
-            bits,
-        )
-        packed = packed.contiguous()
-        _sync_npu_if_needed(x.device)
-        return packed.reshape(*x.shape[:-1], packed_bytes).contiguous()
-
     indices, norms = quantizer.quantize(x_flat)  # [N,D], [N,1]
     idx_storage = _pack_turboquant_indices(indices, bits)
     idx_w = idx_storage.shape[-1]
@@ -718,7 +691,12 @@ def turboquant_pack_kv_for_cache(
             slot_w_v,
         )
         _sync_npu_if_needed(key.device)
-        return packed_k, packed_v
+        # Match ENCODE_OP=0: int8 view of byte storage for _npu_reshape_and_cache.
+        # C++ already returns contiguous kChar tensors; keep the explicit view for parity.
+        return (
+            packed_k.view(dtype=torch.int8),
+            packed_v.view(dtype=torch.int8),
+        )
 
     packed_k = _pad_packed_to_slot_width(
         turboquant_quantize_to_packed_bytes(key, bits=bits_key), slot_w_k
@@ -727,81 +705,6 @@ def turboquant_pack_kv_for_cache(
         turboquant_quantize_to_packed_bytes(value, bits=bits_value), slot_w_v
     )
     return packed_k.view(dtype=torch.int8), packed_v.view(dtype=torch.int8)
-
-
-def turboquant_store_kv(
-    *,
-    key: torch.Tensor,  # [T, H, D]
-    value: torch.Tensor,  # [T, H, D]
-    key_cache: torch.Tensor,  # [B, BS, H, P_k] uint8; P_k may differ from value_cache's P_v
-    value_cache: torch.Tensor,  # [B, BS, H, P_v] uint8
-    slot_mapping: torch.Tensor,  # [T]
-    bits: int = 4,
-    bits_key: int | None = None,
-    bits_value: int | None = None,
-) -> None:
-    if key.numel() == 0:
-        return
-    if value.dtype != key.dtype:
-        raise ValueError("Key/value dtypes must match for turboquant.")
-
-    bk = bits if bits_key is None else bits_key
-    bv = bits if bits_value is None else bits_value
-    slot_w_k = key_cache.shape[-1]
-    slot_w_v = value_cache.shape[-1]
-
-    logger.debug(
-        "TurboQuant(ascend) store_kv: key=%s value=%s cache=%s slot_mapping=%s bits_k=%d bits_v=%d",
-        tuple(key.shape),
-        tuple(value.shape),
-        tuple(key_cache.shape),
-        tuple(slot_mapping.shape),
-        bk,
-        bv,
-    )
-    block_size = key_cache.shape[1]
-    packed_k, packed_v = turboquant_pack_kv_for_cache(
-        key=key,
-        value=value,
-        bits_key=bk,
-        bits_value=bv,
-        slot_w_k=slot_w_k,
-        slot_w_v=slot_w_v,
-    )
-
-    slot = slot_mapping.to(torch.int64)
-    valid = slot >= 0
-    if not torch.any(valid):
-        return
-    slot = slot[valid]
-    tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-    block_idx = torch.div(slot, block_size, rounding_mode="floor")
-    block_off = slot - block_idx * block_size
-
-    # packed_k is [T, H, P_k], packed_v is [T, H, P_v] with P_k/P_v from caches (asymmetric bits OK).
-    key_cache[block_idx, block_off] = packed_k[tok_idx]
-    value_cache[block_idx, block_off] = packed_v[tok_idx]
-
-
-def turboquant_decode_kv_cache(
-    *,
-    key_cache: torch.Tensor,  # [B, BS, H, P] uint8
-    value_cache: torch.Tensor,  # [B, BS, H, P] uint8
-    head_size: int,
-    dtype: torch.dtype,
-    bits: int = 4,
-    bits_key: int | None = None,
-    bits_value: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    bk = bits if bits_key is None else bits_key
-    bv = bits if bits_value is None else bits_value
-    k = turboquant_dequantize_from_packed_bytes(
-        key_cache, head_size=head_size, dtype=dtype, bits=bk
-    )
-    v = turboquant_dequantize_from_packed_bytes(
-        value_cache, head_size=head_size, dtype=dtype, bits=bv
-    )
-    return k, v
 
 
 def turboquant_decode_kv_cache_compact(

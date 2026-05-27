@@ -15,7 +15,7 @@
 
 """Benchmarks and correctness checks for TurboQuant KV store/decode/quantize.
 
-`turboquant_store_kv` + `turboquant_decode_kv_cache_compact` vs FP16 scatter/gather;
+`turboquant_pack_kv_for_cache` + cache scatter + compact decode vs FP16 scatter/gather;
 `turboquant_quantize_to_packed_bytes` + `turboquant_dequantize_from_packed_bytes` for
 encode/decode operator coverage.
 
@@ -54,13 +54,11 @@ import torch
 
 from vllm_ascend.ops.turboquant_kv_cache import (
     _c_ascend_turboquant_op_available,
-    turboquant_decode_kv_cache,
     turboquant_decode_kv_cache_compact,
     turboquant_dequantize_from_packed_bytes,
     turboquant_pack_kv_for_cache,
     turboquant_packed_bytes_per_vector,
     turboquant_quantize_to_packed_bytes,
-    turboquant_store_kv,
 )
 
 try:
@@ -155,6 +153,8 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
     ref_v_u8 = ref_v.view(torch.uint8)
     fused_k_u8 = fused_k.view(torch.uint8)
     fused_v_u8 = fused_v.view(torch.uint8)
+    print(fused_k_u8.cpu().tolist())
+    print(ref_k_u8.cpu().tolist())
 
     print(
         "ENCODE_OP=1 fused vs ENCODE_OP=0 ref:",
@@ -208,7 +208,6 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
     _assert_pack_close("key (ENCODE_OP=1 vs 0)", fused_k, ref_k)
     _assert_pack_close("value (ENCODE_OP=1 vs 0)", fused_v, ref_v)
 
-
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
     if total_token_slots % block_size != 0:
         raise ValueError(f"cache_token_slots {total_token_slots} must divide block_size {block_size}")
@@ -256,6 +255,43 @@ def _fp16_kv_scatter(
     block_off = slot - block_idx * block_size
     key_cache[block_idx, block_off] = key[tok_idx]
     value_cache[block_idx, block_off] = value[tok_idx]
+
+
+def _turboquant_pack_and_scatter(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    bits: int = 4,
+    bits_key: int | None = None,
+    bits_value: int | None = None,
+) -> None:
+    if key.numel() == 0:
+        return
+    bk = bits if bits_key is None else bits_key
+    bv = bits if bits_value is None else bits_value
+    packed_k, packed_v = turboquant_pack_kv_for_cache(
+        key=key,
+        value=value,
+        bits_key=bk,
+        bits_value=bv,
+        slot_w_k=key_cache.shape[-1],
+        slot_w_v=value_cache.shape[-1],
+    )
+
+    slot = slot_mapping.to(torch.int64)
+    valid = slot >= 0
+    if not torch.any(valid):
+        return
+    slot = slot[valid]
+    tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    block_size = key_cache.shape[1]
+    block_idx = torch.div(slot, block_size, rounding_mode="floor")
+    block_off = slot - block_idx * block_size
+    key_cache[block_idx, block_off] = packed_k[tok_idx].view(torch.uint8)
+    value_cache[block_idx, block_off] = packed_v[tok_idx].view(torch.uint8)
 
 
 @dataclass
@@ -326,7 +362,7 @@ def run_turboquant_kv_benchmark(
         decode_op_env = os.environ.get("VLLM_ASCEND_TURBOQUANT_DECODE_OP", "1")
 
         def do_store_tq() -> None:
-            turboquant_store_kv(
+            _turboquant_pack_and_scatter(
                 key=key,
                 value=value,
                 key_cache=key_tq,
@@ -571,7 +607,7 @@ def test_turboquant_kv_compact_matches_full_decode(
     slot_mapping = torch.arange(T, device=device, dtype=torch.int64)
     env = {"VLLM_ASCEND_TURBOQUANT_MSE_IMPL": mse_impl}
     with patch.dict(os.environ, env, clear=False):
-        turboquant_store_kv(
+        _turboquant_pack_and_scatter(
             key=key,
             value=value,
             key_cache=key_cache,
@@ -589,12 +625,11 @@ def test_turboquant_kv_compact_matches_full_decode(
             dtype=dtype,
             bits=tq_bits,
         )
-        k_full, v_full = turboquant_decode_kv_cache(
-            key_cache=key_cache,
-            value_cache=value_cache,
-            head_size=D,
-            dtype=dtype,
-            bits=tq_bits,
+        k_full = turboquant_dequantize_from_packed_bytes(
+            key_cache, head_size=D, dtype=dtype, bits=tq_bits
+        )
+        v_full = turboquant_dequantize_from_packed_bytes(
+            value_cache, head_size=D, dtype=dtype, bits=tq_bits
         )
     used = torch.tensor([0, 1, 2], device=device, dtype=torch.int64)
     torch.testing.assert_close(k_c, k_full.index_select(0, used), rtol=0.01, atol=0.1)
@@ -669,7 +704,7 @@ def test_turboquant_kv_roundtrip_cpu_reference(
         },
         clear=False,
     ):
-        turboquant_store_kv(
+        _turboquant_pack_and_scatter(
             key=key,
             value=value,
             key_cache=key_cache,
@@ -686,12 +721,11 @@ def test_turboquant_kv_roundtrip_cpu_reference(
             bits=tq_bits,
         )
 
-        k_full, v_full = turboquant_decode_kv_cache(
-            key_cache=key_cache,
-            value_cache=value_cache,
-            head_size=D,
-            dtype=dtype,
-            bits=tq_bits,
+        k_full = turboquant_dequantize_from_packed_bytes(
+            key_cache, head_size=D, dtype=dtype, bits=tq_bits
+        )
+        v_full = turboquant_dequantize_from_packed_bytes(
+            value_cache, head_size=D, dtype=dtype, bits=tq_bits
         )
     used = torch.tensor([0, 1], dtype=torch.int64)
     torch.testing.assert_close(k_c, k_full.index_select(0, used), rtol=0.02, atol=0.2)
@@ -718,7 +752,7 @@ def test_turboquant_kv_mixed_key_value_bits_cpu() -> None:
         {"VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0", "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1"},
         clear=False,
     ):
-        turboquant_store_kv(
+        _turboquant_pack_and_scatter(
             key=key,
             value=value,
             key_cache=key_cache,
