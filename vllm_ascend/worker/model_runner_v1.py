@@ -1053,157 +1053,81 @@ def _dynkv_fwd_model_profile_install(model: nn.Module) -> None:
         )
 
 
+def _dynkv_log_forward_profile_decision(
+    *,
+    pa_decode: bool,
+    fia_prof: bool,
+    pa_prof: bool,
+    t_fwd_model: float,
+    mp: dict[str, float],
+    t_fwd_total: float,
+    pa_kv_tokens: float,
+    dynkv_enabled: bool = False,
+) -> None:
+    """Forward profile log (decision fields only, when FORWARD=1)."""
+    model_acl = float(mp.get("model_acl", 0.0))
+    graph_npu_ms = float(mp.get("graph_npu_ms", 0.0))
+    fwd_block_npu_ms = float(mp.get("fwd_block_npu_ms", 0.0))
+    model_replay_est = max(0.0, float(t_fwd_model) - model_acl)
+    _dk = int(bool(dynkv_enabled))
+
+    if pa_decode:
+        logger.info(
+            "[DynamicKV][forward_profile][pa] dynkv=%d "
+            "profile_cpu_total=%.2fms model_acl=%.2fms model_replay_est=%.2fms "
+            "graph_npu_ms=%.3f fwd_block_npu_ms=%.3f pa_kv_tokens_avg=%.1f",
+            _dk,
+            t_fwd_total,
+            model_acl,
+            model_replay_est,
+            graph_npu_ms,
+            fwd_block_npu_ms,
+            pa_kv_tokens,
+        )
+        return
+
+    model_core = float(mp.get("model_core", t_fwd_model))
+    attn_op = float(mp.get("attn_op", 0.0))
+    fia_ms = float(mp.get("fia_ms_total", 0.0))
+    pa_ms = float(mp.get("pa_ms_total", 0.0))
+    logger.info(
+        "[DynamicKV][forward_profile] dynkv=%d "
+        "profile_cpu_total=%.2fms model=%.2fms model_core=%.2fms "
+        "model_attn_op=%.2fms fia_ms_total=%.3f pa_ms_total=%.3f "
+        "pa_kv_tokens_avg=%.1f",
+        _dk,
+        t_fwd_total,
+        t_fwd_model,
+        model_core,
+        attn_op,
+        fia_ms if fia_prof else 0.0,
+        pa_ms if pa_prof else 0.0,
+        pa_kv_tokens,
+    )
+
+
 def _dynkv_log_forward_profile(
     *,
     pa_decode: bool,
     fia_prof: bool,
     pa_prof: bool,
-    ctx_setup: float,
-    kv_setup: float,
-    dynkv_pre: float,
     t_fwd_model: float,
     mp: dict[str, float],
-    t_fwd_dynkv_post: float,
     t_fwd_total: float,
     pa_kv_tokens: float,
     dynkv_enabled: bool = False,
+    **_unused_profile_kwargs: float,
 ) -> None:
-    """Emit forward_profile line; PA graph omits always-zero FIA/eager-PA fields.
-
-    The ``dynkv=<0|1>`` prefix lets log parsers quickly distinguish
-    DynamicKV-on vs disabled runs (matches ``[prepare_profile]`` lines).
-    """
-    model_acl = float(mp.get("model_acl", 0.0))
-    model_core = float(mp.get("model_core", t_fwd_model))
-    graph_replay_wall = float(mp.get("model_graph_replay", 0.0))
-    graph_npu_ms = float(mp.get("graph_npu_ms", 0.0))
-    model_npu_ms = float(mp.get("model_npu_ms", 0.0))
-    fwd_block_npu_ms = float(mp.get("fwd_block_npu_ms", 0.0))
-    _dk = int(bool(dynkv_enabled))
-
-    if pa_decode:
-        logger.info(
-            "[DynamicKV][forward_profile][pa] dynkv=%d ctx_setup=%.2fms "
-            "kv_setup=%.2fms "
-            "dynkv_pre=%.2fms model_cpu=%.2fms model_acl=%.2fms "
-            "graph_replay_wall=%.2fms graph_npu_ms=%.3f model_npu_ms=%.3f "
-            "fwd_block_npu_ms=%.3f pa_kv_tokens_avg=%.1f dynkv_post=%.2fms "
-            "profile_cpu_total=%.2fms",
-            _dk,
-            ctx_setup,
-            kv_setup,
-            dynkv_pre,
-            t_fwd_model,
-            model_acl,
-            graph_replay_wall,
-            graph_npu_ms,
-            model_npu_ms,
-            fwd_block_npu_ms,
-            pa_kv_tokens,
-            t_fwd_dynkv_post,
-            t_fwd_total,
-        )
-        return
-
-    if pa_prof:
-        logger.info(
-            "[DynamicKV][forward_profile] dynkv=%d ctx_setup=%.2fms "
-            "kv_setup=%.2fms "
-            "dynkv_pre=%.2fms model=%.2fms model_acl=%.2fms model_core=%.2fms "
-            "graph_replay_wall=%.2fms graph_npu_ms=%.3f model_npu_ms=%.3f "
-            "fwd_block_npu_ms=%.3f model_embed=%.2fms model_norm=%.2fms "
-            "model_attn=%.2fms model_attn_op=%.2fms%s%s model_mlp=%.2fms "
-            "model_layer_rms=%.2fms model_sp_pcp=%.2fms dynkv_post=%.2fms "
-            "profile_cpu_total=%.2fms",
-            _dk,
-            ctx_setup,
-            kv_setup,
-            dynkv_pre,
-            t_fwd_model,
-            model_acl,
-            model_core,
-            graph_replay_wall,
-            graph_npu_ms,
-            model_npu_ms,
-            fwd_block_npu_ms,
-            float(mp.get("embed", 0.0)),
-            float(mp.get("norm", 0.0)),
-            float(mp.get("attn", 0.0)),
-            float(mp.get("attn_op", 0.0)),
-            (
-                " fia_ms_total=%.3f fia_kv_tokens_avg=%.1f"
-                % (float(mp.get("fia_ms_total", 0.0)),
-                   float(mp.get("fia_kv_tokens_avg", 0.0)))
-                if fia_prof else ""
-            ),
-            (
-                " pa_ms_total=%.3f pa_kv_tokens_avg=%.1f"
-                % (float(mp.get("pa_ms_total", 0.0)), pa_kv_tokens)
-                if pa_prof else ""
-            ),
-            float(mp.get("mlp", 0.0)),
-            max(0.0, model_core - float(mp.get("attn", 0.0))
-                  - float(mp.get("mlp", 0.0))),
-            float(mp.get("model_sp_pcp", 0.0)),
-            t_fwd_dynkv_post,
-            t_fwd_total,
-        )
-        return
-
-    if fia_prof:
-        logger.info(
-            "[DynamicKV][forward_profile] dynkv=%d ctx_setup=%.2fms "
-            "kv_setup=%.2fms "
-            "dynkv_pre=%.2fms model=%.2fms model_acl=%.2fms model_core=%.2fms "
-            "model_embed=%.2fms model_norm=%.2fms model_attn=%.2fms "
-            "model_attn_op=%.2fms fia_ms_total=%.3f fia_kv_tokens_avg=%.1f "
-            "model_mlp=%.2fms model_layer_rms=%.2fms model_sp_pcp=%.2fms "
-            "dynkv_post=%.2fms profile_cpu_total=%.2fms",
-            _dk,
-            ctx_setup,
-            kv_setup,
-            dynkv_pre,
-            t_fwd_model,
-            model_acl,
-            model_core,
-            float(mp.get("embed", 0.0)),
-            float(mp.get("norm", 0.0)),
-            float(mp.get("attn", 0.0)),
-            float(mp.get("attn_op", 0.0)),
-            float(mp.get("fia_ms_total", 0.0)),
-            float(mp.get("fia_kv_tokens_avg", 0.0)),
-            float(mp.get("mlp", 0.0)),
-            max(0.0, model_core - float(mp.get("attn", 0.0))
-                  - float(mp.get("mlp", 0.0))),
-            float(mp.get("model_sp_pcp", 0.0)),
-            t_fwd_dynkv_post,
-            t_fwd_total,
-        )
-        return
-
-    logger.info(
-        "[DynamicKV][forward_profile] dynkv=%d ctx_setup=%.2fms kv_setup=%.2fms "
-        "dynkv_pre=%.2fms model=%.2fms model_acl=%.2fms model_core=%.2fms "
-        "model_embed=%.2fms model_norm=%.2fms model_attn=%.2fms "
-        "model_attn_op=%.2fms model_mlp=%.2fms model_layer_rms=%.2fms "
-        "model_sp_pcp=%.2fms dynkv_post=%.2fms profile_cpu_total=%.2fms",
-        _dk,
-        ctx_setup,
-        kv_setup,
-        dynkv_pre,
-        t_fwd_model,
-        model_acl,
-        model_core,
-        float(mp.get("embed", 0.0)),
-        float(mp.get("norm", 0.0)),
-        float(mp.get("attn", 0.0)),
-        float(mp.get("attn_op", 0.0)),
-        float(mp.get("mlp", 0.0)),
-        max(0.0, model_core - float(mp.get("attn", 0.0))
-              - float(mp.get("mlp", 0.0))),
-        float(mp.get("model_sp_pcp", 0.0)),
-        t_fwd_dynkv_post,
-        t_fwd_total,
+    """Emit one-line forward profile (decision fields only)."""
+    _dynkv_log_forward_profile_decision(
+        pa_decode=pa_decode,
+        fia_prof=fia_prof,
+        pa_prof=pa_prof,
+        t_fwd_model=t_fwd_model,
+        mp=mp,
+        t_fwd_total=t_fwd_total,
+        pa_kv_tokens=pa_kv_tokens,
+        dynkv_enabled=dynkv_enabled,
     )
 
 
@@ -1779,6 +1703,12 @@ class NPUModelRunner(GPUModelRunner):
                 "prepare_kv_setup_ms": 0.0,
                 "prepare_attn_build_ms": 0.0,
                 "prepare_dynkv_branch_ms": 0.0,
+                # Break down ``prepare_dynkv_misc_ms`` into actionable buckets.
+                # These are CPU wall segments inside the DynKV decode branch that
+                # were previously only visible as remainder time.
+                "prepare_dynkv_uniform_check_ms": 0.0,
+                "prepare_dynkv_register_bufs_ms": 0.0,
+                "prepare_dynkv_layer_loop_overhead_ms": 0.0,
                 "prepare_dynkv_misc_ms": 0.0,
                 "prepare_cos_sin_ms": 0.0,
                 "prepare_tail_ms": 0.0,
@@ -1788,6 +1718,7 @@ class NPUModelRunner(GPUModelRunner):
                 "loop_broadcast_ms": 0.0,
                 "loop_stacked_tensor_ms": 0.0,
                 "loop_layer_ctx_fill_batch_ms": 0.0,
+                "loop_layer_slot_remap_ms": 0.0,
                 "loop_total_loop_ms": 0.0,
             }
         elif (
@@ -1836,85 +1767,61 @@ class NPUModelRunner(GPUModelRunner):
         for src, dst in self._DYNKV_PREPARE_LOOP_ACC.items():
             self._dynkv_prepare_step_acc_add(dst, float(vals[src]))
 
-    def _dynkv_log_prepare_profile_reconcile(self) -> None:
+    def _dynkv_log_prepare_profile(self) -> None:
+        """Prepare profile log (decision fields only, when PREPARE=1)."""
         acc = getattr(self, "_dynkv_prepare_step_acc", None)
         if not isinstance(acc, dict):
             return
+        update_states = float(acc.get("update_states_ms", 0.0))
+        wall = float(acc.get("prepare_inputs_wall_ms", 0.0))
+        cos_sin = float(acc.get("prepare_cos_sin_ms", 0.0))
+        baseline = update_states + cos_sin
+        profile_est = update_states + wall
+        core_upload = float(acc.get("prepare_core_dynkv_upload_ms", 0.0))
+        branch = float(acc.get("prepare_dynkv_branch_ms", 0.0))
+        slot_remap = float(acc.get("loop_layer_slot_remap_ms", 0.0))
+        branch_setup = (
+            float(acc.get("loop_stack_init_ms", 0.0))
+            + float(acc.get("loop_layer_ctx_fill_batch_ms", 0.0))
+        )
+        misc_uc = float(acc.get("prepare_dynkv_uniform_check_ms", 0.0))
+        misc_reg = float(acc.get("prepare_dynkv_register_bufs_ms", 0.0))
+        misc_lo = float(acc.get("prepare_dynkv_layer_loop_overhead_ms", 0.0))
+        misc_rem = float(acc.get("prepare_dynkv_misc_ms", 0.0))
+        branch_misc = misc_uc + misc_reg + misc_lo + misc_rem
         loop_sum = sum(
             float(acc.get(k, 0.0)) for k in self._DYNKV_PREPARE_LOOP_ACC.values())
-        dynkv_misc = float(acc.get("prepare_dynkv_misc_ms", 0.0))
-        kv_loop_gap = float(acc.get("prepare_kv_loop_gap_ms", 0.0))
         inner_sum = (
             float(acc.get("prepare_core_ms", 0.0))
             + float(acc.get("prepare_kv_setup_ms", 0.0))
             + float(acc.get("prepare_attn_build_ms", 0.0))
             + loop_sum
-            + dynkv_misc
-            + kv_loop_gap
-            + float(acc.get("prepare_cos_sin_ms", 0.0))
+            + branch_misc
+            + float(acc.get("prepare_kv_loop_gap_ms", 0.0))
+            + cos_sin
             + float(acc.get("prepare_tail_ms", 0.0))
         )
-        wall = float(acc.get("prepare_inputs_wall_ms", 0.0))
         gap = wall - inner_sum
-        update_states = float(acc.get("update_states_ms", 0.0))
-        profile_est = update_states + wall
         logger.info(
-            "[DynamicKV][prepare_profile_reconcile] dynkv=%d "
-            "update_states=%.2fms "
-            "prepare_inputs_wall=%.2fms prepare_core=%.2fms "
-            "prepare_kv_setup=%.2fms prepare_attn_build=%.2fms loop_sum=%.2fms "
-            "prepare_dynkv_misc=%.2fms prepare_kv_loop_gap=%.2fms "
-            "prepare_cos_sin=%.2fms prepare_tail=%.2fms inner_sum=%.2fms "
-            "prepare_gap=%.2fms profile_prepare_est=%.2fms",
+            "[DynamicKV][prepare_profile] dynkv=%d "
+            "profile_prepare_est=%.2fms baseline=%.2fms core_dynkv_upload=%.2fms "
+            "dynkv_branch=%.2fms slot_remap=%.2fms branch_setup=%.2fms "
+            "branch_misc=%.2fms prepare_gap=%.2fms",
             int(self._is_dynamic_kv_enabled()),
-            update_states,
-            wall,
-            float(acc.get("prepare_core_ms", 0.0)),
-            float(acc.get("prepare_kv_setup_ms", 0.0)),
-            float(acc.get("prepare_attn_build_ms", 0.0)),
-            loop_sum,
-            dynkv_misc,
-            kv_loop_gap,
-            float(acc.get("prepare_cos_sin_ms", 0.0)),
-            float(acc.get("prepare_tail_ms", 0.0)),
-            inner_sum,
-            gap,
             profile_est,
+            baseline,
+            core_upload,
+            branch,
+            slot_remap,
+            branch_setup,
+            branch_misc,
+            gap,
         )
 
     def _dynkv_prepare_step_acc_add(self, key: str, ms: float) -> None:
         acc = getattr(self, "_dynkv_prepare_step_acc", None)
         if isinstance(acc, dict):
             acc[key] = float(acc.get(key, 0.0)) + float(ms)
-
-    def _dynkv_log_prepare_profile_ext(self) -> None:
-        acc = getattr(self, "_dynkv_prepare_step_acc", None)
-        if not isinstance(acc, dict):
-            return
-        logger.info(
-            "[DynamicKV][prepare_profile_ext] dynkv=%d update_states=%.2fms "
-            "prepare_core=%.2fms prepare_core_slots=%.2fms prepare_core_rope=%.2fms "
-            "prepare_core_dispatch=%.2fms prepare_core_batch=%.2fms "
-            "prepare_core_dynkv_upload=%.2fms prepare_kv_loop=%.2fms "
-            "prepare_kv_setup=%.2fms prepare_attn_build=%.2fms "
-            "prepare_dynkv_branch=%.2fms prepare_dynkv_misc=%.2fms "
-            "prepare_cos_sin=%.2fms prepare_tail=%.2fms",
-            int(self._is_dynamic_kv_enabled()),
-            float(acc.get("update_states_ms", 0.0)),
-            float(acc.get("prepare_core_ms", 0.0)),
-            float(acc.get("prepare_core_slots_ms", 0.0)),
-            float(acc.get("prepare_core_rope_ms", 0.0)),
-            float(acc.get("prepare_core_dispatch_ms", 0.0)),
-            float(acc.get("prepare_core_batch_ms", 0.0)),
-            float(acc.get("prepare_core_dynkv_upload_ms", 0.0)),
-            float(acc.get("prepare_kv_loop_ms", 0.0)),
-            float(acc.get("prepare_kv_setup_ms", 0.0)),
-            float(acc.get("prepare_attn_build_ms", 0.0)),
-            float(acc.get("prepare_dynkv_branch_ms", 0.0)),
-            float(acc.get("prepare_dynkv_misc_ms", 0.0)),
-            float(acc.get("prepare_cos_sin_ms", 0.0)),
-            float(acc.get("prepare_tail_ms", 0.0)),
-        )
 
     def _dynkv_log_prepare_profile_loop(
         self,
@@ -1933,28 +1840,8 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         total_loop = (layer_copy_meta + layer_slot_remap + layer_meta_assign
                       + layer_slot_assign)
-        logger.info(
-            "[DynamicKV][prepare_profile] dynkv=%d layers=%d stack_init=%.2fms "
-            "kv_list_build=%.2fms build_helper=%.2fms broadcast=%.2fms "
-            "stacked_tensor=%.2fms layer_ctx_fill_batch=%.2fms "
-            "layer_slot_assign=%.2fms layer_copy_meta=%.2fms "
-            "layer_slot_remap=%.2fms layer_meta_assign=%.2fms "
-            "layer_other=%.2fms total_loop=%.2fms",
-            int(self._is_dynamic_kv_enabled()),
-            layers,
-            stack_init,
-            kv_list_build,
-            build_helper,
-            broadcast,
-            stacked_tensor,
-            layer_ctx_fill_batch,
-            layer_slot_assign,
-            layer_copy_meta,
-            layer_slot_remap,
-            layer_meta_assign,
-            layer_meta_assign,
-            total_loop,
-        )
+        self._dynkv_prepare_step_acc_add(
+            "loop_layer_slot_remap_ms", float(layer_slot_remap))
         self._dynkv_prepare_step_acc_add_loop_fields(
             stack_init=stack_init,
             kv_list_build=kv_list_build,
@@ -3312,12 +3199,17 @@ class NPUModelRunner(GPUModelRunner):
                         int(num_input_tokens))
                     _dynkv_layer_names = list(attn_group.layer_names)
                     _dynkv_L = len(_dynkv_layer_names)
-                    self._register_dynkv_graph_context_lens_bufs_from_capture(
-                        int(num_input_tokens), _dynkv_layer_names)
                     _dynkv_n = int(attn_metadata_i.slot_mapping.numel())
 
                     # Timing accumulators (only used when VLLM_DYNKV_PROFILE_PREPARE=1)
                     _dynkv_profile = os.environ.get("VLLM_DYNKV_PROFILE_PREPARE", "0") == "1"
+                    _t0_reg = time.perf_counter() if _dynkv_profile else 0
+                    self._register_dynkv_graph_context_lens_bufs_from_capture(
+                        int(num_input_tokens), _dynkv_layer_names)
+                    _t_register_bufs = (
+                        (time.perf_counter() - _t0_reg) * 1000
+                        if _dynkv_profile else 0.0
+                    )
                     _t_stack_init = 0.0
                     _t_kv_list_build = 0.0
                     _t_build_helper = 0.0
@@ -3328,6 +3220,9 @@ class NPUModelRunner(GPUModelRunner):
                     _t_layer_ctx_fill_batch = 0.0
                     _t_layer_slot_assign = 0.0
                     _t_layer_meta_assign = 0.0
+                    _t_uniform_check = 0.0
+                    _t_layer_loop_overhead = 0.0
+                    _t_layer_loop_total = 0.0
 
                     _t0_stack = time.perf_counter() if _dynkv_profile else 0
                     _dynkv_stack: Optional[torch.Tensor] = None
@@ -3375,6 +3270,7 @@ class NPUModelRunner(GPUModelRunner):
                             _t_kv_list_build = (time.perf_counter() - _t0_kvlist) * 1000
                         # Phase B: detect uniform per_layer_kv_lens (requires
                         # uniform_kv_budget != off and runtime verification).
+                        _t0_uc = time.perf_counter() if _dynkv_profile else 0
                         _dynkv_uniform_lens = (
                             str(getattr(self.ascend_config,
                                         "dynamic_kv_uniform_kv_budget",
@@ -3382,6 +3278,8 @@ class NPUModelRunner(GPUModelRunner):
                             and _dynkv_decode_check_uniform_lens_runtime(
                                 kv_list_dyn, _dynkv_L)
                         )
+                        if _dynkv_profile:
+                            _t_uniform_check = (time.perf_counter() - _t0_uc) * 1000
                         if kv_list_dyn and len(kv_list_dyn) == len(rid_list_dyn):
                             tg_pre = get_tp_group()
                             built_dyn: tuple[
@@ -3645,6 +3543,7 @@ class NPUModelRunner(GPUModelRunner):
                             _t_layer_slot_assign = (
                                 time.perf_counter() - _t0_slot_assign) * 1000
                     for _dyn_li, layer_name in enumerate(_dynkv_layer_names):
+                        _t0_lt = time.perf_counter() if _dynkv_profile else 0
                         # vLLM will index attn_metadata by layer_name. We must ensure
                         # each layer sees its own metadata instance with `layer_name`
                         # populated, otherwise DynamicKV cannot resolve layer_idx.
@@ -3806,6 +3705,8 @@ class NPUModelRunner(GPUModelRunner):
                             except Exception:
                                 pass
                         attn_metadata[layer_name] = meta_i
+                        if _dynkv_profile:
+                            _t_layer_loop_total += (time.perf_counter() - _t0_lt) * 1000
                     # Print timing summary once per step (only layer 0 triggers print)
                     if _dynkv_profile and _dynkv_L > 0:
                         self._dynkv_log_prepare_profile_loop(
@@ -3822,6 +3723,12 @@ class NPUModelRunner(GPUModelRunner):
                             layer_meta_assign=_t_layer_meta_assign,
                         )
                     if _prep_phase_timing:
+                        if _dynkv_profile:
+                            _t_layer_loop_overhead = max(
+                                0.0,
+                                _t_layer_loop_total
+                                - (_t_layer_copy_meta + _t_layer_slot_remap + _t_layer_meta_assign),
+                            )
                         _dynkv_measured = (
                             _t_stack_init + _t_kv_list_build + _t_build_helper
                             + _t_broadcast + _t_stacked_tensor
@@ -3833,8 +3740,23 @@ class NPUModelRunner(GPUModelRunner):
                         self._dynkv_prepare_step_acc_add(
                             "prepare_dynkv_branch_ms", _branch_ms)
                         self._dynkv_prepare_step_acc_add(
+                            "prepare_dynkv_uniform_check_ms", _t_uniform_check)
+                        self._dynkv_prepare_step_acc_add(
+                            "prepare_dynkv_register_bufs_ms", _t_register_bufs)
+                        self._dynkv_prepare_step_acc_add(
+                            "prepare_dynkv_layer_loop_overhead_ms",
+                            _t_layer_loop_overhead,
+                        )
+                        self._dynkv_prepare_step_acc_add(
                             "prepare_dynkv_misc_ms",
-                            max(0.0, _branch_ms - _dynkv_measured),
+                            max(
+                                0.0,
+                                _branch_ms
+                                - _dynkv_measured
+                                - _t_uniform_check
+                                - _t_register_bufs
+                                - _t_layer_loop_overhead,
+                            ),
                         )
 
         if _prep_phase_timing:
@@ -3875,8 +3797,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._dynkv_prepare_step_acc["prepare_inputs_wall_ms"] = _pi_wall_ms
             if self._dynkv_prepare_profile_enabled():
-                self._dynkv_log_prepare_profile_ext()
-                self._dynkv_log_prepare_profile_reconcile()
+                self._dynkv_log_prepare_profile()
         elif _track_prepare_wall:
             self._profile_prepare_inputs_cpu_ms = _pi_wall_ms
 
@@ -4675,15 +4596,10 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     logger.info(
                         "[DynamicKV][forward_profile] dynkv=%d "
-                        "ctx_setup=%.2fms kv_setup=%.2fms dynkv_pre=%.2fms "
-                        "model=%.2fms dynkv_post=%.2fms total=%.2fms",
+                        "profile_cpu_total=%.2fms model=%.2fms",
                         int(self._is_dynamic_kv_enabled()),
-                        _t_fwd_ctx_setup,
-                        _t_fwd_kv_setup,
-                        _t_fwd_dynkv_pre,
-                        _t_fwd_model,
-                        _t_fwd_dynkv_post,
                         _t_fwd_total,
+                        _t_fwd_model,
                     )
 
         kv_connector_output = KVConnectorOutput(
