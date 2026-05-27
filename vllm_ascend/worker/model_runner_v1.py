@@ -2028,16 +2028,23 @@ class NPUModelRunner(GPUModelRunner):
         """
         budget = str(
             getattr(self.ascend_config, "dynamic_kv_uniform_kv_budget", "off"))
-        if budget == "off":
+        # When using token-level head aggregation (sum/max), per-layer kv_lens
+        # tend to become uniform much more often than legacy per-head-union.
+        # Even if uniform_kv_budget is off, enabling the uniform-lens cache
+        # avoids repeated Python scans + rebuild/broadcast in steady-state decode.
+        ha = str(getattr(self.ascend_config, "dynamic_kv_head_aggregation", "sum")).strip().lower()
+        allow_cache = (budget != "off") or (ha in ("sum", "max"))
+        if not allow_cache:
             return False
         if (
-            budget == "fixed_base"
-            and getattr(self, "_dynkv_decode_uniform_lens_state", None) is True
+            getattr(self, "_dynkv_decode_uniform_lens_state", None) is True
         ):
             return True
         uniform = _dynkv_decode_check_uniform_lens_runtime(kv_list_dyn, n_layers)
-        if budget == "fixed_base":
-            self._dynkv_decode_uniform_lens_state = bool(uniform)
+        # Cache the outcome to skip per-step scans in steady-state.
+        # For fixed_base this matches prior behavior; for budget=off + ha in (sum,max)
+        # it is an extra performance optimization (uniformity is typically stable).
+        self._dynkv_decode_uniform_lens_state = bool(uniform)
         return uniform
 
     def _get_dynkv_layer_idx_map(
