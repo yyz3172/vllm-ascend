@@ -24,7 +24,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm_ascend.attention.dynamic_kv import (DynamicKVConfig,
                                               apply_uniform_per_layer_old_budget,
                                               cap_keep_indices_chronological,
-                                              clear_dynkv_softmax_scratch,
+                                              maybe_clear_dynkv_softmax_scratch_per_request,
                                               gather_kv_from_paged_cache_batched,
                                               save_validation_mask,
                                               scores_and_indices_old,
@@ -656,10 +656,11 @@ def run_offload_rewrite_and_build_updates(
             # We keep it empty to avoid misinterpretation; decode uses kv_len only.
             per_layer_keep_indices.append([])
 
-        # Best-effort: release large persistent scratch to reduce fragmentation
-        # and reserved-memory growth under concurrency.
+        # P0 scratch-reuse: keep one ``_DYNKV_SCRATCH`` per device (W_cfg-sized).
+        # Optional per-request clear: ``VLLM_ASCEND_DYNKV_CLEAR_SCRATCH=1``.
         try:
-            clear_dynkv_softmax_scratch(device=layer_items[0][1].device)
+            maybe_clear_dynkv_softmax_scratch_per_request(
+                layer_items[0][1].device)
         except Exception:
             pass
 

@@ -10,13 +10,53 @@ DynamicKV helpers for vLLM-Ascend:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-# Scratch buffers for chunked softmax to reduce allocator fragmentation.
-# Keyed by (device, Hkv, rep, W, chunk_size). Values are float32 tensors.
-_DYNKV_SCRATCH: dict[tuple[str, int, int, int, int], torch.Tensor] = {}
+# Scratch buffers for chunked softmax (float32). Reused process-wide; keyed by
+# (device, Hkv, rep, chunk_size) with allocation width ``W_cfg`` (not per W_eff).
+_DYNKV_SCRATCH: dict[tuple[str, int, int, int], torch.Tensor] = {}
+# Optional override (bytes); else env/default applies in ``_dynkv_scratch_budget_bytes``.
+_DYNKV_SCRATCH_MAX_BYTES: int | None = None
+_DEFAULT_SCRATCH_MAX_MB = 48
+
+
+def set_dynkv_scratch_max_bytes(nbytes: int) -> None:
+    """Set per-device scratch budget (bytes). ``0`` disables the cap."""
+    global _DYNKV_SCRATCH_MAX_BYTES
+    _DYNKV_SCRATCH_MAX_BYTES = max(0, int(nbytes))
+
+
+def _dynkv_scratch_budget_bytes() -> int:
+    if _DYNKV_SCRATCH_MAX_BYTES is not None:
+        return max(0, int(_DYNKV_SCRATCH_MAX_BYTES))
+    raw = os.environ.get("VLLM_ASCEND_DYNKV_SCRATCH_MAX_MB")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0, int(float(raw))) * 1024 * 1024
+        except ValueError:
+            pass
+    return _DEFAULT_SCRATCH_MAX_MB * 1024 * 1024
+
+
+def _dynkv_scratch_cache_key(
+    device: torch.device, Hkv: int, rep: int, chunk_size: int
+) -> tuple[str, int, int, int]:
+    return (str(device), int(Hkv), int(rep), int(chunk_size))
+
+
+def _dynkv_scratch_tensor_bytes(buf: torch.Tensor) -> int:
+    return int(buf.numel()) * int(buf.element_size())
+
+
+def _dynkv_scratch_bytes_on_device(device_str: str) -> int:
+    total = 0
+    for k, buf in _DYNKV_SCRATCH.items():
+        if k and k[0] == device_str and isinstance(buf, torch.Tensor):
+            total += _dynkv_scratch_tensor_bytes(buf)
+    return total
 
 
 def _get_dynkv_softmax_scratch(
@@ -27,22 +67,50 @@ def _get_dynkv_softmax_scratch(
     W: int,
     chunk_size: int,
 ) -> torch.Tensor:
-    key = (str(device), int(Hkv), int(rep), int(W), int(chunk_size))
+    """Return fp32 scratch ``[Hkv, rep, W, chunk_size]``.
+
+    ``W`` must be ``window_size`` (``W_cfg``), not ``W_eff``, so one buffer is
+    reused per device/head layout. Callers only use the first ``W_eff`` rows.
+    """
+    Hkv_i, rep_i = int(Hkv), int(rep)
+    W_alloc = int(W)
+    chunk_i = int(chunk_size)
+    key = _dynkv_scratch_cache_key(device, Hkv_i, rep_i, chunk_i)
+    want_shape = (Hkv_i, rep_i, W_alloc, chunk_i)
     buf = _DYNKV_SCRATCH.get(key)
-    if isinstance(buf, torch.Tensor) and buf.device == device and buf.dtype == torch.float32:
-        if buf.shape == (Hkv, rep, W, chunk_size):
-            return buf
-    buf = torch.empty((Hkv, rep, W, chunk_size), device=device, dtype=torch.float32)
+    if (
+        isinstance(buf, torch.Tensor)
+        and buf.device == device
+        and buf.dtype == torch.float32
+        and tuple(buf.shape) == want_shape
+    ):
+        return buf
+    if isinstance(buf, torch.Tensor):
+        _DYNKV_SCRATCH.pop(key, None)
+
+    need = Hkv_i * rep_i * W_alloc * chunk_i * 4
+    dev_s = str(device)
+    budget = _dynkv_scratch_budget_bytes()
+    if budget > 0 and need > budget:
+        clear_dynkv_softmax_scratch(device=device)
+    elif budget > 0:
+        while _dynkv_scratch_bytes_on_device(dev_s) + need > budget:
+            evicted = False
+            for k in list(_DYNKV_SCRATCH.keys()):
+                if k and k[0] == dev_s:
+                    _DYNKV_SCRATCH.pop(k, None)
+                    evicted = True
+                    break
+            if not evicted:
+                break
+
+    buf = torch.empty(want_shape, device=device, dtype=torch.float32)
     _DYNKV_SCRATCH[key] = buf
     return buf
 
 
 def clear_dynkv_softmax_scratch(device: torch.device | None = None) -> None:
-    """Clear cached scratch buffers to reduce reserved memory.
-
-    When running under tight memory / fragmentation, keeping large persistent
-    scratch buffers can increase `reserved` and make small allocations fail.
-    """
+    """Drop cached scratch buffers (OOM relief or ``VLLM_ASCEND_DYNKV_CLEAR_SCRATCH=1``)."""
     if device is None:
         _DYNKV_SCRATCH.clear()
         return
@@ -50,6 +118,13 @@ def clear_dynkv_softmax_scratch(device: torch.device | None = None) -> None:
     for k in list(_DYNKV_SCRATCH.keys()):
         if k and k[0] == d:
             _DYNKV_SCRATCH.pop(k, None)
+
+
+def maybe_clear_dynkv_softmax_scratch_per_request(device: torch.device) -> None:
+    """Legacy per-request release when ``VLLM_ASCEND_DYNKV_CLEAR_SCRATCH=1``."""
+    flag = os.environ.get("VLLM_ASCEND_DYNKV_CLEAR_SCRATCH", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        clear_dynkv_softmax_scratch(device=device)
 
 
 
@@ -305,7 +380,7 @@ def _compute_token_scores_old_per_kv_head_paged_cache(
 
     chunk_size = max(128, int(softmax_chunk_size))
     scratch = _get_dynkv_softmax_scratch(
-        device=qg.device, Hkv=Hkv, rep=rep, W=W_eff, chunk_size=chunk_size
+        device=qg.device, Hkv=Hkv, rep=rep, W=W_cfg, chunk_size=chunk_size
     )
 
     tail_base = int(L - W_eff)
@@ -565,7 +640,7 @@ def _compute_token_scores_old_per_kv_head(
     device = qg.device
     logit_dtype = qg.dtype
     scratch = _get_dynkv_softmax_scratch(
-        device=device, Hkv=Hkv, rep=rep, W=W_eff, chunk_size=chunk_size
+        device=device, Hkv=Hkv, rep=rep, W=W_cfg, chunk_size=chunk_size
     )
 
     # 1) pass: compute per-(Hkv,rep,W) max over L for numerically-stable softmax.

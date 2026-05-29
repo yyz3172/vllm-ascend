@@ -172,6 +172,16 @@ class AscendConfig:
         # DynamicKV: chunk size for chunked softmax in score computation.
         # Larger is faster but higher peak memory; smaller reduces peak memory.
         self.dynamic_kv_softmax_chunk_size = int(dyn.get("softmax_chunk_size", 1024))
+        # Max fp32 scratch retained per NPU for offload scoring (MiB). One W_cfg
+        # buffer per (device, Hkv, rep, chunk_size); default 48 MiB.
+        self.dynamic_kv_scratch_max_mb = max(
+            0, int(dyn.get("scratch_max_mb", 48)))
+        try:
+            from vllm_ascend.attention.dynamic_kv import set_dynkv_scratch_max_bytes
+
+            set_dynkv_scratch_max_bytes(self.dynamic_kv_scratch_max_mb * 1024 * 1024)
+        except Exception:
+            pass
         # DynamicKV knobs (optional; radio_* match upstream reference).
         self.dynamic_kv_radio_max = float(dyn.get("radio_max", 10.0))
         self.dynamic_kv_radio_min = float(dyn.get("radio_min", 0.1))
