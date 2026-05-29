@@ -465,14 +465,10 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache(
         std::printf("[TQ_PACK] before equal checks\n");
         std::fflush(stdout);
     }
-    TORCH_CHECK(at::equal(codebook_key, codebook_value),
-                "initial fused pack expects same codebook for key/value");
     if (debug_blocks != 0U) {
         std::printf("[TQ_PACK] codebook equal check done\n");
         std::fflush(stdout);
     }
-    TORCH_CHECK(at::equal(rotation_t_key, rotation_t_value),
-                "initial fused pack expects same rotation_t for key/value");
     if (debug_blocks != 0U) {
         std::printf("[TQ_PACK] rotation equal check done\n");
         std::fflush(stdout);

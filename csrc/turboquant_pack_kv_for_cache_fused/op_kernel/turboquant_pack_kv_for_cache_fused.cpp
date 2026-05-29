@@ -44,12 +44,14 @@ static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
 static constexpr uint32_t TQ_ROT_N_PER_SUB = TQ_ROT_N / TQ_AIV_SUB_BLOCKS;
 static constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
-// Broadcast tile: [D, K_TILE] = [128, 128] fits in 32 KiB UB (half).
-static constexpr uint32_t TQ_ARGMIN_K_TILE = 128;
-static constexpr uint32_t TQ_TILE_DIFF_ELEMS = TQ_PACK_D * TQ_ARGMIN_K_TILE;
-static constexpr uint32_t TQ_REDUCE_MIN_WORK = 64;
-static constexpr float TQ_NORM_EPS_F = 1e-10f;
 static constexpr uint32_t TQ_ROT_LOCAL_WORKSPACE_BYTES = TQ_MAX_BATCH_M * TQ_ROT_K * sizeof(half);
+static constexpr float TQ_NORM_EPS_F = 1e-10f;
+static constexpr uint32_t TQ_REDUCE_MASK = 64;  // max mask for float WholeReduceMin
+static constexpr uint32_t TQ_REDUCE_BATCHES = (TQ_PACK_K + TQ_REDUCE_MASK - 1) / TQ_REDUCE_MASK;  // 4
+static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;  // 8 dataBlocks per repeat
+// Dimensions processed per tile — balance between UB usage and sync reduction.
+// distBuf = D_TILE * K * 4 bytes.  D_TILE=16 → 16 KiB.
+static constexpr uint32_t TQ_D_TILE = 16;
 
 __aicore__ inline uint32_t AlignUp16(uint32_t x) {
     return (x + TQ_CUBE_M_ALIGN - 1) / TQ_CUBE_M_ALIGN * TQ_CUBE_M_ALIGN;
@@ -80,13 +82,6 @@ __aicore__ inline void TqSyncVToMte3() {
     WaitFlag<HardEvent::V_MTE3>(e);
 }
 
-__aicore__ inline bool TqDebugEnabled(uint32_t debugLog) {
-    if ASCEND_IS_AIV {
-        return debugLog != 0;
-    }
-    return false;
-}
-
 __aicore__ inline bool TqIsAiv() {
     if ASCEND_IS_AIV {
         return true;
@@ -105,7 +100,7 @@ __aicore__ inline float TqAbsF32(float x) {
     return x < 0.f ? -x : x;
 }
 
-// Match turboquant_pack_nearest_scale_8bit / PyTorch argmin on |y - codebook|.
+// Scalar argmin: find k in [0,TQ_PACK_K) minimizing |yf - cb[k]|.
 __aicore__ inline uint8_t ArgminAbsL1Scalar(float yf, const AscendC::LocalTensor<half>& cbLocal) {
     float best = TqAbsF32(yf - static_cast<float>(cbLocal.GetValue(0)));
     uint8_t bestIdx = 0;
@@ -143,7 +138,7 @@ __aicore__ inline void copy_packed_ub_to_gm(
 
 using TqRotateAT = MatmulType<TPosition::VECOUT, CubeFormat::ND, half>;
 using TqRotateBT = MatmulType<TPosition::GM, CubeFormat::ND, half>;
-using TqRotateCT = MatmulType<TPosition::VECIN, CubeFormat::ND, half>;
+using TqRotateCT = MatmulType<TPosition::GM, CubeFormat::ND, float>;
 using TqRotateBiasT = MatmulType<TPosition::GM, CubeFormat::ND, half>;
 
 using TqRotateMatmulOp =
@@ -164,12 +159,10 @@ public:
         uint32_t nVec,
         uint32_t slot_w_k,
         uint32_t slot_w_v,
-        uint32_t vecPerCore,
-        uint32_t debugLog) {
+        uint32_t vecPerCore) {
         nVec_ = nVec;
         slot_w_k_ = slot_w_k;
         slot_w_v_ = slot_w_v;
-        debugLog_ = debugLog;
         vecPerCore_ = vecPerCore;
         if (vecPerCore_ > TQ_MAX_BATCH_M) {
             vecPerCore_ = TQ_MAX_BATCH_M;
@@ -188,17 +181,33 @@ public:
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * sizeof(half));
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
-        pipe_->InitBuffer(diffTileBuf_, TQ_TILE_DIFF_ELEMS * sizeof(half));
-        pipe_->InitBuffer(cbTileBuf_, TQ_TILE_DIFF_ELEMS * sizeof(half));
+        // distBuf: tiled distance vectors [D_TILE][K] (16×256×4 = 16 KiB)
+        pipe_->InitBuffer(distBuf_, TQ_D_TILE * TQ_PACK_K * sizeof(float) + 256);
+        // yFp32Buf: fp32 y row [D=128]
+        pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
+        pipe_->InitBuffer(cbTileBuf_, TQ_PACK_K * sizeof(float));
+        // idxInt32Buf: int32 buffer for index storage
+        pipe_->InitBuffer(idxInt32Buf_, TQ_PACK_D * sizeof(int32_t));
+        // argminResultBuf: batch results for WholeReduceMin [4 batches × 2 values]
+        pipe_->InitBuffer(argminResultBuf_, TQ_REDUCE_BATCHES * 2 * sizeof(float));
         // NormalizeBatch: fp32 row + fp32 ReduceSum tmp (2 * TQ_PACK_D floats).
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
-        pipe_->InitBuffer(argminWorkBuf_, TQ_REDUCE_MIN_WORK * sizeof(half));
         pipe_->InitBuffer(idxBuf_, TQ_PACK_D * sizeof(uint8_t));
-        pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
         const uint32_t maxSlotW = slot_w_k_ > slot_w_v_ ? slot_w_k_ : slot_w_v_;
         pipe_->InitBuffer(packedRowBuf_, maxSlotW * sizeof(uint8_t));
+        pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
+        // fp32 UB buffer for Cube C output (after DataCopy from GM)
+        pipe_->InitBuffer(yCubeFp32Buf_, TQ_MAX_BATCH_M * TQ_ROT_N * sizeof(float));
 
         matmulReady_ = GetSysWorkSpacePtr() != nullptr;
+        // GM buffer for Cube C output at workspace offset 256KB (ND format, fp32 accumulate)
+        if (matmulReady_) {
+            constexpr uint64_t kCubeCOffset = 256 * 1024;
+            auto* wsBase = reinterpret_cast<__gm__ uint8_t*>(GetSysWorkSpacePtr());
+            cubeCGm_.SetGlobalBuffer(
+                reinterpret_cast<__gm__ float*>(wsBase + kCubeCOffset),
+                (uint64_t)TQ_MAX_BATCH_M * TQ_ROT_N);
+        }
     }
 
     // pack_mode=1 debug path: AIV-only reference rotate (no KFC / no Cube).
@@ -226,9 +235,6 @@ public:
         if (!matmulReady_ || !TqIsAiv()) {
             return;
         }
-        // MIX 1C2V: Cube split-B via rotation_t[dBase] does not match R^T[:, dBase:dBase+N]
-        // in ND row-major GM. Use primary AIV only with the same manual rotate + full-row
-        // pack as pack_mode=1 (REGIST_MATMUL_OBJ still satisfies MIX handshake).
         if (!TqIsPrimaryAivSub()) {
             return;
         }
@@ -241,17 +247,14 @@ public:
         if (start >= end) {
             return;
         }
-        if (TqDebugEnabled(debugLog_)) {
-            const uint32_t blockDim = (nVec_ + vecPerCore_ - 1) / vecPerCore_;
-            if (core < 8 || core + 1 == blockDim) {
-                AscendC::printf(
-                    "[TQ_PACK] block=%u/%u start=%u end=%u rows=%u vecPerCore=%u nVec=%u\n",
-                    core, blockDim, start, end, end - start, vecPerCore_, nVec_);
-            }
-        }
+        AscendC::printf("[TQ_PERF] core=%u rows=%u start=%u\n", core, end - start, start);
 
-        PackBatch(keyGm_, packedKGm_, start, end, slot_w_k_, 0, TQ_PACK_D, true, true);
-        PackBatch(valueGm_, packedVGm_, start, end, slot_w_v_, 0, TQ_PACK_D, true, true);
+        // ---- K ----
+        PackBatchPerf(keyGm_, packedKGm_, start, end, slot_w_k_, 0, TQ_PACK_D, true, false, 'K');
+        // ---- V ----
+        PackBatchPerf(valueGm_, packedVGm_, start, end, slot_w_v_, 0, TQ_PACK_D, true, false, 'V');
+
+        AscendC::printf("[TQ_PERF] core=%u done\n", core);
     }
 
 private:
@@ -283,7 +286,9 @@ private:
         }
     }
 
-    // One batched matmul for all rows on this core (M may be padded to 16 for Cube).
+    // Cube Matmul: half A(VECOUT) × half B(GM) → fp32 C(GM), then copy to UB and cast to half.
+    // C outputs to GM (ND format fully supported) instead of VECIN (NZ only).
+    // fp32 C gives fp32 accumulate precision, close to manual fp32×fp32 version.
     __aicore__ inline void RotateBatchMatmul(
         AscendC::LocalTensor<half>& xUnitBatch,
         AscendC::LocalTensor<half>& yBatch,
@@ -297,10 +302,17 @@ private:
         rotateMm_->SetTensorB(rotationTGm_[dBase], false);
         auto rotateWorkspace = rotateWorkBuf_.Get<uint8_t>();
         rotateMm_->SetLocalWorkspace(rotateWorkspace);
-        while (rotateMm_->template Iterate<true>()) {
-            rotateMm_->template GetTensorC<true>(yBatch, false, true);
+        // Output fp32 C to GM (ND format), non-sequential write for correct [M][N] layout
+        while (rotateMm_->Iterate()) {
+            rotateMm_->GetTensorC(cubeCGm_);
         }
         rotateMm_->End();
+
+        // DataCopy fp32 C from GM to UB, then cast to half
+        auto yFp32 = yCubeFp32Buf_.Get<float>();
+        AscendC::DataCopy(yFp32, cubeCGm_, m * dCount);
+        TqSyncMte2ToV();
+        AscendC::Cast(yBatch, yFp32, AscendC::RoundMode::CAST_NONE, m * dCount);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -322,18 +334,14 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    // Per-dim argmin on |y - codebook[k]| (same as PyTorch quantize + 8bit pack kernel).
-    __aicore__ inline void EncodeRowBroadcast(
-        const AscendC::LocalTensor<half>& yRow,
-        AscendC::LocalTensor<half>& codebookLocal,
-        AscendC::LocalTensor<uint8_t>& idxOut,
-        uint32_t dCount) {
-        for (uint32_t d = 0; d < dCount; ++d) {
-            const float yf = static_cast<float>(yRow.GetValue(d));
-            idxOut.SetValue(d, ArgminAbsL1Scalar(yf, codebookLocal));
-        }
-    }
-
+    // Vectorized argmin per dimension using Duplicate/Sub/Abs + WholeReduceMin.
+    // Python equivalent: d = (y.unsqueeze(-1) - codebook.view(1,1,-1)).abs(); idx = d.argmin(dim=-1)
+    //
+    // Optimization: tile D_TILE dimensions at a time to amortize sync overhead.
+    //   - Batch-read all y values into stack array (1 V→S + 1 S→V sync pair)
+    //   - Per tile: Duplicate/Sub/Abs for D_TILE rows, then WholeReduceMin per row
+    //   - Batch-read results, batch-write indices
+    //   - No PipeBarrier between consecutive V ops (Duplicate→Sub→Abs)
     __aicore__ inline void EncodeBatch(
         AscendC::LocalTensor<half>& yBatch,
         AscendC::LocalTensor<half>& norms,
@@ -344,10 +352,21 @@ private:
         uint32_t dBase,
         uint32_t dCount,
         bool writeMeta) {
+        // Load codebook half → float (split into two 128-element Casts for safety)
         auto codebookLocal = codebookBuf_.Get<half>();
         AscendC::DataCopy(codebookLocal, codebookGm_[0], TQ_PACK_K);
         TqSyncMte2ToV();
 
+        auto cbFp32 = cbTileBuf_.Get<float>();
+        AscendC::Cast(cbFp32, codebookLocal, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(cbFp32[TQ_PACK_D], codebookLocal[TQ_PACK_D], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto yFp32 = yFp32Buf_.Get<float>();
+        auto distTile = distBuf_.Get<float>();    // [D_TILE][K]
+        auto argminRes = argminResultBuf_.Get<float>();
+        auto idxInt32 = idxInt32Buf_.Get<int32_t>();
         auto idxLocal = idxBuf_.Get<uint8_t>();
         auto packedRow = packedRowBuf_.Get<uint8_t>();
 
@@ -356,8 +375,64 @@ private:
             const uint64_t out_base = (uint64_t)vecIdx * slot_w;
             const uint32_t yOff = i * TQ_ROT_N;
 
-            EncodeRowBroadcast(yBatch[yOff], codebookLocal, idxLocal, dCount);
+            // Cast y row half → float, then batch-read all values
+            AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, dCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            TqSyncVToS();
+            float yVals[TQ_PACK_D];
+            for (uint32_t d = 0; d < dCount; ++d) {
+                yVals[d] = yFp32.GetValue(d);
+            }
+            TqSyncSToV();
 
+            // Process dimensions in tiles of D_TILE
+            for (uint32_t tileStart = 0; tileStart < dCount; tileStart += TQ_D_TILE) {
+                const uint32_t tileCnt = (tileStart + TQ_D_TILE <= dCount)
+                    ? TQ_D_TILE : (dCount - tileStart);
+
+                // Phase 1: compute distance vectors for this tile
+                for (uint32_t dl = 0; dl < tileCnt; ++dl) {
+                    auto distRow = distTile[dl * TQ_PACK_K];
+                    AscendC::Duplicate(distRow, yVals[tileStart + dl], TQ_PACK_K);
+                    AscendC::Sub(distRow, distRow, cbFp32, TQ_PACK_K);
+                    AscendC::Abs(distRow, distRow, TQ_PACK_K);
+                }
+
+                // Phase 2+3: WholeReduceMin + merge per dimension (each dl reads its own result)
+                for (uint32_t dl = 0; dl < tileCnt; ++dl) {
+                    auto distRow = distTile[dl * TQ_PACK_K];
+                    AscendC::WholeReduceMin<float>(
+                        argminRes, distRow, TQ_REDUCE_MASK,
+                        TQ_REDUCE_BATCHES, 1, 1, TQ_REDUCE_SRC_REP_STRIDE,
+                        AscendC::ReduceOrder::ORDER_INDEX_VALUE);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    TqSyncVToS();
+
+                    int32_t globalIdx = 0;
+                    float globalMin = argminRes.GetValue(1);
+                    float idxF = argminRes.GetValue(0);
+                    int32_t rawIdx = *reinterpret_cast<int32_t *>(&idxF);
+                    globalIdx = rawIdx;
+                    for (uint32_t b = 1; b < TQ_REDUCE_BATCHES; ++b) {
+                        idxF = argminRes.GetValue(b * 2);
+                        rawIdx = *reinterpret_cast<int32_t *>(&idxF);
+                        float batchMin = argminRes.GetValue(b * 2 + 1);
+                        if (batchMin < globalMin) {
+                            globalMin = batchMin;
+                            globalIdx = rawIdx + static_cast<int32_t>(b * TQ_REDUCE_MASK);
+                        }
+                    }
+                    idxInt32.SetValue(tileStart + dl, globalIdx);
+                    TqSyncSToV();
+                }
+            }
+
+            // Convert int32 indices → uint8 and pack
+            for (uint32_t d = 0; d < dCount; ++d) {
+                idxLocal.SetValue(d, static_cast<uint8_t>(idxInt32.GetValue(d)));
+            }
+
+            // Build packed row
             for (uint32_t k = 0; k < slot_w; ++k) {
                 packedRow.SetValue(k, (uint8_t)0);
             }
@@ -367,6 +442,7 @@ private:
             if (writeMeta) {
                 write_norm_fp16_le_local(packedRow, 0, norms.GetValue(i));
             }
+            TqSyncSToV();
             copy_packed_ub_to_gm(packedGm, out_base, packedRow, slot_w);
         }
     }
@@ -383,48 +459,77 @@ private:
         bool manualRotate) {
         const uint32_t m = end - start;
         const uint32_t mPad = AlignUp16(m);
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] PackBatch enter start=%u end=%u m=%u mPad=%u slot_w=%u\n",
-                            start, end, m, mPad, slot_w);
-        }
 
         auto xBatch = xBatchQue_.AllocTensor<half>();
         auto yBatch = yBatchQue_.AllocTensor<half>();
         auto norms = normsBuf_.Get<half>();
 
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] before DataCopy x\n");
-        }
         AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
         TqSyncMte2ToV();
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] after DataCopy x\n");
-        }
 
         if (mPad > m) {
             AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
 
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] before Normalize\n");
-        }
         NormalizeBatch(xBatch, norms, m);
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] after Normalize before Matmul\n");
-        }
         if (manualRotate) {
             RotateBatchMatmulManual(xBatch, yBatch, m);
         } else {
             RotateBatchMatmul(xBatch, yBatch, m, mPad, dBase, dCount);
         }
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] after Matmul before Encode\n");
-        }
         EncodeBatch(yBatch, norms, packedGm, start, m, slot_w, dBase, dCount, writeMeta);
-        if (TqDebugEnabled(debugLog_)) {
-            AscendC::printf("[TQ_PACK] after Encode\n");
+
+        yBatchQue_.FreeTensor(yBatch);
+        xBatchQue_.FreeTensor(xBatch);
+    }
+
+    // PrintTimeStamp descId mapping:
+    //   0 = start, 1 = after DataCopy, 2 = after Normalize,
+    //   3 = after Rotate, 4 = after Encode
+    // K uses descIds [0..4], V uses descIds [10..14].
+    __aicore__ inline void PackBatchPerf(
+        const AscendC::GlobalTensor<half>& xGm,
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        uint32_t start,
+        uint32_t end,
+        uint32_t slot_w,
+        uint32_t dBase,
+        uint32_t dCount,
+        bool writeMeta,
+        bool manualRotate,
+        char tag) {
+        const uint32_t m = end - start;
+        const uint32_t mPad = AlignUp16(m);
+        const uint32_t base = (tag == 'K') ? 65577 : 65588;
+
+        auto xBatch = xBatchQue_.AllocTensor<half>();
+        auto yBatch = yBatchQue_.AllocTensor<half>();
+        auto norms = normsBuf_.Get<half>();
+
+        AscendC::printf("[TQ_PERF] %c m=%u\n", tag, m);
+        AscendC::PrintTimeStamp(base);
+
+        AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
+        TqSyncMte2ToV();
+        if (mPad > m) {
+            AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
         }
+        AscendC::PrintTimeStamp(base + 1);
+
+        NormalizeBatch(xBatch, norms, m);
+        AscendC::PrintTimeStamp(base + 2);
+
+        if (manualRotate) {
+            RotateBatchMatmulManual(xBatch, yBatch, m);
+        } else {
+            RotateBatchMatmul(xBatch, yBatch, m, mPad, dBase, dCount);
+        }
+        AscendC::PrintTimeStamp(base + 3);
+
+        EncodeBatch(yBatch, norms, packedGm, start, m, slot_w, dBase, dCount, writeMeta);
+        AscendC::PrintTimeStamp(base + 4);
 
         yBatchQue_.FreeTensor(yBatch);
         xBatchQue_.FreeTensor(xBatch);
@@ -437,7 +542,6 @@ private:
     uint32_t slot_w_k_ = 0;
     uint32_t slot_w_v_ = 0;
     uint32_t vecPerCore_ = 1;
-    uint32_t debugLog_ = 0;
     bool matmulReady_ = false;
 
     AscendC::TQue<AscendC::TPosition::VECOUT, 1> xBatchQue_;
@@ -445,14 +549,19 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> diffTileBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> distBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> yFp32Buf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> cbTileBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> argminWorkBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> idxInt32Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> argminResultBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> idxBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> packedRowBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> kValInt32Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECIN> yCubeFp32Buf_;
 
+    AscendC::GlobalTensor<float> cubeCGm_;
     AscendC::GlobalTensor<half> keyGm_;
     AscendC::GlobalTensor<half> valueGm_;
     AscendC::GlobalTensor<half> codebookGm_;
@@ -502,8 +611,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
             tilingData.nVec,
             tilingData.slotWK,
             tilingData.slotWV,
-            tilingData.vecPerCore,
-            0);
+            tilingData.vecPerCore);
         op.Process();
     } else if (TILING_KEY_IS(1)) {
         // pack_mode=1: AIV-only reference path (norm + manual rotate + encode).
@@ -521,8 +629,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
             tilingData.nVec,
             tilingData.slotWK,
             tilingData.slotWV,
-            tilingData.vecPerCore,
-            0);
+            tilingData.vecPerCore);
         op.ProcessNoKfc();
     }
 }
