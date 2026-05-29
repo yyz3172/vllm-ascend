@@ -24,17 +24,49 @@ uint32_t AlignUp16(uint32_t x)
 }
 
 ge::graphStatus FillKfcCubeTiling(
+    const platform_ascendc::PlatformAscendC& platform,
     matmul_tiling::MultiCoreMatmulTiling& tilingApi,
     uint32_t mPad,
     optiling::TCubeTiling& cubeTiling)
 {
+    uint64_t l1Size = 0;
+    uint64_t l0aSize = 0;
+    uint64_t l0bSize = 0;
+    uint64_t l0cSize = 0;
+    uint64_t ubSize = 0;
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1Size);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, l0aSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, l0bSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+
+    // KFC mode: A from VECOUT (L1), B from GM, C to VECIN (L1).
+    // L1 holds both xBatch (A input) and yBatch (C output), so constrain baseM.
+    constexpr uint32_t mmDataTypeSize = 2;  // fp16
+    const uint32_t l1Usable = static_cast<uint32_t>(l1Size);
+    // baseM*baseK + baseM*baseN <= l1Usable (A + C share L1)
+    // For N=128, K=128: baseM*128*2*2 <= l1Usable => baseM <= l1Usable / 512
+    int32_t baseM = static_cast<int32_t>(std::min<uint64_t>(
+        l1Usable / (TQ_PACK_K + TQ_PACK_N) / mmDataTypeSize,
+        static_cast<uint64_t>(TQ_PACK_MAX_BASEM)));
+    baseM = static_cast<int32_t>(AlignUp16(static_cast<uint32_t>(baseM)));
+    if (baseM > static_cast<int32_t>(mPad)) {
+        baseM = static_cast<int32_t>(AlignUp16(mPad));
+    }
+    if (baseM <= 0) {
+        baseM = static_cast<int32_t>(AlignUp16(mPad));
+    }
+
     tilingApi.SetOrgShape(mPad, TQ_PACK_N, TQ_PACK_K);
     tilingApi.SetShape(mPad, TQ_PACK_N, TQ_PACK_K);
     tilingApi.EnableBias(false);
-    tilingApi.SetBufferSpace(-1, -1, -1);
+    tilingApi.SetBufferSpace(l1Size, l0cSize, ubSize);
     if (tilingApi.GetTiling(cubeTiling) == -1) {
         return ge::GRAPH_FAILED;
     }
+
+    // Override with L1-aware baseM; keep auto baseN/baseK from GetTiling.
+    cubeTiling.set_baseM(static_cast<uint32_t>(baseM));
     return ge::GRAPH_SUCCESS;
 }
 
@@ -182,9 +214,9 @@ static ge::graphStatus TurboquantPackKvForCacheFusedTilingFunc(gert::TilingConte
             matmul_tiling::DataType::DT_FLOAT16,
             false);
         tilingApi.SetCType(
-            matmul_tiling::TPosition::VECIN,
+            matmul_tiling::TPosition::GM,
             matmul_tiling::CubeFormat::ND,
-            matmul_tiling::DataType::DT_FLOAT16);
+            matmul_tiling::DataType::DT_FLOAT);
     } else {
         mPad = TQ_PACK_SINGLE_ROT_M_PAD;
         tilingApi.SetDim(1);
@@ -211,7 +243,7 @@ static ge::graphStatus TurboquantPackKvForCacheFusedTilingFunc(gert::TilingConte
     TurboquantPackKvForCacheFusedTilingData tilingData {};
     ge::graphStatus tilingStatus = ge::GRAPH_FAILED;
     if (packMode == 0) {
-        tilingStatus = FillKfcCubeTiling(tilingApi, mPad, tilingData.cubeTiling);
+        tilingStatus = FillKfcCubeTiling(ascendcPlatform, tilingApi, mPad, tilingData.cubeTiling);
     } else {
         tilingStatus = FillGmCubeTiling(ascendcPlatform, mPad, tilingData.cubeTiling);
     }

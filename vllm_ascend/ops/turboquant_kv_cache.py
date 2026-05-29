@@ -379,9 +379,9 @@ class TurboQuantMSEV2:
             device=device, dtype=torch.float32
         )
         print("TurboQuantMSEV2 codebook: ", self.codebook)
-        self._codebook_fp16: torch.Tensor | None = None
-        self._rotation_fp16: torch.Tensor | None = None
-        self._rotation_t_fp16: torch.Tensor | None = None
+        self._codebook_fp16 = self.codebook.to(dtype=torch.float16)
+        self._rotation_fp16 = self.rotation.to(dtype=torch.float16)
+        self._rotation_t_fp16 = self.rotation_t.to(dtype=torch.float16)
         self._rotation_batched_fp16: dict[tuple[str, int], torch.Tensor] = {}
 
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -437,15 +437,9 @@ class TurboQuantMSEV3(TurboQuantMSEV2):
 
 @lru_cache(maxsize=64)
 def _get_quantizer(
-    dim: int, bits: int, device: str, mse_impl: str
-) -> TurboQuantMSE | TurboQuantMSEV2 | TurboQuantMSEV3:
-    impl = _normalize_turboquant_mse_impl(mse_impl)
-    dev = torch.device(device)
-    if impl == "v3":
-        return TurboQuantMSEV3(dim=dim, bits=bits, device=dev, seed=42)
-    if impl == "v2":
-        return TurboQuantMSEV2(dim=dim, bits=bits, device=dev, seed=42)
-    return TurboQuantMSE(dim=dim, bits=bits, device=dev, seed=42)
+    dim: int, bits: int, device: torch.device
+) -> TurboQuantMSE:
+    return TurboQuantMSE(dim=dim, bits=bits, device=device, seed=42)
 
 
 def _current_mse_impl() -> str:
@@ -513,7 +507,7 @@ def _pad_packed_to_slot_width(packed: torch.Tensor, slot_width: int) -> torch.Te
 def turboquant_quantize_to_packed_bytes(x: torch.Tensor, *, bits: int = 4) -> torch.Tensor:
     head_size = x.shape[-1]
     packed_bytes = turboquant_packed_bytes_per_vector(head_size, bits=bits)
-    quantizer = _get_quantizer(head_size, bits, str(x.device), _current_mse_impl())
+    quantizer = _get_quantizer(head_size, bits, x.device)
 
     x_flat = x.reshape(-1, head_size)
     indices, norms = quantizer.quantize(x_flat)  # [N,D], [N,1]
@@ -557,7 +551,7 @@ def turboquant_dequantize_from_packed_bytes(
             and dtype in (torch.float16, torch.bfloat16)
             and _c_ascend_turboquant_op_available("turboquant_decode_packed_blocks")):
         # codebook: [16] fp16 on NPU, rotation: [D, D] fp16 on NPU
-        quantizer = _get_quantizer(head_size, bits, str(packed.device), _current_mse_impl())
+        quantizer = _get_quantizer(head_size, bits, packed.device)
         if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != packed.device:
             quantizer._codebook_fp16 = quantizer.codebook.to(device=packed.device, dtype=torch.float16)
         if quantizer._rotation_fp16 is None or quantizer._rotation_fp16.device != packed.device:
@@ -590,7 +584,7 @@ def turboquant_dequantize_from_packed_bytes(
         return out
 
     # Reference path (PyTorch ops).
-    quantizer = _get_quantizer(head_size, bits, str(packed.device), _current_mse_impl())
+    quantizer = _get_quantizer(head_size, bits, packed.device)
     packed_flat = packed_logical.reshape(-1, packed_bytes)
     idx_len = turboquant_indices_byte_len(head_size, bits)
     idx_packed = packed_flat[:, :idx_len]
@@ -609,17 +603,9 @@ def turboquant_dequantize_from_packed_bytes(
 
 def _ensure_quantizer_fp16_views(
     quantizer: TurboQuantMSE | TurboQuantMSEV2 | TurboQuantMSEV3,
-    device: torch.device,
+    _device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (codebook_fp16, rotation_t_fp16) on ``device`` for custom encode ops."""
-    if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != device:
-        quantizer._codebook_fp16 = quantizer.codebook.to(
-            device=device, dtype=torch.float16
-        )
-    if quantizer._rotation_t_fp16 is None or quantizer._rotation_t_fp16.device != device:
-        quantizer._rotation_t_fp16 = quantizer.rotation_t.to(
-            device=device, dtype=torch.float16
-        )
+    """Return (codebook_fp16, rotation_t_fp16) eager-cached at init time."""
     return quantizer._codebook_fp16, quantizer._rotation_t_fp16
 
 
@@ -657,9 +643,9 @@ def turboquant_pack_kv_for_cache(
 
     head_size = key.shape[-1]
     if envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP:
-        qk = _get_quantizer(head_size, bits_key, str(key.device), _current_mse_impl())
+        qk = _get_quantizer(head_size, bits_key, key.device)
         qv = qk if bits_key == bits_value else _get_quantizer(
-            head_size, bits_value, str(key.device), _current_mse_impl()
+            head_size, bits_value, key.device
         )
         if codebook is None or rotation is None:
             cb_k, rot_k = _ensure_quantizer_fp16_views(qk, key.device)
@@ -690,7 +676,6 @@ def turboquant_pack_kv_for_cache(
             slot_w_k,
             slot_w_v,
         )
-        _sync_npu_if_needed(key.device)
         # Match ENCODE_OP=0: int8 view of byte storage for _npu_reshape_and_cache.
         # C++ already returns contiguous kChar tensors; keep the explicit view for parity.
         return (
