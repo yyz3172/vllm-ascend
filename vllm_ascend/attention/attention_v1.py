@@ -71,6 +71,7 @@ from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 from vllm_ascend.ops.turboquant_kv_cache import (
     turboquant_decode_kv_cache_compact,
+    turboquant_fused_infer_attention_score_8bit,
     turboquant_pack_kv_for_cache,
     turboquant_packed_bytes_per_vector,
 )
@@ -1342,9 +1343,36 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table, actual_seq_lengths_kv = get_kvcomp_decode_params(
                 self.layerIndex, attn_metadata.kvcomp_metadata, query, passed_key, block_table, actual_seq_lengths_kv
             )
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
 
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
+            if (
+                self.sinks is None
+                and self.turboquant_kv_bits_key == 8
+                and self.turboquant_kv_bits_value == 8
+                and self.head_size == 128
+                and query.dtype == torch.float16
+            ):
+                attn_output = turboquant_fused_infer_attention_score_8bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    atten_mask=attn_metadata.attn_mask,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                output[:num_tokens] = attn_output[:num_tokens]
+                return output
             key_dec, value_dec, block_table = turboquant_decode_kv_cache_compact(
                 key_cache=self.key_cache,
                 value_cache=self.value_cache,
@@ -1359,8 +1387,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key = key_dec.flatten(2, 3).contiguous()
             value = value_dec.flatten(2, 3).contiguous()
 
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        query = query[:num_tokens]
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
