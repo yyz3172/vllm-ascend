@@ -48,6 +48,8 @@
 #include "lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "turboquant_rotate_matmul_probe/op_host/aclnn_turboquant_rotate_matmul_probe.h"
 #include "turboquant_pack_kv_for_cache_fused/op_host/aclnn_turboquant_pack_kv_for_cache_fused.h"
+#include "turboquant_fused_infer_attention_score8bit/op_host/aclnn_turboquant_fused_infer_attention_score8bit.h"
+#include "aclnnop/aclnn_fused_infer_attention_score_v3.h"
 #include <c10/core/Device.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Logging.h>
@@ -201,6 +203,80 @@ at::Tensor turboquant_decode_packed_blocks_compact(
     } else {
         out.copy_(x_hat.to(out_dtype));
     }
+    return out;
+}
+
+namespace {
+
+std::tuple<at::Tensor, at::Tensor> TurboquantCompactSelectBlocks(
+    const at::Tensor &cache, const at::Tensor &block_tables) {
+    at::Tensor bt = block_tables.to(torch::kInt32);
+    at::Tensor valid = bt.ge(0);
+    if (!valid.any().item<bool>()) {
+        at::Tensor empty = cache.index({0}).slice(0, 0);
+        return {empty, bt};
+    }
+    at::Tensor used = std::get<0>(at::_unique(bt.masked_select(valid), true, false));
+    at::Tensor selected = cache.index_select(0, used);
+    at::Tensor bt_compact = bt.clone();
+    at::Tensor used_vals = bt.masked_select(valid);
+    at::Tensor compact_idx = at::searchsorted(used, used_vals);
+    bt_compact.masked_scatter_(valid, compact_idx);
+    return {selected, bt_compact};
+}
+
+at::Tensor TurboquantMakeRotationBatched(const at::Tensor &rotation, int64_t block_size, int64_t num_kv_heads) {
+    const int64_t batch = block_size * num_kv_heads;
+    return rotation.unsqueeze(0).expand({batch, rotation.size(0), rotation.size(1)}).contiguous();
+}
+
+}  // namespace
+
+// True fused TurboQuant 8-bit KV attention: dispatch to custom aclnn op.
+at::Tensor turboquant_fused_infer_attention_score_8bit(
+    const at::Tensor &query,
+    const at::Tensor &key_cache,
+    const at::Tensor &value_cache,
+    const at::Tensor &block_table,
+    const at::Tensor &atten_mask,
+    const at::Tensor &actual_seq_len_q,
+    const at::Tensor &actual_seq_len_kv,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    const at::Tensor &codebook_value,
+    const at::Tensor &rotation_value,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t block_size,
+    double scale_value) {
+    TORCH_CHECK(query.is_privateuseone(), "query must be on NPU");
+    TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
+    TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
+    TORCH_CHECK(query.scalar_type() == at::kHalf, "fp16 only in initial version");
+    TORCH_CHECK(head_size == 128, "initial version only supports head_size=128");
+    TORCH_CHECK(atten_mask.defined(), "atten_mask is required");
+
+    at::Tensor out = at::empty(query.sizes(), query.options().dtype(at::kHalf));
+    EXEC_NPU_CMD(
+        aclnnTurboquantFusedInferAttentionScore8bit,
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        actual_seq_len_q,
+        actual_seq_len_kv,
+        atten_mask,
+        codebook,
+        rotation,
+        codebook_value,
+        rotation_value,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        scale_value,
+        out);
     return out;
 }
 
@@ -1212,6 +1288,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "turboquant_rotate_matmul_probe(Tensor a, Tensor b, int probe_mode) -> Tensor");
     ops.impl("turboquant_rotate_matmul_probe", torch::kPrivateUse1,
              &vllm_ascend::turboquant_rotate_matmul_probe);
+
+    ops.def(
+        "turboquant_fused_infer_attention_score_8bit("
+        "Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, "
+        "Tensor atten_mask, Tensor actual_seq_len_q, Tensor actual_seq_len_kv, "
+        "Tensor codebook, Tensor rotation, Tensor codebook_value, Tensor rotation_value, "
+        "int num_heads, int num_kv_heads, int head_size, int block_size, float scale_value"
+        ") -> Tensor"
+    );
+    ops.impl(
+        "turboquant_fused_infer_attention_score_8bit",
+        torch::kPrivateUse1,
+        &vllm_ascend::turboquant_fused_infer_attention_score_8bit);
 
     ops.def(
         "grouped_matmul_swiglu_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor x_scale,"

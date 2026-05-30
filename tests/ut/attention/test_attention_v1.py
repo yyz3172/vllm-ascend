@@ -245,6 +245,44 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_npu_fused_infer_attention_score.assert_called_once()
         assert output.shape == (10, 8, 64)
 
+    @patch('vllm_ascend.attention.attention_v1.turboquant_fused_infer_attention_score_8bit')
+    @patch('torch_npu.npu_fused_infer_attention_score')
+    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    def test_forward_fia_turboquant_8bit_uses_fused_op(
+            self, mock_get_forward_context, mock_npu_fused_infer_attention_score,
+            mock_turboquant_fused_fia):
+        query = torch.randn(10, 8, 128, dtype=torch.float16)
+        key = torch.randn(10, 8, 128, dtype=torch.float16)
+        value = torch.randn(10, 8, 128, dtype=torch.float16)
+        output = torch.empty_like(query)
+
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.attn_mask = torch.randn(1, 1, 10, 10)
+        metadata.seq_lens = torch.tensor([10])
+        metadata.seq_lens_list = [10]
+        metadata.actual_seq_lengths_q = [10]
+        metadata.block_tables = torch.zeros(1, 5, dtype=torch.long)
+
+        self.impl.kv_cache_dtype = "turboquant"
+        self.impl.turboquant_kv_bits_key = 8
+        self.impl.turboquant_kv_bits_value = 8
+        self.impl.head_size = 128
+        self.impl.num_heads = 8
+        self.impl.num_kv_heads = 8
+        self.impl.key_cache = torch.empty(5, 128, 8, 130, dtype=torch.int8)
+        self.impl.value_cache = torch.empty(5, 128, 8, 130, dtype=torch.int8)
+
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_turboquant_fused_fia.return_value = torch.ones(10, 8, 128, dtype=torch.float16)
+
+        out = self.impl.forward_fused_infer_attention(query, key, value,
+                                                      metadata, output)
+
+        mock_turboquant_fused_fia.assert_called_once()
+        mock_npu_fused_infer_attention_score.assert_not_called()
+        assert out.shape == (10, 8, 128)
+
     @patch('vllm_ascend.attention.attention_v1.using_paged_attention')
     @patch('torch_npu._npu_paged_attention')
     @patch('torch_npu._npu_reshape_and_cache')

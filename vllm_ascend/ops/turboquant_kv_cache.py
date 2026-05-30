@@ -807,3 +807,147 @@ def turboquant_decode_kv_cache_compact(
     bt_compact[valid] = torch.searchsorted(used_sorted, used, out_int32=True)
     return k, v, bt_compact.to(block_tables.dtype)
 
+
+def _turboquant_fused_infer_attention_score_8bit_impl(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    atten_mask: torch.Tensor | None,
+    actual_seq_lengths_q: list[int],
+    actual_seq_lengths_kv: list[int],
+    head_size: int,
+    num_heads: int,
+    num_key_value_heads: int,
+    block_size: int,
+    scale: float,
+) -> torch.Tensor:
+    """Fallback path (non-fused): decode 8-bit TurboQuant KV cache then run FIA.
+
+    True fused implementation is provided by `_C_ascend.turboquant_fused_infer_attention_score_8bit`.
+    This function is only used when the compiled custom op is unavailable.
+    """
+    if torch_npu is None:
+        raise RuntimeError("torch_npu is required for TurboQuant FIA fallback.")
+    if atten_mask is None:
+        raise RuntimeError("atten_mask is required for TurboQuant FIA fallback.")
+
+    key_dec, value_dec, block_tables_compact = turboquant_decode_kv_cache_compact(
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_tables,
+        head_size=head_size,
+        dtype=query.dtype,
+        bits_key=8,
+        bits_value=8,
+    )
+    key = key_dec.flatten(2, 3).contiguous()
+    value = value_dec.flatten(2, 3).contiguous()
+
+    attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        atten_mask=atten_mask,
+        block_table=block_tables_compact,
+        input_layout="TND",
+        block_size=block_size,
+        actual_seq_lengths=actual_seq_lengths_q,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        num_key_value_heads=num_key_value_heads,
+        num_heads=num_heads,
+        scale=scale,
+        sparse_mode=3,
+    )
+    return attn_output.view(query.shape[0], num_heads, head_size)
+
+
+def _turboquant_fused_8bit_decode_tables(
+    device: torch.device,
+    head_size: int,
+    bits_key: int,
+    bits_value: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (codebook_k, rotation_k, codebook_v, rotation_v) fp16 on device."""
+    qk = _get_quantizer(head_size, bits_key, str(device), _current_mse_impl())
+    if bits_key == bits_value:
+        qv = qk
+    else:
+        qv = _get_quantizer(head_size, bits_value, str(device), _current_mse_impl())
+    if qk._codebook_fp16 is None or qk._codebook_fp16.device != device:
+        qk._codebook_fp16 = qk.codebook.to(device=device, dtype=torch.float16)
+    if qk._rotation_fp16 is None or qk._rotation_fp16.device != device:
+        qk._rotation_fp16 = qk.rotation.to(device=device, dtype=torch.float16)
+    cb_k, rot_k = qk._codebook_fp16, qk._rotation_fp16
+    if qv is qk:
+        return cb_k, rot_k, cb_k, rot_k
+    if qv._codebook_fp16 is None or qv._codebook_fp16.device != device:
+        qv._codebook_fp16 = qv.codebook.to(device=device, dtype=torch.float16)
+    if qv._rotation_fp16 is None or qv._rotation_fp16.device != device:
+        qv._rotation_fp16 = qv.rotation.to(device=device, dtype=torch.float16)
+    return cb_k, rot_k, qv._codebook_fp16, qv._rotation_fp16
+
+
+def turboquant_fused_infer_attention_score_8bit(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    atten_mask: torch.Tensor | None,
+    actual_seq_lengths_q: list[int],
+    actual_seq_lengths_kv: list[int],
+    head_size: int,
+    num_heads: int,
+    num_key_value_heads: int,
+    block_size: int,
+    scale: float,
+    bits_key: int = 8,
+    bits_value: int = 8,
+) -> torch.Tensor:
+    """Call the fused `_C_ascend` op when available; otherwise decode+FIA fallback."""
+    if atten_mask is None:
+        raise RuntimeError("atten_mask is required for TurboQuant fused FIA.")
+
+    fused = getattr(getattr(torch.ops, "_C_ascend", None), "turboquant_fused_infer_attention_score_8bit", None)
+    if fused is None:
+        return _turboquant_fused_infer_attention_score_8bit_impl(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            atten_mask,
+            actual_seq_lengths_q,
+            actual_seq_lengths_kv,
+            head_size,
+            num_heads,
+            num_key_value_heads,
+            block_size,
+            scale,
+        )
+
+    cb_k, rot_k, cb_v, rot_v = _turboquant_fused_8bit_decode_tables(
+        query.device, head_size, bits_key, bits_value
+    )
+    seq_q = torch.tensor(actual_seq_lengths_q, device=query.device, dtype=torch.int32)
+    seq_kv = torch.tensor(actual_seq_lengths_kv, device=query.device, dtype=torch.int32)
+    out = fused(
+        query,
+        key_cache,
+        value_cache,
+        block_tables.to(torch.int32),
+        atten_mask,
+        seq_q,
+        seq_kv,
+        cb_k,
+        rot_k,
+        cb_v,
+        rot_v,
+        int(num_heads),
+        int(num_key_value_heads),
+        int(head_size),
+        int(block_size),
+        float(scale),
+    )
+    return out.view(query.shape[0], num_heads, head_size)
+
