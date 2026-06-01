@@ -717,10 +717,17 @@ def turboquant_decode_kv_cache_compact(
     bits: int = 4,
     bits_key: int | None = None,
     bits_value: int | None = None,
+    decode_only_arange_fast_path: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Decode only blocks referenced by `block_tables` and remap block_tables to a
     compact 0..U-1 range to avoid decoding the full KV cache.
+
+    When ``decode_only_arange_fast_path`` is True (DecodeOnly state), this function
+    skips the ``unique``/``searchsorted`` compaction (which has data-dependent shape
+    and breaks ACL Graph capture) and uses an ``arange`` mapping instead. The cost
+    is that physical blocks shared across sequences are decoded once per reference
+    rather than once total; the benefit is fully static shapes and no host sync.
 
     Returns:
       key_cache_decoded: [U, BS, H, D]
@@ -733,6 +740,40 @@ def turboquant_decode_kv_cache_compact(
         return empty, empty, block_tables
 
     bt = block_tables.to(torch.int32)
+
+    bk = bits if bits_key is None else bits_key
+    bv = bits if bits_value is None else bits_value
+
+    if decode_only_arange_fast_path:
+        # Static-shape decode path for DecodeOnly:
+        #   ``index_select`` over ``bt.flatten().clamp(min=0)`` (no boolean mask, no unique).
+        # The clamp routes -1 paddings to physical block 0; ``bt_compact`` re-marks those
+        # positions as -1 so attention skips them.
+        flat_bt = bt.flatten()
+        gather_idx = flat_bt.clamp(min=0).to(torch.int64)
+        key_packed = key_cache.index_select(0, gather_idx)  # [N, BS, H, P]  N=numel(bt)
+        value_packed = value_cache.index_select(0, gather_idx)
+
+        # Decode via the PyTorch reference path (always correct). An 8-bit
+        # dedicated decode op is the subject of design doc Phase 0.4 / Phase 1.
+        k = turboquant_dequantize_from_packed_bytes(
+            key_packed, head_size=head_size, dtype=dtype, bits=bk
+        )
+        v = turboquant_dequantize_from_packed_bytes(
+            value_packed, head_size=head_size, dtype=dtype, bits=bv
+        )
+
+        n = flat_bt.numel()
+        bt_compact_flat = torch.arange(n, device=bt.device, dtype=torch.int32)
+        bt_compact = bt_compact_flat.view_as(bt)
+        # Preserve -1 padding positions; valid positions get their flat arange index.
+        bt_compact = torch.where(
+            bt >= 0,
+            bt_compact,
+            torch.full_like(bt_compact, -1),
+        )
+        return k, v, bt_compact.to(block_tables.dtype)
+
     valid = bt >= 0
     if not torch.any(valid):
         empty = torch.empty((0,) + key_cache.shape[1:-1] + (head_size,), dtype=dtype, device=key_cache.device)
@@ -750,56 +791,16 @@ def turboquant_decode_kv_cache_compact(
     key_packed = key_cache.index_select(0, used_sorted)    # [U, BS, H, P]
     value_packed = value_cache.index_select(0, used_sorted)  # [U, BS, H, P]
 
-    bk = bits if bits_key is None else bits_key
-    bv = bits if bits_value is None else bits_value
-    slot_p = int(key_packed.shape[-1])
-    p4 = turboquant_packed_bytes_per_vector(head_size, bits=4)
-
-    dev_type = getattr(getattr(key_packed, "device", None), "type", None)
-    is_npu_tensor = (dev_type in ("npu", "privateuseone"))
-
-    # Fast path for small-U decode: use compact decode op with pre-batched rotation.
-    # Mixed K/V bit width, 8-bit rows, or padded rows fall back to PyTorch decode.
-    if (envs_ascend.VLLM_ASCEND_TURBOQUANT_DECODE_OP
-            and is_npu_tensor
-            and bk == 4 and bv == 4
-            and slot_p == p4
-            and head_size % 2 == 0
-            and _current_mse_impl() != "v3"
-            and dtype in (torch.float16, torch.bfloat16)
-            and _c_ascend_turboquant_op_available("turboquant_decode_packed_blocks_compact")):
-        quantizer = _get_quantizer(head_size, bk, str(key_packed.device), _current_mse_impl())
-        if quantizer._codebook_fp16 is None or quantizer._codebook_fp16.device != key_packed.device:
-            quantizer._codebook_fp16 = quantizer.codebook.to(device=key_packed.device, dtype=torch.float16)
-        if quantizer._rotation_fp16 is None or quantizer._rotation_fp16.device != key_packed.device:
-            quantizer._rotation_fp16 = quantizer.rotation.to(device=key_packed.device, dtype=torch.float16)
-
-        batch = int(key_packed.shape[1] * key_packed.shape[2])  # BS*H
-        cache_key = (str(key_packed.device), batch)
-        rot_batched = quantizer._rotation_batched_fp16.get(cache_key)
-        if rot_batched is None or rot_batched.device != key_packed.device:
-            # Materialize batched rotation once (can be large: batch*D*D).
-            rot_batched = quantizer._rotation_fp16.unsqueeze(0).expand(batch, -1, -1).contiguous()
-            quantizer._rotation_batched_fp16[cache_key] = rot_batched
-
-        # Decode K/V together to amortize op launch + matmul overhead.
-        packed_kv = torch.cat([key_packed, value_packed], dim=0).contiguous()  # [2U, BS, H, P]
-        decoded_kv = torch.ops._C_ascend.turboquant_decode_packed_blocks_compact(
-            packed_kv,
-            quantizer._codebook_fp16,
-            rot_batched,
-            head_size,
-            0 if dtype == torch.float16 else 1,
-        )  # [2U, BS, H, D]
-        u = key_packed.shape[0]
-        k, v = decoded_kv[:u], decoded_kv[u:]
-    else:
-        k = turboquant_dequantize_from_packed_bytes(
-            key_packed, head_size=head_size, dtype=dtype, bits=bk
-        )
-        v = turboquant_dequantize_from_packed_bytes(
-            value_packed, head_size=head_size, dtype=dtype, bits=bv
-        )
+    # 8-bit only: decode via PyTorch reference path. The legacy 4-bit
+    # ``turboquant_decode_packed_blocks_compact`` custom op was removed because
+    # its correctness has not been verified (see design doc §0/§1.3); an 8-bit
+    # dedicated decode op is the subject of Phase 0.4 / Phase 1.
+    k = turboquant_dequantize_from_packed_bytes(
+        key_packed, head_size=head_size, dtype=dtype, bits=bk
+    )
+    v = turboquant_dequantize_from_packed_bytes(
+        value_packed, head_size=head_size, dtype=dtype, bits=bv
+    )
 
     # Remap block tables to compact indices.
     # block_tables_compact = searchsorted(used_sorted, bt) for valid entries.

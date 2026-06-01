@@ -1381,6 +1381,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 dtype=query.dtype,
                 bits_key=self.turboquant_kv_bits_key,
                 bits_value=self.turboquant_kv_bits_value,
+                decode_only_arange_fast_path=(
+                    attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                ),
             )
             # FIA expects key/value shaped like [num_blocks, block_size, hidden]
             # in TND layout flattening; keep consistent with existing path.
