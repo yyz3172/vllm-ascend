@@ -266,6 +266,30 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache_meta(
         at::empty_symint(shape_v, opts_v));
 }
 
+std::tuple<at::Tensor, at::Tensor> turboquant_decode_paged_8bit_meta(
+    const at::Tensor &key_cache,
+    const at::Tensor &value_cache,
+    const at::Tensor &gather_block_ids,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    int64_t head_size,
+    int64_t block_size,
+    int64_t out_dtype_code,
+    int64_t mode) {
+    (void)value_cache;
+    (void)codebook;
+    (void)rotation;
+    (void)out_dtype_code;
+    (void)mode;
+    const c10::SymInt total_blocks = gather_block_ids.sym_size(0);
+    const c10::SymInt num_kv_heads = key_cache.sym_size(2);
+    std::vector<c10::SymInt> shape{total_blocks, block_size, num_kv_heads, head_size};
+    auto opts = key_cache.options().dtype(at::kHalf).device(at::kMeta);
+    return std::make_tuple(
+        at::empty_symint(shape, opts),
+        at::empty_symint(shape, opts));
+}
+
 at::Tensor turboquant_fused_infer_attention_score_8bit_meta(
     const at::Tensor& query,
     const at::Tensor& key_cache,
@@ -735,5 +759,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("turboquant_encode_packed_blocks", &vllm_ascend::meta::turboquant_encode_packed_blocks_meta);
     ops.impl("turboquant_pack_kv_for_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
     ops.impl("turboquant_fused_infer_attention_score_8bit", &vllm_ascend::meta::turboquant_fused_infer_attention_score_8bit_meta);
+    ops.impl("turboquant_decode_paged_8bit", &vllm_ascend::meta::turboquant_decode_paged_8bit_meta);
 }
 }

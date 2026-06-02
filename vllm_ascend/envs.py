@@ -73,6 +73,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 4-bit MSE path only; 8-bit falls back to PyTorch.
     "VLLM_ASCEND_TURBOQUANT_ENCODE_OP":
     lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_ENCODE_OP", "1"))),
+    # Use the 8-bit paged decode custom op (design doc §2.6 / Phase 1, scheme A):
+    # folds block_table addressing into the kernel and decodes packed uint8 KV
+    # cache to compact fp16 K/V, replacing the unique/searchsorted + PyTorch
+    # decode path. Default OFF (gray rollout); a separate switch from the 4-bit
+    # ``VLLM_ASCEND_TURBOQUANT_DECODE_OP`` because the 4-bit op is unverified.
+    "VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT", "0"))),
+    # 8-bit paged decode kernel mode: 0 = KFC Cube (Gather LUT + Cube y_hat@R,
+    # performance path), 1 = AIV-only scalar reference (numeric golden / debug).
+    "VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE":
+    lambda: int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE", "0")),
     # TurboQuant codebook construction method:
     # - "fast": use a deterministic, precomputed codebook (recommended for serving)
     # - "sample": approximate via Beta sampling + Lloyd-like iterations (very slow)
