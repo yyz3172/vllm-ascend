@@ -714,10 +714,19 @@ def turboquant_decode_kv_cache_compact(
     is that physical blocks shared across sequences are decoded once per reference
     rather than once total; the benefit is fully static shapes and no host sync.
 
+    Padding slots in ``block_tables`` (vLLM v1 fills unused slots with 0, the
+    reserved ``null_block``) are kept in the compact mapping rather than re-marked
+    as -1: a negative compact index would be unsafe for NPU paged-attention
+    kernels that prefetch entire block_table rows. The arange path prepends a
+    null_block sentinel as workspace slot 0 so every padding entry can map to a
+    valid index pointing at all-zero content.
+
     Returns:
-      key_cache_decoded: [U, BS, H, D]
-      value_cache_decoded: [U, BS, H, D]
-      block_tables_compact: same shape as block_tables, with -1 preserved
+      key_cache_decoded: shape ``[U, BS, H, D]`` (unique path) or
+        ``[N + 1, BS, H, D]`` (arange path, with slot 0 as null_block sentinel)
+      value_cache_decoded: same shape as ``key_cache_decoded``
+      block_tables_compact: same shape as block_tables; every entry is a valid
+        non-negative index into the decoded workspace.
     """
     if block_tables.numel() == 0:
         # Degenerate case: return empty decoded caches.
@@ -731,12 +740,29 @@ def turboquant_decode_kv_cache_compact(
 
     if decode_only_arange_fast_path:
         # Static-shape decode path for DecodeOnly:
-        #   ``index_select`` over ``bt.flatten().clamp(min=0)`` (no boolean mask, no unique).
-        # The clamp routes -1 paddings to physical block 0; ``bt_compact`` re-marks those
-        # positions as -1 so attention skips them.
+        #
+        # Workspace layout (size N + 1, where N = bt.numel()):
+        #   slot 0      : decode(cache[0]) — null_block sentinel for padding sinks
+        #   slot 1..N   : decode(cache[bt.flatten()[i].clamp(min=0)]) for i in [0, N)
+        #
+        # ``bt_compact`` mapping:
+        #   bt[i] >  0 (valid)   : i + 1   (own dedicated workspace slot)
+        #   bt[i] <= 0 (padding) : 0       (points at the null_block sentinel)
+        #
+        # vLLM v1 reserves physical block id 0 as ``null_block`` and zero-fills
+        # unused slots of ``block_table``. Routing padding to compact index 0
+        # mirrors the unique-path convention (where searchsorted maps padding to
+        # the null_block's compact index) — every entry of ``bt_compact`` is a
+        # valid workspace index, no negative offsets.
+        n = bt.numel()
         flat_bt = bt.flatten()
-        gather_idx = flat_bt.clamp(min=0).to(torch.int64)
-        key_packed = key_cache.index_select(0, gather_idx)  # [N, BS, H, P]  N=numel(bt)
+        gather_idx = torch.cat(
+            (
+                torch.zeros(1, device=bt.device, dtype=torch.int64),
+                flat_bt.clamp(min=0).to(torch.int64),
+            )
+        )  # [N + 1]
+        key_packed = key_cache.index_select(0, gather_idx)  # [N+1, BS, H, P]
         value_packed = value_cache.index_select(0, gather_idx)
 
         # Decode via the PyTorch reference path (always correct). An 8-bit
@@ -748,15 +774,10 @@ def turboquant_decode_kv_cache_compact(
             value_packed, head_size=head_size, dtype=dtype, bits=bv
         )
 
-        n = flat_bt.numel()
-        bt_compact_flat = torch.arange(n, device=bt.device, dtype=torch.int32)
-        bt_compact = bt_compact_flat.view_as(bt)
-        # Preserve -1 padding positions; valid positions get their flat arange index.
-        bt_compact = torch.where(
-            bt >= 0,
-            bt_compact,
-            torch.full_like(bt_compact, -1),
-        )
+        # bt_compact = (arange(1..N+1) reshaped) * (bt > 0). Padding → 0;
+        # arithmetic mask avoids ``torch.where`` and its bool dispatch.
+        arange_plus_one = torch.arange(1, n + 1, device=bt.device, dtype=torch.int32)
+        bt_compact = arange_plus_one.view_as(bt) * (bt > 0).to(torch.int32)
         return k, v, bt_compact.to(block_tables.dtype)
 
     valid = bt >= 0
