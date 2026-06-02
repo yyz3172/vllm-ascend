@@ -70,6 +70,7 @@ from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 from vllm_ascend.ops.turboquant_kv_cache import (
+    _try_8bit_decode_paged,
     turboquant_decode_kv_cache_compact,
     turboquant_fused_infer_attention_score_8bit,
     turboquant_pack_kv_for_cache,
@@ -1348,7 +1349,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
-            if (
+            # Phase 1 / scheme A: decode packed 8-bit KV -> compact fp16 via the
+            # fused paged decode op (opt-in), then fall through to the standard
+            # FIA below. Returns None (and we keep the old paths) when disabled or
+            # the op/conditions are not met.
+            fast = _try_8bit_decode_paged(
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                block_table=block_table,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                head_size=self.head_size,
+                dtype=query.dtype,
+                bits_key=self.turboquant_kv_bits_key,
+                bits_value=self.turboquant_kv_bits_value,
+            )
+            if fast is not None:
+                key_ws, value_ws, block_table = fast
+                key = key_ws.flatten(2, 3).contiguous()
+                value = value_ws.flatten(2, 3).contiguous()
+            elif (
                 self.sinks is None
                 and self.turboquant_kv_bits_key == 8
                 and self.turboquant_kv_bits_value == 8
@@ -1373,22 +1392,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
-            key_dec, value_dec, block_table = turboquant_decode_kv_cache_compact(
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                block_tables=block_table,
-                head_size=self.head_size,
-                dtype=query.dtype,
-                bits_key=self.turboquant_kv_bits_key,
-                bits_value=self.turboquant_kv_bits_value,
-                decode_only_arange_fast_path=(
-                    attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-                ),
-            )
-            # FIA expects key/value shaped like [num_blocks, block_size, hidden]
-            # in TND layout flattening; keep consistent with existing path.
-            key = key_dec.flatten(2, 3).contiguous()
-            value = value_dec.flatten(2, 3).contiguous()
+            else:
+                key_dec, value_dec, block_table = turboquant_decode_kv_cache_compact(
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    head_size=self.head_size,
+                    dtype=query.dtype,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                    decode_only_arange_fast_path=(
+                        attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                    ),
+                )
+                # FIA expects key/value shaped like [num_blocks, block_size, hidden]
+                # in TND layout flattening; keep consistent with existing path.
+                key = key_dec.flatten(2, 3).contiguous()
+                value = value_dec.flatten(2, 3).contiguous()
 
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache

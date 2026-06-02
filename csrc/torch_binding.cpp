@@ -65,6 +65,7 @@
 #include "turboquant_rotate_matmul_probe/op_host/aclnn_turboquant_rotate_matmul_probe.h"
 #include "turboquant_pack_kv_for_cache_fused/op_host/aclnn_turboquant_pack_kv_for_cache_fused.h"
 #include "turboquant_fused_infer_attention_score8bit/op_host/aclnn_turboquant_fused_infer_attention_score8bit.h"
+#include "turboquant_decode_paged8bit/op_host/aclnn_turboquant_decode_paged8bit.h"
 #include "aclnnop/aclnn_fused_infer_attention_score_v3.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
@@ -531,6 +532,98 @@ at::Tensor turboquant_fused_infer_attention_score_8bit(
         scale_value,
         out);
     return out;
+}
+
+// TurboQuant 8-bit paged decode (设计文档 §2.6 方案 X / Phase 1).
+//
+// 算子吞掉 block_table 寻址 — host 侧只做 ceil + cumsum 算紧凑物理块号列表 gather_block_ids,
+// 算子吃完整 packed KV cache + gather_block_ids,输出按 seq 顺序紧凑排布的 fp16 K/V workspace。
+//
+// S1 阶段语义: kernel 只验证寻址链路,把 packed 行的 idx 字节(uint8) zero-extend 成 fp16 写出。
+// S2/S3 阶段会替换为 codebook 查表 + ×norm + Cube y_hat @ R(KFC).
+//
+// Inputs:
+//   key_cache:        [num_blocks_total, BS, H, P=130] uint8
+//   value_cache:      同 key_cache shape
+//   gather_block_ids: [total_blocks] int32, host 侧 prefix-sum 生成
+//   codebook:         [256] fp16  (S1 不读,占位)
+//   rotation:         [128, 128] fp16  (S1 不读,占位)
+// Outputs:
+//   key_out / value_out: [total_blocks, BS, H, 128] fp16
+std::tuple<at::Tensor, at::Tensor> turboquant_decode_paged_8bit(
+    const at::Tensor &key_cache,
+    const at::Tensor &value_cache,
+    const at::Tensor &gather_block_ids,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    int64_t head_size,
+    int64_t block_size,
+    int64_t out_dtype_code,
+    int64_t mode) {
+    TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
+    TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
+    TORCH_CHECK(gather_block_ids.is_privateuseone(), "gather_block_ids must be on NPU");
+    TORCH_CHECK(codebook.is_privateuseone(), "codebook must be on NPU");
+    TORCH_CHECK(rotation.is_privateuseone(), "rotation must be on NPU");
+    TORCH_CHECK(key_cache.scalar_type() == at::kByte, "key_cache must be uint8");
+    TORCH_CHECK(value_cache.scalar_type() == at::kByte, "value_cache must be uint8");
+    TORCH_CHECK(gather_block_ids.scalar_type() == at::kInt, "gather_block_ids must be int32");
+    TORCH_CHECK(codebook.scalar_type() == at::kHalf, "codebook must be fp16");
+    TORCH_CHECK(rotation.scalar_type() == at::kHalf, "rotation must be fp16");
+    TORCH_CHECK(head_size == 128, "Phase 1 only supports head_size=128");
+    TORCH_CHECK(out_dtype_code == 0, "Phase 1 only supports fp16 output (out_dtype=0)");
+    TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 (KFC) or 1 (AIV-only), got ", mode);
+    TORCH_CHECK(key_cache.dim() == 4, "key_cache must be [num_blocks, BS, H, P]");
+    TORCH_CHECK(value_cache.dim() == 4, "value_cache must be [num_blocks, BS, H, P]");
+    TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
+                "key_cache and value_cache must have identical shape");
+    const int64_t packed_bytes = head_size + 2;
+    TORCH_CHECK(key_cache.size(3) == packed_bytes,
+                "key_cache last dim must be head_size + 2 (=130 for 8-bit)");
+    TORCH_CHECK(key_cache.size(1) == block_size, "key_cache.size(1) must == block_size");
+    TORCH_CHECK(codebook.numel() == 256, "8-bit codebook must have 256 entries");
+    TORCH_CHECK(rotation.dim() == 2 && rotation.size(0) == head_size && rotation.size(1) == head_size,
+                "rotation must be [128, 128]");
+    TORCH_CHECK(gather_block_ids.dim() == 1, "gather_block_ids must be 1D");
+
+    const int64_t total_blocks = gather_block_ids.size(0);
+    const int64_t num_kv_heads = key_cache.size(2);
+
+    const at::Tensor key_cache_c = key_cache.contiguous();
+    const at::Tensor value_cache_c = value_cache.contiguous();
+    const at::Tensor gather_ids_c = gather_block_ids.contiguous();
+    const at::Tensor codebook_c = codebook.contiguous();
+    const at::Tensor rotation_c = rotation.contiguous();
+
+    at::Tensor key_out = at::empty({total_blocks, block_size, num_kv_heads, head_size},
+                                   key_cache.options().dtype(at::kHalf));
+    at::Tensor value_out = at::empty({total_blocks, block_size, num_kv_heads, head_size},
+                                     key_cache.options().dtype(at::kHalf));
+
+    const c10_npu::OptionalNPUGuard npuGuard(key_cache_c.device());
+
+    // rows_per_core: 当前简化为常量 32(与 kernel 内 TQ_T_ROWS 对齐)。
+    // tiling 函数会按平台 AIV 数算 blockDim,无需 host 提供更多信息。
+    const int64_t rows_per_core = 32;
+
+    EXEC_NPU_CMD(
+        aclnnTurboquantDecodePaged8bit,
+        key_cache_c,
+        value_cache_c,
+        gather_ids_c,
+        codebook_c,
+        rotation_c,
+        head_size,
+        block_size,
+        num_kv_heads,
+        total_blocks,
+        rows_per_core,
+        out_dtype_code,
+        mode,
+        key_out,
+        value_out);
+
+    return std::make_tuple(key_out, value_out);
 }
 
 // TurboQuant encode (fp16 rotated unit vectors -> packed uint8), 4- or 8-bit MSE path.
@@ -2938,6 +3031,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "turboquant_fused_infer_attention_score_8bit",
         torch::kPrivateUse1,
         &vllm_ascend::turboquant_fused_infer_attention_score_8bit);
+
+    // TurboQuant 8-bit paged decode (设计文档 §2.6 方案 X / Phase 1).
+    // 算子吞掉 block_table 寻址,host 侧只需 ceil + cumsum 算 gather_block_ids。
+    ops.def(
+        "turboquant_decode_paged_8bit("
+        "Tensor key_cache, Tensor value_cache, Tensor gather_block_ids, "
+        "Tensor codebook, Tensor rotation, "
+        "int head_size, int block_size, int out_dtype_code, int mode"
+        ") -> (Tensor, Tensor)");
+    ops.impl("turboquant_decode_paged_8bit", torch::kPrivateUse1,
+             &vllm_ascend::turboquant_decode_paged_8bit);
 
     ops.def(
         "grouped_matmul_swiglu_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor x_scale,"

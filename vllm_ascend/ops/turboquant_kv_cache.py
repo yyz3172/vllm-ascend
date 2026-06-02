@@ -815,6 +815,126 @@ def turboquant_decode_kv_cache_compact(
     return k, v, bt_compact.to(block_tables.dtype)
 
 
+def turboquant_paged_decode_host_indices(
+    block_table: torch.Tensor,
+    actual_seq_lengths_kv,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Host-side ceil+cumsum for the 8-bit paged decode op (design doc §2.6.7).
+
+    Replaces the ``unique``/``searchsorted`` compaction with a compact physical
+    block-id list (in seq order) plus a remapped block table. Pure tensor ops
+    (no custom op), so it is CPU-testable.
+
+    Args:
+      block_table: ``[batch, max_blocks_per_seq]`` physical block ids; the first
+        ``ceil(seq_len / block_size)`` entries of each row are the live blocks.
+      actual_seq_lengths_kv: per-seq KV lengths (list or tensor).
+      block_size: KV block size (BS).
+
+    Returns:
+      gather_block_ids: ``[total_blocks]`` int32, ``block_table`` entries of every
+        seq concatenated in order (the workspace block order).
+      bt_compact: same shape/dtype as ``block_table``; valid slot ``[s, j]`` maps to
+        ``block_offsets[s] + j`` and padding slots collapse to ``block_offsets[s]``
+        (a valid workspace slot, so FIA prefetch never reads out of range).
+      total_blocks: ``int`` number of referenced blocks (one D2H sync).
+    """
+    device = block_table.device
+    _, max_bps = block_table.shape
+    if isinstance(actual_seq_lengths_kv, torch.Tensor):
+        actual_kv = actual_seq_lengths_kv.to(device=device, dtype=torch.int64)
+    else:
+        actual_kv = torch.tensor(actual_seq_lengths_kv, dtype=torch.int64, device=device)
+
+    num_blocks_per_seq = (actual_kv + block_size - 1) // block_size          # [batch]
+    block_offsets = num_blocks_per_seq.cumsum(0) - num_blocks_per_seq        # [batch]
+    total_blocks = int(num_blocks_per_seq.sum().item())
+
+    arange_j = torch.arange(max_bps, device=device, dtype=torch.int64)
+    j_mask = arange_j.unsqueeze(0) < num_blocks_per_seq.unsqueeze(1)         # [batch, max_bps]
+    gather_block_ids = block_table[j_mask].to(torch.int32)                   # [total_blocks]
+
+    bt_compact = block_offsets.unsqueeze(1) + arange_j.unsqueeze(0)          # [batch, max_bps]
+    bt_compact = torch.where(j_mask, bt_compact, block_offsets.unsqueeze(1))
+    bt_compact = bt_compact.to(block_table.dtype)
+    return gather_block_ids, bt_compact, total_blocks
+
+
+def _try_8bit_decode_paged(
+    *,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lengths_kv,
+    head_size: int,
+    dtype: torch.dtype,
+    bits_key: int,
+    bits_value: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """8-bit packed KV cache -> compact fp16 K/V via the fused paged decode op.
+
+    Returns ``(key_ws, value_ws, bt_compact)`` on hit (``key_ws``/``value_ws`` are
+    ``[total_blocks, BS, H, head_size]`` fp16) or ``None`` to fall back to the
+    PyTorch ``turboquant_decode_kv_cache_compact`` path. Two gates: the env switch
+    and op availability (design doc §2.6.7). Kept as a separate switch from the
+    4-bit ``VLLM_ASCEND_TURBOQUANT_DECODE_OP`` because the 4-bit op is unverified.
+    """
+    if not envs_ascend.VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT:
+        return None
+    if bits_key != 8 or bits_value != 8:
+        return None
+    if dtype != torch.float16 or head_size != 128:
+        return None
+    if block_table.numel() == 0:
+        return None
+    # mixed / padded slot (last dim != head_size + 2) does not hit the 8-bit op.
+    if int(key_cache.shape[-1]) != head_size + 2:
+        return None
+    if key_cache.shape != value_cache.shape:
+        return None
+    if not _c_ascend_turboquant_op_available("turboquant_decode_paged_8bit"):
+        return None
+
+    block_size = int(key_cache.shape[1])
+    device = key_cache.device
+
+    gather_block_ids, bt_compact, total_blocks = turboquant_paged_decode_host_indices(
+        block_table, actual_seq_lengths_kv, block_size
+    )
+    if total_blocks == 0:
+        empty = torch.empty(
+            (0,) + tuple(key_cache.shape[1:-1]) + (head_size,),
+            dtype=dtype,
+            device=device,
+        )
+        return empty, empty, bt_compact
+
+    quantizer = _get_quantizer(head_size, 8, device)
+    codebook = quantizer._codebook_fp16
+    if codebook is None or codebook.device != device:
+        codebook = quantizer.codebook.to(device=device, dtype=torch.float16)
+        quantizer._codebook_fp16 = codebook
+    rotation = quantizer._rotation_fp16
+    if rotation is None or rotation.device != device:
+        rotation = quantizer.rotation.to(device=device, dtype=torch.float16)
+        quantizer._rotation_fp16 = rotation
+
+    mode = 1 if envs_ascend.VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE == 1 else 0
+    key_ws, value_ws = torch.ops._C_ascend.turboquant_decode_paged_8bit(
+        key_cache.contiguous(),
+        value_cache.contiguous(),
+        gather_block_ids.contiguous(),
+        codebook,
+        rotation,
+        head_size,
+        block_size,
+        0,  # out_dtype = fp16
+        mode,
+    )
+    return key_ws, value_ws, bt_compact
+
+
 def _turboquant_fused_infer_attention_score_8bit_impl(
     query: torch.Tensor,
     key_cache: torch.Tensor,
