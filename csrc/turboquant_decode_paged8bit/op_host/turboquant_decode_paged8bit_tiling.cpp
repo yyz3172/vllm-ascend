@@ -53,7 +53,7 @@ ge::graphStatus FillKfcCubeTiling(
     platformInfo.l0BSize = l0bSize;
 
     matmul_tiling::MultiCoreMatmulTiling tilingApi(platformInfo);
-    tilingApi.SetDim(1);
+    tilingApi.SetDim(2);
     tilingApi.SetAType(matmul_tiling::TPosition::VECOUT,
                        matmul_tiling::CubeFormat::ND,
                        matmul_tiling::DataType::DT_FLOAT16, false);
@@ -75,6 +75,7 @@ ge::graphStatus FillKfcCubeTiling(
         return ge::GRAPH_FAILED;
     }
     cubeTiling.set_baseM(mPad);
+    cubeTiling.set_usedCoreNum(1);
     return ge::GRAPH_SUCCESS;
 }
 

@@ -95,10 +95,13 @@ __aicore__ inline void DecodeRows8bit(
     const uint32_t D = TQ_DECODE_HEAD_SIZE;
     const uint32_t n = M * D;
 
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows enter M=%u mPad=%u n=%u\n", M, mPad, n);
     // (1) idx bytes (stride 130) -> contiguous fp16 [M, 128]. Source rows after
     //     row 0 are not VEC-aligned (130B stride), so unpack through scalar S
     //     pipe first; later VEC ops consume the aligned contiguous idxHalf.
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before MTE2_S packed\n");
     TqDecodeSync<AscendC::HardEvent::MTE2_S>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after MTE2_S packed\n");
     for (uint32_t i = 0; i < M; ++i) {
         const uint32_t rowBase = i * TQ_DECODE_PACKED_BYTES;
         const uint32_t outBase = i * D;
@@ -107,20 +110,27 @@ __aicore__ inline void DecodeRows8bit(
             idxHalf.SetValue(outBase + j, static_cast<half>(idx));
         }
     }
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after scalar unpack\n");
     TqDecodeSync<AscendC::HardEvent::S_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after S_V unpack\n");
 
     // (2) idx -> int32 byte offsets into the fp16 codebook (idx * sizeof(half)).
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before Cast idxHalf->idxFloat\n");
     AscendC::Cast(idxFloat, idxHalf, AscendC::RoundMode::CAST_NONE, n);
     AscendC::PipeBarrier<PIPE_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before Cast idxFloat->idxS32\n");
     AscendC::Cast(idxS32, idxFloat, AscendC::RoundMode::CAST_RINT, n);
     AscendC::PipeBarrier<PIPE_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before Muls idxS32\n");
     AscendC::Muls(idxS32, idxS32, static_cast<int32_t>(sizeof(half)), n);
     AscendC::PipeBarrier<PIPE_V>();
 
     // (3) codebook LUT: y_hat = codebook[idx] (256-entry, fits Vector LUT).
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before Gather\n");
     AscendC::Gather(yHat, codebook, idxS32.template ReinterpretCast<uint32_t>(),
                     static_cast<uint32_t>(0), n);
     AscendC::PipeBarrier<PIPE_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after Gather\n");
 
     // (4) per-row norms read from the packed slot (scalar; packed already in UB).
     half normArr[64];  // >= max T_rows
@@ -130,10 +140,12 @@ __aicore__ inline void DecodeRows8bit(
 
     // (5) y_hat *= norm (broadcast over the feature dim). The Gather output and
     //     this Muls are both on PIPE_V so the prior barrier orders them.
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before norm Muls\n");
     for (uint32_t i = 0; i < M; ++i) {
         AscendC::Muls(yHat[i * D], yHat[i * D], normArr[i], D);
     }
     AscendC::PipeBarrier<PIPE_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after norm Muls\n");
 
     // Zero-pad the Cube A tail when M is not 16-aligned (compact blocks keep M ==
     // T_rows so this is normally a no-op, but stay safe for a ragged last tile).
@@ -143,20 +155,29 @@ __aicore__ inline void DecodeRows8bit(
     }
 
     // (6) Cube: x_hat = y_hat @ R, fp32 accumulate to GM, then back to UB + fp16.
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before Cube setup\n");
     rotateMm.SetOrgShape(mPad, D, D);
     rotateMm.SetSingleShape(M, D, D);
     rotateMm.SetTensorA(yHat, false);
     rotateMm.SetTensorB(rotationGm, false);
     rotateMm.SetLocalWorkspace(rotateWork);
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows before Cube Iterate\n");
+    uint32_t iterCount = 0;
     while (rotateMm.Iterate()) {
+        AscendC::printf("[TQ_DECODE_KFC] DecodeRows Cube iter=%u before GetTensorC\n", iterCount);
         rotateMm.GetTensorC(cubeCGm);
+        AscendC::printf("[TQ_DECODE_KFC] DecodeRows Cube iter=%u after GetTensorC\n", iterCount);
+        ++iterCount;
     }
-    rotateMm.End();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after Cube Iterate count=%u\n", iterCount);
 
     AscendC::DataCopy(cubeFp32, cubeCGm, n);
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after cube GM->UB copy\n");
     TqDecodeSync<AscendC::HardEvent::MTE2_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows after cube MTE2_V\n");
     AscendC::Cast(xHat, cubeFp32, AscendC::RoundMode::CAST_NONE, n);
     AscendC::PipeBarrier<PIPE_V>();
+    AscendC::printf("[TQ_DECODE_KFC] DecodeRows exit\n");
 }
 
 // Fully scalar reference decode (AIV-only). No Gather, no Cube — used as the
