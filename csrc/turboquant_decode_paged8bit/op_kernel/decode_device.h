@@ -42,10 +42,10 @@ static constexpr uint32_t TQ_DECODE_NORM_OFFSET = TQ_DECODE_HEAD_SIZE;       // 
 // KFC matmul type five-tuple — identical to the (validated) pack op
 // (csrc/turboquant_pack_kv_for_cache_fused): A in VECOUT UB, B/C in GM.
 // fp32 C accumulate (then cast to fp16) avoids fp16 K=128 accumulation error.
-using TqDecodeRotateAT = AscendC::MatmulType<AscendC::TPosition::VECOUT, AscendC::CubeFormat::ND, half>;
-using TqDecodeRotateBT = AscendC::MatmulType<AscendC::TPosition::GM, AscendC::CubeFormat::ND, half>;
-using TqDecodeRotateCT = AscendC::MatmulType<AscendC::TPosition::GM, AscendC::CubeFormat::ND, float>;
-using TqDecodeRotateBiasT = AscendC::MatmulType<AscendC::TPosition::GM, AscendC::CubeFormat::ND, half>;
+using TqDecodeRotateAT = AscendC::MatmulType<AscendC::TPosition::VECOUT, CubeFormat::ND, half>;
+using TqDecodeRotateBT = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half>;
+using TqDecodeRotateCT = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
+using TqDecodeRotateBiasT = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half>;
 using TqDecodeRotateMatmulOp =
     AscendC::Matmul<TqDecodeRotateAT, TqDecodeRotateBT, TqDecodeRotateCT, TqDecodeRotateBiasT>;
 
@@ -53,7 +53,7 @@ using TqDecodeRotateMatmulOp =
 // HardEvent is a compile-time template arg for SetFlag/WaitFlag.
 template <AscendC::HardEvent EVT>
 __aicore__ inline void TqDecodeSync() {
-    event_t e = static_cast<event_t>(AscendC::GetTPipePtr()->FetchEventID(EVT));
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVT));
     AscendC::SetFlag<EVT>(e);
     AscendC::WaitFlag<EVT>(e);
 }
@@ -95,13 +95,19 @@ __aicore__ inline void DecodeRows8bit(
     const uint32_t D = TQ_DECODE_HEAD_SIZE;
     const uint32_t n = M * D;
 
-    // (1) idx bytes (stride 130) -> contiguous fp16 [M, 128]. uint8->half is a
-    //     zero-extend cast; per-row because the 2-byte norm slot breaks contiguity.
+    // (1) idx bytes (stride 130) -> contiguous fp16 [M, 128]. Source rows after
+    //     row 0 are not VEC-aligned (130B stride), so unpack through scalar S
+    //     pipe first; later VEC ops consume the aligned contiguous idxHalf.
+    TqDecodeSync<AscendC::HardEvent::MTE2_S>();
     for (uint32_t i = 0; i < M; ++i) {
-        AscendC::Cast(idxHalf[i * D], packed[i * TQ_DECODE_PACKED_BYTES],
-                      AscendC::RoundMode::CAST_NONE, D);
+        const uint32_t rowBase = i * TQ_DECODE_PACKED_BYTES;
+        const uint32_t outBase = i * D;
+        for (uint32_t j = 0; j < D; ++j) {
+            const int32_t idx = static_cast<int32_t>(packed.GetValue(rowBase + j));
+            idxHalf.SetValue(outBase + j, static_cast<half>(idx));
+        }
     }
-    AscendC::PipeBarrier<PIPE_V>();
+    TqDecodeSync<AscendC::HardEvent::S_V>();
 
     // (2) idx -> int32 byte offsets into the fp16 codebook (idx * sizeof(half)).
     AscendC::Cast(idxFloat, idxHalf, AscendC::RoundMode::CAST_NONE, n);
@@ -117,7 +123,6 @@ __aicore__ inline void DecodeRows8bit(
     AscendC::PipeBarrier<PIPE_V>();
 
     // (4) per-row norms read from the packed slot (scalar; packed already in UB).
-    TqDecodeSync<AscendC::HardEvent::MTE2_S>();
     half normArr[64];  // >= max T_rows
     for (uint32_t i = 0; i < M; ++i) {
         normArr[i] = TqDecodeReadNorm(packed, i * TQ_DECODE_PACKED_BYTES);
