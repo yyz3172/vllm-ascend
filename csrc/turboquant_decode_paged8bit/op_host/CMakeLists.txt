@@ -1,7 +1,7 @@
 add_ops_compile_options(
         OP_NAME TurboquantDecodePaged8bit
         OPTIONS --cce-auto-sync=on
-                -DASCENDC_DUMP=0
+                -DASCENDC_DUMP=1
                 -Wno-deprecated-declarations
                 -Werror
 )
