@@ -485,43 +485,56 @@ class NPUWorker(WorkerBase):
         ensure_ec_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):
-        # Torch profiler. Enabled and configured through env vars:
-        # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
-        if envs_vllm.VLLM_TORCH_PROFILER_DIR:
-            if envs_ascend.MSMONITOR_USE_DAEMON:
-                raise RuntimeError(
-                    "MSMONITOR_USE_DAEMON and VLLM_TORCH_PROFILER_DIR cannot be both set at the same time."
-                )
-            torch_profiler_trace_dir = envs_vllm.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
-
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                export_type=torch_npu.profiler.ExportType.Text,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                msprof_tx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-                l2_cache=False,
-                op_attr=False,
-                data_simplification=False,
-                record_op_args=False,
-                gc_detect_threshold=None,
-            )
-
-            return torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
-                with_stack=envs_vllm.VLLM_TORCH_PROFILER_WITH_STACK,
-                profile_memory=envs_vllm.\
-                    VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
-                with_modules=False,
-                experimental_config=experimental_config,
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir))
-        else:
+        # Torch profiler: enabled via --profiler-config only.
+        profiler_config = self.vllm_config.profiler_config
+        if profiler_config.profiler != "torch":
             return None
+
+        torch_profiler_trace_dir = profiler_config.torch_profiler_dir
+        if not torch_profiler_trace_dir:
+            return None
+
+        with_stack = profiler_config.torch_profiler_with_stack
+        profile_memory = profiler_config.torch_profiler_with_memory
+        record_shapes = profiler_config.torch_profiler_record_shapes
+        with_flops = profiler_config.torch_profiler_with_flops
+
+        if envs_ascend.MSMONITOR_USE_DAEMON:
+            raise RuntimeError(
+                "MSMONITOR_USE_DAEMON and torch profiler cannot be both "
+                "enabled at the same time."
+            )
+        logger.info(
+            "Profiling enabled. Traces will be saved to: %s "
+            "(with_stack=%s, profile_memory=%s, record_shapes=%s, with_flops=%s)",
+            torch_profiler_trace_dir, with_stack, profile_memory, record_shapes,
+            with_flops)
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            msprof_tx=False,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=False,
+            record_op_args=record_shapes,
+            gc_detect_threshold=None,
+        )
+
+        return torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            record_shapes=record_shapes,
+            with_stack=with_stack,
+            profile_memory=profile_memory,
+            with_flops=with_flops,
+            with_modules=False,
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                torch_profiler_trace_dir))
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
