@@ -738,47 +738,47 @@ def turboquant_decode_kv_cache_compact(
     bk = bits if bits_key is None else bits_key
     bv = bits if bits_value is None else bits_value
 
-    if decode_only_arange_fast_path:
-        # Static-shape decode path for DecodeOnly:
-        #
-        # Workspace layout (size N + 1, where N = bt.numel()):
-        #   slot 0      : decode(cache[0]) — null_block sentinel for padding sinks
-        #   slot 1..N   : decode(cache[bt.flatten()[i].clamp(min=0)]) for i in [0, N)
-        #
-        # ``bt_compact`` mapping:
-        #   bt[i] >  0 (valid)   : i + 1   (own dedicated workspace slot)
-        #   bt[i] <= 0 (padding) : 0       (points at the null_block sentinel)
-        #
-        # vLLM v1 reserves physical block id 0 as ``null_block`` and zero-fills
-        # unused slots of ``block_table``. Routing padding to compact index 0
-        # mirrors the unique-path convention (where searchsorted maps padding to
-        # the null_block's compact index) — every entry of ``bt_compact`` is a
-        # valid workspace index, no negative offsets.
-        n = bt.numel()
-        flat_bt = bt.flatten()
-        gather_idx = torch.cat(
-            (
-                torch.zeros(1, device=bt.device, dtype=torch.int64),
-                flat_bt.clamp(min=0).to(torch.int64),
-            )
-        )  # [N + 1]
-        key_packed = key_cache.index_select(0, gather_idx)  # [N+1, BS, H, P]
-        value_packed = value_cache.index_select(0, gather_idx)
+    # if decode_only_arange_fast_path:
+    #     # Static-shape decode path for DecodeOnly:
+    #     #
+    #     # Workspace layout (size N + 1, where N = bt.numel()):
+    #     #   slot 0      : decode(cache[0]) — null_block sentinel for padding sinks
+    #     #   slot 1..N   : decode(cache[bt.flatten()[i].clamp(min=0)]) for i in [0, N)
+    #     #
+    #     # ``bt_compact`` mapping:
+    #     #   bt[i] >  0 (valid)   : i + 1   (own dedicated workspace slot)
+    #     #   bt[i] <= 0 (padding) : 0       (points at the null_block sentinel)
+    #     #
+    #     # vLLM v1 reserves physical block id 0 as ``null_block`` and zero-fills
+    #     # unused slots of ``block_table``. Routing padding to compact index 0
+    #     # mirrors the unique-path convention (where searchsorted maps padding to
+    #     # the null_block's compact index) — every entry of ``bt_compact`` is a
+    #     # valid workspace index, no negative offsets.
+    #     n = bt.numel()
+    #     flat_bt = bt.flatten()
+    #     gather_idx = torch.cat(
+    #         (
+    #             torch.zeros(1, device=bt.device, dtype=torch.int64),
+    #             flat_bt.clamp(min=0).to(torch.int64),
+    #         )
+    #     )  # [N + 1]
+    #     key_packed = key_cache.index_select(0, gather_idx)  # [N+1, BS, H, P]
+    #     value_packed = value_cache.index_select(0, gather_idx)
 
-        # Decode via the PyTorch reference path (always correct). An 8-bit
-        # dedicated decode op is the subject of design doc Phase 0.4 / Phase 1.
-        k = turboquant_dequantize_from_packed_bytes(
-            key_packed, head_size=head_size, dtype=dtype, bits=bk
-        )
-        v = turboquant_dequantize_from_packed_bytes(
-            value_packed, head_size=head_size, dtype=dtype, bits=bv
-        )
+    #     # Decode via the PyTorch reference path (always correct). An 8-bit
+    #     # dedicated decode op is the subject of design doc Phase 0.4 / Phase 1.
+    #     k = turboquant_dequantize_from_packed_bytes(
+    #         key_packed, head_size=head_size, dtype=dtype, bits=bk
+    #     )
+    #     v = turboquant_dequantize_from_packed_bytes(
+    #         value_packed, head_size=head_size, dtype=dtype, bits=bv
+    #     )
 
-        # bt_compact = (arange(1..N+1) reshaped) * (bt > 0). Padding → 0;
-        # arithmetic mask avoids ``torch.where`` and its bool dispatch.
-        arange_plus_one = torch.arange(1, n + 1, device=bt.device, dtype=torch.int32)
-        bt_compact = arange_plus_one.view_as(bt) * (bt > 0).to(torch.int32)
-        return k, v, bt_compact.to(block_tables.dtype)
+    #     # bt_compact = (arange(1..N+1) reshaped) * (bt > 0). Padding → 0;
+    #     # arithmetic mask avoids ``torch.where`` and its bool dispatch.
+    #     arange_plus_one = torch.arange(1, n + 1, device=bt.device, dtype=torch.int32)
+    #     bt_compact = arange_plus_one.view_as(bt) * (bt > 0).to(torch.int32)
+    #     return k, v, bt_compact.to(block_tables.dtype)
 
     valid = bt >= 0
     if not torch.any(valid):
@@ -842,19 +842,26 @@ def turboquant_paged_decode_host_indices(
     """
     device = block_table.device
     _, max_bps = block_table.shape
+    print("device", device, "max_bps", max_bps, "actual_seq_lengths_kv", actual_seq_lengths_kv)
     if isinstance(actual_seq_lengths_kv, torch.Tensor):
         actual_kv = actual_seq_lengths_kv.to(device=device, dtype=torch.int64)
+        print("1 actual_kv shape", actual_kv.shape, "actual_kv dtype", actual_kv.dtype)
     else:
         actual_kv = torch.tensor(actual_seq_lengths_kv, dtype=torch.int64, device=device)
+        print("2 actual_kv shape", actual_kv.shape, "actual_kv dtype", actual_kv.dtype)
 
     num_blocks_per_seq = (actual_kv + block_size - 1) // block_size          # [batch]
+    print("3 num_blocks_per_seq shape", num_blocks_per_seq.shape, "num_blocks_per_seq dtype", num_blocks_per_seq.dtype)
     block_offsets = num_blocks_per_seq.cumsum(0) - num_blocks_per_seq        # [batch]
+    print("4 block_offsets shape", block_offsets.shape, "block_offsets dtype", block_offsets.dtype)
     total_blocks = int(num_blocks_per_seq.sum().item())
-
+    print("5 total_blocks", total_blocks)
     arange_j = torch.arange(max_bps, device=device, dtype=torch.int64)
+    print("6 arange_j shape", arange_j.shape, "arange_j dtype", arange_j.dtype)
     j_mask = arange_j.unsqueeze(0) < num_blocks_per_seq.unsqueeze(1)         # [batch, max_bps]
+    print("7 j_mask shape", j_mask.shape, "j_mask dtype", j_mask.dtype)
     gather_block_ids = block_table[j_mask].to(torch.int32)                   # [total_blocks]
-
+    print("8 gather_block_ids shape", gather_block_ids.shape, "gather_block_ids dtype", gather_block_ids.dtype)
     bt_compact = block_offsets.unsqueeze(1) + arange_j.unsqueeze(0)          # [batch, max_bps]
     bt_compact = torch.where(j_mask, bt_compact, block_offsets.unsqueeze(1))
     bt_compact = bt_compact.to(block_table.dtype)
@@ -882,23 +889,13 @@ def _try_8bit_decode_paged(
     """
     if not envs_ascend.VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT:
         return None
-    if bits_key != 8 or bits_value != 8:
-        return None
-    if dtype != torch.float16 or head_size != 128:
-        return None
     if block_table.numel() == 0:
         return None
-    # mixed / padded slot (last dim != head_size + 2) does not hit the 8-bit op.
-    if int(key_cache.shape[-1]) != head_size + 2:
-        return None
-    if key_cache.shape != value_cache.shape:
-        return None
-    if not _c_ascend_turboquant_op_available("turboquant_decode_paged_8bit"):
-        return None
-
     block_size = int(key_cache.shape[1])
     device = key_cache.device
-
+    print("block_table shape", block_table.shape, "block_table dtype", block_table.dtype)
+    print("actual_seq_lengths_kv", actual_seq_lengths_kv)
+    print("block_size", block_size)
     gather_block_ids, bt_compact, total_blocks = turboquant_paged_decode_host_indices(
         block_table, actual_seq_lengths_kv, block_size
     )
@@ -922,8 +919,8 @@ def _try_8bit_decode_paged(
 
     mode = 1 if envs_ascend.VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE == 1 else 0
     key_ws, value_ws = torch.ops._C_ascend.turboquant_decode_paged_8bit(
-        key_cache.contiguous(),
-        value_cache.contiguous(),
+        key_cache.view(torch.uint8).contiguous(),
+        value_cache.view(torch.uint8).contiguous(),
         gather_block_ids.contiguous(),
         codebook,
         rotation,
@@ -932,7 +929,7 @@ def _try_8bit_decode_paged(
         0,  # out_dtype = fp16
         mode,
     )
-    return key_ws, value_ws, bt_compact
+    return key_ws.to(torch.bfloat16), value_ws.to(torch.bfloat16), bt_compact
 
 
 def _turboquant_fused_infer_attention_score_8bit_impl(

@@ -170,7 +170,7 @@ def test_decode_paged_op_matches_pytorch_golden(mode):
     os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT"] = "1"
     os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE"] = str(mode)
     device = torch.device("npu")
-    num_kv_heads = 2
+    num_kv_heads = 8
     num_blocks = 6
 
     key_packed, value_packed = _build_packed_cache(num_blocks, num_kv_heads, device)
@@ -183,6 +183,7 @@ def test_decode_paged_op_matches_pytorch_golden(mode):
     gather, bt_compact, total = turboquant_paged_decode_host_indices(
         block_table, actual_kv, BLOCK_SIZE
     )
+    print(f"gather: {gather}, bt_compact: {bt_compact}, total: {total}")
 
     from vllm_ascend.ops.turboquant_kv_cache import _get_quantizer
 

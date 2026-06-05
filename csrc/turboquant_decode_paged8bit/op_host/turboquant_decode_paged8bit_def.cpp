@@ -87,8 +87,11 @@ public:
             .ExtendCfgInfo("aclnnSupport.value", "support_aclnn")
             .ExtendCfgInfo("multiKernelSupportDynamicGraph.value", "multi_kernel");
 
-        this->AICore().AddConfig("ascend910_93", aicoreConfig);
-        this->AICore().AddConfig("ascend910b", aicoreConfig);
+            OpAICoreConfig aicoreConfigA2 = aicoreConfig;
+            aicoreConfigA2.ExtendCfgInfo("jitCompile.flag", "static_false");
+    
+            this->AICore().AddConfig("ascend910_93", aicoreConfig);
+            this->AICore().AddConfig("ascend910b", aicoreConfigA2);
     }
 };
 
