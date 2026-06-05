@@ -168,11 +168,11 @@ __aicore__ inline void DecodeRows8bit(
 
 // Fully scalar reference decode (AIV-only). No Gather, no Cube — used as the
 // numeric golden / debug fallback (design doc §2.6.5.8). codebook + rotation are
-// read scalar from UB / GM; caller must have MTE2->S synced ``packed``/codebook.
+// read scalar from UB; caller must issue S->MTE3 before copying xHat to GM.
 __aicore__ inline void DecodeRowsScalar(
     const AscendC::LocalTensor<uint8_t>& packed,
     const AscendC::LocalTensor<half>& codebook,
-    AscendC::GlobalTensor<half>& rotationGm,
+    const AscendC::LocalTensor<half>& rotation,
     const AscendC::LocalTensor<half>& xHat,
     uint32_t M) {
     const uint32_t D = TQ_DECODE_HEAD_SIZE;
@@ -190,7 +190,7 @@ __aicore__ inline void DecodeRowsScalar(
             float acc = 0.f;
             for (uint32_t k = 0; k < D; ++k) {
                 acc += static_cast<float>(yhat[k]) *
-                       static_cast<float>(rotationGm.GetValue(static_cast<uint64_t>(k) * D + nn));
+                       static_cast<float>(rotation.GetValue(k * D + nn));
             }
             xHat.SetValue(i * D + nn, static_cast<half>(acc * norm));
         }

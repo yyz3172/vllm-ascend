@@ -87,13 +87,13 @@ public:
         pipe_->InitBuffer(codebookBuf_, TQ_CODEBOOK_SIZE * sizeof(half));
         pipe_->InitBuffer(packedBuf_, TQ_T_ROWS * packedBytes_ * sizeof(uint8_t));
         pipe_->InitBuffer(xHatBuf_, TQ_T_ROWS * headSize_ * sizeof(half));
+        pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_WORKSPACE_BYTES);
         if (mode_ == 0) {
             pipe_->InitBuffer(idxHalfBuf_, TQ_T_ROWS * headSize_ * sizeof(half));
             pipe_->InitBuffer(idxFloatBuf_, TQ_T_ROWS * headSize_ * sizeof(float));
             pipe_->InitBuffer(idxS32Buf_, TQ_T_ROWS * headSize_ * sizeof(int32_t));
             pipe_->InitBuffer(yHatBuf_, TQ_T_ROWS * headSize_ * sizeof(half));
             pipe_->InitBuffer(cubeFp32Buf_, TQ_T_ROWS * headSize_ * sizeof(float));
-            pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_WORKSPACE_BYTES);
 
             auto* wsBase = reinterpret_cast<__gm__ uint8_t*>(GetSysWorkSpacePtr());
             matmulReady_ = (wsBase != nullptr);
@@ -157,13 +157,15 @@ public:
         }
 
         LoadCodebook();
+        auto rotation = rotateWorkBuf_.Get<half>();
+        DataCopy(rotation, rotationGm_, static_cast<uint32_t>(TQ_HEAD_SIZE * TQ_HEAD_SIZE));
         TqDecodeSyncMte2ToS();
         auto codebook = codebookBuf_.Get<half>();
         auto packed = packedBuf_.Get<uint8_t>();
         auto xHat = xHatBuf_.Get<half>();
 
-        DecodeSegmentScalar(keyCacheGm_, keyOutGm_, blkStart, blkEnd, codebook, packed, xHat);
-        DecodeSegmentScalar(valueCacheGm_, valueOutGm_, blkStart, blkEnd, codebook, packed, xHat);
+        DecodeSegmentScalar(keyCacheGm_, keyOutGm_, blkStart, blkEnd, codebook, packed, rotation, xHat);
+        DecodeSegmentScalar(valueCacheGm_, valueOutGm_, blkStart, blkEnd, codebook, packed, rotation, xHat);
     }
 
 private:
@@ -209,8 +211,37 @@ private:
         WaitFlag<HardEvent::S_V>(e);
     }
 
+    __aicore__ inline void TqDecodeSyncSToMte3() {
+        event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+        SetFlag<HardEvent::S_MTE3>(e);
+        WaitFlag<HardEvent::S_MTE3>(e);
+    }
+
+    __aicore__ inline void TqDecodeSyncMte3ToS() {
+        event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_S));
+        SetFlag<HardEvent::MTE3_S>(e);
+        WaitFlag<HardEvent::MTE3_S>(e);
+    }
+
+    __aicore__ inline void LoadPackedTile(
+        GlobalTensor<uint8_t>& srcCacheGm,
+        const LocalTensor<uint8_t>& packed,
+        uint64_t srcOff,
+        uint32_t M) {
+        DataCopy(packed, srcCacheGm[srcOff], M * packedBytes_);
+        TqDecodeSyncMte2ToS();
+
+        // Keep the fp16 norm tail visible after the 130-byte row copy.
+        for (uint32_t i = 0; i < M; ++i) {
+            const uint64_t srcRow = srcOff + static_cast<uint64_t>(i) * packedBytes_;
+            const uint32_t dstRow = i * packedBytes_;
+            packed.SetValue(dstRow + TQ_HEAD_SIZE, srcCacheGm.GetValue(srcRow + TQ_HEAD_SIZE));
+            packed.SetValue(dstRow + TQ_HEAD_SIZE + 1, srcCacheGm.GetValue(srcRow + TQ_HEAD_SIZE + 1));
+        }
+    }
+
     __aicore__ inline void DecodeSegmentKfc(
-        const GlobalTensor<uint8_t>& srcCacheGm,
+        GlobalTensor<uint8_t>& srcCacheGm,
         const GlobalTensor<half>& dstOutGm,
         uint32_t blkStart,
         uint32_t blkEnd,
@@ -233,7 +264,7 @@ private:
                 const uint64_t srcOff = srcBlockBase + static_cast<uint64_t>(t) * packedBytes_;
                 const uint64_t dstOff = dstBlockBase + static_cast<uint64_t>(t) * headSize_;
 
-                DataCopy(packed, srcCacheGm[srcOff], M * packedBytes_);
+                LoadPackedTile(srcCacheGm, packed, srcOff, M);
                 TqDecodeSyncMte2ToV();
                 turboquant::DecodeRows8bit(
                     packed, codebook, rotationGm_, cubeCGm_, *rotateMm_,
@@ -247,12 +278,13 @@ private:
     }
 
     __aicore__ inline void DecodeSegmentScalar(
-        const GlobalTensor<uint8_t>& srcCacheGm,
-        const GlobalTensor<half>& dstOutGm,
+        GlobalTensor<uint8_t>& srcCacheGm,
+        GlobalTensor<half>& dstOutGm,
         uint32_t blkStart,
         uint32_t blkEnd,
         const LocalTensor<half>& codebook,
         const LocalTensor<uint8_t>& packed,
+        const LocalTensor<half>& rotation,
         const LocalTensor<half>& xHat) {
         for (uint32_t blk = blkStart; blk < blkEnd; ++blk) {
             const uint32_t phys = static_cast<uint32_t>(gatherBlockIdsGm_.GetValue(blk));
@@ -264,15 +296,15 @@ private:
                 const uint64_t srcOff = srcBlockBase + static_cast<uint64_t>(t) * packedBytes_;
                 const uint64_t dstOff = dstBlockBase + static_cast<uint64_t>(t) * headSize_;
 
-                DataCopy(packed, srcCacheGm[srcOff], M * packedBytes_);
-                TqDecodeSyncMte2ToS();
+                LoadPackedTile(srcCacheGm, packed, srcOff, M);
 
-                turboquant::DecodeRowsScalar(packed, codebook, rotationGm_, xHat, M);
+                turboquant::DecodeRowsScalar(packed, codebook, rotation, xHat, M);
 
-                // xHat is written scalar (S pipe); order S->V->MTE3 to the GM store.
-                TqDecodeSyncSToV();
-                TqDecodeSyncVToMte3();
+                // xHat is produced by scalar SetValue; order S writes before MTE3
+                // reads it, then wait before reusing the UB tile on the next row.
+                TqDecodeSyncSToMte3();
                 DataCopy(dstOutGm[dstOff], xHat, M * headSize_);
+                TqDecodeSyncMte3ToS();
             }
         }
     }

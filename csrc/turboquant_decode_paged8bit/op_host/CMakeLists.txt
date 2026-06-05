@@ -1,9 +1,22 @@
+set(_TQ_DECODE_COMPILE_OPTIONS
+        --cce-auto-sync=on
+        -DASCENDC_DUMP=1
+        -Wno-deprecated-declarations
+        -Werror
+)
+
+set(_TQ_DECODE_DEBUG_LINE "$ENV{KENEL_DEBUG_LINE}")
+if("${_TQ_DECODE_DEBUG_LINE}" STREQUAL "")
+    set(_TQ_DECODE_DEBUG_LINE "$ENV{KERNEL_DEBUG_LINE}")
+endif()
+string(TOUPPER "${_TQ_DECODE_DEBUG_LINE}" _TQ_DECODE_DEBUG_LINE)
+if(_TQ_DECODE_DEBUG_LINE STREQUAL "ON")
+    list(APPEND _TQ_DECODE_COMPILE_OPTIONS -g)
+endif()
+
 add_ops_compile_options(
         OP_NAME TurboquantDecodePaged8bit
-        OPTIONS --cce-auto-sync=on
-                -DASCENDC_DUMP=1
-                -Wno-deprecated-declarations
-                -Werror
+        OPTIONS ${_TQ_DECODE_COMPILE_OPTIONS}
 )
 
 target_sources(op_host_aclnn PRIVATE
