@@ -994,7 +994,7 @@ class VllmRunner:
             **kwargs,
         )
         print("profiler_config", profiler_config)
-        #self.model.start_profile()
+        self.model.start_profile()
 
     @staticmethod
     def _finalize_generate_outputs(req_outputs: list[RequestOutput]) -> list[tuple[list[list[int]], list[str]]]:
@@ -1171,7 +1171,7 @@ class VllmRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        #self.model.stop_profile()
+        self.model.stop_profile()
         del self.model
         clear_ascend_config()
         cleanup_dist_env_and_memory()

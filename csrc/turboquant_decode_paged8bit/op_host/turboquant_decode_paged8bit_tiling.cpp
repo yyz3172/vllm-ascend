@@ -35,6 +35,7 @@ uint32_t AlignUp16(uint32_t x) {
 // KFC Cube tiling for y_hat @ R: A fp16 VECOUT, B fp16 GM (rotation), C fp32 GM.
 // Same five-tuple as the validated pack op; M fixed to the tile size T_rows.
 ge::graphStatus FillKfcCubeTiling(
+    const char* nodeName,
     const platform_ascendc::PlatformAscendC& platform,
     optiling::TCubeTiling& cubeTiling) {
     uint64_t l1Size = 0, l0aSize = 0, l0bSize = 0, l0cSize = 0, ubSize = 0;
@@ -76,6 +77,15 @@ ge::graphStatus FillKfcCubeTiling(
     }
     cubeTiling.set_baseM(mPad);
     cubeTiling.set_usedCoreNum(1);
+    matmul_tiling::SysTilingTempBufSize tmpBufSize{};
+    const int32_t tmpBufRet = MultiCoreMatmulGetTmpBufSize(cubeTiling, tmpBufSize);
+    OPS_LOG_I(nodeName,
+              "TurboquantDecodePaged8bit KFC matmul tmp buf ret=%d, ubSize=%d, l1Size=%d, l0cSize=%d, "
+              "M=%d, N=%d, Ka=%d, Kb=%d, baseM=%d, baseN=%d, baseK=%d, usedCoreNum=%d",
+              tmpBufRet, tmpBufSize.ubSize, tmpBufSize.l1Size, tmpBufSize.l0cSize,
+              cubeTiling.get_M(), cubeTiling.get_N(), cubeTiling.get_Ka(), cubeTiling.get_Kb(),
+              cubeTiling.get_baseM(), cubeTiling.get_baseN(), cubeTiling.get_baseK(),
+              cubeTiling.get_usedCoreNum());
     return ge::GRAPH_SUCCESS;
 }
 
@@ -136,7 +146,7 @@ static ge::graphStatus TurboquantDecodePaged8bitTilingFunc(gert::TilingContext* 
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
 
     TurboquantDecodePaged8bitTilingData tiling{};
-    if (FillKfcCubeTiling(ascendcPlatform, tiling.cubeTiling) != ge::GRAPH_SUCCESS) {
+    if (FillKfcCubeTiling(nodeName, ascendcPlatform, tiling.cubeTiling) != ge::GRAPH_SUCCESS) {
         OPS_LOG_E(nodeName, "failed to fill cube tiling");
         return ge::GRAPH_FAILED;
     }
@@ -149,6 +159,7 @@ static ge::graphStatus TurboquantDecodePaged8bitTilingFunc(gert::TilingContext* 
     const uint32_t usableCores = std::max<uint32_t>(1, coreNum);
     const uint32_t blocksPerCore = std::max<uint32_t>(1, (totalBlocks + usableCores - 1) / usableCores);
     const uint32_t dataCores = (totalBlocks + blocksPerCore - 1) / blocksPerCore;
+    OPS_LOG_E(nodeName, "coreNum=%d, usableCores=%d, blocksPerCore=%d, dataCores=%d, totalBlocks=%d", coreNum, usableCores, blocksPerCore, dataCores, totalBlocks);
 
     tiling.set_totalBlocks(totalBlocks);
     tiling.set_blockSize(blockSize);
@@ -173,6 +184,7 @@ static ge::graphStatus TurboquantDecodePaged8bitTilingFunc(gert::TilingContext* 
         const uint32_t mixBlockDim = ascendcPlatform.CalcTschBlockDim(
             TQ_DECODE_KFC_AIV_NUM, TQ_DECODE_KFC_AIC_NUM, TQ_DECODE_KFC_AIV_NUM);
         blockDim = dataCores * mixBlockDim;
+        OPS_LOG_E(nodeName, "mixBlockDim=%d, dataCores=%d, blockDim=%d", mixBlockDim, dataCores, blockDim);
     }
 
     size_t* workspaces = context->GetWorkspaceSizes(1);

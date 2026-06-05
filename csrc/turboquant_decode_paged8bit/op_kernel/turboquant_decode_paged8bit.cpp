@@ -108,37 +108,23 @@ public:
     // KFC path: vectorized Gather LUT + Cube y_hat @ R. Only the primary AIV sub
     // drives the work; the matmul lib uses the AIC + secondary AIV via KFC.
     __aicore__ inline void ProcessKfc() {
-        AscendC::printf("[TQ_DECODE_KFC] ProcessKfc enter block=%u sub=%u ready=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx(), matmulReady_ ? 1U : 0U);
         if (!matmulReady_) {
-            AscendC::printf("[TQ_DECODE_KFC] ProcessKfc return no workspace block=%u sub=%u\n",
-                            GetBlockIdx(), GetSubBlockIdx());
             return;
         }
         if ASCEND_IS_AIC {
-            AscendC::printf("[TQ_DECODE_KFC] ProcessKfc return aic block=%u sub=%u\n",
-                            GetBlockIdx(), GetSubBlockIdx());
             return;
         }
         if ((GetSubBlockIdx() % TQ_AIV_SUB_BLOCKS) != 0) {
-            AscendC::printf("[TQ_DECODE_KFC] ProcessKfc return secondary aiv block=%u sub=%u\n",
-                            GetBlockIdx(), GetSubBlockIdx());
             return;
         }
         const uint32_t core = GetBlockIdx() / TQ_AIV_SUB_BLOCKS;
         uint32_t blkStart = 0;
         uint32_t blkEnd = 0;
         if (!CoreBlockRange(core, blkStart, blkEnd)) {
-            AscendC::printf("[TQ_DECODE_KFC] ProcessKfc return no range block=%u sub=%u core=%u\n",
-                            GetBlockIdx(), GetSubBlockIdx(), core);
             return;
         }
 
-        AscendC::printf("[TQ_DECODE_KFC] LoadCodebook begin block=%u sub=%u core=%u blkStart=%u blkEnd=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx(), core, blkStart, blkEnd);
         LoadCodebook();
-        AscendC::printf("[TQ_DECODE_KFC] LoadCodebook done block=%u sub=%u core=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx(), core);
         auto codebook = codebookBuf_.Get<half>();
         auto packed = packedBuf_.Get<uint8_t>();
         auto idxHalf = idxHalfBuf_.Get<half>();
@@ -150,26 +136,12 @@ public:
         auto xHat = xHatBuf_.Get<half>();
 
         // K segment then V segment: R stays in L1 across both (no re-handshake).
-        AscendC::printf("[TQ_DECODE_KFC] K segment begin block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
         DecodeSegmentKfc(keyCacheGm_, keyOutGm_, blkStart, blkEnd,
                          codebook, packed, idxHalf, idxFloat, idxS32, yHat,
                          rotateWork, cubeFp32, xHat);
-        AscendC::printf("[TQ_DECODE_KFC] K segment done block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
-        AscendC::printf("[TQ_DECODE_KFC] V segment begin block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
         DecodeSegmentKfc(valueCacheGm_, valueOutGm_, blkStart, blkEnd,
                          codebook, packed, idxHalf, idxFloat, idxS32, yHat,
                          rotateWork, cubeFp32, xHat);
-        AscendC::printf("[TQ_DECODE_KFC] V segment done block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
-
-        AscendC::printf("[TQ_DECODE_KFC] segment before Cube End block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
-        rotateMm_->End();
-        AscendC::printf("[TQ_DECODE_KFC] segment after Cube End block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
     }
 
     // AIV-only scalar reference path (golden / debug).
@@ -261,30 +233,15 @@ private:
                 const uint64_t srcOff = srcBlockBase + static_cast<uint64_t>(t) * packedBytes_;
                 const uint64_t dstOff = dstBlockBase + static_cast<uint64_t>(t) * headSize_;
 
-                AscendC::printf("[TQ_DECODE_KFC] tile begin block=%u sub=%u blk=%u t=%u M=%u phys=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t, M, phys);
                 DataCopy(packed, srcCacheGm[srcOff], M * packedBytes_);
-                AscendC::printf("[TQ_DECODE_KFC] tile after DataCopy block=%u sub=%u blk=%u t=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t);
                 TqDecodeSyncMte2ToV();
-                AscendC::printf("[TQ_DECODE_KFC] tile after MTE2_V block=%u sub=%u blk=%u t=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t);
-
-                AscendC::printf("[TQ_DECODE_KFC] DecodeRows8bit begin block=%u sub=%u blk=%u t=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t);
                 turboquant::DecodeRows8bit(
                     packed, codebook, rotationGm_, cubeCGm_, *rotateMm_,
                     idxHalf, idxFloat, idxS32, yHat, rotateWork, cubeFp32, xHat,
                     M, AlignUp16(M));
-                AscendC::printf("[TQ_DECODE_KFC] DecodeRows8bit done block=%u sub=%u blk=%u t=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t);
 
                 TqDecodeSyncVToMte3();
-                AscendC::printf("[TQ_DECODE_KFC] tile after V_MTE3 block=%u sub=%u blk=%u t=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t);
                 DataCopy(dstOutGm[dstOff], xHat, M * headSize_);
-                AscendC::printf("[TQ_DECODE_KFC] tile output copy done block=%u sub=%u blk=%u t=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), blk, t);
             }
         }
     }
@@ -378,30 +335,17 @@ extern "C" __global__ __aicore__ void turboquant_decode_paged8bit(
     if (TILING_KEY_IS(0)) {
         // KFC mix: Gather LUT + Cube y_hat @ R.
         KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
-        AscendC::printf("[TQ_DECODE_KFC] kernel mode0 enter block=%u sub=%u totalBlocks=%u blocksPerCore=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx(), tilingData.totalBlocks, tilingData.blocksPerCore);
-        AscendC::SetSysWorkspace(workspace);
         if (GetSysWorkSpacePtr() == nullptr) {
-            AscendC::printf("[TQ_DECODE_KFC] kernel mode0 return null workspace block=%u sub=%u\n",
-                            GetBlockIdx(), GetSubBlockIdx());
             return;
         }
         AscendC::TPipe pipe;
         turboquant::TqDecodeRotateMatmulOp rotateMm;
         TCubeTiling cubeTiling = tilingData.cubeTiling;
-        AscendC::printf("[TQ_DECODE_KFC] before REGIST block=%u sub=%u cubeM=%d usedCore=%d\n",
-                        GetBlockIdx(), GetSubBlockIdx(), cubeTiling.M, cubeTiling.usedCoreNum);
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &cubeTiling);
-        AscendC::printf("[TQ_DECODE_KFC] after REGIST block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
         TurboquantDecodePaged8bitKernel<TurboquantDecodePaged8bitTilingData> op(&pipe, &rotateMm);
         op.Init(keyCachePtr, valueCachePtr, gatherPtr, codebookPtr, rotationPtr,
                 keyOutPtr, valueOutPtr, &tilingData);
-        AscendC::printf("[TQ_DECODE_KFC] after Init block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
         op.ProcessKfc();
-        AscendC::printf("[TQ_DECODE_KFC] after ProcessKfc block=%u sub=%u\n",
-                        GetBlockIdx(), GetSubBlockIdx());
     } else if (TILING_KEY_IS(1)) {
         // AIV-only scalar reference.
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_AIV_ONLY);

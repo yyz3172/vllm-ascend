@@ -89,7 +89,7 @@ def _run_greedy(
             # cudagraph_capture_sizes=[1, 2, 4, 8],
             gpu_memory_utilization=0.7,
             additional_config={"turboquant_kv_bits": [8, 8]},
-            #profiler_config={"profiler": "torch", "torch_profiler_dir": "/root/l00856060/perflog2", "torch_profiler_with_stack": True},
+            profiler_config={"profiler": "torch", "torch_profiler_dir": "/root/l00856060/perflog2", "torch_profiler_with_stack": True},
             enforce_eager=True,
             # compilation_config={"cudagraph_mode": "NONE"}
         )
