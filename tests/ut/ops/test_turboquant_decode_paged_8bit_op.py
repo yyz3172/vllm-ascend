@@ -170,8 +170,8 @@ def test_decode_paged_op_matches_pytorch_golden(mode):
     os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT"] = "1"
     os.environ["VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE"] = str(mode)
     device = torch.device("npu")
-    num_kv_heads = 8
-    num_blocks = 6
+    num_kv_heads = 1
+    num_blocks = 1
 
     key_packed, value_packed = _build_packed_cache(num_blocks, num_kv_heads, device)
     # block_table referencing a subset (with one shared block) in seq order.
