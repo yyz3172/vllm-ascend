@@ -842,26 +842,17 @@ def turboquant_paged_decode_host_indices(
     """
     device = block_table.device
     _, max_bps = block_table.shape
-    print("device", device, "max_bps", max_bps, "actual_seq_lengths_kv", actual_seq_lengths_kv)
     if isinstance(actual_seq_lengths_kv, torch.Tensor):
         actual_kv = actual_seq_lengths_kv.to(device=device, dtype=torch.int64)
-        print("1 actual_kv shape", actual_kv.shape, "actual_kv dtype", actual_kv.dtype)
     else:
         actual_kv = torch.tensor(actual_seq_lengths_kv, dtype=torch.int64, device=device)
-        print("2 actual_kv shape", actual_kv.shape, "actual_kv dtype", actual_kv.dtype)
 
     num_blocks_per_seq = (actual_kv + block_size - 1) // block_size          # [batch]
-    print("3 num_blocks_per_seq shape", num_blocks_per_seq.shape, "num_blocks_per_seq dtype", num_blocks_per_seq.dtype)
     block_offsets = num_blocks_per_seq.cumsum(0) - num_blocks_per_seq        # [batch]
-    print("4 block_offsets shape", block_offsets.shape, "block_offsets dtype", block_offsets.dtype)
     total_blocks = int(num_blocks_per_seq.sum().item())
-    print("5 total_blocks", total_blocks)
     arange_j = torch.arange(max_bps, device=device, dtype=torch.int64)
-    print("6 arange_j shape", arange_j.shape, "arange_j dtype", arange_j.dtype)
     j_mask = arange_j.unsqueeze(0) < num_blocks_per_seq.unsqueeze(1)         # [batch, max_bps]
-    print("7 j_mask shape", j_mask.shape, "j_mask dtype", j_mask.dtype)
     gather_block_ids = block_table[j_mask].to(torch.int32)                   # [total_blocks]
-    print("8 gather_block_ids shape", gather_block_ids.shape, "gather_block_ids dtype", gather_block_ids.dtype)
     bt_compact = block_offsets.unsqueeze(1) + arange_j.unsqueeze(0)          # [batch, max_bps]
     bt_compact = torch.where(j_mask, bt_compact, block_offsets.unsqueeze(1))
     bt_compact = bt_compact.to(block_table.dtype)
@@ -893,9 +884,6 @@ def _try_8bit_decode_paged(
         return None
     block_size = int(key_cache.shape[1])
     device = key_cache.device
-    print("block_table shape", block_table.shape, "block_table dtype", block_table.dtype)
-    print("actual_seq_lengths_kv", actual_seq_lengths_kv)
-    print("block_size", block_size)
     gather_block_ids, bt_compact, total_blocks = turboquant_paged_decode_host_indices(
         block_table, actual_seq_lengths_kv, block_size
     )

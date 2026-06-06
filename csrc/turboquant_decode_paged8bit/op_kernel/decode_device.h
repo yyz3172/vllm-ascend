@@ -37,7 +37,7 @@ namespace turboquant {
 static constexpr uint32_t TQ_DECODE_HEAD_SIZE = 128;
 static constexpr uint32_t TQ_DECODE_PACKED_BYTES = TQ_DECODE_HEAD_SIZE + 2;  // 130
 static constexpr uint32_t TQ_DECODE_CODEBOOK_SIZE = 256;
-static constexpr uint32_t TQ_DECODE_NORM_OFFSET = TQ_DECODE_HEAD_SIZE;       // byte 128..129
+static constexpr uint32_t TQ_DECODE_NORM_OFFSET = TQ_DECODE_HEAD_SIZE;       // byte 128..129 in GM row
 
 // KFC matmul type five-tuple — identical to the (validated) pack op
 // (csrc/turboquant_pack_kv_for_cache_fused): A in VECOUT UB, B/C in GM.
@@ -58,10 +58,10 @@ __aicore__ inline void TqDecodeSync() {
     AscendC::WaitFlag<EVT>(e);
 }
 
-// Reinterpret the 2 little-endian bytes of a packed row's norm slot as fp16.
-__aicore__ inline half TqDecodeReadNorm(const AscendC::LocalTensor<uint8_t>& packed, uint32_t rowByteBase) {
-    const uint16_t lo = static_cast<uint16_t>(packed.GetValue(rowByteBase + TQ_DECODE_NORM_OFFSET));
-    const uint16_t hi = static_cast<uint16_t>(packed.GetValue(rowByteBase + TQ_DECODE_NORM_OFFSET + 1));
+// Reinterpret 2 little-endian bytes in UB as fp16.
+__aicore__ inline half TqDecodeReadNorm(const AscendC::LocalTensor<uint8_t>& packed, uint32_t normByteOffset) {
+    const uint16_t lo = static_cast<uint16_t>(packed.GetValue(normByteOffset));
+    const uint16_t hi = static_cast<uint16_t>(packed.GetValue(normByteOffset + 1));
     union {
         uint16_t u;
         half h;
@@ -71,7 +71,8 @@ __aicore__ inline half TqDecodeReadNorm(const AscendC::LocalTensor<uint8_t>& pac
 }
 
 // Vectorized 8-bit decode for M packed rows. Caller must have:
-//   - DataCopied ``packed`` (M*130 bytes) into UB and issued MTE2->V sync,
+//   - Compacted ``packed`` into UB as [M*128 index bytes][M*2 norm bytes],
+//     with the index region DataCopied and ready for MTE2->V sync,
 //   - ``codebook`` (256 fp16) resident in UB,
 //   - ``rotationGm`` (128x128 fp16) in GM with ``rotateMm`` REGIST_MATMUL_OBJ'd,
 //   - ``cubeCGm`` a fp32 GM scratch of >= M*128 floats.
@@ -95,19 +96,11 @@ __aicore__ inline void DecodeRows8bit(
     const uint32_t D = TQ_DECODE_HEAD_SIZE;
     const uint32_t n = M * D;
 
-    // (1) idx bytes (stride 130) -> contiguous fp16 [M, 128]. Source rows after
-    //     row 0 are not VEC-aligned (130B stride), so unpack through scalar S
-    //     pipe first; later VEC ops consume the aligned contiguous idxHalf.
-    TqDecodeSync<AscendC::HardEvent::MTE2_S>();
-    for (uint32_t i = 0; i < M; ++i) {
-        const uint32_t rowBase = i * TQ_DECODE_PACKED_BYTES;
-        const uint32_t outBase = i * D;
-        for (uint32_t j = 0; j < D; ++j) {
-            const int32_t idx = static_cast<int32_t>(packed.GetValue(rowBase + j));
-            idxHalf.SetValue(outBase + j, static_cast<half>(idx));
-        }
-    }
-    TqDecodeSync<AscendC::HardEvent::S_V>();
+    // (1) idx bytes are compacted by LoadPackedTile, so V can widen the full
+    //     [M, 128] region directly without scalar GetValue/SetValue loops.
+    TqDecodeSync<AscendC::HardEvent::MTE2_V>();
+    AscendC::Cast(idxHalf, packed, AscendC::RoundMode::CAST_NONE, n);
+    AscendC::PipeBarrier<PIPE_V>();
 
     // (2) idx -> int32 byte offsets into the fp16 codebook (idx * sizeof(half)).
     AscendC::Cast(idxFloat, idxHalf, AscendC::RoundMode::CAST_NONE, n);
@@ -122,10 +115,11 @@ __aicore__ inline void DecodeRows8bit(
                     static_cast<uint32_t>(0), n);
     AscendC::PipeBarrier<PIPE_V>();
 
-    // (4) per-row norms read from the packed slot (scalar; packed already in UB).
+    // (4) per-row norms read from the compact norm tail (scalar; packed already in UB).
     half normArr[64];  // >= max T_rows
+    const uint32_t normBase = M * D;
     for (uint32_t i = 0; i < M; ++i) {
-        normArr[i] = TqDecodeReadNorm(packed, i * TQ_DECODE_PACKED_BYTES);
+        normArr[i] = TqDecodeReadNorm(packed, normBase + i * sizeof(half));
     }
 
     // (5) y_hat *= norm (broadcast over the feature dim). The Gather output and
@@ -176,9 +170,10 @@ __aicore__ inline void DecodeRowsScalar(
     const AscendC::LocalTensor<half>& xHat,
     uint32_t M) {
     const uint32_t D = TQ_DECODE_HEAD_SIZE;
+    const uint32_t normBase = M * D;
     for (uint32_t i = 0; i < M; ++i) {
-        const uint32_t rowByteBase = i * TQ_DECODE_PACKED_BYTES;
-        const float norm = static_cast<float>(TqDecodeReadNorm(packed, rowByteBase));
+        const uint32_t rowByteBase = i * D;
+        const float norm = static_cast<float>(TqDecodeReadNorm(packed, normBase + i * sizeof(half)));
         // y_hat[k] = codebook[idx[k]]
         half yhat[TQ_DECODE_HEAD_SIZE];
         for (uint32_t k = 0; k < D; ++k) {
