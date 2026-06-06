@@ -85,6 +85,7 @@ public:
         valueOutGm_.SetGlobalBuffer(valueOut, totalRows * headSize_);
 
         pipe_->InitBuffer(codebookBuf_, TQ_CODEBOOK_SIZE * sizeof(half));
+        // UB layout: [TQ_T_ROWS * 128 compact index bytes][TQ_T_ROWS * 2 norm bytes].
         pipe_->InitBuffer(packedBuf_, TQ_T_ROWS * packedBytes_ * sizeof(uint8_t));
         pipe_->InitBuffer(xHatBuf_, TQ_T_ROWS * headSize_ * sizeof(half));
         pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_WORKSPACE_BYTES);
@@ -228,15 +229,23 @@ private:
         const LocalTensor<uint8_t>& packed,
         uint64_t srcOff,
         uint32_t M) {
-        DataCopy(packed, srcCacheGm[srcOff], M * packedBytes_);
-        TqDecodeSyncMte2ToS();
-
-        // Keep the fp16 norm tail visible after the 130-byte row copy.
+        // Compact 130-byte GM rows into a vector-friendly UB layout. The index
+        // region becomes contiguous so DecodeRows8bit can widen it with Cast
+        // instead of scalar GetValue/SetValue loops.
         for (uint32_t i = 0; i < M; ++i) {
             const uint64_t srcRow = srcOff + static_cast<uint64_t>(i) * packedBytes_;
-            const uint32_t dstRow = i * packedBytes_;
-            packed.SetValue(dstRow + TQ_HEAD_SIZE, srcCacheGm.GetValue(srcRow + TQ_HEAD_SIZE));
-            packed.SetValue(dstRow + TQ_HEAD_SIZE + 1, srcCacheGm.GetValue(srcRow + TQ_HEAD_SIZE + 1));
+            const uint32_t dstRow = i * TQ_HEAD_SIZE;
+            DataCopy(packed[dstRow], srcCacheGm[srcRow], TQ_HEAD_SIZE);
+        }
+        TqDecodeSyncMte2ToS();
+
+        // Keep fp16 norms in a compact tail after the index region.
+        const uint32_t normBase = M * TQ_HEAD_SIZE;
+        for (uint32_t i = 0; i < M; ++i) {
+            const uint64_t srcRow = srcOff + static_cast<uint64_t>(i) * packedBytes_;
+            const uint32_t dstNorm = normBase + i * sizeof(half);
+            packed.SetValue(dstNorm, srcCacheGm.GetValue(srcRow + TQ_HEAD_SIZE));
+            packed.SetValue(dstNorm + 1, srcCacheGm.GetValue(srcRow + TQ_HEAD_SIZE + 1));
         }
     }
 
@@ -265,7 +274,6 @@ private:
                 const uint64_t dstOff = dstBlockBase + static_cast<uint64_t>(t) * headSize_;
 
                 LoadPackedTile(srcCacheGm, packed, srcOff, M);
-                TqDecodeSyncMte2ToV();
                 turboquant::DecodeRows8bit(
                     packed, codebook, rotationGm_, cubeCGm_, *rotateMm_,
                     idxHalf, idxFloat, idxS32, yHat, rotateWork, cubeFp32, xHat,
