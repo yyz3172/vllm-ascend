@@ -125,14 +125,15 @@ echo "[profile_tq_decode] kernel object: ${kernel_obj}"
 echo "[profile_tq_decode] output=${PERF_OUT}"
 
 set +e
-#msprof op simulator \
-#    --soc-version="${SIM_SOC}" \
-#    --launch-count="${LAUNCH_COUNT}" \
-msprof op \
+set -x
+msprof op simulator \
+   --soc-version="${SIM_SOC}" \
+   --launch-count="${LAUNCH_COUNT}" \
     --output="${PERF_OUT}" \
     --application="${runner}" \
     2>&1 | tee "${MSPROF_LOG}"
 msprof_status=${PIPESTATUS[0]}
+set +x
 set -e
 
 latest_opprof=""

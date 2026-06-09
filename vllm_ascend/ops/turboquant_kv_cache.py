@@ -981,11 +981,11 @@ def _turboquant_fused_8bit_decode_tables(
     bits_value: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (codebook_k, rotation_k, codebook_v, rotation_v) fp16 on device."""
-    qk = _get_quantizer(head_size, bits_key, str(device), _current_mse_impl())
+    qk = _get_quantizer(head_size, bits_key, device)
     if bits_key == bits_value:
         qv = qk
     else:
-        qv = _get_quantizer(head_size, bits_value, str(device), _current_mse_impl())
+        qv = _get_quantizer(head_size, bits_value, device)
     if qk._codebook_fp16 is None or qk._codebook_fp16.device != device:
         qk._codebook_fp16 = qk.codebook.to(device=device, dtype=torch.float16)
     if qk._rotation_fp16 is None or qk._rotation_fp16.device != device:
@@ -1059,6 +1059,94 @@ def turboquant_fused_infer_attention_score_8bit(
         int(num_key_value_heads),
         int(head_size),
         int(block_size),
+        float(scale),
+    )
+    return out.view(query.shape[0], num_heads, head_size)
+
+
+def _seq_lens_tensor_and_max(
+    seq_lens,
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.int64,
+) -> tuple[torch.Tensor, int]:
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens_tensor = seq_lens.to(device=device, dtype=dtype)
+        max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 0
+        return seq_lens_tensor, max_seq_len
+
+    max_seq_len = max(seq_lens) if seq_lens else 0
+    seq_lens_tensor = torch.tensor(seq_lens, device=device, dtype=dtype)
+    return seq_lens_tensor, int(max_seq_len)
+
+
+def turboquant_attention_paged8bit(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    actual_seq_lengths_q: list[int],
+    actual_seq_lengths_kv: list[int],
+    head_size: int,
+    num_heads: int,
+    num_key_value_heads: int,
+    block_size: int,
+    scale: float,
+    bits_key: int = 8,
+    bits_value: int = 8,
+) -> torch.Tensor | None:
+    """Call the fused packed 8-bit paged attention op when supported.
+
+    Returns ``None`` when the custom op is unavailable or the request falls
+    outside the initial kernel constraints, so callers can keep existing
+    decode+FIA fallbacks.
+    """
+    if (
+        bits_key != 8
+        or bits_value != 8
+        or head_size != 128
+        or block_tables.numel() == 0
+        or num_key_value_heads <= 0
+        or num_heads % num_key_value_heads != 0
+    ):
+        return None
+    gqa_group = num_heads // num_key_value_heads
+    # Kernel UB buffers are sized for G <= 8 (see turboquant_attention_paged8bit.cpp).
+    if gqa_group > 8:
+        return None
+    if not _c_ascend_turboquant_op_available("turboquant_attention_paged8bit"):
+        print("op not available")
+        return None
+
+    cb_k, rot_k, cb_v, rot_v = _turboquant_fused_8bit_decode_tables(
+        query.device, head_size, bits_key, bits_value
+    )
+    seq_q, _ = _seq_lens_tensor_and_max(
+        actual_seq_lengths_q, device=query.device, dtype=torch.int64
+    )
+    seq_kv, max_actual_seq_len = _seq_lens_tensor_and_max(
+        actual_seq_lengths_kv, device=query.device, dtype=torch.int64
+    )
+    if max_actual_seq_len <= 0:
+        return None
+    fused = torch.ops._C_ascend.turboquant_attention_paged8bit
+    out = fused(
+        query.to(torch.float16).contiguous(),
+        key_cache.view(torch.uint8).contiguous(),
+        value_cache.view(torch.uint8).contiguous(),
+        block_tables.to(torch.int32).contiguous(),
+        seq_q.contiguous(),
+        seq_kv.contiguous(),
+        cb_k,
+        rot_k,
+        cb_v,
+        rot_v,
+        int(num_heads),
+        int(num_key_value_heads),
+        int(head_size),
+        int(block_size),
+        int(max_actual_seq_len),
         float(scale),
     )
     return out.view(query.shape[0], num_heads, head_size)
