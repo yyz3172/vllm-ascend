@@ -8,7 +8,10 @@ VENDOR_NAME=${VENDOR_NAME:-vllm-ascend}
 KENEL_DEBUG_LINE=${KENEL_DEBUG_LINE:-${KERNEL_DEBUG_LINE:-OFF}}
 JOBS=${JOBS:-$(nproc)}
 SYNC_TO_VENDOR=${SYNC_TO_VENDOR:-1}
-
+echo "ROOT_DIR ${ROOT_DIR}"
+echo "KENEL_DEBUG_LINE ${KENEL_DEBUG_LINE}"
+rm -rf ${ROOT_DIR}/build
+rm -rf ${ROOT_DIR}/csrc/build
 case "${KENEL_DEBUG_LINE^^}" in
     ON)
         build_type="RelWithDebInfo"
