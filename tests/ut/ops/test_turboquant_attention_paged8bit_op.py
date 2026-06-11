@@ -170,8 +170,8 @@ def _run_custom_op(
         key_cache_packed.contiguous(),
         value_cache_packed.contiguous(),
         block_table.contiguous(),
-        actual_seq_len_q,
-        actual_seq_len_kv,
+        actual_seq_len_q,  # Python list
+        actual_seq_lens_kv,  # Python list
         codebook,
         rotation,
         codebook,

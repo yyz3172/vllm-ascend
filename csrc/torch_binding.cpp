@@ -283,13 +283,14 @@ at::Tensor turboquant_fused_infer_attention_score_8bit(
 }
 
 // TurboQuant Scheme B: fused packed decode + paged attention (DecodeOnly).
+// Accepts Python lists for actual_seq_len_q and actual_seq_len_kv (similar to torch_npu).
 at::Tensor turboquant_attention_paged8bit(
     const at::Tensor &query,
     const at::Tensor &key_cache,
     const at::Tensor &value_cache,
     const at::Tensor &block_table,
-    const at::Tensor &actual_seq_len_q,
-    const at::Tensor &actual_seq_len_kv,
+    at::IntArrayRef actual_seq_len_q,  // 使用 at::IntArrayRef 接收 Python list
+    at::IntArrayRef actual_seq_len_kv,  // 使用 at::IntArrayRef 接收 Python list
     const at::Tensor &codebook,
     const at::Tensor &rotation,
     const at::Tensor &codebook_value,
@@ -308,23 +309,19 @@ at::Tensor turboquant_attention_paged8bit(
     TORCH_CHECK(max_actual_seq_len > 0, "max_actual_seq_len must be > 0");
     TORCH_CHECK(num_heads > 0 && num_kv_heads > 0, "head counts must be > 0");
     TORCH_CHECK(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads");
-
-    at::Tensor actual_seq_len_q_i64 = actual_seq_len_q.scalar_type() == at::kLong
-                                          ? actual_seq_len_q
-                                          : actual_seq_len_q.to(at::kLong);
-    at::Tensor actual_seq_len_kv_i64 = actual_seq_len_kv.scalar_type() == at::kLong
-                                           ? actual_seq_len_kv
-                                           : actual_seq_len_kv.to(at::kLong);
+    TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(), 
+                "actual_seq_len_q and actual_seq_len_kv must have the same length");
 
     at::Tensor out = at::empty(query.sizes(), query.options().dtype(at::kHalf));
+    // 直接传递 at::IntArrayRef，EXEC_NPU_CMD 会自动转换为 aclIntArray*
     EXEC_NPU_CMD(
         aclnnTurboquantAttentionPaged8bit,
         query,
         key_cache,
         value_cache,
         block_table,
-        actual_seq_len_q_i64,
-        actual_seq_len_kv_i64,
+        actual_seq_len_q,      // 直接传递 at::IntArrayRef
+        actual_seq_len_kv,     // 直接传递 at::IntArrayRef
         codebook,
         rotation,
         codebook_value,
@@ -1452,7 +1449,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "turboquant_attention_paged8bit("
         "Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, "
-        "Tensor actual_seq_len_q, Tensor actual_seq_len_kv, "
+        "int[] actual_seq_len_q, int[] actual_seq_len_kv, "  // 使用 int[] 类型说明符
         "Tensor codebook, Tensor rotation, Tensor codebook_value, Tensor rotation_value, "
         "int num_heads, int num_kv_heads, int head_size, int block_size, "
         "int max_actual_seq_len, float scale_value"

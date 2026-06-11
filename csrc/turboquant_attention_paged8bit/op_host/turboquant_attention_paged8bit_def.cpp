@@ -45,15 +45,15 @@ public:
             .AutoContiguous();
         this->Input("actual_seq_len_q")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_INT64})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND})
+            .DataTypeList({ge::DT_INT64})
+            .FormatList({ge::FORMAT_ND})
+            .ValueDepend(REQUIRED)
             .AutoContiguous();
         this->Input("actual_seq_len_kv")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_INT64})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND})
+            .DataTypeList({ge::DT_INT64})
+            .FormatList({ge::FORMAT_ND})
+            .ValueDepend(REQUIRED)
             .AutoContiguous();
         this->Input("codebook")
             .ParamType(REQUIRED)
