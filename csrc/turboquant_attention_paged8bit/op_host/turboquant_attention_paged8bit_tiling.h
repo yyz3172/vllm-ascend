@@ -19,6 +19,9 @@ constexpr uint32_t TQ_ATTN_CUBE_MIN_TILE = 32;
 // extents (not runtime kvTileRows/gqa). Keep aligned with decode TQ_T_ROWS=32.
 constexpr uint32_t TQ_ATTN_UB_KV_TILE_CAP = 32;
 constexpr uint32_t TQ_ATTN_UB_GQA_CAP = 8;
+// Mc2 sys workspace is shared across launched MIX blocks (same wsBase); cubeC
+// scratch lives at a fixed +256KB offset. Limit concurrent KFC cores to avoid hang.
+constexpr uint32_t TQ_ATTN_MAX_PARALLEL_CORES = 8;
 constexpr uint32_t TQ_ATTN_SPLIT_BN = 0;
 constexpr uint32_t TQ_ATTN_SPLIT_BNS = 1;
 constexpr uint32_t TQ_ATTN_QKPV_VECTOR = 0;
