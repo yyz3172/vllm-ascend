@@ -270,34 +270,118 @@ uint64_t PickTilingKey(uint32_t splitMode, uint32_t qkPvMode)
                                                      : optiling::TQ_ATTN_KEY_SPLITBNS_VECTOR;
 }
 
-ge::graphStatus GetMaxActualSeqLen(const char* nodeName,
-                                   const gert::IntArray* actualSeqLenKvArray,
+ge::graphStatus CheckActualSeqLenQ(const char* nodeName,
+                                   const gert::StorageShape* actualSeqLenQShape,
+                                   const gert::CompileTimeTensorDesc* actualSeqLenQDesc,
+                                   const gert::Tensor* actualSeqLenQTensor,
                                    uint32_t batchSize,
-                                   uint32_t maxKvLen,
-                                   uint32_t attrMaxActualSeqLen,
-                                   uint32_t& maxActualSeqLen)
+                                   uint32_t numTokens)
 {
-    maxActualSeqLen = maxKvLen;
-    if (actualSeqLenKvArray == nullptr) {
-        OPS_LOG_E(nodeName, "actual_seq_len_kv is null");
+    if (actualSeqLenQShape == nullptr || actualSeqLenQDesc == nullptr || actualSeqLenQTensor == nullptr) {
+        OPS_LOG_E(nodeName, "actual_seq_len_q shape, desc, or tensor is null");
         return ge::GRAPH_FAILED;
     }
 
-    const int64_t actualLenElems = actualSeqLenKvArray->GetNumElements();
-    if (actualLenElems == 0) {
-        OPS_LOG_E(nodeName, "actual_seq_len_kv size is 0");
+    if (actualSeqLenQDesc->GetDataType() != ge::DT_INT64) {
+        OPS_LOG_E(nodeName, "actual_seq_len_q dtype must be int64");
         return ge::GRAPH_FAILED;
     }
-    if (actualLenElems != 1 && actualLenElems < static_cast<int64_t>(batchSize)) {
-        OPS_LOG_E(nodeName,
-                  "actual_seq_len_kv size(%ld) must be >= batch_size(%u) or equal to 1",
+
+    const auto actualSeqLenQStorageShape = actualSeqLenQShape->GetStorageShape();
+    if (actualSeqLenQStorageShape.GetDimNum() != 1) {
+        OPS_LOG_E(nodeName, "actual_seq_len_q must be 1D");
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t actualLenElems = actualSeqLenQStorageShape.GetDim(0);
+    if (actualLenElems != static_cast<int64_t>(batchSize)) {
+        OPS_LOG_E(nodeName, "actual_seq_len_q size(%ld) must equal batch_size(%u)",
                   actualLenElems, batchSize);
         return ge::GRAPH_FAILED;
+    }
+
+    const int64_t* actualSeqLenQ = actualSeqLenQTensor->GetData<int64_t>();
+    if (actualSeqLenQ == nullptr) {
+        OPS_LOG_E(nodeName, "actual_seq_len_q data is null");
+        return ge::GRAPH_FAILED;
+    }
+
+    int64_t prev = 0;
+    for (uint32_t i = 0; i < batchSize; ++i) {
+        const int64_t cur = actualSeqLenQ[i];
+        if (cur < prev || cur > static_cast<int64_t>(numTokens)) {
+            OPS_LOG_E(nodeName,
+                      "actual_seq_len_q[%u]=%ld must be non-decreasing and in [0, %u]",
+                      i, cur, numTokens);
+            return ge::GRAPH_FAILED;
+        }
+        prev = cur;
+    }
+    if (batchSize > 0 && actualSeqLenQ[batchSize - 1] != static_cast<int64_t>(numTokens)) {
+        OPS_LOG_E(nodeName, "actual_seq_len_q last value(%ld) must equal num_tokens(%u)",
+                  actualSeqLenQ[batchSize - 1], numTokens);
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CheckAndGetMaxActualSeqLenKv(const char* nodeName,
+                                             const gert::StorageShape* actualSeqLenKvShape,
+                                             const gert::CompileTimeTensorDesc* actualSeqLenKvDesc,
+                                             const gert::Tensor* actualSeqLenKvTensor,
+                                             uint32_t batchSize,
+                                             uint32_t maxKvLen,
+                                             uint32_t attrMaxActualSeqLen,
+                                             uint32_t& maxActualSeqLen)
+{
+    maxActualSeqLen = maxKvLen;
+    if (actualSeqLenKvShape == nullptr || actualSeqLenKvDesc == nullptr || actualSeqLenKvTensor == nullptr) {
+        OPS_LOG_E(nodeName, "actual_seq_len_kv shape, desc, or tensor is null");
+        return ge::GRAPH_FAILED;
+    }
+
+    if (actualSeqLenKvDesc->GetDataType() != ge::DT_INT64) {
+        OPS_LOG_E(nodeName, "actual_seq_len_kv dtype must be int64");
+        return ge::GRAPH_FAILED;
+    }
+
+    const auto actualSeqLenKvStorageShape = actualSeqLenKvShape->GetStorageShape();
+    if (actualSeqLenKvStorageShape.GetDimNum() != 1) {
+        OPS_LOG_E(nodeName, "actual_seq_len_kv must be 1D");
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t actualLenElems = actualSeqLenKvStorageShape.GetDim(0);
+    if (actualLenElems != static_cast<int64_t>(batchSize)) {
+        OPS_LOG_E(nodeName, "actual_seq_len_kv size(%ld) must equal batch_size(%u)",
+                  actualLenElems, batchSize);
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t* actualSeqLenKv = actualSeqLenKvTensor->GetData<int64_t>();
+    if (actualSeqLenKv == nullptr) {
+        OPS_LOG_E(nodeName, "actual_seq_len_kv data is null");
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t observedMaxActualSeqLen = 0;
+    for (uint32_t i = 0; i < batchSize; ++i) {
+        const int64_t cur = actualSeqLenKv[i];
+        if (cur < 0 || cur > static_cast<int64_t>(maxKvLen)) {
+            OPS_LOG_E(nodeName,
+                      "actual_seq_len_kv[%u]=%ld must be in [0, %u]",
+                      i, cur, maxKvLen);
+            return ge::GRAPH_FAILED;
+        }
+        observedMaxActualSeqLen = std::max(observedMaxActualSeqLen, static_cast<uint32_t>(cur));
     }
 
     if (attrMaxActualSeqLen == 0 || attrMaxActualSeqLen > maxKvLen) {
         OPS_LOG_E(nodeName, "max_actual_seq_len attr %u must be in (0, %u]",
                   attrMaxActualSeqLen, maxKvLen);
+        return ge::GRAPH_FAILED;
+    }
+    if (attrMaxActualSeqLen < observedMaxActualSeqLen) {
+        OPS_LOG_E(nodeName,
+                  "max_actual_seq_len attr %u must be >= max(actual_seq_len_kv) %u",
+                  attrMaxActualSeqLen, observedMaxActualSeqLen);
         return ge::GRAPH_FAILED;
     }
     maxActualSeqLen = attrMaxActualSeqLen;
@@ -350,7 +434,12 @@ static ge::graphStatus TurboquantAttentionPaged8bitTilingFunc(gert::TilingContex
     auto qShapePtr = context->GetInputShape(0);
     auto cacheShapePtr = context->GetInputShape(1);
     auto btShapePtr = context->GetInputShape(3);
-    auto actualSeqLenKvArray = context->GetInputIntArray(5);
+    auto actualSeqLenQShapePtr = context->GetInputShape(4);
+    auto actualSeqLenKvShapePtr = context->GetInputShape(5);
+    auto actualSeqLenQDesc = context->GetInputDesc(4);
+    auto actualSeqLenKvDesc = context->GetInputDesc(5);
+    auto actualSeqLenQTensor = context->GetInputTensor(4);
+    auto actualSeqLenKvTensor = context->GetInputTensor(5);
     if (qShapePtr == nullptr || cacheShapePtr == nullptr || btShapePtr == nullptr) {
         OPS_LOG_E(nodeName, "required input shapes are null");
         return ge::GRAPH_FAILED;
@@ -397,8 +486,12 @@ static ge::graphStatus TurboquantAttentionPaged8bitTilingFunc(gert::TilingContex
 
     const uint32_t maxKvLen = maxBlocksPerSeq * blockSize;
     uint32_t maxActualSeqLen = maxKvLen;
-    if (GetMaxActualSeqLen(nodeName, actualSeqLenKvArray, batchSize, maxKvLen,
-                           attrMaxActualSeqLen, maxActualSeqLen) != ge::GRAPH_SUCCESS) {
+    if (CheckActualSeqLenQ(nodeName, actualSeqLenQShapePtr, actualSeqLenQDesc, actualSeqLenQTensor,
+                           batchSize, numTokens) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    if (CheckAndGetMaxActualSeqLenKv(nodeName, actualSeqLenKvShapePtr, actualSeqLenKvDesc, actualSeqLenKvTensor,
+                                     batchSize, maxKvLen, attrMaxActualSeqLen, maxActualSeqLen) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 

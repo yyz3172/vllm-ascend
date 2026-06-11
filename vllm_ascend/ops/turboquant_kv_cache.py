@@ -1103,24 +1103,38 @@ def turboquant_attention_paged8bit(
         print("op not available")
         return None
 
+    actual_seq_lengths_q = [int(length) for length in actual_seq_lengths_q]
+    actual_seq_lengths_kv = [int(length) for length in actual_seq_lengths_kv]
+    if (
+        not actual_seq_lengths_q
+        or len(actual_seq_lengths_q) != len(actual_seq_lengths_kv)
+        or actual_seq_lengths_q[-1] != query.shape[0]
+    ):
+        return None
+    if any(length < 0 for length in actual_seq_lengths_kv):
+        return None
+    if any(
+        current < previous
+        for previous, current in zip(actual_seq_lengths_q, actual_seq_lengths_q[1:])
+    ):
+        return None
+
     cb_k, rot_k, cb_v, rot_v = _turboquant_fused_8bit_decode_tables(
         query.device, head_size, bits_key, bits_value
     )
-    
-    # Compute max_seq_len on CPU to avoid device sync
+
     max_actual_seq_len = max(actual_seq_lengths_kv) if actual_seq_lengths_kv else 0
     if max_actual_seq_len <= 0:
         return None
-    
-    # Call fused op with Python lists directly (C++ binding handles implicit conversion)
+
     fused = torch.ops._C_ascend.turboquant_attention_paged8bit
     out = fused(
         query.to(torch.float16).contiguous(),
         key_cache.view(torch.uint8).contiguous(),
         value_cache.view(torch.uint8).contiguous(),
         block_tables.to(torch.int32).contiguous(),
-        actual_seq_lengths_q,  # Python list - C++ binding converts to aclIntArray*
-        actual_seq_lengths_kv,  # Python list - C++ binding converts to aclIntArray*
+        actual_seq_lengths_q,
+        actual_seq_lengths_kv,
         cb_k,
         rot_k,
         cb_v,
@@ -1133,4 +1147,3 @@ def turboquant_attention_paged8bit(
         float(scale),
     )
     return out.view(query.shape[0], num_heads, head_size)
-

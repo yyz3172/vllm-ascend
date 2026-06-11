@@ -13,8 +13,8 @@ aclnnStatus aclnnTurboquantAttentionPaged8bitGetWorkspaceSize(
     const aclTensor* keyCache,
     const aclTensor* valueCache,
     const aclTensor* blockTable,
-    const aclIntArray* actualSeqLenQ,      // 修改为 aclIntArray*
-    const aclIntArray* actualSeqLenKv,     // 修改为 aclIntArray*
+    const aclIntArray* actualSeqLenQ,
+    const aclIntArray* actualSeqLenKv,
     const aclTensor* codebook,
     const aclTensor* rotation,
     const aclTensor* codebookValue,
