@@ -43,16 +43,51 @@ def _sync_npu_if_needed(device: torch.device) -> None:
         pass
 
 
+# Cache for custom op availability check (checked once at module load time)
+# Stores {op_name: bool} for all known ops
+_CUSTOM_OP_CACHE = {}
+
+
+# List of all known turboquant ops that need to be checked
+_KNOWN_OPS = [
+    "turboquant_decode_packed_blocks",
+    "turboquant_attention_paged8bit",
+]
+
+
+def _init_custom_op_cache() -> None:
+    """Initialize custom op availability cache at module load time."""
+    global _CUSTOM_OP_CACHE
+    if _CUSTOM_OP_CACHE:
+        return  # Already initialized
+    
+    lib = None
+    if enable_custom_op() and hasattr(torch.ops, "_C_ascend"):
+        lib = getattr(torch.ops, "_C_ascend", None)
+    
+    for op_name in _KNOWN_OPS:
+        _CUSTOM_OP_CACHE[op_name] = (lib is not None) and hasattr(lib, op_name)
+
+
 def _c_ascend_turboquant_op_available(op_name: str) -> bool:
     """Return True once ``vllm_ascend_C`` is loaded and ``op_name`` exists on ``torch.ops._C_ascend``.
 
     Custom ops are registered when the extension module is imported; ``hasattr`` alone
     after ``build_ext`` is not enough until ``enable_custom_op()`` runs in this process.
     """
+    # Return cached result if available
+    if op_name in _CUSTOM_OP_CACHE:
+        return _CUSTOM_OP_CACHE[op_name]
+    
+    # For unknown ops, check dynamically (should be rare)
     if not enable_custom_op():
         return False
     lib = getattr(torch.ops, "_C_ascend", None)
     return lib is not None and hasattr(lib, op_name)
+
+
+# Initialize cache at module load time
+_init_custom_op_cache()
 
 
 def pack_uint4(indices: torch.Tensor) -> torch.Tensor:
