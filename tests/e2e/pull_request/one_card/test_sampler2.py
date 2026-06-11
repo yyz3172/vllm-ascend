@@ -91,6 +91,7 @@ def _run_greedy(
             additional_config={"turboquant_kv_bits": [8, 8]},
             profiler_config={"profiler": "torch", "torch_profiler_dir": "/root/l00856060/perflog2", "torch_profiler_with_stack": True},
             enforce_eager=True,
+            # enable_chunked_prefill=False,
             # compilation_config={"cudagraph_mode": "NONE"}
         )
         if kv_cache_dtype is not None:
@@ -184,6 +185,7 @@ if __name__ == "__main__":
     try:
         prompts = [
             "Hello, my name is",
+            "介绍TurboQuant",
         ]
         _test_qwen3_turboquant_decode_accuracy(prompts=prompts)
         print("测试 完成（turboquant ref vs custom）")

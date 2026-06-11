@@ -56,11 +56,6 @@ OP_AVAILABLE = (
 )
 
 
-def _make_cumulative_q_lens(num_tokens: int, device: torch.device) -> torch.Tensor:
-    # DecodeOnly test layout: one query token per sequence.
-    return torch.arange(1, num_tokens + 1, device=device, dtype=torch.int64)
-
-
 def _build_block_table(
     actual_seq_lens_kv: list[int],
     block_size: int,
@@ -107,7 +102,9 @@ def _npu_fia_turboquant_attention_golden(
     key_cache_packed: torch.Tensor,
     value_cache_packed: torch.Tensor,
     block_table: torch.Tensor,
+    actual_seq_lens_q: list[int],
     actual_seq_lens_kv: list[int],
+    block_size: int,
     num_kv_heads: int,
     scale: float,
 ) -> torch.Tensor:
@@ -119,7 +116,6 @@ def _npu_fia_turboquant_attention_golden(
     )
 
     num_tokens, num_heads, _ = query.shape
-    actual_seq_lens_q = list(range(1, num_tokens + 1))
     atten_mask = torch.triu(
         torch.ones(
             FIA_ATTEN_MASK_SIZE,
@@ -136,7 +132,7 @@ def _npu_fia_turboquant_attention_golden(
         atten_mask=atten_mask,
         block_table=block_table.contiguous(),
         input_layout="TND",
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         actual_seq_lengths=actual_seq_lens_q,
         actual_seq_lengths_kv=actual_seq_lens_kv,
         num_key_value_heads=num_kv_heads,
@@ -153,7 +149,9 @@ def _run_custom_op(
     key_cache_packed: torch.Tensor,
     value_cache_packed: torch.Tensor,
     block_table: torch.Tensor,
+    actual_seq_lens_q: list[int],
     actual_seq_lens_kv: list[int],
+    block_size: int,
     num_heads: int,
     num_kv_heads: int,
     scale: float,
@@ -161,7 +159,9 @@ def _run_custom_op(
     quantizer = _get_quantizer(HEAD_SIZE, BITS, query.device)
     codebook = quantizer.codebook.to(device=query.device, dtype=torch.float16)
     rotation = quantizer.rotation.to(device=query.device, dtype=torch.float16)
-    actual_seq_len_q = _make_cumulative_q_lens(query.shape[0], query.device)
+    actual_seq_len_q = torch.tensor(
+        actual_seq_lens_q, device=query.device, dtype=torch.int64
+    )
     actual_seq_len_kv = torch.tensor(
         actual_seq_lens_kv, device=query.device, dtype=torch.int64
     )
@@ -179,7 +179,7 @@ def _run_custom_op(
         num_heads,
         num_kv_heads,
         HEAD_SIZE,
-        BLOCK_SIZE,
+        block_size,
         max(actual_seq_lens_kv),
         float(scale),
     )
@@ -218,12 +218,15 @@ def test_attention_paged8bit_matches_fia_splitbn(
         (num_tokens, num_heads, HEAD_SIZE), dtype=torch.float16, device=device
     )
 
+    actual_seq_lens_q = list(range(1, num_tokens + 1))
     golden = _npu_fia_turboquant_attention_golden(
         query=query,
         key_cache_packed=key_packed,
         value_cache_packed=value_packed,
         block_table=block_table,
+        actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
+        block_size=BLOCK_SIZE,
         num_kv_heads=num_kv_heads,
         scale=scale,
     )
@@ -232,7 +235,9 @@ def test_attention_paged8bit_matches_fia_splitbn(
         key_cache_packed=key_packed,
         value_cache_packed=value_packed,
         block_table=block_table,
+        actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
+        block_size=BLOCK_SIZE,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         scale=scale,
@@ -266,12 +271,15 @@ def test_attention_paged8bit_matches_fia_splitbns_flashdecode():
         (num_tokens, num_heads, HEAD_SIZE), dtype=torch.float16, device=device
     )
 
+    actual_seq_lens_q = list(range(1, num_tokens + 1))
     golden = _npu_fia_turboquant_attention_golden(
         query=query,
         key_cache_packed=key_packed,
         value_cache_packed=value_packed,
         block_table=block_table,
+        actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
+        block_size=BLOCK_SIZE,
         num_kv_heads=num_kv_heads,
         scale=scale,
     )
@@ -280,7 +288,68 @@ def test_attention_paged8bit_matches_fia_splitbns_flashdecode():
         key_cache_packed=key_packed,
         value_cache_packed=value_packed,
         block_table=block_table,
+        actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
+        block_size=BLOCK_SIZE,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+
+    torch.testing.assert_close(actual.float(), golden.float(), atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.skipif(not OP_AVAILABLE, reason="requires NPU + turboquant_attention_paged8bit")
+def test_attention_paged8bit_mixed_decode_prefill_batch():
+    """ChunkedPrefill-like mixed batch from test_sampler2 (Qwen3-0.6B layout).
+
+    seq0: 1 decode token with kv_len=6
+    seq1: 4 prefill tokens with kv_len=4
+    total tokens=5, bn=40, block_size=128 (chunked prefill)
+    """
+    device = torch.device("npu")
+    num_heads = 16
+    num_kv_heads = 8
+    block_size = 128
+    actual_seq_lens_kv = [6, 4]
+    actual_seq_lens_q = [1, 5]
+    num_tokens = actual_seq_lens_q[-1]
+    scale = HEAD_SIZE**-0.5
+
+    block_table, total_blocks = _build_block_table(
+        actual_seq_lens_kv, block_size, device
+    )
+    key_packed, value_packed = _build_packed_cache(
+        num_blocks=total_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        device=device,
+        seed=42,
+    )
+    torch.manual_seed(43)
+    query = torch.randn(
+        (num_tokens, num_heads, HEAD_SIZE), dtype=torch.float16, device=device
+    )
+
+    golden = _npu_fia_turboquant_attention_golden(
+        query=query,
+        key_cache_packed=key_packed,
+        value_cache_packed=value_packed,
+        block_table=block_table,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+    actual = _run_custom_op(
+        query=query,
+        key_cache_packed=key_packed,
+        value_cache_packed=value_packed,
+        block_table=block_table,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_size=block_size,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         scale=scale,

@@ -405,6 +405,7 @@ static ge::graphStatus TurboquantAttentionPaged8bitTilingFunc(gert::TilingContex
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t aicNum = static_cast<uint32_t>(ascendcPlatform.GetCoreNumAic());
     const uint32_t coreNum = std::max(1U, aicNum);
+    const uint32_t parallelCoreNum = std::min(coreNum, optiling::TQ_ATTN_MAX_PARALLEL_CORES);
     const uint32_t gqaGroup = numHeads / numKvHeads;
     const uint32_t bn = numTokens * numKvHeads;
     const uint32_t kvTileRows = PickKvTileRows(blockSize);
@@ -451,10 +452,10 @@ static ge::graphStatus TurboquantAttentionPaged8bitTilingFunc(gert::TilingContex
     uint32_t kvSegmentLen = maxActualSeqLen;
 
     if (splitMode == TQ_ATTN_SPLIT_BNS) {
-        SplitBns(bn, maxActualSeqLen, blockSize, coreNum, usedCoreNum, kvSplitPart, kvSegmentLen,
-                 formerCoreNum, blockSplitRange, tailSplitRange);
+        SplitBns(bn, maxActualSeqLen, blockSize, parallelCoreNum, usedCoreNum, kvSplitPart,
+                 kvSegmentLen, formerCoreNum, blockSplitRange, tailSplitRange);
     } else {
-        SplitBn(bn, coreNum, usedCoreNum, formerCoreNum, blockSplitRange, tailSplitRange);
+        SplitBn(bn, parallelCoreNum, usedCoreNum, formerCoreNum, blockSplitRange, tailSplitRange);
     }
 
     tiling.set_numTokens(numTokens);

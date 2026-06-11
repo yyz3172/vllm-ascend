@@ -1350,29 +1350,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
-            attn_output = turboquant_attention_paged8bit(
-                query=query,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                block_tables=block_table,
-                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                head_size=self.head_size,
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                block_size=block_size,
-                scale=self.scale,
-                bits_key=self.turboquant_kv_bits_key,
-                bits_value=self.turboquant_kv_bits_value,
-            )
-            if attn_output is not None:
-                output[:num_tokens] = attn_output[:num_tokens]
-                return output
+            # Scheme B kernel supports DecodeOnly and ChunkedPrefill (mixed
+            # prefill/decode) with per-token causal KV bounds.
+            if attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.ChunkedPrefill,
+            ):
+                attn_output = turboquant_attention_paged8bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                if attn_output is not None:
+                    output[:num_tokens] = attn_output[:num_tokens]
+                    return output
             # Phase 1 / scheme A: decode packed 8-bit KV -> compact fp16 via the
             # fused paged decode op (opt-in), then fall through to the standard
             # FIA below. Returns None (and we keep the old paths) when disabled or
             # the op/conditions are not met.
-            print("_try_8bit_decode_paged")
             fast = _try_8bit_decode_paged(
                 key_cache=self.key_cache,
                 value_cache=self.value_cache,

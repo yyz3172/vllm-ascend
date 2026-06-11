@@ -1,6 +1,6 @@
 set(_TQ_ATTN_COMPILE_OPTIONS
         --cce-auto-sync=on
-        -DASCENDC_DUMP=1
+        -DASCENDC_DUMP=0
         -Wno-deprecated-declarations
         -Werror
 )

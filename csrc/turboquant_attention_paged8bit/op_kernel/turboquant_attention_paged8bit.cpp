@@ -8,7 +8,9 @@
  * http://www.apache.org/licenses/LICENSE-2.0
  */
 
-// TurboQuant Scheme B: fused packed KV decode + paged attention (DecodeOnly).
+// TurboQuant Scheme B: fused packed KV decode + paged attention.
+// Supports DecodeOnly and ChunkedPrefill (mixed prefill/decode) via per-token
+// causal KV bounds derived from actual_seq_len_q / actual_seq_len_kv.
 //
 // Tiling keys (host-selected):
 //   0 SplitBN  + Vector QK/PV
@@ -141,9 +143,13 @@ public:
         auto* wsBase = reinterpret_cast<__gm__ uint8_t*>(GetSysWorkSpacePtr());
         matmulReady_ = (wsBase != nullptr);
         if (matmulReady_) {
-            const uint64_t cubeCOff =
-                TQ_CUBE_C_OFF + static_cast<uint64_t>(GetBlockIdx()) * TQ_UB_KV_TILE_CAP *
-                                    TQ_HEAD * sizeof(float);
+            // wsBase is shared across blocks; stride by logical MIX core (coreIdx), not
+            // GetBlockIdx() (primary+secondary AIV share one MIX core). Must match host
+            // TQ_ATTN_MAX_PARALLEL_CORES cap on usedCoreNum / blockDim.
+            const uint32_t coreIdx = GetBlockIdx() / TQ_AIV_SUB;
+            constexpr uint64_t kCubeCStride =
+                static_cast<uint64_t>(TQ_UB_KV_TILE_CAP) * TQ_HEAD * sizeof(float);
+            const uint64_t cubeCOff = TQ_CUBE_C_OFF + static_cast<uint64_t>(coreIdx) * kCubeCStride;
             cubeCGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(wsBase + cubeCOff),
                                      static_cast<uint64_t>(TQ_UB_KV_TILE_CAP) * TQ_HEAD);
         }
@@ -163,7 +169,6 @@ public:
     __aicore__ inline void Process()
     {
         const uint32_t coreIdx = GetBlockIdx() / TQ_AIV_SUB;
-
         if (splitMode_ == 1) {
             // SplitBNS + FlashDecode: every launched MIX core (AIC + both AIV
             // sub-blocks, including idle ones) must enter SyncAll exactly once.
@@ -300,7 +305,8 @@ private:
         LocalTensor<half> codebookLocal,
         GlobalTensor<half>& rotationGm,
         LocalTensor<half>& xHat,
-        uint32_t mRows)
+        uint32_t mRows,
+        uint32_t decodePhase)
     {
         turboquant::TqDecodeSync<AscendC::HardEvent::S_V>();
         if (!matmulReady_ || rotateMm_ == nullptr) {
@@ -335,6 +341,18 @@ private:
         }
     }
 
+    __aicore__ inline uint32_t GetCausalKvEnd(uint32_t tokenIdx, uint32_t seqIdx) const
+    {
+        const uint32_t qChunkEnd = static_cast<uint32_t>(actualSeqLenQGm_.GetValue(seqIdx));
+        const uint32_t qChunkStart =
+            (seqIdx == 0) ? 0U : static_cast<uint32_t>(actualSeqLenQGm_.GetValue(seqIdx - 1));
+        const uint32_t numQInChunk = qChunkEnd - qChunkStart;
+        const uint32_t qPosInChunk = tokenIdx - qChunkStart;
+        const uint32_t kvLen = static_cast<uint32_t>(actualSeqLenKvGm_.GetValue(seqIdx));
+        const uint32_t absQPos = kvLen - numQInChunk + qPosInChunk;
+        return absQPos + 1U;
+    }
+
     __aicore__ inline void ComputeAttention(
         uint32_t tokenIdx,
         uint32_t kvHead,
@@ -344,20 +362,21 @@ private:
     {
         const uint32_t seqIdx = FindSeqForToken(tokenIdx, actualSeqLenQGm_, batchSize_);
         const uint32_t kvLen = static_cast<uint32_t>(actualSeqLenKvGm_.GetValue(seqIdx));
-        if (kvLen == 0) {
+        const uint32_t causalKvEnd = GetCausalKvEnd(tokenIdx, seqIdx);
+        if (kvLen == 0 || causalKvEnd == 0) {
             WriteZeroOutput(tokenIdx, kvHead);
             return;
         }
 
         uint32_t kvStart = 0;
-        uint32_t kvEnd = kvLen;
+        uint32_t kvEnd = causalKvEnd;
         if (numSegs > 1) {
             kvStart = segIdx * kvSegmentLen_;
             kvEnd = (segIdx + 1) * kvSegmentLen_;
-            if (kvEnd > kvLen) {
-                kvEnd = kvLen;
+            if (kvEnd > causalKvEnd) {
+                kvEnd = causalKvEnd;
             }
-            if (kvStart >= kvLen) {
+            if (kvStart >= causalKvEnd) {
                 return;
             }
         }
@@ -385,14 +404,14 @@ private:
             const uint32_t tileRows = (pos + kvTileRows_ <= kvEnd) ? kvTileRows_ : (kvEnd - pos);
             LoadPackedTileRows(keyCacheGm_, packedLocal, tileRows, seqIdx, kvHead, pos);
             LocalTensor<half> kTile = xHat;
-            DecodeTile(packedLocal, codebookLocal, rotationGm_, kTile, tileRows);
+            DecodeTile(packedLocal, codebookLocal, rotationGm_, kTile, tileRows, 0);
 
             auto scoreTile = scoreBuf_.Get<float>();
             turboquant_attn::VectorQk(qGroup, kTile, scoreTile, gqaGroup_, tileRows, scaleValue_);
 
             LoadPackedTileRows(valueCacheGm_, packedLocal, tileRows, seqIdx, kvHead, pos);
             LocalTensor<half> vTile = xHat;
-            DecodeTile(packedLocal, codebookLocal[TQ_CODEBOOK], rotationVGm_, vTile, tileRows);
+            DecodeTile(packedLocal, codebookLocal[TQ_CODEBOOK], rotationVGm_, vTile, tileRows, 1);
 
             turboquant_attn::OnlineSoftmaxUpdateTile(
                 scoreTile, vTile, mState, sState, outAcc, expLocal, gqaGroup_, tileRows);
@@ -601,6 +620,7 @@ extern "C" __global__ __aicore__ void turboquant_attention_paged8bit(
     // Single MIX entry: splitMode/qkPvMode are runtime tiling fields. Additional
     // TILING_KEY_IS branches each register matmul and trigger Mc2 workspace blow-up.
     KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
+    AscendC::SetSysWorkspace(workspace);
     if (GetSysWorkSpacePtr() == nullptr) {
         return;
     }
