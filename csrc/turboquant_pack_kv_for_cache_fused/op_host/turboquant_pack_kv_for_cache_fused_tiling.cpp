@@ -66,7 +66,11 @@ ge::graphStatus FillKfcCubeTiling(
     }
 
     // Override with L1-aware baseM; keep auto baseN/baseK from GetTiling.
+    // Force usedCoreNum=1: each AIV calls IterateAll independently; the Cube
+    // tiling must not reserve multi-core workspace that would overlap with
+    // our per-core scratch at TQ_PER_CORE_SCRATCH_BASE.
     cubeTiling.set_baseM(static_cast<uint32_t>(baseM));
+    cubeTiling.set_usedCoreNum(1);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -258,14 +262,24 @@ static ge::graphStatus TurboquantPackKvForCacheFusedTilingFunc(gert::TilingConte
     tilingData.set_slotWV(slotWV);
     tilingData.set_packMode(packMode);
 
-    const uint32_t dataCores = std::max<uint32_t>(1, (nVec + vecPerCore - 1) / vecPerCore);
+    uint32_t dataCores = std::max<uint32_t>(1, (nVec + vecPerCore - 1) / vecPerCore);
     uint32_t blockDim = dataCores;
     if (packMode == 0) {
-        // MIX 1C2V per data-parallel group (same as turboquant_rotate_matmul_probe probe_mode=0).
+        // MIX 1C2V per data-parallel group.
         const uint32_t kfcAicNum = 1;
         const uint32_t kfcAivNum = 2;
         const uint32_t mixBlockDim =
             ascendcPlatform.CalcTschBlockDim(kfcAivNum, kfcAicNum, kfcAivNum);
+
+        // Always use 16 data-parallel cores for KFC mode.  This keeps blockDim
+        // constant (16 * mixBlockDim) across all nVec values, avoiding CANN
+        // runtime kernel re-compilation and MIX scheduling conflicts when
+        // blockDim varies between consecutive calls.
+        // The kernel internally loops in sub-batches of vecPerCore rows when
+        // nVec > dataCores * vecPerCore.
+        const uint32_t maxMixGroups = 16;
+        dataCores = maxMixGroups;
+
         blockDim = dataCores * mixBlockDim;
     }
 
@@ -282,7 +296,18 @@ static ge::graphStatus TurboquantPackKvForCacheFusedTilingFunc(gert::TilingConte
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    workspaces[0] = SYSTEM_NEED_WORKSPACE;
+    // Workspace: 16 MB shared for KFC internals + per-core scratch for Cube C output.
+    // KFC message queues are indexed per-block within the shared region.
+    if (packMode == 0) {
+        constexpr uint64_t kPerCoreScratchBase = 512 * 1024;
+        constexpr uint64_t kPerCoreScratch = 64 * 1024;  // 64 KB per core (128*128*4)
+        workspaces[0] = kPerCoreScratchBase + dataCores * kPerCoreScratch;
+        if (workspaces[0] < SYSTEM_NEED_WORKSPACE) {
+            workspaces[0] = SYSTEM_NEED_WORKSPACE;
+        }
+    } else {
+        workspaces[0] = SYSTEM_NEED_WORKSPACE;
+    }
     context->SetBlockDim(blockDim);
     context->SetTilingKey(packMode == 0 ? TQ_PACK_TILING_KEY_KFC : TQ_PACK_TILING_KEY_AIC_GM);
     return ge::GRAPH_SUCCESS;

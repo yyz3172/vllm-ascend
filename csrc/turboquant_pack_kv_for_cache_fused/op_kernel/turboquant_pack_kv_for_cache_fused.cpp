@@ -41,8 +41,6 @@ static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
 static constexpr uint32_t TQ_MAX_BATCH_M = 128;
 static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
-static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
-static constexpr uint32_t TQ_ROT_N_PER_SUB = TQ_ROT_N / TQ_AIV_SUB_BLOCKS;
 static constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
 static constexpr uint32_t TQ_ROT_LOCAL_WORKSPACE_BYTES = TQ_MAX_BATCH_M * TQ_ROT_K * sizeof(half);
 static constexpr float TQ_NORM_EPS_F = 1e-10f;
@@ -52,6 +50,11 @@ static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;  // 8 da
 // Dimensions processed per tile — balance between UB usage and sync reduction.
 // distBuf = D_TILE * K * 4 bytes.  D_TILE=16 → 16 KiB.
 static constexpr uint32_t TQ_D_TILE = 16;
+
+// Per-core Cube C scratch layout within the workspace.
+constexpr uint64_t TQ_PER_CORE_CUBEC_BYTES = static_cast<uint64_t>(TQ_MAX_BATCH_M) * TQ_ROT_N * sizeof(float);
+constexpr uint64_t TQ_PER_CORE_SCRATCH = TQ_PER_CORE_CUBEC_BYTES;  // 64 KB per core
+constexpr uint64_t TQ_PER_CORE_SCRATCH_BASE = 512 * 1024;
 
 __aicore__ inline uint32_t AlignUp16(uint32_t x) {
     return (x + TQ_CUBE_M_ALIGN - 1) / TQ_CUBE_M_ALIGN * TQ_CUBE_M_ALIGN;
@@ -85,13 +88,6 @@ __aicore__ inline void TqSyncVToMte3() {
 __aicore__ inline bool TqIsAiv() {
     if ASCEND_IS_AIV {
         return true;
-    }
-    return false;
-}
-
-__aicore__ inline bool TqIsPrimaryAivSub() {
-    if ASCEND_IS_AIV {
-        return (AscendC::GetSubBlockIdx() % TQ_AIV_SUB_BLOCKS) == 0;
     }
     return false;
 }
@@ -156,6 +152,7 @@ public:
         __gm__ half* rotation_t,
         __gm__ uint8_t* packed_k,
         __gm__ uint8_t* packed_v,
+        __gm__ uint8_t* rawWorkspace,
         uint32_t nVec,
         uint32_t slot_w_k,
         uint32_t slot_w_v,
@@ -199,13 +196,15 @@ public:
         // fp32 UB buffer for Cube C output (after DataCopy from GM)
         pipe_->InitBuffer(yCubeFp32Buf_, TQ_MAX_BATCH_M * TQ_ROT_N * sizeof(float));
 
-        matmulReady_ = GetSysWorkSpacePtr() != nullptr;
-        // GM buffer for Cube C output at workspace offset 256KB (ND format, fp32 accumulate)
+        matmulReady_ = (rawWorkspace != nullptr);
+        // Per-core Cube C scratch: each blockIdx gets its own region within the
+        // shared workspace.  KFC internals use per-block offsets (GetBlockIdxImpl).
         if (matmulReady_) {
-            constexpr uint64_t kCubeCOffset = 256 * 1024;
-            auto* wsBase = reinterpret_cast<__gm__ uint8_t*>(GetSysWorkSpacePtr());
+            const uint32_t core = GetBlockIdx();
+            auto* coreScratch = rawWorkspace + TQ_PER_CORE_SCRATCH_BASE
+                                + static_cast<uint64_t>(core) * TQ_PER_CORE_SCRATCH;
             cubeCGm_.SetGlobalBuffer(
-                reinterpret_cast<__gm__ float*>(wsBase + kCubeCOffset),
+                reinterpret_cast<__gm__ float*>(coreScratch),
                 (uint64_t)TQ_MAX_BATCH_M * TQ_ROT_N);
         }
     }
@@ -235,26 +234,33 @@ public:
         if (!matmulReady_ || !TqIsAiv()) {
             return;
         }
-        if (!TqIsPrimaryAivSub()) {
+        // On 910B3 each blockIdx is one AIV (sub-block indices alternate
+        // 0,1,0,1… — all are independent workers).  Use blockIdx directly.
+        // dataCores is always 16 for KFC mode; rows are distributed evenly
+        // and each core loops in sub-batches of vecPerCore_ rows.
+        const uint32_t dataCores = 16;
+        const uint32_t core = AscendC::GetBlockIdx();
+        const uint32_t rowsPerCore = (nVec_ + dataCores - 1) / dataCores;
+        const uint32_t coreStart = core * rowsPerCore;
+        if (coreStart >= nVec_) {
             return;
         }
-        const uint32_t core = AscendC::GetBlockIdx() / TQ_AIV_SUB_BLOCKS;
-        const uint32_t start = core * vecPerCore_;
-        uint32_t end = start + vecPerCore_;
-        if (end > nVec_) {
-            end = nVec_;
-        }
-        if (start >= end) {
-            return;
-        }
-        AscendC::printf("[TQ_PERF] core=%u rows=%u start=%u\n", core, end - start, start);
+        const uint32_t coreEnd = coreStart + rowsPerCore > nVec_
+            ? nVec_ : coreStart + rowsPerCore;
 
-        // ---- K ----
-        PackBatchPerf(keyGm_, packedKGm_, start, end, slot_w_k_, 0, TQ_PACK_D, true, false, 'K');
-        // ---- V ----
-        PackBatchPerf(valueGm_, packedVGm_, start, end, slot_w_v_, 0, TQ_PACK_D, true, false, 'V');
+        // Process assigned rows in sub-batches of up to vecPerCore_ (128).
+        for (uint32_t batchStart = coreStart; batchStart < coreEnd;
+             batchStart += vecPerCore_) {
+            const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
+                ? coreEnd : batchStart + vecPerCore_;
 
-        AscendC::printf("[TQ_PERF] core=%u done\n", core);
+            // ---- K ----
+            PackBatchPerf(keyGm_, packedKGm_, batchStart, batchEnd,
+                          slot_w_k_, 0, TQ_PACK_D, true, false, 'K');
+            // ---- V ----
+            PackBatchPerf(valueGm_, packedVGm_, batchStart, batchEnd,
+                          slot_w_v_, 0, TQ_PACK_D, true, false, 'V');
+        }
     }
 
 private:
@@ -302,10 +308,9 @@ private:
         rotateMm_->SetTensorB(rotationTGm_[dBase], false);
         auto rotateWorkspace = rotateWorkBuf_.Get<uint8_t>();
         rotateMm_->SetLocalWorkspace(rotateWorkspace);
-        // Output fp32 C to GM (ND format), non-sequential write for correct [M][N] layout
-        while (rotateMm_->Iterate()) {
-            rotateMm_->GetTensorC(cubeCGm_);
-        }
+        // IterateAll: single atomic KFC message — safe when 2 AIVs share one AIC
+        // in MIX mode (no tile interleaving across concurrent AIVs).
+        rotateMm_->IterateAll(cubeCGm_);
         rotateMm_->End();
 
         // DataCopy fp32 C from GM to UB, then cast to half
@@ -592,7 +597,8 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
 
     if (TILING_KEY_IS(0)) {
         KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
-        AscendC::SetSysWorkspace(workspace);
+        auto* wsPtr = reinterpret_cast<__gm__ uint8_t*>(workspace);
+        AscendC::SetSysWorkspace(wsPtr);
         if (GetSysWorkSpacePtr() == nullptr) {
             return;
         }
@@ -608,6 +614,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
             rotationPtr,
             packedKPtr,
             packedVPtr,
+            wsPtr,
             tilingData.nVec,
             tilingData.slotWK,
             tilingData.slotWV,
@@ -626,6 +633,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
             rotationPtr,
             packedKPtr,
             packedVPtr,
+            nullptr,
             tilingData.nVec,
             tilingData.slotWK,
             tilingData.slotWV,

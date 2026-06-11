@@ -11,9 +11,14 @@
 // Phase 1 / Phase 2 reuse contract — design doc §2.6.9.
 //
 // DecodeRows8bit: given packed (M, 130) UB rows, emit xHat (M, 128) fp16 UB by
-//   y_hat = codebook[idx]                 (256-entry LUT, vectorized Gather)
+//   y_hat = 0.0026 * (idx - 127.5)        (V3 closed-form affine, 8-bit)
 //   y_hat = y_hat * norm                  (per-row broadcast)
 //   x_hat = y_hat @ R                     (Cube, KFC, R stationary in L1)
+//
+// The V3 formula replaces the V1 codebook Gather (256-entry LUT) with a simple
+// affine transform, avoiding expensive Gather addressing and the codebook UB
+// buffer. The formula matches TurboQuantMSEV3._turboquant_v3_y_hat_from_indices.
+//
 // Multiplying ``norm`` (a per-row scalar) before the matmul is equivalent to the
 // PyTorch reference's post-matmul scaling because the matmul is linear in each
 // row: (c * y) @ R == c * (y @ R). This lets the Cube input already carry the
@@ -39,9 +44,9 @@ static constexpr uint32_t TQ_DECODE_PACKED_BYTES = TQ_DECODE_HEAD_SIZE + 2;  // 
 static constexpr uint32_t TQ_DECODE_CODEBOOK_SIZE = 256;
 static constexpr uint32_t TQ_DECODE_NORM_OFFSET = TQ_DECODE_HEAD_SIZE;       // byte 128..129 in GM row
 
-// KFC matmul type five-tuple — identical to the (validated) pack op
-// (csrc/turboquant_pack_kv_for_cache_fused): A in VECOUT UB, B/C in GM.
-// fp32 C accumulate (then cast to fp16) avoids fp16 K=128 accumulation error.
+// KFC matmul type five-tuple — A fp16 VECOUT (Cube reads from UB via KFC),
+// B fp16 GM (rotation), C fp32 GM (accumulate then cast to fp16).
+// fp32 C accumulate avoids fp16 K=128 accumulation error.
 using TqDecodeRotateAT = AscendC::MatmulType<AscendC::TPosition::VECOUT, CubeFormat::ND, half>;
 using TqDecodeRotateBT = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half>;
 using TqDecodeRotateCT = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
@@ -70,23 +75,20 @@ __aicore__ inline half TqDecodeReadNorm(const AscendC::LocalTensor<uint8_t>& pac
     return bits.h;
 }
 
-// Vectorized 8-bit decode for M packed rows. Caller must have:
+// Vectorized 8-bit decode for M packed rows using V3 closed-form formula.
+// Caller must have:
 //   - Compacted ``packed`` into UB as [M*128 index bytes][M*2 norm bytes],
 //     with the index region DataCopied and ready for MTE2->V sync,
-//   - ``codebook`` (256 fp16) resident in UB,
 //   - ``rotationGm`` (128x128 fp16) in GM with ``rotateMm`` REGIST_MATMUL_OBJ'd,
-//   - ``cubeCGm`` a fp32 GM scratch of >= M*128 floats.
-// Scratch tensors (idxHalf/idxFloat/idxS32/yHat[VECOUT]/cubeFp32/xHat) sized M*128.
+//   - ``cubeCGm`` a fp32 GM scratch of >= M*128 floats (for Cube C output).
+// Scratch tensors (idxHalf/yHat[VECOUT]/cubeFp32/xHat) sized M*128.
 // On return ``xHat`` (UB fp16, M*128) holds the decoded rows row-major.
 __aicore__ inline void DecodeRows8bit(
     const AscendC::LocalTensor<uint8_t>& packed,
-    const AscendC::LocalTensor<half>& codebook,
     AscendC::GlobalTensor<half>& rotationGm,
     AscendC::GlobalTensor<float>& cubeCGm,
     TqDecodeRotateMatmulOp& rotateMm,
     const AscendC::LocalTensor<half>& idxHalf,
-    const AscendC::LocalTensor<float>& idxFloat,
-    const AscendC::LocalTensor<int32_t>& idxS32,
     const AscendC::LocalTensor<half>& yHat,
     const AscendC::LocalTensor<uint8_t>& rotateWork,
     const AscendC::LocalTensor<float>& cubeFp32,
@@ -102,28 +104,22 @@ __aicore__ inline void DecodeRows8bit(
     AscendC::Cast(idxHalf, packed, AscendC::RoundMode::CAST_NONE, n);
     AscendC::PipeBarrier<PIPE_V>();
 
-    // (2) idx -> int32 byte offsets into the fp16 codebook (idx * sizeof(half)).
-    AscendC::Cast(idxFloat, idxHalf, AscendC::RoundMode::CAST_NONE, n);
+    // (2) V3 closed-form: y_hat = 0.0026 * (idx - 127.5)
+    //     Replaces V1 codebook Gather (256-entry LUT + byte offset computation)
+    //     with a simple 2-op affine transform. Matches TurboQuantMSEV3 8-bit formula.
+    AscendC::Adds(yHat, idxHalf, static_cast<half>(-127.5f), n);
     AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Cast(idxS32, idxFloat, AscendC::RoundMode::CAST_RINT, n);
-    AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Muls(idxS32, idxS32, static_cast<int32_t>(sizeof(half)), n);
-    AscendC::PipeBarrier<PIPE_V>();
-
-    // (3) codebook LUT: y_hat = codebook[idx] (256-entry, fits Vector LUT).
-    AscendC::Gather(yHat, codebook, idxS32.template ReinterpretCast<uint32_t>(),
-                    static_cast<uint32_t>(0), n);
+    AscendC::Muls(yHat, yHat, static_cast<half>(0.0026f), n);
     AscendC::PipeBarrier<PIPE_V>();
 
-    // (4) per-row norms read from the compact norm tail (scalar; packed already in UB).
+    // (3) per-row norms read from the compact norm tail (scalar; packed already in UB).
     half normArr[64];  // >= max T_rows
     const uint32_t normBase = M * D;
     for (uint32_t i = 0; i < M; ++i) {
         normArr[i] = TqDecodeReadNorm(packed, normBase + i * sizeof(half));
     }
 
-    // (5) y_hat *= norm (broadcast over the feature dim). The Gather output and
-    //     this Muls are both on PIPE_V so the prior barrier orders them.
+    // (4) y_hat *= norm (broadcast over the feature dim).
     for (uint32_t i = 0; i < M; ++i) {
         AscendC::Muls(yHat[i * D], yHat[i * D], normArr[i], D);
     }
@@ -136,21 +132,12 @@ __aicore__ inline void DecodeRows8bit(
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    // (6) Cube: x_hat = y_hat @ R, fp32 accumulate to GM, then back to UB + fp16.
-    // SetSingleShape(singleM, singleN, singleK): A[M,K] @ B[K,N], doc requires
-    // tensorA >= singleM*singleK, tensorB >= singleK*singleN (in elements).
+    // (5) Cube: x_hat = y_hat @ R, fp32 accumulate to GM, then back to UB + fp16.
     rotateMm.SetOrgShape(mPad, D, D);
     rotateMm.SetSingleShape(M, D, D);
     rotateMm.SetTensorA(yHat, false);
     rotateMm.SetTensorB(rotationGm, false);
     rotateMm.SetLocalWorkspace(rotateWork);
-    // Match pack op: non-sequential GetTensorC per baseN tile assembles full [mPad,N]
-    // in cubeCGm; linear DataCopy(m*D) is valid. IterateAll does not reproduce this
-    // layout on MIX KFC (CANN: IterateAll expects continuous GM).
-    // while (rotateMm.Iterate()) {
-    //     rotateMm.GetTensorC(cubeCGm);
-    //     iterCount++;
-    // }
     rotateMm.IterateAll(cubeCGm);
     rotateMm.End();
 
@@ -160,12 +147,11 @@ __aicore__ inline void DecodeRows8bit(
     AscendC::PipeBarrier<PIPE_V>();
 }
 
-// Fully scalar reference decode (AIV-only). No Gather, no Cube — used as the
-// numeric golden / debug fallback (design doc §2.6.5.8). codebook + rotation are
-// read scalar from UB; caller must issue S->MTE3 before copying xHat to GM.
+// Fully scalar reference decode (AIV-only) using V3 formula. No Gather, no Cube —
+// used as the numeric golden / debug fallback (design doc §2.6.5.8).
+// rotation is read scalar from UB; caller must issue S->MTE3 before copying xHat to GM.
 __aicore__ inline void DecodeRowsScalar(
     const AscendC::LocalTensor<uint8_t>& packed,
-    const AscendC::LocalTensor<half>& codebook,
     const AscendC::LocalTensor<half>& rotation,
     const AscendC::LocalTensor<half>& xHat,
     uint32_t M) {
@@ -174,11 +160,12 @@ __aicore__ inline void DecodeRowsScalar(
     for (uint32_t i = 0; i < M; ++i) {
         const uint32_t rowByteBase = i * D;
         const float norm = static_cast<float>(TqDecodeReadNorm(packed, normBase + i * sizeof(half)));
-        // y_hat[k] = codebook[idx[k]]
+        // V3: y_hat[k] = 0.0026 * (idx[k] - 127.5)
         half yhat[TQ_DECODE_HEAD_SIZE];
         for (uint32_t k = 0; k < D; ++k) {
-            const uint8_t idx = packed.GetValue(rowByteBase + k);
-            yhat[k] = codebook.GetValue(idx);
+            const int32_t idxVal = static_cast<int32_t>(packed.GetValue(rowByteBase + k));
+            float y = 0.0026f * (static_cast<float>(idxVal) - 127.5f);
+            yhat[k] = static_cast<half>(y);
         }
         // x_hat[n] = (sum_k y_hat[k] * R[k, n]) * norm
         for (uint32_t nn = 0; nn < D; ++nn) {

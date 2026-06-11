@@ -26,13 +26,12 @@ constexpr uint32_t TQ_DECODE_MODE_KFC = 0;
 constexpr uint32_t TQ_DECODE_MODE_AIV = 1;
 constexpr uint32_t TQ_DECODE_KFC_AIC_NUM = 1;
 constexpr uint32_t TQ_DECODE_KFC_AIV_NUM = 2;
-constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 
 uint32_t AlignUp16(uint32_t x) {
     return (x + TQ_DECODE_M_ALIGN - 1) / TQ_DECODE_M_ALIGN * TQ_DECODE_M_ALIGN;
 }
 
-// KFC Cube tiling for y_hat @ R: A fp16 VECOUT, B fp16 GM (rotation), C fp32 GM.
+// KFC Cube tiling for y_hat @ R: A fp16 VECOUT (UB), B fp16 GM (rotation), C fp32 GM.
 // Same five-tuple as the validated pack op; M fixed to the tile size T_rows.
 ge::graphStatus FillKfcCubeTiling(
     const char* nodeName,
@@ -157,9 +156,27 @@ static ge::graphStatus TurboquantDecodePaged8bitTilingFunc(gert::TilingContext* 
         ? static_cast<uint32_t>(ascendcPlatform.GetCoreNumAic())
         : static_cast<uint32_t>(ascendcPlatform.GetCoreNumAiv());
     const uint32_t usableCores = std::max<uint32_t>(1, coreNum);
-    const uint32_t blocksPerCore = std::max<uint32_t>(1, (totalBlocks + usableCores - 1) / usableCores);
-    const uint32_t dataCores = (totalBlocks + blocksPerCore - 1) / blocksPerCore;
-    OPS_LOG_E(nodeName, "coreNum=%d, usableCores=%d, blocksPerCore=%d, dataCores=%d, totalBlocks=%d", coreNum, usableCores, blocksPerCore, dataCores, totalBlocks);
+
+    // For KFC MIX mode, query the mix block dimension.
+    uint32_t mixBlockDim = 1;
+    if (mode == TQ_DECODE_MODE_KFC) {
+        mixBlockDim = ascendcPlatform.CalcTschBlockDim(
+            TQ_DECODE_KFC_AIV_NUM, TQ_DECODE_KFC_AIC_NUM, TQ_DECODE_KFC_AIV_NUM);
+    }
+
+    // Multi-core data partitioning.  On 910B3 with KERNEL_TYPE_MIX_AIC_1_2 and
+    // mixBlockDim=1, each blockIdx maps to one AIV (sub-block indices alternate
+    // 0,1,0,1…).  Up to 16 independent workers share one workspace for KFC
+    // message queues (ClearWorkspaceImpl already indexes per-block via
+    // GetBlockIdxImpl); per-core Cube-C scratch is at fixed offsets past the
+    // KFC region.
+    // Cap at 16: 910B3 reports 20 AIC cores but only 16 are usable for MIX mode.
+    const uint32_t maxMixGroups = 16;
+    uint32_t dataCores = std::min<uint32_t>({usableCores, totalBlocks, maxMixGroups});
+    uint32_t blocksPerCore = std::max<uint32_t>(1, (totalBlocks + dataCores - 1) / dataCores);
+
+    OPS_LOG_E(nodeName, "coreNum=%d, usableCores=%d, dataCores=%d, blocksPerCore=%d, totalBlocks=%d, mixBlockDim=%d",
+              coreNum, usableCores, dataCores, blocksPerCore, totalBlocks, mixBlockDim);
 
     tiling.set_totalBlocks(totalBlocks);
     tiling.set_blockSize(blockSize);
@@ -169,6 +186,8 @@ static ge::graphStatus TurboquantDecodePaged8bitTilingFunc(gert::TilingContext* 
     tiling.set_blocksPerCore(blocksPerCore);
     tiling.set_outDtype(outDtype);
     tiling.set_mode(mode);
+    tiling.set_kfcMixBlockDim(mixBlockDim);
+    tiling.set_dataCores(dataCores);
 
     auto rawTiling = context->GetRawTilingData();
     if (rawTiling == nullptr || rawTiling->GetCapacity() < tiling.GetDataSize()) {
@@ -180,19 +199,25 @@ static ge::graphStatus TurboquantDecodePaged8bitTilingFunc(gert::TilingContext* 
 
     uint32_t blockDim = dataCores;
     if (mode == TQ_DECODE_MODE_KFC) {
-        // MIX 1 AIC + 2 AIV per data-parallel group (same as the pack op).
-        const uint32_t mixBlockDim = ascendcPlatform.CalcTschBlockDim(
-            TQ_DECODE_KFC_AIV_NUM, TQ_DECODE_KFC_AIC_NUM, TQ_DECODE_KFC_AIV_NUM);
         blockDim = dataCores * mixBlockDim;
-        OPS_LOG_E(nodeName, "mixBlockDim=%d, dataCores=%d, blockDim=%d", mixBlockDim, dataCores, blockDim);
     }
 
+    // Workspace: 16 MB shared for KFC internals + per-core scratch for Cube C output.
+    // KFC message queues are indexed per-block within the shared region by
+    // ClearWorkspaceImpl (using GetBlockIdxImpl), so one shared region suffices.
+    constexpr uint64_t kKfcSharedWorkspace = 16 * 1024 * 1024;       // 16 MB for KFC lib internals
+    constexpr uint64_t kPerCoreScratchBase = 512 * 1024;             // start per-core at 512 KB
+    constexpr uint64_t kPerCoreScratch = 16 * 1024;                  // 16 KB per core (cube C fp32)
     size_t* workspaces = context->GetWorkspaceSizes(1);
     if (workspaces == nullptr) {
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    workspaces[0] = SYSTEM_NEED_WORKSPACE;
+    workspaces[0] = kPerCoreScratchBase + dataCores * kPerCoreScratch;
+    // Ensure at least the KFC shared workspace is available.
+    if (workspaces[0] < kKfcSharedWorkspace) {
+        workspaces[0] = kKfcSharedWorkspace;
+    }
 
     context->SetBlockDim(blockDim);
     context->SetTilingKey(mode);

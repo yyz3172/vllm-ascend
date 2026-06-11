@@ -25,6 +25,8 @@ TILING_DATA_FIELD_DEF(uint32_t, packedBytes);           // 130 (= headSize + 2)
 TILING_DATA_FIELD_DEF(uint32_t, blocksPerCore);         // 每个逻辑核处理多少紧凑块
 TILING_DATA_FIELD_DEF(uint32_t, outDtype);              // 0=fp16
 TILING_DATA_FIELD_DEF(uint32_t, mode);                  // 0=KFC Cube, 1=AIV-only scalar
+TILING_DATA_FIELD_DEF(uint32_t, kfcMixBlockDim);        // CalcTschBlockDim result (1=no MIX, 3=MIX_AIC_1_2)
+TILING_DATA_FIELD_DEF(uint32_t, dataCores);              // 数据并行核数（用于 per-core workspace 偏移）
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(TurboquantDecodePaged8bit, TurboquantDecodePaged8bitTilingData)
