@@ -13,8 +13,8 @@ at::Tensor turboquant_attention_paged8bit(
     const at::Tensor& key_cache,
     const at::Tensor& value_cache,
     const at::Tensor& block_table,
-    const at::Tensor& actual_seq_len_q,
-    const at::Tensor& actual_seq_len_kv,
+    at::IntArrayRef actual_seq_len_q,
+    at::IntArrayRef actual_seq_len_kv,
     const at::Tensor& codebook,
     const at::Tensor& rotation,
     const at::Tensor& codebook_value,
@@ -35,13 +35,9 @@ at::Tensor turboquant_attention_paged8bit(
     TORCH_CHECK(max_actual_seq_len > 0, "max_actual_seq_len must be > 0");
     TORCH_CHECK(num_heads > 0 && num_kv_heads > 0, "head counts must be > 0");
     TORCH_CHECK(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads");
-
-    at::Tensor actual_seq_len_q_i64 = actual_seq_len_q.scalar_type() == at::kLong
-                                          ? actual_seq_len_q
-                                          : actual_seq_len_q.to(at::kLong);
-    at::Tensor actual_seq_len_kv_i64 = actual_seq_len_kv.scalar_type() == at::kLong
-                                           ? actual_seq_len_kv
-                                           : actual_seq_len_kv.to(at::kLong);
+    TORCH_CHECK(actual_seq_len_q.size() > 0, "actual_seq_len_q must not be empty");
+    TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(),
+                "actual_seq_len_q and actual_seq_len_kv must have the same length");
 
     at::Tensor out = at::empty(query.sizes(), query.options().dtype(at::kHalf));
 
@@ -51,8 +47,8 @@ at::Tensor turboquant_attention_paged8bit(
         key_cache,
         value_cache,
         block_table,
-        actual_seq_len_q_i64,
-        actual_seq_len_kv_i64,
+        actual_seq_len_q,
+        actual_seq_len_kv,
         codebook,
         rotation,
         codebook_value,
