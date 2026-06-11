@@ -271,21 +271,21 @@ uint64_t PickTilingKey(uint32_t splitMode, uint32_t qkPvMode)
 }
 
 ge::graphStatus GetMaxActualSeqLen(const char* nodeName,
-                                   const gert::Tensor* actualSeqLenKvTensor,
+                                   const gert::IntArray* actualSeqLenKvArray,
                                    uint32_t batchSize,
                                    uint32_t maxKvLen,
                                    uint32_t attrMaxActualSeqLen,
                                    uint32_t& maxActualSeqLen)
 {
     maxActualSeqLen = maxKvLen;
-    if (actualSeqLenKvTensor == nullptr) {
+    if (actualSeqLenKvArray == nullptr) {
         OPS_LOG_E(nodeName, "actual_seq_len_kv is null");
         return ge::GRAPH_FAILED;
     }
 
-    const int64_t actualLenElems = actualSeqLenKvTensor->GetShapeSize();
+    const int64_t actualLenElems = actualSeqLenKvArray->GetNumElements();
     if (actualLenElems == 0) {
-        OPS_LOG_E(nodeName, "actual_seq_len_kv shape size is 0");
+        OPS_LOG_E(nodeName, "actual_seq_len_kv size is 0");
         return ge::GRAPH_FAILED;
     }
     if (actualLenElems != 1 && actualLenElems < static_cast<int64_t>(batchSize)) {
@@ -350,7 +350,7 @@ static ge::graphStatus TurboquantAttentionPaged8bitTilingFunc(gert::TilingContex
     auto qShapePtr = context->GetInputShape(0);
     auto cacheShapePtr = context->GetInputShape(1);
     auto btShapePtr = context->GetInputShape(3);
-    auto actualSeqLenKvTensor = context->GetInputTensor(5);
+    auto actualSeqLenKvArray = context->GetInputIntArray(5);
     if (qShapePtr == nullptr || cacheShapePtr == nullptr || btShapePtr == nullptr) {
         OPS_LOG_E(nodeName, "required input shapes are null");
         return ge::GRAPH_FAILED;
@@ -397,7 +397,7 @@ static ge::graphStatus TurboquantAttentionPaged8bitTilingFunc(gert::TilingContex
 
     const uint32_t maxKvLen = maxBlocksPerSeq * blockSize;
     uint32_t maxActualSeqLen = maxKvLen;
-    if (GetMaxActualSeqLen(nodeName, actualSeqLenKvTensor, batchSize, maxKvLen,
+    if (GetMaxActualSeqLen(nodeName, actualSeqLenKvArray, batchSize, maxKvLen,
                            attrMaxActualSeqLen, maxActualSeqLen) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }

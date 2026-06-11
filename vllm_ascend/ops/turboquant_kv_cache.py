@@ -1064,22 +1064,6 @@ def turboquant_fused_infer_attention_score_8bit(
     return out.view(query.shape[0], num_heads, head_size)
 
 
-def _seq_lens_tensor_and_max(
-    seq_lens,
-    *,
-    device: torch.device,
-    dtype: torch.dtype = torch.int64,
-) -> tuple[torch.Tensor, int]:
-    if isinstance(seq_lens, torch.Tensor):
-        seq_lens_tensor = seq_lens.to(device=device, dtype=dtype)
-        max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 0
-        return seq_lens_tensor, max_seq_len
-
-    max_seq_len = max(seq_lens) if seq_lens else 0
-    seq_lens_tensor = torch.tensor(seq_lens, device=device, dtype=dtype)
-    return seq_lens_tensor, int(max_seq_len)
-
-
 def turboquant_attention_paged8bit(
     *,
     query: torch.Tensor,
@@ -1122,22 +1106,21 @@ def turboquant_attention_paged8bit(
     cb_k, rot_k, cb_v, rot_v = _turboquant_fused_8bit_decode_tables(
         query.device, head_size, bits_key, bits_value
     )
-    seq_q, _ = _seq_lens_tensor_and_max(
-        actual_seq_lengths_q, device=query.device, dtype=torch.int64
-    )
-    seq_kv, max_actual_seq_len = _seq_lens_tensor_and_max(
-        actual_seq_lengths_kv, device=query.device, dtype=torch.int64
-    )
+    
+    # Compute max_seq_len on CPU to avoid device sync
+    max_actual_seq_len = max(actual_seq_lengths_kv) if actual_seq_lengths_kv else 0
     if max_actual_seq_len <= 0:
         return None
+    
+    # Call fused op with Python lists directly (C++ binding handles implicit conversion)
     fused = torch.ops._C_ascend.turboquant_attention_paged8bit
     out = fused(
         query.to(torch.float16).contiguous(),
         key_cache.view(torch.uint8).contiguous(),
         value_cache.view(torch.uint8).contiguous(),
         block_tables.to(torch.int32).contiguous(),
-        seq_q.contiguous(),
-        seq_kv.contiguous(),
+        actual_seq_lengths_q,  # Python list - C++ binding converts to aclIntArray*
+        actual_seq_lengths_kv,  # Python list - C++ binding converts to aclIntArray*
         cb_k,
         rot_k,
         cb_v,
