@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Fused TurboQuant pack for KV cache (fp16, aligned with TurboQuantMSE v1).
+// Fused TurboQuant pack for KV cache (fp16/bf16, aligned with TurboQuantMSE v1).
 //
 // Reference (Python):
 //   norms = vector_norm(x, dim=-1, keepdim=True)
@@ -50,6 +50,27 @@ static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;  // 8 da
 // Dimensions processed per tile — balance between UB usage and sync reduction.
 // distBuf = D_TILE * K * 4 bytes.  D_TILE=16 → 16 KiB.
 static constexpr uint32_t TQ_D_TILE = 16;
+
+#if defined(ORIG_DTYPE_KEY)
+#if (ORIG_DTYPE_KEY == DT_BF16)
+#define TQ_INPUT_IS_BF16 1
+using TqInputT = bfloat16_t;
+#else
+#define TQ_INPUT_IS_BF16 0
+using TqInputT = half;
+#endif
+#elif defined(DTYPE_KEY)
+#if (DTYPE_KEY == DT_BF16)
+#define TQ_INPUT_IS_BF16 1
+using TqInputT = bfloat16_t;
+#else
+#define TQ_INPUT_IS_BF16 0
+using TqInputT = half;
+#endif
+#else
+#define TQ_INPUT_IS_BF16 0
+using TqInputT = half;
+#endif
 
 // Per-core Cube C scratch layout within the workspace.
 constexpr uint64_t TQ_PER_CORE_CUBEC_BYTES = static_cast<uint64_t>(TQ_MAX_BATCH_M) * TQ_ROT_N * sizeof(float);
@@ -146,8 +167,8 @@ public:
         : pipe_(pipe), rotateMm_(rotateMm) {}
 
     __aicore__ inline void Init(
-        __gm__ half* key,
-        __gm__ half* value,
+        GM_ADDR key,
+        GM_ADDR value,
         __gm__ half* codebook,
         __gm__ half* rotation_t,
         __gm__ uint8_t* packed_k,
@@ -165,8 +186,8 @@ public:
             vecPerCore_ = TQ_MAX_BATCH_M;
         }
 
-        keyGm_.SetGlobalBuffer(key, (uint64_t)nVec_ * TQ_PACK_D);
-        valueGm_.SetGlobalBuffer(value, (uint64_t)nVec_ * TQ_PACK_D);
+        keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ TqInputT*>(key), (uint64_t)nVec_ * TQ_PACK_D);
+        valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ TqInputT*>(value), (uint64_t)nVec_ * TQ_PACK_D);
         codebookGm_.SetGlobalBuffer(codebook, TQ_PACK_K);
         rotationTGm_.SetGlobalBuffer(rotation_t, (uint64_t)TQ_PACK_D * TQ_PACK_D);
         packedKGm_.SetGlobalBuffer(packed_k, (uint64_t)nVec_ * slot_w_k_);
@@ -175,6 +196,9 @@ public:
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
         pipe_->InitBuffer(xBatchQue_, 1, batchElems * sizeof(half));
         pipe_->InitBuffer(yBatchQue_, 1, batchElems * sizeof(half));
+#if TQ_INPUT_IS_BF16
+        pipe_->InitBuffer(xBatchInputQue_, 1, batchElems * sizeof(TqInputT));
+#endif
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * sizeof(half));
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
@@ -453,7 +477,7 @@ private:
     }
 
     __aicore__ inline void PackBatch(
-        const AscendC::GlobalTensor<half>& xGm,
+        const AscendC::GlobalTensor<TqInputT>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
         uint32_t start,
         uint32_t end,
@@ -469,8 +493,20 @@ private:
         auto yBatch = yBatchQue_.AllocTensor<half>();
         auto norms = normsBuf_.Get<half>();
 
+#if TQ_INPUT_IS_BF16
+        auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
+        auto xBatchFp32 = yCubeFp32Buf_.Get<float>();
+        AscendC::DataCopy(xBatchInput, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
+        TqSyncMte2ToV();
+        AscendC::Cast(xBatchFp32, xBatchInput, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(xBatch, xBatchFp32, AscendC::RoundMode::CAST_ROUND, m * TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        xBatchInputQue_.FreeTensor(xBatchInput);
+#else
         AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
         TqSyncMte2ToV();
+#endif
 
         if (mPad > m) {
             AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
@@ -494,7 +530,7 @@ private:
     //   3 = after Rotate, 4 = after Encode
     // K uses descIds [0..4], V uses descIds [10..14].
     __aicore__ inline void PackBatchPerf(
-        const AscendC::GlobalTensor<half>& xGm,
+        const AscendC::GlobalTensor<TqInputT>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
         uint32_t start,
         uint32_t end,
@@ -512,29 +548,41 @@ private:
         auto yBatch = yBatchQue_.AllocTensor<half>();
         auto norms = normsBuf_.Get<half>();
 
-        AscendC::printf("[TQ_PERF] %c m=%u\n", tag, m);
-        AscendC::PrintTimeStamp(base);
+        // AscendC::printf("[TQ_PERF] %c m=%u\n", tag, m);
+        // AscendC::PrintTimeStamp(base);
 
+#if TQ_INPUT_IS_BF16
+        auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
+        auto xBatchFp32 = yCubeFp32Buf_.Get<float>();
+        AscendC::DataCopy(xBatchInput, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
+        TqSyncMte2ToV();
+        AscendC::Cast(xBatchFp32, xBatchInput, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(xBatch, xBatchFp32, AscendC::RoundMode::CAST_ROUND, m * TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        xBatchInputQue_.FreeTensor(xBatchInput);
+#else
         AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
         TqSyncMte2ToV();
+#endif
         if (mPad > m) {
             AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
-        AscendC::PrintTimeStamp(base + 1);
+        // AscendC::PrintTimeStamp(base + 1);
 
         NormalizeBatch(xBatch, norms, m);
-        AscendC::PrintTimeStamp(base + 2);
+        // AscendC::PrintTimeStamp(base + 2);
 
         if (manualRotate) {
             RotateBatchMatmulManual(xBatch, yBatch, m);
         } else {
             RotateBatchMatmul(xBatch, yBatch, m, mPad, dBase, dCount);
         }
-        AscendC::PrintTimeStamp(base + 3);
+        // AscendC::PrintTimeStamp(base + 3);
 
         EncodeBatch(yBatch, norms, packedGm, start, m, slot_w, dBase, dCount, writeMeta);
-        AscendC::PrintTimeStamp(base + 4);
+        // AscendC::PrintTimeStamp(base + 4);
 
         yBatchQue_.FreeTensor(yBatch);
         xBatchQue_.FreeTensor(xBatch);
@@ -551,6 +599,7 @@ private:
 
     AscendC::TQue<AscendC::TPosition::VECOUT, 1> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, 1> yBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> xBatchInputQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
@@ -567,8 +616,8 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECIN> yCubeFp32Buf_;
 
     AscendC::GlobalTensor<float> cubeCGm_;
-    AscendC::GlobalTensor<half> keyGm_;
-    AscendC::GlobalTensor<half> valueGm_;
+    AscendC::GlobalTensor<TqInputT> keyGm_;
+    AscendC::GlobalTensor<TqInputT> valueGm_;
     AscendC::GlobalTensor<half> codebookGm_;
     AscendC::GlobalTensor<half> rotationTGm_;
     AscendC::GlobalTensor<uint8_t> packedKGm_;
@@ -588,8 +637,6 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
     GM_ADDR tiling) {
     GET_TILING_DATA(tilingData, tiling);
 
-    auto* keyPtr = reinterpret_cast<__gm__ half*>(key);
-    auto* valuePtr = reinterpret_cast<__gm__ half*>(value);
     auto* codebookPtr = reinterpret_cast<__gm__ half*>(codebook);
     auto* rotationPtr = reinterpret_cast<__gm__ half*>(rotation_t);
     auto* packedKPtr = reinterpret_cast<__gm__ uint8_t*>(packed_k);
@@ -608,8 +655,8 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &cubeTiling);
         TurboquantPackKVForCacheFused op(&pipe, &rotateMm);
         op.Init(
-            keyPtr,
-            valuePtr,
+            key,
+            value,
             codebookPtr,
             rotationPtr,
             packedKPtr,
@@ -627,8 +674,8 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
         AscendC::TPipe pipe;
         TurboquantPackKVForCacheFused op(&pipe, nullptr);
         op.Init(
-            keyPtr,
-            valuePtr,
+            key,
+            value,
             codebookPtr,
             rotationPtr,
             packedKPtr,
