@@ -59,6 +59,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.turboquant_kv_cache import (
     _try_8bit_decode_paged,
+    ensure_turboquant_pack_tables_registered,
     turboquant_decode_kv_cache_compact,
     turboquant_fused_infer_attention_score_8bit,
     turboquant_pack_kv_for_cache,
@@ -403,6 +404,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             except Exception:
                 self.turboquant_kv_bits_key = 4
                 self.turboquant_kv_bits_value = 4
+            # Eager-register pack v2 tables (codebook + R^T) on the default NPU device.
+            try:
+                ensure_turboquant_pack_tables_registered(
+                    torch.device("npu"),
+                    head_size,
+                    self.turboquant_kv_bits_key,
+                )
+            except Exception:
+                pass
         else:
             self.turboquant_kv_bits_key = 4
             self.turboquant_kv_bits_value = 4

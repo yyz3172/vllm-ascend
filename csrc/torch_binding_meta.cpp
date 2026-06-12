@@ -238,6 +238,29 @@ at::Tensor turboquant_encode_packed_blocks_meta(
     return at::empty_symint({N, packed_bytes}, y.options().dtype(at::kByte).device(at::kMeta));
 }
 
+void turboquant_pack_register_tables_meta(
+    const at::Tensor &codebook,
+    const at::Tensor &rotation_t) {
+    (void)codebook;
+    (void)rotation_t;
+}
+
+std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache_v2_meta(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    std::vector<c10::SymInt> shape_k(key.sym_sizes().begin(), key.sym_sizes().end());
+    std::vector<c10::SymInt> shape_v(value.sym_sizes().begin(), value.sym_sizes().end());
+    shape_k.back() = slot_w_k;
+    shape_v.back() = slot_w_v;
+    auto opts_k = key.options().dtype(at::kByte).device(at::kMeta);
+    auto opts_v = value.options().dtype(at::kByte).device(at::kMeta);
+    return std::make_tuple(
+        at::empty_symint(shape_k, opts_k),
+        at::empty_symint(shape_v, opts_v));
+}
+
 std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache_meta(
     const at::Tensor &key,
     const at::Tensor &value,
@@ -758,6 +781,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // TurboQuant packed encode (4-bit MSE quant)
     ops.impl("turboquant_encode_packed_blocks", &vllm_ascend::meta::turboquant_encode_packed_blocks_meta);
     ops.impl("turboquant_pack_kv_for_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
+
+    ops.impl("turboquant_pack_register_tables", &vllm_ascend::meta::turboquant_pack_register_tables_meta);
+
+    ops.impl("turboquant_pack_kv_for_cache_v2", &vllm_ascend::meta::turboquant_pack_kv_for_cache_v2_meta);
     ops.impl("turboquant_fused_infer_attention_score_8bit", &vllm_ascend::meta::turboquant_fused_infer_attention_score_8bit_meta);
     ops.impl("turboquant_decode_paged_8bit", &vllm_ascend::meta::turboquant_decode_paged_8bit_meta);
 }

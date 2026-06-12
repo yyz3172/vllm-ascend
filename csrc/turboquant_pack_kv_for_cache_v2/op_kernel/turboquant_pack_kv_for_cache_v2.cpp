@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Fused TurboQuant pack for KV cache (fp16, aligned with TurboQuantMSE v1).
+// TurboQuant pack KV cache v2: registered tables + in-kernel bf16->fp16 cast on load.
 //
 // Reference (Python):
 //   norms = vector_norm(x, dim=-1, keepdim=True)
@@ -52,6 +52,27 @@ static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;  // 8 da
 // Dimensions processed per tile — balance between UB usage and sync reduction.
 // distBuf = D_TILE * K * 4 bytes.  D_TILE=16 → 16 KiB.
 static constexpr uint32_t TQ_D_TILE = 16;
+
+#if defined(ORIG_DTYPE_KEY)
+#if (ORIG_DTYPE_KEY == DT_BF16)
+#define TQ_INPUT_IS_BF16 1
+using TqInputT = bfloat16_t;
+#else
+#define TQ_INPUT_IS_BF16 0
+using TqInputT = half;
+#endif
+#elif defined(DTYPE_KEY)
+#if (DTYPE_KEY == DT_BF16)
+#define TQ_INPUT_IS_BF16 1
+using TqInputT = bfloat16_t;
+#else
+#define TQ_INPUT_IS_BF16 0
+using TqInputT = half;
+#endif
+#else
+#define TQ_INPUT_IS_BF16 0
+using TqInputT = half;
+#endif
 
 __aicore__ inline uint32_t AlignUp16(uint32_t x) {
     return (x + TQ_CUBE_M_ALIGN - 1) / TQ_CUBE_M_ALIGN * TQ_CUBE_M_ALIGN;
@@ -144,14 +165,14 @@ using TqRotateBiasT = MatmulType<TPosition::GM, CubeFormat::ND, half>;
 using TqRotateMatmulOp =
     AscendC::Matmul<TqRotateAT, TqRotateBT, TqRotateCT, TqRotateBiasT>;
 
-class TurboquantPackKVForCacheFused {
+class TurboquantPackKVForCacheV2 {
 public:
-    __aicore__ inline explicit TurboquantPackKVForCacheFused(AscendC::TPipe* pipe, TqRotateMatmulOp* rotateMm)
+    __aicore__ inline explicit TurboquantPackKVForCacheV2(AscendC::TPipe* pipe, TqRotateMatmulOp* rotateMm)
         : pipe_(pipe), rotateMm_(rotateMm) {}
 
     __aicore__ inline void Init(
-        __gm__ half* key,
-        __gm__ half* value,
+        GM_ADDR key,
+        GM_ADDR value,
         __gm__ half* codebook,
         __gm__ half* rotation_t,
         __gm__ uint8_t* packed_k,
@@ -168,8 +189,8 @@ public:
             vecPerCore_ = TQ_MAX_BATCH_M;
         }
 
-        keyGm_.SetGlobalBuffer(key, (uint64_t)nVec_ * TQ_PACK_D);
-        valueGm_.SetGlobalBuffer(value, (uint64_t)nVec_ * TQ_PACK_D);
+        keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ TqInputT*>(key), (uint64_t)nVec_ * TQ_PACK_D);
+        valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ TqInputT*>(value), (uint64_t)nVec_ * TQ_PACK_D);
         codebookGm_.SetGlobalBuffer(codebook, TQ_PACK_K);
         rotationTGm_.SetGlobalBuffer(rotation_t, (uint64_t)TQ_PACK_D * TQ_PACK_D);
         packedKGm_.SetGlobalBuffer(packed_k, (uint64_t)nVec_ * slot_w_k_);
@@ -178,6 +199,9 @@ public:
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
         pipe_->InitBuffer(xBatchQue_, 1, batchElems * sizeof(half));
         pipe_->InitBuffer(yBatchQue_, 1, batchElems * sizeof(half));
+#if TQ_INPUT_IS_BF16
+        pipe_->InitBuffer(xBatchInputQue_, 1, batchElems * sizeof(TqInputT));
+#endif
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * sizeof(half));
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
@@ -249,12 +273,8 @@ public:
         }
         // AscendC::printf("[TQ_PERF] core=%u rows=%u start=%u\n", core, end - start, start);
 
-        // ---- K ----
-        PackBatchPerf(keyGm_, packedKGm_, start, end, slot_w_k_, 0, TQ_PACK_D, true, false, 'K');
-        // ---- V ----
-        PackBatchPerf(valueGm_, packedVGm_, start, end, slot_w_v_, 0, TQ_PACK_D, true, false, 'V');
-
-        // AscendC::printf("[TQ_PERF] core=%u done\n", core);
+        PackBatch(keyGm_, packedKGm_, start, end, slot_w_k_, 0, TQ_PACK_D, true, false);
+        PackBatch(valueGm_, packedVGm_, start, end, slot_w_v_, 0, TQ_PACK_D, true, false);
     }
 
 private:
@@ -448,7 +468,7 @@ private:
     }
 
     __aicore__ inline void PackBatch(
-        const AscendC::GlobalTensor<half>& xGm,
+        const AscendC::GlobalTensor<TqInputT>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
         uint32_t start,
         uint32_t end,
@@ -464,8 +484,20 @@ private:
         auto yBatch = yBatchQue_.AllocTensor<half>();
         auto norms = normsBuf_.Get<half>();
 
+#if TQ_INPUT_IS_BF16
+            auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
+            auto xBatchFp32 = yCubeFp32Buf_.Get<float>();
+            AscendC::DataCopy(xBatchInput, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
+            TqSyncMte2ToV();
+            AscendC::Cast(xBatchFp32, xBatchInput, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(xBatch, xBatchFp32, AscendC::RoundMode::CAST_ROUND, m * TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            xBatchInputQue_.FreeTensor(xBatchInput);
+#else
         AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
         TqSyncMte2ToV();
+#endif
 
         if (mPad > m) {
             AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
@@ -543,9 +575,9 @@ private:
     uint32_t slot_w_v_ = 0;
     uint32_t vecPerCore_ = 1;
     bool matmulReady_ = false;
-
     AscendC::TQue<AscendC::TPosition::VECOUT, 1> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, 1> yBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> xBatchInputQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
@@ -562,8 +594,8 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECIN> yCubeFp32Buf_;
 
     AscendC::GlobalTensor<float> cubeCGm_;
-    AscendC::GlobalTensor<half> keyGm_;
-    AscendC::GlobalTensor<half> valueGm_;
+    AscendC::GlobalTensor<TqInputT> keyGm_;
+    AscendC::GlobalTensor<TqInputT> valueGm_;
     AscendC::GlobalTensor<half> codebookGm_;
     AscendC::GlobalTensor<half> rotationTGm_;
     AscendC::GlobalTensor<uint8_t> packedKGm_;
@@ -572,7 +604,7 @@ private:
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
+extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_v2(
     GM_ADDR key,
     GM_ADDR value,
     GM_ADDR codebook,
@@ -583,8 +615,6 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
     GM_ADDR tiling) {
     GET_TILING_DATA(tilingData, tiling);
 
-    auto* keyPtr = reinterpret_cast<__gm__ half*>(key);
-    auto* valuePtr = reinterpret_cast<__gm__ half*>(value);
     auto* codebookPtr = reinterpret_cast<__gm__ half*>(codebook);
     auto* rotationPtr = reinterpret_cast<__gm__ half*>(rotation_t);
     auto* packedKPtr = reinterpret_cast<__gm__ uint8_t*>(packed_k);
@@ -600,10 +630,10 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
         TqRotateMatmulOp rotateMm;
         TCubeTiling cubeTiling = tilingData.cubeTiling;
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &cubeTiling);
-        TurboquantPackKVForCacheFused op(&pipe, &rotateMm);
+        TurboquantPackKVForCacheV2 op(&pipe, &rotateMm);
         op.Init(
-            keyPtr,
-            valuePtr,
+            key,
+            value,
             codebookPtr,
             rotationPtr,
             packedKPtr,
@@ -614,14 +644,12 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
             tilingData.vecPerCore);
         op.Process();
     } else if (TILING_KEY_IS(1)) {
-        // pack_mode=1: AIV-only reference path (norm + manual rotate + encode).
-        // Do not run vector ops under KERNEL_TYPE_AIC_ONLY (causes stream sync 507057).
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_AIV_ONLY);
         AscendC::TPipe pipe;
-        TurboquantPackKVForCacheFused op(&pipe, nullptr);
+        TurboquantPackKVForCacheV2 op(&pipe, nullptr);
         op.Init(
-            keyPtr,
-            valuePtr,
+            key,
+            value,
             codebookPtr,
             rotationPtr,
             packedKPtr,
