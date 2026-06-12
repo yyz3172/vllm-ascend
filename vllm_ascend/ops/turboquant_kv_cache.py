@@ -644,6 +644,52 @@ def _ensure_quantizer_fp16_views(
     return quantizer._codebook_fp16, quantizer._rotation_t_fp16
 
 
+_turboquant_pack_tables_registered: set[tuple[int, int, int]] = set()
+_turboquant_pack_v2_ops_available: bool | None = None
+
+
+def _turboquant_pack_reg_key(
+    device: torch.device, head_size: int, bits_key: int
+) -> tuple[int, int, int]:
+    return (device.index if device.index is not None else 0, head_size, bits_key)
+
+
+def _turboquant_pack_v2_ops_ready() -> bool:
+    """Check v2/register ops once, cache result for hot path."""
+    global _turboquant_pack_v2_ops_available
+    if _turboquant_pack_v2_ops_available is None:
+        _turboquant_pack_v2_ops_available = (
+            _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache")
+            and _c_ascend_turboquant_op_available("turboquant_pack_register_tables")
+        )
+    return _turboquant_pack_v2_ops_available
+
+
+def ensure_turboquant_pack_tables_registered(
+    device: torch.device,
+    head_size: int,
+    bits_key: int,
+) -> bool:
+    """Register V1 fp16 codebook + R^T on the NPU for pack v2 (once per device/head/bits).
+
+    Returns True when v2 tables are registered and the v2 op is available.
+    """
+    if bits_key != 8 or head_size != 128:
+        return False
+
+    reg_key = _turboquant_pack_reg_key(device, head_size, bits_key)
+    if reg_key in _turboquant_pack_tables_registered:
+        return True
+    if not _turboquant_pack_v2_ops_ready():
+        return False
+
+    qk = _get_quantizer(head_size, bits_key, device)
+    cb_k, rot_k = _ensure_quantizer_fp16_views(qk, device)
+    torch.ops._C_ascend.turboquant_pack_register_tables(cb_k, rot_k)
+    _turboquant_pack_tables_registered.add(reg_key)
+    return True
+
+
 def turboquant_pack_kv_for_cache(
     *,
     key: torch.Tensor,  # [T, H, D]
@@ -662,10 +708,10 @@ def turboquant_pack_kv_for_cache(
     Intended for ``torch_npu._npu_reshape_and_cache`` on Ascend, which performs the
     paged layout write when the last dim matches ``key_cache`` / ``value_cache``.
 
-    When ``VLLM_ASCEND_TURBOQUANT_ENCODE_OP=1`` and the fused NPU op is built,
-    uses ``turboquant_pack_kv_for_cache``: norm + ``@ R^T`` + nearest-neighbor
-    encode. If ``bits_key == bits_value``, K and V are encoded in one batched
-    kernel launch.
+    Uses ``turboquant_pack_kv_for_cache_v2`` when available (registered tables,
+    in-kernel bf16→fp16 cast, no per-step ``aten::to``). Otherwise falls back to
+    ``torch.ops._C_ascend.turboquant_pack_kv_for_cache``. Both perform norm +
+    ``@ R^T`` + nearest-neighbor encode in one batched kernel launch for K and V.
 
     Optional ``codebook`` / ``rotation`` (``R^T``, fp16) override the per-head
     quantizer tables; ``codebook_value`` / ``rotation_value`` apply to V when
@@ -677,54 +723,69 @@ def turboquant_pack_kv_for_cache(
         raise ValueError("Key/value dtypes must match for turboquant.")
 
     head_size = key.shape[-1]
-    if envs_ascend.VLLM_ASCEND_TURBOQUANT_ENCODE_OP:
-        qk = _get_quantizer(head_size, bits_key, key.device)
-        qv = qk if bits_key == bits_value else _get_quantizer(
-            head_size, bits_value, key.device
+    use_v2 = False
+    try_v2 = (
+        codebook is None
+        and rotation is None
+        and codebook_value is None
+        and rotation_value is None
+        and bits_key == bits_value == 8
+        and head_size == 128
+        and key.dtype in (torch.float16, torch.bfloat16)
+    )
+    if try_v2:
+        reg_key = _turboquant_pack_reg_key(key.device, head_size, bits_key)
+        use_v2 = (
+            reg_key in _turboquant_pack_tables_registered
+            or ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
         )
-        if codebook is None or rotation is None:
-            cb_k, rot_k = _ensure_quantizer_fp16_views(qk, key.device)
-        else:
-            cb_k = codebook.to(device=key.device, dtype=torch.float16)
-            rot_k = rotation.to(device=key.device, dtype=torch.float16)
-        if bits_key == bits_value:
-            cb_v, rot_v = cb_k, rot_k
-        elif codebook_value is None or rotation_value is None:
-            cb_v, rot_v = _ensure_quantizer_fp16_views(qv, key.device)
-        else:
-            cb_v = codebook_value.to(device=key.device, dtype=torch.float16)
-            rot_v = rotation_value.to(device=key.device, dtype=torch.float16)
-
-        # The fused AscendC kernel currently accepts fp16 K/V only. Cast here so
-        # callers with bf16/fp32 KV tensors still use the fused path consistently.
-        key_fused = key.to(dtype=torch.float16).contiguous()
-        value_fused = value.to(dtype=torch.float16).contiguous()
+    if use_v2:
         packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
-            key_fused,
-            value_fused,
-            cb_k,
-            rot_k,
-            cb_v,
-            rot_v,
-            bits_key,
-            bits_value,
+            key,
+            value,
             slot_w_k,
             slot_w_v,
         )
-        # Match ENCODE_OP=0: int8 view of byte storage for _npu_reshape_and_cache.
-        # C++ already returns contiguous kChar tensors; keep the explicit view for parity.
         return (
             packed_k.view(dtype=torch.int8),
             packed_v.view(dtype=torch.int8),
         )
 
-    packed_k = _pad_packed_to_slot_width(
-        turboquant_quantize_to_packed_bytes(key, bits=bits_key), slot_w_k
+    qk = _get_quantizer(head_size, bits_key, key.device)
+    qv = qk if bits_key == bits_value else _get_quantizer(
+        head_size, bits_value, key.device
     )
-    packed_v = _pad_packed_to_slot_width(
-        turboquant_quantize_to_packed_bytes(value, bits=bits_value), slot_w_v
+    if codebook is None or rotation is None:
+        cb_k, rot_k = _ensure_quantizer_fp16_views(qk, key.device)
+    else:
+        cb_k = codebook.to(device=key.device, dtype=torch.float16)
+        rot_k = rotation.to(device=key.device, dtype=torch.float16)
+    if bits_key == bits_value:
+        cb_v, rot_v = cb_k, rot_k
+    elif codebook_value is None or rotation_value is None:
+        cb_v, rot_v = _ensure_quantizer_fp16_views(qv, key.device)
+    else:
+        cb_v = codebook_value.to(device=key.device, dtype=torch.float16)
+        rot_v = rotation_value.to(device=key.device, dtype=torch.float16)
+
+    key_fused = key.to(dtype=torch.float16).contiguous()
+    value_fused = value.to(dtype=torch.float16).contiguous()
+    packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
+        key_fused,
+        value_fused,
+        cb_k,
+        rot_k,
+        cb_v,
+        rot_v,
+        bits_key,
+        bits_value,
+        slot_w_k,
+        slot_w_v,
     )
-    return packed_k.view(dtype=torch.int8), packed_v.view(dtype=torch.int8)
+    return (
+        packed_k.view(dtype=torch.int8),
+        packed_v.view(dtype=torch.int8),
+    )
 
 
 def turboquant_decode_kv_cache_compact(
