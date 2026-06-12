@@ -106,6 +106,12 @@ __aicore__ inline void TqSyncVToMte3() {
     WaitFlag<HardEvent::V_MTE3>(e);
 }
 
+__aicore__ inline void TqSyncSToMte3() {
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+    SetFlag<HardEvent::S_MTE3>(e);
+    WaitFlag<HardEvent::S_MTE3>(e);
+}
+
 __aicore__ inline bool TqIsAiv() {
     if ASCEND_IS_AIV {
         return true;
@@ -148,7 +154,7 @@ __aicore__ inline void copy_packed_ub_to_gm(
     uint64_t gm_offset,
     AscendC::LocalTensor<uint8_t>& packedLocal,
     uint32_t nbytes) {
-    TqSyncVToMte3();
+    TqSyncSToMte3();
     AscendC::DataCopyExtParams copyParams{1, nbytes, 0, 0, 0};
     AscendC::DataCopyPad(packedGm[gm_offset], packedLocal, copyParams);
 }
@@ -207,13 +213,10 @@ public:
         // yFp32Buf: fp32 y row [D=128]
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(cbTileBuf_, TQ_PACK_K * sizeof(float));
-        // idxInt32Buf: int32 buffer for index storage
-        pipe_->InitBuffer(idxInt32Buf_, TQ_PACK_D * sizeof(int32_t));
-        // argminResultBuf: batch results for WholeReduceMin [4 batches × 2 values]
+        // argminResultBuf: results for WholeReduceMin [4 reduce batches][index,value].
         pipe_->InitBuffer(argminResultBuf_, TQ_REDUCE_BATCHES * 2 * sizeof(float));
         // NormalizeBatch: fp32 row + fp32 ReduceSum tmp (2 * TQ_PACK_D floats).
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
-        pipe_->InitBuffer(idxBuf_, TQ_PACK_D * sizeof(uint8_t));
         const uint32_t maxSlotW = slot_w_k_ > slot_w_v_ ? slot_w_k_ : slot_w_v_;
         pipe_->InitBuffer(packedRowBuf_, maxSlotW * sizeof(uint8_t));
         pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
@@ -278,12 +281,10 @@ public:
             const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
                 ? coreEnd : batchStart + vecPerCore_;
 
-            // ---- K ----
-            PackBatchPerf(keyGm_, packedKGm_, batchStart, batchEnd,
-                          slot_w_k_, 0, TQ_PACK_D, true, false, 'K');
-            // ---- V ----
-            PackBatchPerf(valueGm_, packedVGm_, batchStart, batchEnd,
-                          slot_w_v_, 0, TQ_PACK_D, true, false, 'V');
+            PackBatch(keyGm_, packedKGm_, batchStart, batchEnd,
+                      slot_w_k_, 0, TQ_PACK_D, true, false);
+            PackBatch(valueGm_, packedVGm_, batchStart, batchEnd,
+                      slot_w_v_, 0, TQ_PACK_D, true, false);
         }
     }
 
@@ -395,8 +396,6 @@ private:
         auto yFp32 = yFp32Buf_.Get<float>();
         auto distTile = distBuf_.Get<float>();    // [D_TILE][K]
         auto argminRes = argminResultBuf_.Get<float>();
-        auto idxInt32 = idxInt32Buf_.Get<int32_t>();
-        auto idxLocal = idxBuf_.Get<uint8_t>();
         auto packedRow = packedRowBuf_.Get<uint8_t>();
 
         for (uint32_t i = 0; i < m; ++i) {
@@ -427,7 +426,8 @@ private:
                     AscendC::Abs(distRow, distRow, TQ_PACK_K);
                 }
 
-                // Phase 2+3: WholeReduceMin + merge per dimension (each dl reads its own result)
+                // Phase 2+3: reduce each dimension, merge reduce-batch results
+                // on Scalar, and write the final uint8 index directly to the packed row.
                 for (uint32_t dl = 0; dl < tileCnt; ++dl) {
                     auto distRow = distTile[dl * TQ_PACK_K];
                     AscendC::WholeReduceMin<float>(
@@ -451,27 +451,17 @@ private:
                             globalIdx = rawIdx + static_cast<int32_t>(b * TQ_REDUCE_MASK);
                         }
                     }
-                    idxInt32.SetValue(tileStart + dl, globalIdx);
+                    packedRow.SetValue(tileStart + dl, static_cast<uint8_t>(globalIdx));
                     TqSyncSToV();
                 }
             }
 
-            // Convert int32 indices → uint8 and pack
-            for (uint32_t d = 0; d < dCount; ++d) {
-                idxLocal.SetValue(d, static_cast<uint8_t>(idxInt32.GetValue(d)));
-            }
-
-            // Build packed row
-            for (uint32_t k = 0; k < slot_w; ++k) {
+            for (uint32_t k = dCount; k < slot_w; ++k) {
                 packedRow.SetValue(k, (uint8_t)0);
-            }
-            for (uint32_t j = 0; j < dCount; ++j) {
-                packedRow.SetValue(j, idxLocal.GetValue(j));
             }
             if (writeMeta) {
                 write_norm_fp16_le_local(packedRow, 0, norms.GetValue(i));
             }
-            TqSyncSToV();
             copy_packed_ub_to_gm(packedGm, out_base, packedRow, slot_w);
         }
     }
@@ -607,9 +597,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> yFp32Buf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> cbTileBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> idxInt32Buf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminResultBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> idxBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> packedRowBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> kValInt32Buf_;
@@ -688,4 +676,3 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_fused(
         op.ProcessNoKfc();
     }
 }
-
