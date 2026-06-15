@@ -312,9 +312,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
         if isinstance(self.kv_cache_spec, CrossAttentionSpec):
             seq_lens = common_attn_metadata.seq_lens
-            slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)
+            slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)[
+                :num_actual_tokens
+            ]
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
+
+        # Pack-to-cache / _npu_reshape_and_cache expect dense int32 slot indices.
+        # Normalize once here so hot paths do not call .to() / .contiguous() per layer.
+        if slot_mapping.dtype != torch.int32:
+            slot_mapping = slot_mapping.to(torch.int32)
+        if not slot_mapping.is_contiguous():
+            slot_mapping = slot_mapping.contiguous()
 
         attn_state = common_attn_metadata.attn_state
 
@@ -1055,14 +1064,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
             
             if self.kv_cache_dtype == "turboquant":
                 if attn_metadata.num_actual_tokens > 0:
-                    cache_slots = (
-                        slots[: attn_metadata.num_actual_tokens]
-                        if not encoder_decoder
-                        else slots
-                    ).to(torch.int32)
+                    # slot_mapping is int32+contiguous from metadata build().
+                    # K/V are contiguous after Attention.forward view(-1, H, D).
+                    num_tok = attn_metadata.num_actual_tokens
+                    if not encoder_decoder:
+                        key_in = key if key.shape[0] == num_tok else key[:num_tok]
+                        value_in = (
+                            value if value.shape[0] == num_tok else value[:num_tok]
+                        )
+                        cache_slots = (
+                            slots if slots.shape[0] == num_tok else slots[:num_tok]
+                        )
+                    else:
+                        key_in = key
+                        value_in = value
+                        cache_slots = slots
                     turboquant_pack_kv_for_cache_to_cache(
-                        key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
-                        value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
+                        key=key_in,
+                        value=value_in,
                         key_cache=self.key_cache,
                         value_cache=self.value_cache,
                         slot_mapping=cache_slots,
