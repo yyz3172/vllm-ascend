@@ -471,6 +471,8 @@ void turboquant_pack_kv_for_cache_to_cache(
     TORCH_CHECK(tables.valid,
                 "turboquant pack tables not registered; call turboquant_pack_register_tables first");
 
+    // Last-resort fallback: upstream (metadata build + Attention.view) should
+    // already provide contiguous tensors; OpDef AutoContiguous is another layer.
     at::Tensor key_work = key;
     at::Tensor value_work = value;
     at::Tensor slot_work = slot_mapping;
