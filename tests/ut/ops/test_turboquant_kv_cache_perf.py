@@ -57,6 +57,7 @@ from vllm_ascend.ops.turboquant_kv_cache import (
     turboquant_decode_kv_cache_compact,
     turboquant_dequantize_from_packed_bytes,
     turboquant_pack_kv_for_cache,
+    turboquant_pack_kv_for_cache_to_cache,
     turboquant_packed_bytes_per_vector,
     turboquant_quantize_to_packed_bytes,
 )
@@ -207,6 +208,56 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
 
     _assert_pack_close("key (ENCODE_OP=1 vs 0)", fused_k, ref_k)
     _assert_pack_close("value (ENCODE_OP=1 vs 0)", fused_v, ref_v)
+
+
+@requires_npu
+def test_turboquant_pack_kv_for_cache_to_cache_matches_old_path():
+    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_to_cache"):
+        pytest.skip("turboquant_pack_kv_for_cache_to_cache op not available")
+
+    device = torch.device("npu")
+    dtype = torch.float16
+    T, H, D = 7, 2, KV_HEAD_DIM
+    bits_key = bits_value = 8
+    P = turboquant_packed_bytes_per_vector(D, bits=bits_key)
+    B, BS = 2, KV_BLOCK_SIZE
+    key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+    value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+    slot_mapping = torch.tensor([0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device)
+    key_cache_old = torch.zeros(B, BS, H, P, dtype=torch.int8, device=device)
+    value_cache_old = torch.zeros_like(key_cache_old)
+    key_cache_new = torch.zeros_like(key_cache_old)
+    value_cache_new = torch.zeros_like(value_cache_old)
+
+    packed_k, packed_v = turboquant_pack_kv_for_cache(
+        key=key,
+        value=value,
+        bits_key=bits_key,
+        bits_value=bits_value,
+        slot_w_k=P,
+        slot_w_v=P,
+    )
+    torch_npu = pytest.importorskip("torch_npu")
+    torch_npu._npu_reshape_and_cache(
+        key=packed_k,
+        value=packed_v,
+        key_cache=key_cache_old,
+        value_cache=value_cache_old,
+        slot_indices=slot_mapping,
+    )
+    turboquant_pack_kv_for_cache_to_cache(
+        key=key,
+        value=value,
+        key_cache=key_cache_new,
+        value_cache=value_cache_new,
+        slot_mapping=slot_mapping,
+        bits_key=bits_key,
+        bits_value=bits_value,
+    )
+    torch.npu.synchronize()
+    torch.testing.assert_close(key_cache_new.view(torch.uint8), key_cache_old.view(torch.uint8), rtol=0, atol=0)
+    torch.testing.assert_close(value_cache_new.view(torch.uint8), value_cache_old.view(torch.uint8), rtol=0, atol=0)
+
 
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
     if total_token_slots % block_size != 0:

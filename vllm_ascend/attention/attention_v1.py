@@ -64,6 +64,7 @@ from vllm_ascend.ops.turboquant_kv_cache import (
     turboquant_decode_kv_cache_compact,
     turboquant_fused_infer_attention_score_8bit,
     turboquant_pack_kv_for_cache,
+    turboquant_pack_kv_for_cache_to_cache,
     turboquant_packed_bytes_per_vector,
 )
 from vllm_ascend.ascend_config import get_ascend_config
@@ -1054,20 +1055,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             
             if self.kv_cache_dtype == "turboquant":
                 if attn_metadata.num_actual_tokens > 0:
-                    packed_k, packed_v = turboquant_pack_kv_for_cache(
+                    cache_slots = (
+                        slots[: attn_metadata.num_actual_tokens]
+                        if not encoder_decoder
+                        else slots
+                    ).to(torch.int32)
+                    turboquant_pack_kv_for_cache_to_cache(
                         key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                         value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
-                        bits_key=self.turboquant_kv_bits_key,
-                        bits_value=self.turboquant_kv_bits_value,
-                        slot_w_k=self.key_cache.shape[-1],
-                        slot_w_v=self.value_cache.shape[-1],
-                    )
-                    torch_npu._npu_reshape_and_cache(
-                        key=packed_k,
-                        value=packed_v,
                         key_cache=self.key_cache,
                         value_cache=self.value_cache,
-                        slot_indices=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots,
+                        slot_mapping=cache_slots,
+                        bits_key=self.turboquant_kv_bits_key,
+                        bits_value=self.turboquant_kv_bits_value,
                     )
                 if self.is_kv_producer:
                     attn_metadata.reshape_cache_event.record()
