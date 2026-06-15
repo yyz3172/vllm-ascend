@@ -646,6 +646,7 @@ def _ensure_quantizer_fp16_views(
 
 _turboquant_pack_tables_registered: set[tuple[int, int, int]] = set()
 _turboquant_pack_v2_ops_available: bool | None = None
+_turboquant_pack_to_cache_op_available: bool | None = None
 
 
 def _turboquant_pack_reg_key(
@@ -663,6 +664,15 @@ def _turboquant_pack_v2_ops_ready() -> bool:
             and _c_ascend_turboquant_op_available("turboquant_pack_register_tables")
         )
     return _turboquant_pack_v2_ops_available
+
+
+def _turboquant_pack_to_cache_op_ready() -> bool:
+    global _turboquant_pack_to_cache_op_available
+    if _turboquant_pack_to_cache_op_available is None:
+        _turboquant_pack_to_cache_op_available = _c_ascend_turboquant_op_available(
+            "turboquant_pack_kv_for_cache_to_cache"
+        )
+    return _turboquant_pack_to_cache_op_available
 
 
 def ensure_turboquant_pack_tables_registered(
@@ -785,6 +795,62 @@ def turboquant_pack_kv_for_cache(
     return (
         packed_k.view(dtype=torch.int8),
         packed_v.view(dtype=torch.int8),
+    )
+
+
+def turboquant_pack_kv_for_cache_to_cache(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    bits_key: int,
+    bits_value: int,
+) -> None:
+    if key.numel() == 0:
+        return
+    if value.dtype != key.dtype:
+        raise ValueError("Key/value dtypes must match for turboquant.")
+    if slot_mapping.dtype != torch.int32:
+        raise ValueError("TurboQuant fused pack-to-cache expects int32 slot_mapping.")
+
+    head_size = key.shape[-1]
+    use_to_cache = (
+        bits_key == bits_value == 8
+        and head_size == 128
+        and key.dtype in (torch.float16, torch.bfloat16)
+        and _turboquant_pack_to_cache_op_ready()
+        and ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
+    )
+    if use_to_cache:
+        torch.ops._C_ascend.turboquant_pack_kv_for_cache_to_cache(
+            key,
+            value,
+            slot_mapping.contiguous(),
+            key_cache.view(dtype=torch.uint8),
+            value_cache.view(dtype=torch.uint8),
+            key_cache.shape[-1],
+            value_cache.shape[-1],
+        )
+        return
+
+    packed_k, packed_v = turboquant_pack_kv_for_cache(
+        key=key,
+        value=value,
+        bits_key=bits_key,
+        bits_value=bits_value,
+        slot_w_k=key_cache.shape[-1],
+        slot_w_v=value_cache.shape[-1],
+    )
+    if torch_npu is None:
+        raise RuntimeError("torch_npu is required for TurboQuant cache scatter.")
+    torch_npu._npu_reshape_and_cache(
+        key=packed_k,
+        value=packed_v,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_indices=slot_mapping,
     )
 
 

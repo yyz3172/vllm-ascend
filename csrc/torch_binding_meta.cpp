@@ -261,6 +261,23 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache_meta(
         at::empty_symint(shape_v, opts_v));
 }
 
+void turboquant_pack_kv_for_cache_to_cache_meta(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    (void)key;
+    (void)value;
+    (void)slot_mapping;
+    (void)key_cache;
+    (void)value_cache;
+    (void)slot_w_k;
+    (void)slot_w_v;
+}
+
 std::tuple<at::Tensor, at::Tensor> turboquant_decode_paged_8bit_meta(
     const at::Tensor &key_cache,
     const at::Tensor &value_cache,
@@ -753,6 +770,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // TurboQuant packed encode (4-bit MSE quant)
     ops.impl("turboquant_encode_packed_blocks", &vllm_ascend::meta::turboquant_encode_packed_blocks_meta);
     ops.impl("turboquant_pack_kv_for_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
 
     ops.impl("turboquant_pack_register_tables", &vllm_ascend::meta::turboquant_pack_register_tables_meta);
     ops.impl("turboquant_fused_infer_attention_score_8bit", &vllm_ascend::meta::turboquant_fused_infer_attention_score_8bit_meta);
