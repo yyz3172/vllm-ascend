@@ -824,10 +824,11 @@ def turboquant_pack_kv_for_cache_to_cache(
         and ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
     )
     if use_to_cache:
+        # slot_mapping layout is normalized in AscendMetadata.build().
         torch.ops._C_ascend.turboquant_pack_kv_for_cache_to_cache(
             key,
             value,
-            slot_mapping.contiguous(),
+            slot_mapping,
             key_cache.view(dtype=torch.uint8),
             value_cache.view(dtype=torch.uint8),
             key_cache.shape[-1],
