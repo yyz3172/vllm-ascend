@@ -8,7 +8,7 @@
 
 - 支持 fp16/bf16 的 key/value，head size 固定为 128。
 - 支持 8-bit TurboQuant pack，输出 `packed_key` 和 `packed_value`。
-- 默认每批次最多处理 32 行，host tiling 会把更大的 `vec_per_core` 截断到 32。
+- 默认每批次最多处理 64 行，host tiling 会把更大的 `vec_per_core` 截断到 64。
 - kernel task type 固定为 `KERNEL_TYPE_AIV_ONLY`，不注册 Matmul 对象，不申请 KFC
   system workspace。
 - 前端 Python 调用不变；`torch_binding.cpp` 中的
