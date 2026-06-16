@@ -658,9 +658,9 @@ def _turboquant_pack_reg_key(
 def _turboquant_pack_v2_ops_ready() -> bool:
     """Check v2/register ops once, cache result for hot path."""
     global _turboquant_pack_v2_ops_available
-    if _turboquant_pack_v2_ops_available is None:
+    if _turboquant_pack_v2_ops_available is not True:
         _turboquant_pack_v2_ops_available = (
-            _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache")
+            _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_v2")
             and _c_ascend_turboquant_op_available("turboquant_pack_register_tables")
         )
     return _turboquant_pack_v2_ops_available
@@ -668,7 +668,7 @@ def _turboquant_pack_v2_ops_ready() -> bool:
 
 def _turboquant_pack_to_cache_op_ready() -> bool:
     global _turboquant_pack_to_cache_op_available
-    if _turboquant_pack_to_cache_op_available is None:
+    if _turboquant_pack_to_cache_op_available is not True:
         _turboquant_pack_to_cache_op_available = _c_ascend_turboquant_op_available(
             "turboquant_pack_kv_for_cache_to_cache"
         )
@@ -750,7 +750,7 @@ def turboquant_pack_kv_for_cache(
             or ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
         )
     if use_v2:
-        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
+        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2(
             key,
             value,
             slot_w_k,
