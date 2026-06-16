@@ -35,8 +35,8 @@ ge::graphStatus FillKfcCubeTiling(
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
 
-    // KFC mode: A from VECOUT, B from GM, C to GM.
-    // L1 holds both xBatch (A input) and yBatch (C output), so constrain baseM.
+    // KFC mode: A from VECOUT, B from GM, C to VECIN.
+    // Keep baseM conservative because local A/C buffers are allocated per AIV.
     constexpr uint32_t mmDataTypeSize = 2;  // fp16
     const uint32_t l1Usable = static_cast<uint32_t>(l1Size);
     // baseM*baseK + baseM*baseN <= l1Usable (A + C share L1)
@@ -61,9 +61,7 @@ ge::graphStatus FillKfcCubeTiling(
     }
 
     // Override with L1-aware baseM; keep auto baseN/baseK from GetTiling.
-    // Force usedCoreNum=1: each AIV calls IterateAll independently; the Cube
-    // tiling must not reserve multi-core workspace that would overlap with
-    // our per-core scratch at TQ_PER_CORE_SCRATCH_BASE.
+    // Force usedCoreNum=1: each AIV calls IterateAll independently.
     cubeTiling.set_baseM(static_cast<uint32_t>(baseM));
     cubeTiling.set_usedCoreNum(1);
     return ge::GRAPH_SUCCESS;
@@ -118,9 +116,9 @@ static ge::graphStatus TurboquantPackKvForCacheV2TilingFunc(gert::TilingContext*
         matmul_tiling::DataType::DT_FLOAT16,
         false);
     tilingApi.SetCType(
-        matmul_tiling::TPosition::GM,
+        matmul_tiling::TPosition::VECIN,
         matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_FLOAT);
+        matmul_tiling::DataType::DT_FLOAT16);
     tilingApi.SetBiasType(
         matmul_tiling::TPosition::GM,
         matmul_tiling::CubeFormat::ND,
@@ -163,14 +161,8 @@ static ge::graphStatus TurboquantPackKvForCacheV2TilingFunc(gert::TilingContext*
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    // Workspace: 16 MB shared for KFC internals + per-core scratch for Cube C output.
-    // KFC message queues are indexed per-block within the shared region.
-    constexpr uint64_t kPerCoreScratchBase = 512 * 1024;
-    constexpr uint64_t kPerCoreScratch = TQ_PACK_MAX_BATCH_M * TQ_PACK_N * sizeof(float);
-    workspaces[0] = kPerCoreScratchBase + dataCores * kPerCoreScratch;
-    if (workspaces[0] < SYSTEM_NEED_WORKSPACE) {
-        workspaces[0] = SYSTEM_NEED_WORKSPACE;
-    }
+    // KFC message queues and CANN internal workspace.
+    workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
     context->SetTilingKey(TQ_PACK_TILING_KEY_KFC);
     return ge::GRAPH_SUCCESS;
