@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Fused TurboQuant pack for KV cache (fp16/bf16, aligned with TurboQuantMSE v1).
+// Fused TurboQuant pack for KV cache v3 (fp16/bf16, AIV-only vector rotate).
 //
 // Reference (Python):
 //   norms = vector_norm(x, dim=-1, keepdim=True)
@@ -22,12 +22,11 @@
 //   d = (y.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()
 //   idx = d.argmin(dim=-1)
 //
-// Per AICore: normalize all assigned rows, then ONE matmul [M,128]@[128,128],
-// not M separate M=1 matmuls (avoids Cube padding waste).
+// Per AIV: normalize assigned rows, compute rotate by vector instructions, then
+// encode to packed KV rows.  This variant intentionally does not use Cube/KFC.
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#include "lib/matmul_intf.h"
 
 using namespace AscendC;
 
@@ -37,12 +36,9 @@ static constexpr int TQ_PACK_D = 128;
 static constexpr int TQ_PACK_K = 256;
 static constexpr uint32_t TQ_UB_ALIGN = 32;
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
-// Max rows per batch for static Matmul tiling / UB batch buffers.
+// Max rows per batch for UB batch buffers.
 static constexpr uint32_t TQ_MAX_BATCH_M = 32;
-static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
-static constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
-static constexpr uint32_t TQ_ROT_LOCAL_WORKSPACE_BYTES = TQ_MAX_BATCH_M * TQ_ROT_K * sizeof(half);
 static constexpr float TQ_NORM_EPS_F = 1e-10f;
 static constexpr uint32_t TQ_REDUCE_MASK = 64;  // max mask for float WholeReduceMin
 static constexpr uint32_t TQ_REDUCE_BATCHES = (TQ_PACK_K + TQ_REDUCE_MASK - 1) / TQ_REDUCE_MASK;  // 4
@@ -163,18 +159,10 @@ __aicore__ inline void copy_packed_ub_to_gm(
     AscendC::DataCopyPad(packedGm[gm_offset], packedLocal, copyParams);
 }
 
-using TqRotateAT = MatmulType<TPosition::VECOUT, CubeFormat::ND, half>;
-using TqRotateBT = MatmulType<TPosition::GM, CubeFormat::ND, half>;
-using TqRotateCT = MatmulType<TPosition::VECIN, CubeFormat::ND, half>;
-using TqRotateBiasT = MatmulType<TPosition::GM, CubeFormat::ND, half>;
-
-using TqRotateMatmulOp =
-    AscendC::Matmul<TqRotateAT, TqRotateBT, TqRotateCT, TqRotateBiasT>;
-
-class TurboquantPackKVForCacheV2 {
+class TurboquantPackKVForCacheV3 {
 public:
-    __aicore__ inline explicit TurboquantPackKVForCacheV2(AscendC::TPipe* pipe, TqRotateMatmulOp* rotateMm)
-        : pipe_(pipe), rotateMm_(rotateMm) {}
+    __aicore__ inline explicit TurboquantPackKVForCacheV3(AscendC::TPipe* pipe)
+        : pipe_(pipe) {}
 
     __aicore__ inline void Init(
         GM_ADDR key,
@@ -188,6 +176,7 @@ public:
         uint32_t slot_w_k,
         uint32_t slot_w_v,
         uint32_t vecPerCore) {
+        (void)rawWorkspace;
         nVec_ = nVec;
         slot_w_k_ = slot_w_k;
         slot_w_v_ = slot_w_v;
@@ -227,22 +216,19 @@ public:
         // NormalizeBatch: fp32 row + fp32 ReduceSum tmp (2 * TQ_PACK_D floats).
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
         pipe_->InitBuffer(packedRowQue_, 2, TQ_MAX_BATCH_M * packedStride_ * sizeof(uint8_t));
-        pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
-
-        matmulReady_ = (rawWorkspace != nullptr);
-        if (matmulReady_ && TqIsAiv()) {
+        if (TqIsAiv()) {
             LoadStaticTablesToUb();
         }
     }
 
     __aicore__ inline void Process() {
-        if (!matmulReady_ || !TqIsAiv()) {
+        if (!TqIsAiv()) {
             return;
         }
         // On 910B3 each blockIdx is one AIV (sub-block indices alternate
         // 0,1,0,1… — all are independent workers).  Use blockIdx directly.
-        // dataCores is always 16 for KFC mode; K/V rows are distributed evenly
-        // and each core loops in sub-batches of vecPerCore_ rows.
+        // K/V rows are distributed evenly and each core loops in sub-batches
+        // of vecPerCore_ rows.
         const uint32_t dataCores = 16;
         const uint32_t core = AscendC::GetBlockIdx();
         const uint32_t totalRows = nVec_ * 2;
@@ -385,26 +371,44 @@ private:
         }
     }
 
-    // Cube Matmul: half A(VECOUT) × half B(GM) → half C(VECIN).
-    // Keep the rotate result in local memory and let EncodeBatch consume it
-    // directly, avoiding the previous explicit GM scratch + GM->UB readback.
-    __aicore__ inline void RotateBatchMatmul(
+    // Vector rotate matmul: half A(VECOUT) x half B(UB) -> half C(VECIN).
+    // It keeps the same output layout as the v2 Cube path for comparison.
+    __aicore__ inline void RotateBatchMatmulVector(
         AscendC::LocalTensor<half>& xUnitBatch,
         AscendC::LocalTensor<half>& yBatch,
         uint32_t m,
         uint32_t mPad,
         uint32_t dBase,
         uint32_t dCount) {
-        rotateMm_->SetOrgShape(mPad, TQ_ROT_N, TQ_ROT_K);
-        rotateMm_->SetSingleShape(m, dCount, TQ_ROT_K);
-        rotateMm_->SetTensorA(xUnitBatch, false);
-        rotateMm_->SetTensorB(rotationTGm_[dBase], false);
-        auto rotateWorkspace = rotateWorkBuf_.Get<uint8_t>();
-        rotateMm_->SetLocalWorkspace(rotateWorkspace);
-        // IterateAll: single atomic KFC message — safe when 2 AIVs share one AIC
-        // in MIX mode (no tile interleaving across concurrent AIVs).
-        rotateMm_->IterateAll(yBatch);
-        rotateMm_->End();
+        (void)mPad;
+        auto rotationTLocal = rotationTBuf_.Get<half>();
+        auto acc = yFp32Buf_.Get<float>();
+        auto rotFp32 = reduceOutBuf_.Get<float>();
+        auto term = reduceOutBuf_.Get<float>()[TQ_PACK_D];
+
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t xOff = i * TQ_PACK_D;
+            float xVals[TQ_PACK_D];
+            TqSyncVToS();
+            for (uint32_t k = 0; k < TQ_PACK_D; ++k) {
+                xVals[k] = static_cast<float>(xUnitBatch.GetValue(xOff + k));
+            }
+            TqSyncSToV();
+
+            AscendC::Duplicate(acc, 0.0f, dCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            for (uint32_t k = 0; k < TQ_PACK_D; ++k) {
+                const uint32_t rotOff = k * TQ_PACK_D + dBase;
+                AscendC::Cast(rotFp32, rotationTLocal[rotOff], AscendC::RoundMode::CAST_NONE, dCount);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(term, rotFp32, xVals[k], dCount);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Add(acc, acc, term, dCount);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Cast(yBatch[i * TQ_ROT_N], acc, AscendC::RoundMode::CAST_NONE, dCount);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
     }
 
     // Vectorized argmin per dimension using Duplicate/Sub/Abs + WholeReduceMin.
@@ -542,7 +546,7 @@ private:
         aBatchQue_.EnQue(aBatch);
         auto aReady = aBatchQue_.DeQue<half>();
 
-        RotateBatchMatmul(aReady, yBatch, m, mPad, 0, TQ_PACK_D);
+        RotateBatchMatmulVector(aReady, yBatch, m, mPad, 0, TQ_PACK_D);
         aBatchQue_.FreeTensor(aReady);
         yBatchQue_.EnQue(yBatch);
         auto yReady = yBatchQue_.DeQue<half>();
@@ -566,12 +570,10 @@ private:
 
 private:
     AscendC::TPipe* pipe_ = nullptr;
-    TqRotateMatmulOp* rotateMm_ = nullptr;
     uint32_t nVec_ = 0;
     uint32_t slot_w_k_ = 0;
     uint32_t slot_w_v_ = 0;
     uint32_t vecPerCore_ = 1;
-    bool matmulReady_ = false;
 
     AscendC::TQue<AscendC::TPosition::VECIN, 2> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECOUT, 2> aBatchQue_;
@@ -588,7 +590,6 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminResultBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bf16SquareBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     uint32_t maxSlotW_ = 0;
     uint32_t packedStride_ = 0;
 
@@ -602,7 +603,7 @@ private:
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_v2(
+extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_v3(
     GM_ADDR key,
     GM_ADDR value,
     GM_ADDR codebook,
@@ -621,17 +622,10 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_v2(
     if (!TILING_KEY_IS(0)) {
         return;
     }
-    KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
-    auto* wsPtr = reinterpret_cast<__gm__ uint8_t*>(workspace);
-    AscendC::SetSysWorkspace(wsPtr);
-    if (GetSysWorkSpacePtr() == nullptr) {
-        return;
-    }
+    (void)workspace;
+    KERNEL_TASK_TYPE(0, KERNEL_TYPE_AIV_ONLY);
     AscendC::TPipe pipe;
-    TqRotateMatmulOp rotateMm;
-    TCubeTiling cubeTiling = tilingData.cubeTiling;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &cubeTiling);
-    TurboquantPackKVForCacheV2 op(&pipe, &rotateMm);
+    TurboquantPackKVForCacheV3 op(&pipe);
     op.Init(
         key,
         value,
@@ -639,7 +633,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache_v2(
         rotationPtr,
         packedKPtr,
         packedVPtr,
-        wsPtr,
+        nullptr,
         tilingData.nVec,
         tilingData.slotWK,
         tilingData.slotWV,

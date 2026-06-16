@@ -27,8 +27,13 @@
 - K/V 按线性行号合并搬入：先搬 key，key 尾部不足一个 `vecPerCore_` 批次时，
   同一批次继续搬 value 到同一个 `TPosition::VECIN` 缓冲区；归一化后再复制到
   `TPosition::VECOUT` 作为 KFC Matmul 的 A 输入，保持原版稳定的 Cube 输入位置。
+- Rotate Matmul 的 C 输出直接写入 `TPosition::VECIN` 的 `yBatch`，后续
+  `EncodeBatch` 直接消费本地结果；算子不再为 C 输出申请 per-core GM scratch，
+  也不再执行显式的 GM 回拷和 `float -> half` 转换。
+- `PackMergedBatch` 只保留搬入、计算、搬出三段；归一化、padding、Cube Rotate
+  Matmul、encode 统一封装在 `Compute` 中。
 - 每批次最多处理 32 行。即使前端传入更大的 `vecPerCore`，host tiling 和 kernel
-  初始化都会限制到 32，以降低 UB 队列和 Cube C 回拷缓冲占用。
+  初始化都会限制到 32，以降低 UB 队列和 Matmul 本地输出缓冲占用。
 - 搬入阶段不提前 padding；仅在 Rotate Matmul 前按 16 行对齐补零，encode 和搬出阶段
   只处理真实行数，补齐行不会写回。
 - pack 后的结果先写入 `TPosition::VECOUT` 队列，队列内部行 stride 按 32B
