@@ -37,8 +37,8 @@ static constexpr int TQ_PACK_D = 128;
 static constexpr int TQ_PACK_K = 256;
 static constexpr uint32_t TQ_UB_ALIGN = 32;
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
-// Max rows per core for static Matmul tiling / UB batch buffers.
-static constexpr uint32_t TQ_MAX_BATCH_M = 128;
+// Max rows per batch for static Matmul tiling / UB batch buffers.
+static constexpr uint32_t TQ_MAX_BATCH_M = 32;
 static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr uint32_t TQ_SINGLE_ROT_M_PAD = 16;
@@ -74,11 +74,15 @@ using TqInputT = half;
 
 // Per-core Cube C scratch layout within the workspace.
 constexpr uint64_t TQ_PER_CORE_CUBEC_BYTES = static_cast<uint64_t>(TQ_MAX_BATCH_M) * TQ_ROT_N * sizeof(float);
-constexpr uint64_t TQ_PER_CORE_SCRATCH = TQ_PER_CORE_CUBEC_BYTES;  // 64 KB per core
+constexpr uint64_t TQ_PER_CORE_SCRATCH = TQ_PER_CORE_CUBEC_BYTES;  // 16 KB per core
 constexpr uint64_t TQ_PER_CORE_SCRATCH_BASE = 512 * 1024;
 
 __aicore__ inline uint32_t AlignUp16(uint32_t x) {
     return (x + TQ_CUBE_M_ALIGN - 1) / TQ_CUBE_M_ALIGN * TQ_CUBE_M_ALIGN;
+}
+
+__aicore__ inline uint32_t AlignUp32(uint32_t x) {
+    return (x + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
 }
 
 // csrc/kernels build has no PipeSync / SetWaitFlag; use SetFlag+WaitFlag (moe_gating_top_k).
@@ -152,7 +156,7 @@ __aicore__ inline void write_norm_fp16_le_local(
 __aicore__ inline void copy_packed_ub_to_gm(
     AscendC::GlobalTensor<uint8_t>& packedGm,
     uint64_t gm_offset,
-    AscendC::LocalTensor<uint8_t>& packedLocal,
+    AscendC::LocalTensor<uint8_t> packedLocal,
     uint32_t nbytes) {
     TqSyncSToMte3();
     AscendC::DataCopyExtParams copyParams{1, nbytes, 0, 0, 0};
@@ -187,6 +191,8 @@ public:
         nVec_ = nVec;
         slot_w_k_ = slot_w_k;
         slot_w_v_ = slot_w_v;
+        maxSlotW_ = slot_w_k_ > slot_w_v_ ? slot_w_k_ : slot_w_v_;
+        packedStride_ = AlignUp32(maxSlotW_);
         vecPerCore_ = vecPerCore;
         if (vecPerCore_ > TQ_MAX_BATCH_M) {
             vecPerCore_ = TQ_MAX_BATCH_M;
@@ -200,14 +206,16 @@ public:
         packedVGm_.SetGlobalBuffer(packed_v, (uint64_t)nVec_ * slot_w_v_);
 
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
-        pipe_->InitBuffer(xBatchQue_, 1, batchElems * sizeof(half));
-        pipe_->InitBuffer(yBatchQue_, 1, batchElems * sizeof(half));
+        pipe_->InitBuffer(xBatchQue_, 2, batchElems * sizeof(half));
+        pipe_->InitBuffer(aBatchQue_, 2, batchElems * sizeof(half));
+        pipe_->InitBuffer(yBatchQue_, 2, batchElems * sizeof(half));
 #if TQ_INPUT_IS_BF16
-        pipe_->InitBuffer(xBatchInputQue_, 1, batchElems * sizeof(TqInputT));
+        pipe_->InitBuffer(xBatchInputQue_, 2, batchElems * sizeof(TqInputT));
 #endif
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * sizeof(half));
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
+        pipe_->InitBuffer(rotationTBuf_, TQ_PACK_D * TQ_PACK_D * sizeof(half));
         // distBuf: tiled distance vectors [D_TILE][K] (16×256×4 = 16 KiB)
         pipe_->InitBuffer(distBuf_, TQ_D_TILE * TQ_PACK_K * sizeof(float) + 256);
         // yFp32Buf: fp32 y row [D=128]
@@ -217,8 +225,7 @@ public:
         pipe_->InitBuffer(argminResultBuf_, TQ_REDUCE_BATCHES * 2 * sizeof(float));
         // NormalizeBatch: fp32 row + fp32 ReduceSum tmp (2 * TQ_PACK_D floats).
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
-        const uint32_t maxSlotW = slot_w_k_ > slot_w_v_ ? slot_w_k_ : slot_w_v_;
-        pipe_->InitBuffer(packedRowBuf_, maxSlotW * sizeof(uint8_t));
+        pipe_->InitBuffer(packedRowQue_, 2, TQ_MAX_BATCH_M * packedStride_ * sizeof(uint8_t));
         pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
         // fp32 UB buffer for Cube C output (after DataCopy from GM)
         pipe_->InitBuffer(yCubeFp32Buf_, TQ_MAX_BATCH_M * TQ_ROT_N * sizeof(float));
@@ -234,6 +241,9 @@ public:
                 reinterpret_cast<__gm__ float*>(coreScratch),
                 (uint64_t)TQ_MAX_BATCH_M * TQ_ROT_N);
         }
+        if (matmulReady_ && TqIsAiv()) {
+            LoadStaticTablesToUb();
+        }
     }
 
     __aicore__ inline void Process() {
@@ -242,32 +252,44 @@ public:
         }
         // On 910B3 each blockIdx is one AIV (sub-block indices alternate
         // 0,1,0,1… — all are independent workers).  Use blockIdx directly.
-        // dataCores is always 16 for KFC mode; rows are distributed evenly
+        // dataCores is always 16 for KFC mode; K/V rows are distributed evenly
         // and each core loops in sub-batches of vecPerCore_ rows.
         const uint32_t dataCores = 16;
         const uint32_t core = AscendC::GetBlockIdx();
-        const uint32_t rowsPerCore = (nVec_ + dataCores - 1) / dataCores;
+        const uint32_t totalRows = nVec_ * 2;
+        const uint32_t rowsPerCore = (totalRows + dataCores - 1) / dataCores;
         const uint32_t coreStart = core * rowsPerCore;
-        if (coreStart >= nVec_) {
+        if (coreStart >= totalRows) {
             return;
         }
-        const uint32_t coreEnd = coreStart + rowsPerCore > nVec_
-            ? nVec_ : coreStart + rowsPerCore;
+        const uint32_t coreEnd = coreStart + rowsPerCore > totalRows
+            ? totalRows : coreStart + rowsPerCore;
 
-        // Process assigned rows in sub-batches of up to vecPerCore_ (128).
+        // Process assigned rows in sub-batches of up to vecPerCore_ (32).
         for (uint32_t batchStart = coreStart; batchStart < coreEnd;
              batchStart += vecPerCore_) {
             const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
                 ? coreEnd : batchStart + vecPerCore_;
 
-            PackBatch(keyGm_, packedKGm_, batchStart, batchEnd,
-                      slot_w_k_, 0, TQ_PACK_D, true);
-            PackBatch(valueGm_, packedVGm_, batchStart, batchEnd,
-                      slot_w_v_, 0, TQ_PACK_D, true);
+            PackMergedBatch(batchStart, batchEnd);
         }
     }
 
 private:
+    __aicore__ inline void LoadStaticTablesToUb() {
+        auto codebookLocal = codebookBuf_.Get<half>();
+        auto rotationTLocal = rotationTBuf_.Get<half>();
+        AscendC::DataCopy(codebookLocal, codebookGm_[0], TQ_PACK_K);
+        AscendC::DataCopy(rotationTLocal, rotationTGm_[0], TQ_PACK_D * TQ_PACK_D);
+        TqSyncMte2ToV();
+
+        auto cbFp32 = cbTileBuf_.Get<float>();
+        AscendC::Cast(cbFp32, codebookLocal, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(cbFp32[TQ_PACK_D], codebookLocal[TQ_PACK_D], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
     // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
     // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids fp16 overflow.
     __aicore__ inline void NormalizeBatch(
@@ -280,7 +302,6 @@ private:
             const uint32_t rowOff = i * TQ_PACK_D;
 
             AscendC::Cast(fp32Row, xBatch[rowOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            TqSyncMte2ToV();
             AscendC::Mul(fp32Row, fp32Row, fp32Row, TQ_PACK_D);
             AscendC::ReduceSum<float>(normAcc, fp32Row, fp32Tmp, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -336,33 +357,20 @@ private:
     __aicore__ inline void EncodeBatch(
         AscendC::LocalTensor<half>& yBatch,
         AscendC::LocalTensor<half>& norms,
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint32_t start,
+        AscendC::LocalTensor<uint8_t>& packedBatch,
         uint32_t m,
-        uint32_t slot_w,
         uint32_t dBase,
         uint32_t dCount,
         bool writeMeta) {
-        // Load codebook half → float (split into two 128-element Casts for safety)
-        auto codebookLocal = codebookBuf_.Get<half>();
-        AscendC::DataCopy(codebookLocal, codebookGm_[0], TQ_PACK_K);
-        TqSyncMte2ToV();
-
+        // codebook fp32 table is prepared once in UB during Init.
         auto cbFp32 = cbTileBuf_.Get<float>();
-        AscendC::Cast(cbFp32, codebookLocal, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(cbFp32[TQ_PACK_D], codebookLocal[TQ_PACK_D], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-
         auto yFp32 = yFp32Buf_.Get<float>();
         auto distTile = distBuf_.Get<float>();    // [D_TILE][K]
         auto argminRes = argminResultBuf_.Get<float>();
-        auto packedRow = packedRowBuf_.Get<uint8_t>();
 
         for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t vecIdx = start + i;
-            const uint64_t out_base = (uint64_t)vecIdx * slot_w;
             const uint32_t yOff = i * TQ_ROT_N;
+            auto packedRow = packedBatch[i * packedStride_];
 
             // Cast y row half → float, then batch-read all values
             AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, dCount);
@@ -417,46 +425,80 @@ private:
                 }
             }
 
-            for (uint32_t k = dCount; k < slot_w; ++k) {
+            for (uint32_t k = dCount; k < packedStride_; ++k) {
                 packedRow.SetValue(k, (uint8_t)0);
             }
             if (writeMeta) {
                 write_norm_fp16_le_local(packedRow, 0, norms.GetValue(i));
             }
-            copy_packed_ub_to_gm(packedGm, out_base, packedRow, slot_w);
         }
     }
 
-    __aicore__ inline void PackBatch(
-        const AscendC::GlobalTensor<TqInputT>& xGm,
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint32_t start,
-        uint32_t end,
-        uint32_t slot_w,
-        uint32_t dBase,
-        uint32_t dCount,
-        bool writeMeta) {
+    __aicore__ inline void CopyInMergedBatch(uint32_t start, uint32_t end) {
         const uint32_t m = end - start;
-        const uint32_t mPad = AlignUp16(m);
-
         auto xBatch = xBatchQue_.AllocTensor<half>();
-        auto yBatch = yBatchQue_.AllocTensor<half>();
-        auto norms = normsBuf_.Get<half>();
-
 #if TQ_INPUT_IS_BF16
         auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
+        uint32_t inputOffset = 0;
+#endif
+        uint32_t dstOffset = 0;
+        uint32_t linear = start;
+        while (linear < end) {
+            const bool isKey = linear < nVec_;
+            const uint32_t srcRow = isKey ? linear : (linear - nVec_);
+            const uint32_t srcRemain = nVec_ - srcRow;
+            const uint32_t take = (end - linear) < srcRemain ? (end - linear) : srcRemain;
+#if TQ_INPUT_IS_BF16
+            auto src = isKey ? keyGm_[(uint64_t)srcRow * TQ_PACK_D]
+                             : valueGm_[(uint64_t)srcRow * TQ_PACK_D];
+            AscendC::DataCopy(xBatchInput[inputOffset], src, take * TQ_PACK_D);
+            inputOffset += take * TQ_PACK_D;
+#else
+            auto src = isKey ? keyGm_[(uint64_t)srcRow * TQ_PACK_D]
+                             : valueGm_[(uint64_t)srcRow * TQ_PACK_D];
+            AscendC::DataCopy(xBatch[dstOffset], src, take * TQ_PACK_D);
+            dstOffset += take * TQ_PACK_D;
+#endif
+            linear += take;
+        }
+#if TQ_INPUT_IS_BF16
+        xBatchInputQue_.EnQue(xBatchInput);
+        auto inputReady = xBatchInputQue_.DeQue<TqInputT>();
         auto xBatchFp32 = yCubeFp32Buf_.Get<float>();
-        AscendC::DataCopy(xBatchInput, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
-        TqSyncMte2ToV();
-        AscendC::Cast(xBatchFp32, xBatchInput, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
+        AscendC::Cast(xBatchFp32, inputReady, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(xBatch, xBatchFp32, AscendC::RoundMode::CAST_ROUND, m * TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
-        xBatchInputQue_.FreeTensor(xBatchInput);
-#else
-        AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
-        TqSyncMte2ToV();
+        xBatchInputQue_.FreeTensor(inputReady);
 #endif
+        xBatchQue_.EnQue(xBatch);
+    }
+
+    __aicore__ inline void CopyOutPackedBatch(
+        AscendC::LocalTensor<uint8_t>& packedBatch,
+        uint32_t start,
+        uint32_t m) {
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t linear = start + i;
+            auto packedRow = packedBatch[i * packedStride_];
+            if (linear < nVec_) {
+                copy_packed_ub_to_gm(packedKGm_, (uint64_t)linear * slot_w_k_, packedRow, slot_w_k_);
+            } else {
+                const uint32_t valueRow = linear - nVec_;
+                copy_packed_ub_to_gm(packedVGm_, (uint64_t)valueRow * slot_w_v_, packedRow, slot_w_v_);
+            }
+        }
+    }
+
+    __aicore__ inline void PackMergedBatch(uint32_t start, uint32_t end) {
+        const uint32_t m = end - start;
+        const uint32_t mPad = AlignUp16(m);
+
+        CopyInMergedBatch(start, end);
+        auto xBatch = xBatchQue_.DeQue<half>();
+        auto yBatch = yBatchQue_.AllocTensor<half>();
+        auto packedBatch = packedRowQue_.AllocTensor<uint8_t>();
+        auto norms = normsBuf_.Get<half>();
 
         if (mPad > m) {
             AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
@@ -464,68 +506,23 @@ private:
         }
 
         NormalizeBatch(xBatch, norms, m);
-        RotateBatchMatmul(xBatch, yBatch, m, mPad, dBase, dCount);
-        EncodeBatch(yBatch, norms, packedGm, start, m, slot_w, dBase, dCount, writeMeta);
-
-        yBatchQue_.FreeTensor(yBatch);
-        xBatchQue_.FreeTensor(xBatch);
-    }
-
-    // PrintTimeStamp descId mapping:
-    //   0 = start, 1 = after DataCopy, 2 = after Normalize,
-    //   3 = after Rotate, 4 = after Encode
-    // K uses descIds [0..4], V uses descIds [10..14].
-    __aicore__ inline void PackBatchPerf(
-        const AscendC::GlobalTensor<TqInputT>& xGm,
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint32_t start,
-        uint32_t end,
-        uint32_t slot_w,
-        uint32_t dBase,
-        uint32_t dCount,
-        bool writeMeta,
-        char tag) {
-        const uint32_t m = end - start;
-        const uint32_t mPad = AlignUp16(m);
-        const uint32_t base = (tag == 'K') ? 65577 : 65588;
-
-        auto xBatch = xBatchQue_.AllocTensor<half>();
-        auto yBatch = yBatchQue_.AllocTensor<half>();
-        auto norms = normsBuf_.Get<half>();
-
-        // AscendC::printf("[TQ_PERF] %c m=%u\n", tag, m);
-        // AscendC::PrintTimeStamp(base);
-
-#if TQ_INPUT_IS_BF16
-        auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
-        auto xBatchFp32 = yCubeFp32Buf_.Get<float>();
-        AscendC::DataCopy(xBatchInput, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
-        TqSyncMte2ToV();
-        AscendC::Cast(xBatchFp32, xBatchInput, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
+        auto aBatch = aBatchQue_.AllocTensor<half>();
+        AscendC::Adds(aBatch, xBatch, static_cast<half>(0.0), mPad * TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(xBatch, xBatchFp32, AscendC::RoundMode::CAST_ROUND, m * TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        xBatchInputQue_.FreeTensor(xBatchInput);
-#else
-        AscendC::DataCopy(xBatch, xGm[(uint64_t)start * TQ_PACK_D], m * TQ_PACK_D);
-        TqSyncMte2ToV();
-#endif
-        if (mPad > m) {
-            AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        // AscendC::PrintTimeStamp(base + 1);
+        aBatchQue_.EnQue(aBatch);
+        auto aReady = aBatchQue_.DeQue<half>();
 
-        NormalizeBatch(xBatch, norms, m);
-        // AscendC::PrintTimeStamp(base + 2);
+        RotateBatchMatmul(aReady, yBatch, m, mPad, 0, TQ_PACK_D);
+        aBatchQue_.FreeTensor(aReady);
+        yBatchQue_.EnQue(yBatch);
+        auto yReady = yBatchQue_.DeQue<half>();
+        EncodeBatch(yReady, norms, packedBatch, m, 0, TQ_PACK_D, true);
+        yBatchQue_.FreeTensor(yReady);
 
-        RotateBatchMatmul(xBatch, yBatch, m, mPad, dBase, dCount);
-        // AscendC::PrintTimeStamp(base + 3);
-
-        EncodeBatch(yBatch, norms, packedGm, start, m, slot_w, dBase, dCount, writeMeta);
-        // AscendC::PrintTimeStamp(base + 4);
-
-        yBatchQue_.FreeTensor(yBatch);
+        packedRowQue_.EnQue(packedBatch);
+        auto packedReady = packedRowQue_.DeQue<uint8_t>();
+        CopyOutPackedBatch(packedReady, start, m);
+        packedRowQue_.FreeTensor(packedReady);
         xBatchQue_.FreeTensor(xBatch);
     }
 
@@ -538,21 +535,24 @@ private:
     uint32_t vecPerCore_ = 1;
     bool matmulReady_ = false;
 
-    AscendC::TQue<AscendC::TPosition::VECOUT, 1> xBatchQue_;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1> yBatchQue_;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1> xBatchInputQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 2> xBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 2> aBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 2> yBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 2> xBatchInputQue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 2> packedRowQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rotationTBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> distBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> yFp32Buf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> cbTileBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminResultBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> packedRowBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> kValInt32Buf_;
     AscendC::TBuf<AscendC::TPosition::VECIN> yCubeFp32Buf_;
+    uint32_t maxSlotW_ = 0;
+    uint32_t packedStride_ = 0;
 
     AscendC::GlobalTensor<float> cubeCGm_;
     AscendC::GlobalTensor<TqInputT> keyGm_;

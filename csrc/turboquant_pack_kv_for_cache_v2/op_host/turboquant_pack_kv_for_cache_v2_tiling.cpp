@@ -10,7 +10,8 @@ constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PACK_TILING_KEY_KFC = 0;
-constexpr int32_t TQ_PACK_MAX_BASEM = 256;
+constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
+constexpr int32_t TQ_PACK_MAX_BASEM = static_cast<int32_t>(TQ_PACK_MAX_BATCH_M);
 
 uint32_t AlignUp16(uint32_t x)
 {
@@ -34,7 +35,7 @@ ge::graphStatus FillKfcCubeTiling(
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
 
-    // KFC mode: A from VECOUT (L1), B from GM, C to VECIN (L1).
+    // KFC mode: A from VECOUT, B from GM, C to GM.
     // L1 holds both xBatch (A input) and yBatch (C output), so constrain baseM.
     constexpr uint32_t mmDataTypeSize = 2;  // fp16
     const uint32_t l1Usable = static_cast<uint32_t>(l1Size);
@@ -97,8 +98,8 @@ static ge::graphStatus TurboquantPackKvForCacheV2TilingFunc(gert::TilingContext*
         OPS_LOG_E(nodeName, "invalid pack attrs");
         return ge::GRAPH_FAILED;
     }
-    if (vecPerCore > 128) {
-        vecPerCore = 128;
+    if (vecPerCore > TQ_PACK_MAX_BATCH_M) {
+        vecPerCore = TQ_PACK_MAX_BATCH_M;
     }
 
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -165,7 +166,7 @@ static ge::graphStatus TurboquantPackKvForCacheV2TilingFunc(gert::TilingContext*
     // Workspace: 16 MB shared for KFC internals + per-core scratch for Cube C output.
     // KFC message queues are indexed per-block within the shared region.
     constexpr uint64_t kPerCoreScratchBase = 512 * 1024;
-    constexpr uint64_t kPerCoreScratch = 64 * 1024;  // 64 KB per core (128*128*4)
+    constexpr uint64_t kPerCoreScratch = TQ_PACK_MAX_BATCH_M * TQ_PACK_N * sizeof(float);
     workspaces[0] = kPerCoreScratchBase + dataCores * kPerCoreScratch;
     if (workspaces[0] < SYSTEM_NEED_WORKSPACE) {
         workspaces[0] = SYSTEM_NEED_WORKSPACE;
