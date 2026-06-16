@@ -5,7 +5,7 @@
 namespace {
 constexpr uint32_t TQ_PACK_TILING_KEY_AIV = 0;
 constexpr uint32_t TQ_PACK_AIV_CORES = 16;
-constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
+constexpr uint32_t TQ_PACK_MAX_BATCH_M = 64;
 }  // namespace
 
 namespace optiling {

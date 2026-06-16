@@ -36,7 +36,7 @@ static constexpr int TQ_PACK_D = 128;
 static constexpr int TQ_PACK_K = 256;
 static constexpr uint32_t TQ_UB_ALIGN = 32;
 // Max rows per batch for UB batch buffers.
-static constexpr uint32_t TQ_MAX_BATCH_M = 32;
+static constexpr uint32_t TQ_MAX_BATCH_M = 64;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr float TQ_NORM_EPS_F = 1e-10f;
 static constexpr uint32_t TQ_REDUCE_MASK = 64;  // max mask for float WholeReduceMin
@@ -235,7 +235,7 @@ public:
         const uint32_t coreEnd = coreStart + rowsPerCore > totalRows
             ? totalRows : coreStart + rowsPerCore;
 
-        // Process assigned rows in sub-batches of up to vecPerCore_ (32).
+        // Process assigned rows in sub-batches of up to vecPerCore_ (64).
         for (uint32_t batchStart = coreStart; batchStart < coreEnd;
              batchStart += vecPerCore_) {
             const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
