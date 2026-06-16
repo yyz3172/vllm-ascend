@@ -53,24 +53,29 @@ static constexpr uint32_t TQ_D_TILE = 16;
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
-#define TQ_INPUT_IS_BF16 1
 using TqInputT = bfloat16_t;
 #else
-#define TQ_INPUT_IS_BF16 0
 using TqInputT = half;
 #endif
 #elif defined(DTYPE_KEY)
 #if (DTYPE_KEY == DT_BF16)
-#define TQ_INPUT_IS_BF16 1
 using TqInputT = bfloat16_t;
 #else
-#define TQ_INPUT_IS_BF16 0
 using TqInputT = half;
 #endif
 #else
-#define TQ_INPUT_IS_BF16 0
 using TqInputT = half;
 #endif
+
+template <typename T>
+struct TqInputTraits {
+    static constexpr bool isBf16 = false;
+};
+
+template <>
+struct TqInputTraits<bfloat16_t> {
+    static constexpr bool isBf16 = true;
+};
 
 // Per-core Cube C scratch layout within the workspace.
 constexpr uint64_t TQ_PER_CORE_CUBEC_BYTES = static_cast<uint64_t>(TQ_MAX_BATCH_M) * TQ_ROT_N * sizeof(float);
@@ -209,9 +214,10 @@ public:
         pipe_->InitBuffer(xBatchQue_, 2, batchElems * sizeof(half));
         pipe_->InitBuffer(aBatchQue_, 2, batchElems * sizeof(half));
         pipe_->InitBuffer(yBatchQue_, 2, batchElems * sizeof(half));
-#if TQ_INPUT_IS_BF16
-        pipe_->InitBuffer(xBatchInputQue_, 2, batchElems * sizeof(TqInputT));
-#endif
+        if constexpr (TqInputTraits<TqInputT>::isBf16) {
+            pipe_->InitBuffer(xBatchInputQue_, 2, batchElems * sizeof(TqInputT));
+            pipe_->InitBuffer(bf16SquareBuf_, TQ_PACK_D * sizeof(float));
+        }
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * sizeof(half));
         pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(half));
@@ -314,6 +320,85 @@ private:
             const half invH = static_cast<half>(1.0f / (normF + TQ_NORM_EPS_F));
             AscendC::Muls(xBatch[rowOff], xBatch[rowOff], invH, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+    template <typename InputT>
+    __aicore__ inline void CopyMergedRowsToLocal(
+        AscendC::LocalTensor<InputT>& dstBatch,
+        uint32_t start,
+        uint32_t end) {
+        uint32_t dstOffset = 0;
+        uint32_t linear = start;
+        while (linear < end) {
+            const bool isKey = linear < nVec_;
+            const uint32_t srcRow = isKey ? linear : (linear - nVec_);
+            const uint32_t srcRemain = nVec_ - srcRow;
+            const uint32_t take = (end - linear) < srcRemain ? (end - linear) : srcRemain;
+            auto src = isKey ? keyGm_[(uint64_t)srcRow * TQ_PACK_D]
+                             : valueGm_[(uint64_t)srcRow * TQ_PACK_D];
+            AscendC::DataCopy(dstBatch[dstOffset], src, take * TQ_PACK_D);
+            dstOffset += take * TQ_PACK_D;
+            linear += take;
+        }
+    }
+
+    // BF16 input path: cast one row to fp32, normalize in fp32, then write fp16 xBatch once.
+    template <typename InputT>
+    __aicore__ inline void NormalizeInputBatch(
+        AscendC::LocalTensor<InputT>& inputBatch,
+        AscendC::LocalTensor<half>& xBatch,
+        AscendC::LocalTensor<half>& norms,
+        uint32_t m) {
+        if constexpr (TqInputTraits<InputT>::isBf16) {
+            auto fp32Row = reduceOutBuf_.Get<float>();
+            auto reduceTmp = reduceOutBuf_.Get<float>()[TQ_PACK_D];
+            auto squareRow = bf16SquareBuf_.Get<float>();
+            auto normAcc = normScalarBuf_.Get<float>();
+
+            for (uint32_t i = 0; i < m; ++i) {
+                const uint32_t rowOff = i * TQ_PACK_D;
+
+                AscendC::Cast(fp32Row, inputBatch[rowOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mul(squareRow, fp32Row, fp32Row, TQ_PACK_D);
+                AscendC::ReduceSum<float>(normAcc, squareRow, reduceTmp, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sqrt(normAcc, normAcc, 1);
+                TqSyncVToS();
+                const float normF = normAcc.GetValue(0);
+                TqSyncSToV();
+
+                norms.SetValue(i, static_cast<half>(normF));
+                AscendC::Muls(fp32Row, fp32Row, 1.0f / (normF + TQ_NORM_EPS_F), TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(xBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_ROUND, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        } else {
+            NormalizeBatch(xBatch, norms, m);
+        }
+    }
+
+    template <typename InputT>
+    __aicore__ inline void NormalizeDequeuedBatch(
+        AscendC::LocalTensor<half>& xBatch,
+        AscendC::LocalTensor<half>& norms,
+        uint32_t m) {
+        if constexpr (!TqInputTraits<InputT>::isBf16) {
+            NormalizeBatch(xBatch, norms, m);
+        }
+    }
+
+    template <typename InputT>
+    __aicore__ inline void NormalizeCopiedInputIfNeeded(
+        AscendC::LocalTensor<half>& xBatch,
+        AscendC::LocalTensor<half>& norms,
+        uint32_t m) {
+        if constexpr (TqInputTraits<InputT>::isBf16) {
+            auto inputReady = xBatchInputQue_.DeQue<InputT>();
+            NormalizeInputBatch(inputReady, xBatch, norms, m);
+            xBatchInputQue_.FreeTensor(inputReady);
         }
     }
 
@@ -435,42 +520,14 @@ private:
     }
 
     __aicore__ inline void CopyInMergedBatch(uint32_t start, uint32_t end) {
-        const uint32_t m = end - start;
         auto xBatch = xBatchQue_.AllocTensor<half>();
-#if TQ_INPUT_IS_BF16
-        auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
-        uint32_t inputOffset = 0;
-#endif
-        uint32_t dstOffset = 0;
-        uint32_t linear = start;
-        while (linear < end) {
-            const bool isKey = linear < nVec_;
-            const uint32_t srcRow = isKey ? linear : (linear - nVec_);
-            const uint32_t srcRemain = nVec_ - srcRow;
-            const uint32_t take = (end - linear) < srcRemain ? (end - linear) : srcRemain;
-#if TQ_INPUT_IS_BF16
-            auto src = isKey ? keyGm_[(uint64_t)srcRow * TQ_PACK_D]
-                             : valueGm_[(uint64_t)srcRow * TQ_PACK_D];
-            AscendC::DataCopy(xBatchInput[inputOffset], src, take * TQ_PACK_D);
-            inputOffset += take * TQ_PACK_D;
-#else
-            auto src = isKey ? keyGm_[(uint64_t)srcRow * TQ_PACK_D]
-                             : valueGm_[(uint64_t)srcRow * TQ_PACK_D];
-            AscendC::DataCopy(xBatch[dstOffset], src, take * TQ_PACK_D);
-            dstOffset += take * TQ_PACK_D;
-#endif
-            linear += take;
+        if constexpr (TqInputTraits<TqInputT>::isBf16) {
+            auto xBatchInput = xBatchInputQue_.AllocTensor<TqInputT>();
+            CopyMergedRowsToLocal(xBatchInput, start, end);
+            xBatchInputQue_.EnQue(xBatchInput);
+        } else {
+            CopyMergedRowsToLocal(xBatch, start, end);
         }
-#if TQ_INPUT_IS_BF16
-        xBatchInputQue_.EnQue(xBatchInput);
-        auto inputReady = xBatchInputQue_.DeQue<TqInputT>();
-        auto xBatchFp32 = yCubeFp32Buf_.Get<float>();
-        AscendC::Cast(xBatchFp32, inputReady, AscendC::RoundMode::CAST_NONE, m * TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(xBatch, xBatchFp32, AscendC::RoundMode::CAST_ROUND, m * TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        xBatchInputQue_.FreeTensor(inputReady);
-#endif
         xBatchQue_.EnQue(xBatch);
     }
 
@@ -500,12 +557,13 @@ private:
         auto packedBatch = packedRowQue_.AllocTensor<uint8_t>();
         auto norms = normsBuf_.Get<half>();
 
+        NormalizeCopiedInputIfNeeded<TqInputT>(xBatch, norms, m);
         if (mPad > m) {
             AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
 
-        NormalizeBatch(xBatch, norms, m);
+        NormalizeDequeuedBatch<TqInputT>(xBatch, norms, m);
         auto aBatch = aBatchQue_.AllocTensor<half>();
         AscendC::Adds(aBatch, xBatch, static_cast<half>(0.0), mPad * TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
@@ -549,6 +607,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> cbTileBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminResultBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bf16SquareBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECIN> yCubeFp32Buf_;
     uint32_t maxSlotW_ = 0;

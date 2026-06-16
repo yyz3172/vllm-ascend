@@ -19,6 +19,11 @@
   地址/tiling 对齐问题。
 - `NormalizeBatch` 只保留必要的 V/Scalar 同步，移除 Cast 后无 GM->UB 依赖的冗余
   MTE2->V 同步。
+- 输入 dtype 由 `TqInputTraits` 模板在编译期分派，FP16/BF16 路径不引入运行时分支。
+- `CopyInMergedBatch` 只负责搬入和队列入队；BF16 输入路径在 `PackMergedBatch`
+  计算阶段从输入队列取出后，按行转换到 fp32 并完成 Normalize，再写回 fp16
+  `xBatch`，跳过旧的整批 `bf16 -> fp32 -> fp16` 后再 `fp16 -> fp32`
+  Normalize 往返转换。
 - K/V 按线性行号合并搬入：先搬 key，key 尾部不足一个 `vecPerCore_` 批次时，
   同一批次继续搬 value 到同一个 `TPosition::VECIN` 缓冲区；归一化后再复制到
   `TPosition::VECOUT` 作为 KFC Matmul 的 A 输入，保持原版稳定的 Cube 输入位置。
