@@ -54,6 +54,7 @@ import torch
 
 from vllm_ascend.ops.turboquant_kv_cache import (
     _c_ascend_turboquant_op_available,
+    ensure_turboquant_pack_tables_registered,
     turboquant_decode_kv_cache_compact,
     turboquant_dequantize_from_packed_bytes,
     turboquant_pack_kv_for_cache,
@@ -208,6 +209,35 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
 
     _assert_pack_close("key (ENCODE_OP=1 vs 0)", fused_k, ref_k)
     _assert_pack_close("value (ENCODE_OP=1 vs 0)", fused_v, ref_v)
+
+
+@requires_npu
+def test_turboquant_pack_kv_for_cache_v2_matches_registered_pack():
+    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_v2"):
+        pytest.skip("turboquant_pack_kv_for_cache_v2 op not available")
+    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache"):
+        pytest.skip("turboquant_pack_kv_for_cache op not available")
+
+    device = torch.device("npu")
+    dtype = torch.float16
+    T, H, D = 5, 2, KV_HEAD_DIM
+    bits_key = bits_value = 8
+    P = turboquant_packed_bytes_per_vector(D, bits=bits_key)
+
+    key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+    value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+
+    assert ensure_turboquant_pack_tables_registered(device, D, bits_key)
+    ref_k, ref_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
+        key, value, P, P
+    )
+    v2_k, v2_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2(
+        key, value, P, P
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(v2_k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(v2_v, ref_v, rtol=0, atol=0)
 
 
 @requires_npu
