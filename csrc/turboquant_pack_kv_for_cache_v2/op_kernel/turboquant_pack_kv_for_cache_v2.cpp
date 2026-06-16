@@ -507,10 +507,8 @@ private:
         xBatchQue_.EnQue(xBatch);
     }
 
-    __aicore__ inline void CopyOutPackedBatch(
-        AscendC::LocalTensor<uint8_t>& packedBatch,
-        uint32_t start,
-        uint32_t m) {
+    __aicore__ inline void CopyOutPackedBatch(uint32_t start, uint32_t m) {
+        auto packedBatch = packedRowQue_.DeQue<uint8_t>();
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t linear = start + i;
             auto packedRow = packedBatch[i * packedStride_];
@@ -521,6 +519,7 @@ private:
                 copy_packed_ub_to_gm(packedVGm_, (uint64_t)valueRow * slot_w_v_, packedRow, slot_w_v_);
             }
         }
+        packedRowQue_.FreeTensor(packedBatch);
     }
 
     __aicore__ inline void Compute(uint32_t m, uint32_t mPad) {
@@ -559,9 +558,7 @@ private:
 
         CopyInMergedBatch(start, end);
         Compute(m, mPad);
-        auto packedReady = packedRowQue_.DeQue<uint8_t>();
-        CopyOutPackedBatch(packedReady, start, m);
-        packedRowQue_.FreeTensor(packedReady);
+        CopyOutPackedBatch(start, m);
     }
 
 private:

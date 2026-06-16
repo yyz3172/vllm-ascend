@@ -35,7 +35,6 @@ namespace {
 static constexpr int TQ_PACK_D = 128;
 static constexpr int TQ_PACK_K = 256;
 static constexpr uint32_t TQ_UB_ALIGN = 32;
-static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
 // Max rows per batch for UB batch buffers.
 static constexpr uint32_t TQ_MAX_BATCH_M = 32;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
@@ -72,10 +71,6 @@ template <>
 struct TqInputTraits<bfloat16_t> {
     static constexpr bool isBf16 = true;
 };
-
-__aicore__ inline uint32_t AlignUp16(uint32_t x) {
-    return (x + TQ_CUBE_M_ALIGN - 1) / TQ_CUBE_M_ALIGN * TQ_CUBE_M_ALIGN;
-}
 
 __aicore__ inline uint32_t AlignUp32(uint32_t x) {
     return (x + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
@@ -350,17 +345,7 @@ private:
     }
 
     template <typename InputT>
-    __aicore__ inline void NormalizeDequeuedBatch(
-        AscendC::LocalTensor<half>& xBatch,
-        AscendC::LocalTensor<half>& norms,
-        uint32_t m) {
-        if constexpr (!TqInputTraits<InputT>::isBf16) {
-            NormalizeBatch(xBatch, norms, m);
-        }
-    }
-
-    template <typename InputT>
-    __aicore__ inline void NormalizeCopiedInputIfNeeded(
+    __aicore__ inline void NormalizeMergedBatch(
         AscendC::LocalTensor<half>& xBatch,
         AscendC::LocalTensor<half>& norms,
         uint32_t m) {
@@ -368,6 +353,8 @@ private:
             auto inputReady = xBatchInputQue_.DeQue<InputT>();
             NormalizeInputBatch(inputReady, xBatch, norms, m);
             xBatchInputQue_.FreeTensor(inputReady);
+        } else {
+            NormalizeBatch(xBatch, norms, m);
         }
     }
 
@@ -377,10 +364,8 @@ private:
         AscendC::LocalTensor<half>& xUnitBatch,
         AscendC::LocalTensor<half>& yBatch,
         uint32_t m,
-        uint32_t mPad,
         uint32_t dBase,
         uint32_t dCount) {
-        (void)mPad;
         auto rotationTLocal = rotationTBuf_.Get<half>();
         auto acc = yFp32Buf_.Get<float>();
         auto rotFp32 = reduceOutBuf_.Get<float>();
@@ -511,10 +496,8 @@ private:
         xBatchQue_.EnQue(xBatch);
     }
 
-    __aicore__ inline void CopyOutPackedBatch(
-        AscendC::LocalTensor<uint8_t>& packedBatch,
-        uint32_t start,
-        uint32_t m) {
+    __aicore__ inline void CopyOutPackedBatch(uint32_t start, uint32_t m) {
+        auto packedBatch = packedRowQue_.DeQue<uint8_t>();
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t linear = start + i;
             auto packedRow = packedBatch[i * packedStride_];
@@ -525,28 +508,23 @@ private:
                 copy_packed_ub_to_gm(packedVGm_, (uint64_t)valueRow * slot_w_v_, packedRow, slot_w_v_);
             }
         }
+        packedRowQue_.FreeTensor(packedBatch);
     }
 
-    __aicore__ inline void Compute(uint32_t m, uint32_t mPad) {
+    __aicore__ inline void Compute(uint32_t m) {
         auto xBatch = xBatchQue_.DeQue<half>();
         auto yBatch = yBatchQue_.AllocTensor<half>();
         auto packedBatch = packedRowQue_.AllocTensor<uint8_t>();
         auto norms = normsBuf_.Get<half>();
 
-        NormalizeCopiedInputIfNeeded<TqInputT>(xBatch, norms, m);
-        if (mPad > m) {
-            AscendC::Duplicate(xBatch[m * TQ_PACK_D], (half)0, (mPad - m) * TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-
-        NormalizeDequeuedBatch<TqInputT>(xBatch, norms, m);
+        NormalizeMergedBatch<TqInputT>(xBatch, norms, m);
         auto aBatch = aBatchQue_.AllocTensor<half>();
-        AscendC::Adds(aBatch, xBatch, static_cast<half>(0.0), mPad * TQ_PACK_D);
+        AscendC::Adds(aBatch, xBatch, static_cast<half>(0.0), m * TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
         aBatchQue_.EnQue(aBatch);
         auto aReady = aBatchQue_.DeQue<half>();
 
-        RotateBatchMatmulVector(aReady, yBatch, m, mPad, 0, TQ_PACK_D);
+        RotateBatchMatmulVector(aReady, yBatch, m, 0, TQ_PACK_D);
         aBatchQue_.FreeTensor(aReady);
         yBatchQue_.EnQue(yBatch);
         auto yReady = yBatchQue_.DeQue<half>();
@@ -559,13 +537,10 @@ private:
 
     __aicore__ inline void PackMergedBatch(uint32_t start, uint32_t end) {
         const uint32_t m = end - start;
-        const uint32_t mPad = AlignUp16(m);
 
         CopyInMergedBatch(start, end);
-        Compute(m, mPad);
-        auto packedReady = packedRowQue_.DeQue<uint8_t>();
-        CopyOutPackedBatch(packedReady, start, m);
-        packedRowQue_.FreeTensor(packedReady);
+        Compute(m);
+        CopyOutPackedBatch(start, m);
     }
 
 private:
