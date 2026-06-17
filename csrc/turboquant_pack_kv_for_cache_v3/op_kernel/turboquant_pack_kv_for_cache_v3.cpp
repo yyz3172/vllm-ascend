@@ -369,30 +369,21 @@ private:
         auto rotationTLocal = rotationTBuf_.Get<half>();
         auto acc = yFp32Buf_.Get<float>();
         auto rotFp32 = reduceOutBuf_.Get<float>();
-        auto term = reduceOutBuf_.Get<float>()[TQ_PACK_D];
 
+        TqSyncVToS();
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t xOff = i * TQ_PACK_D;
-            float xVals[TQ_PACK_D];
-            TqSyncVToS();
-            for (uint32_t k = 0; k < TQ_PACK_D; ++k) {
-                xVals[k] = static_cast<float>(xUnitBatch.GetValue(xOff + k));
-            }
-            TqSyncSToV();
+            auto xBlock = xUnitBatch[xOff];
 
             AscendC::Duplicate(acc, 0.0f, dCount);
-            AscendC::PipeBarrier<PIPE_V>();
             for (uint32_t k = 0; k < TQ_PACK_D; ++k) {
                 const uint32_t rotOff = k * TQ_PACK_D + dBase;
+                const float xVal = static_cast<float>(xBlock.GetValue(k));
                 AscendC::Cast(rotFp32, rotationTLocal[rotOff], AscendC::RoundMode::CAST_NONE, dCount);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(term, rotFp32, xVals[k], dCount);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Add(acc, acc, term, dCount);
-                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(rotFp32, rotFp32, xVal, dCount);
+                AscendC::Add(acc, acc, rotFp32, dCount);
             }
             AscendC::Cast(yBatch[i * TQ_ROT_N], acc, AscendC::RoundMode::CAST_NONE, dCount);
-            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
