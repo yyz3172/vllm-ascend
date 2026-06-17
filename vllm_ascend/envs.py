@@ -84,6 +84,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # performance path), 1 = AIV-only scalar reference (numeric golden / debug).
     "VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE":
     lambda: int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE", "0")),
+    # TurboQuant pack-to-cache kernel selected in torch_binding.cpp:
+    # "v2" = 1C2V KFC/Cube path (default), "v3" = AIV-only vector rotate path.
+    # Valid debug aliases for C++ selection: "3" and "aiv". Not sensitive.
+    "VLLM_ASCEND_TURBOQUANT_PACK_OP":
+    lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_PACK_OP", "v2").lower().strip(),
     # TurboQuant codebook construction method:
     # - "fast": use a deterministic, precomputed codebook (recommended for serving)
     # - "sample": approximate via Beta sampling + Lloyd-like iterations (very slow)
