@@ -2030,6 +2030,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("turboquant_pack_kv_for_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
     ops.impl("turboquant_pack_kv_for_cache_v2", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
     ops.impl("turboquant_pack_kv_for_cache_v3", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_v2_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_v3_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
     ops.impl("turboquant_pack_kv_for_cache_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
 
     ops.impl("turboquant_pack_register_tables", &vllm_ascend::meta::turboquant_pack_register_tables_meta);

@@ -646,6 +646,9 @@ def _ensure_quantizer_fp16_views(
 
 _turboquant_pack_tables_registered: set[tuple[int, int, int]] = set()
 _turboquant_pack_v2_ops_available: bool | None = None
+_turboquant_pack_v3_ops_available: bool | None = None
+_turboquant_pack_v2_to_cache_op_available: bool | None = None
+_turboquant_pack_v3_to_cache_op_available: bool | None = None
 _turboquant_pack_to_cache_op_available: bool | None = None
 
 
@@ -666,6 +669,34 @@ def _turboquant_pack_v2_ops_ready() -> bool:
     return _turboquant_pack_v2_ops_available
 
 
+def _turboquant_pack_v3_ops_ready() -> bool:
+    global _turboquant_pack_v3_ops_available
+    if _turboquant_pack_v3_ops_available is not True:
+        _turboquant_pack_v3_ops_available = (
+            _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_v3")
+            and _c_ascend_turboquant_op_available("turboquant_pack_register_tables")
+        )
+    return _turboquant_pack_v3_ops_available
+
+
+def _turboquant_pack_v2_to_cache_op_ready() -> bool:
+    global _turboquant_pack_v2_to_cache_op_available
+    if _turboquant_pack_v2_to_cache_op_available is not True:
+        _turboquant_pack_v2_to_cache_op_available = _c_ascend_turboquant_op_available(
+            "turboquant_pack_kv_for_cache_v2_to_cache"
+        )
+    return _turboquant_pack_v2_to_cache_op_available
+
+
+def _turboquant_pack_v3_to_cache_op_ready() -> bool:
+    global _turboquant_pack_v3_to_cache_op_available
+    if _turboquant_pack_v3_to_cache_op_available is not True:
+        _turboquant_pack_v3_to_cache_op_available = _c_ascend_turboquant_op_available(
+            "turboquant_pack_kv_for_cache_v3_to_cache"
+        )
+    return _turboquant_pack_v3_to_cache_op_available
+
+
 def _turboquant_pack_to_cache_op_ready() -> bool:
     global _turboquant_pack_to_cache_op_available
     if _turboquant_pack_to_cache_op_available is not True:
@@ -675,14 +706,48 @@ def _turboquant_pack_to_cache_op_ready() -> bool:
     return _turboquant_pack_to_cache_op_available
 
 
+def _normalize_turboquant_pack_op(pack_op: str | None = None) -> str:
+    """Normalize ``VLLM_ASCEND_TURBOQUANT_PACK_OP`` to fused|v2|v3|legacy."""
+    raw = pack_op if pack_op is not None else envs_ascend.VLLM_ASCEND_TURBOQUANT_PACK_OP
+    mode = raw.lower().strip()
+    if mode in ("fused", "to_cache", ""):
+        return "fused"
+    if mode in ("v2", "2", "kfc"):
+        return "v2"
+    if mode in ("v3", "3", "aiv"):
+        return "v3"
+    if mode in ("legacy", "fused_pack", "pack"):
+        return "legacy"
+    return "v2"
+
+
+def _scatter_packed_kv_to_cache(
+    *,
+    packed_k: torch.Tensor,
+    packed_v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    if torch_npu is None:
+        raise RuntimeError("torch_npu is required for TurboQuant cache scatter.")
+    torch_npu._npu_reshape_and_cache(
+        key=packed_k,
+        value=packed_v,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_indices=slot_mapping,
+    )
+
+
 def ensure_turboquant_pack_tables_registered(
     device: torch.device,
     head_size: int,
     bits_key: int,
 ) -> bool:
-    """Register V1 fp16 codebook + R^T on the NPU for pack v2 (once per device/head/bits).
+    """Register fp16 codebook + R^T on the NPU for pack kernels (once per device/head/bits).
 
-    Returns True when v2 tables are registered and the v2 op is available.
+    Returns True when tables are registered and register op is available.
     """
     if bits_key != 8 or head_size != 128:
         return False
@@ -718,10 +783,9 @@ def turboquant_pack_kv_for_cache(
     Intended for ``torch_npu._npu_reshape_and_cache`` on Ascend, which performs the
     paged layout write when the last dim matches ``key_cache`` / ``value_cache``.
 
-    Uses ``turboquant_pack_kv_for_cache_v2`` when available (registered tables,
-    in-kernel bf16→fp16 cast, no per-step ``aten::to``). Otherwise falls back to
-    ``torch.ops._C_ascend.turboquant_pack_kv_for_cache``. Both perform norm +
-    ``@ R^T`` + nearest-neighbor encode in one batched kernel launch for K and V.
+    Uses ``torch.ops._C_ascend.turboquant_pack_kv_for_cache`` (registered-table
+    fused pack) when tables are available for 8-bit/head_size=128.  Does not call
+    v2/v3; use ``turboquant_pack_kv_for_cache_to_cache`` env routing for those paths.
 
     Optional ``codebook`` / ``rotation`` (``R^T``, fp16) override the per-head
     quantizer tables; ``codebook_value`` / ``rotation_value`` apply to V when
@@ -733,8 +797,7 @@ def turboquant_pack_kv_for_cache(
         raise ValueError("Key/value dtypes must match for turboquant.")
 
     head_size = key.shape[-1]
-    use_v2 = False
-    try_v2 = (
+    try_registered_pack = (
         codebook is None
         and rotation is None
         and codebook_value is None
@@ -743,23 +806,22 @@ def turboquant_pack_kv_for_cache(
         and head_size == 128
         and key.dtype in (torch.float16, torch.bfloat16)
     )
-    if try_v2:
+    if try_registered_pack:
         reg_key = _turboquant_pack_reg_key(key.device, head_size, bits_key)
-        use_v2 = (
+        if (
             reg_key in _turboquant_pack_tables_registered
             or ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
-        )
-    if use_v2:
-        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2(
-            key,
-            value,
-            slot_w_k,
-            slot_w_v,
-        )
-        return (
-            packed_k.view(dtype=torch.int8),
-            packed_v.view(dtype=torch.int8),
-        )
+        ):
+            packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache(
+                key,
+                value,
+                slot_w_k,
+                slot_w_v,
+            )
+            return (
+                packed_k.view(dtype=torch.int8),
+                packed_v.view(dtype=torch.int8),
+            )
 
     qk = _get_quantizer(head_size, bits_key, key.device)
     qv = qk if bits_key == bits_value else _get_quantizer(
@@ -816,23 +878,82 @@ def turboquant_pack_kv_for_cache_to_cache(
         raise ValueError("TurboQuant fused pack-to-cache expects int32 slot_mapping.")
 
     head_size = key.shape[-1]
-    use_to_cache = (
+    slot_w_k = key_cache.shape[-1]
+    slot_w_v = value_cache.shape[-1]
+    pack_mode = _normalize_turboquant_pack_op()
+
+    can_use_registered = (
         bits_key == bits_value == 8
         and head_size == 128
         and key.dtype in (torch.float16, torch.bfloat16)
-        and _turboquant_pack_to_cache_op_ready()
         and ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
     )
-    if use_to_cache:
-        # slot_mapping layout is normalized in AscendMetadata.build().
+
+    if pack_mode == "fused" and can_use_registered and _turboquant_pack_to_cache_op_ready():
         torch.ops._C_ascend.turboquant_pack_kv_for_cache_to_cache(
             key,
             value,
             slot_mapping,
             key_cache.view(dtype=torch.uint8),
             value_cache.view(dtype=torch.uint8),
-            key_cache.shape[-1],
-            value_cache.shape[-1],
+            slot_w_k,
+            slot_w_v,
+        )
+        return
+
+    if pack_mode == "v2" and can_use_registered and _turboquant_pack_v2_to_cache_op_ready():
+        torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2_to_cache(
+            key,
+            value,
+            slot_mapping,
+            key_cache.view(dtype=torch.uint8),
+            value_cache.view(dtype=torch.uint8),
+            slot_w_k,
+            slot_w_v,
+        )
+        return
+
+    if pack_mode == "v2" and can_use_registered and _turboquant_pack_v2_ops_ready():
+        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2(
+            key,
+            value,
+            slot_w_k,
+            slot_w_v,
+        )
+        _scatter_packed_kv_to_cache(
+            packed_k=packed_k.view(dtype=torch.int8),
+            packed_v=packed_v.view(dtype=torch.int8),
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
+        )
+        return
+
+    if pack_mode == "v3" and can_use_registered and _turboquant_pack_v3_to_cache_op_ready():
+        torch.ops._C_ascend.turboquant_pack_kv_for_cache_v3_to_cache(
+            key,
+            value,
+            slot_mapping,
+            key_cache.view(dtype=torch.uint8),
+            value_cache.view(dtype=torch.uint8),
+            slot_w_k,
+            slot_w_v,
+        )
+        return
+
+    if pack_mode == "v3" and can_use_registered and _turboquant_pack_v3_ops_ready():
+        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v3(
+            key,
+            value,
+            slot_w_k,
+            slot_w_v,
+        )
+        _scatter_packed_kv_to_cache(
+            packed_k=packed_k.view(dtype=torch.int8),
+            packed_v=packed_v.view(dtype=torch.int8),
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=slot_mapping,
         )
         return
 
@@ -841,17 +962,15 @@ def turboquant_pack_kv_for_cache_to_cache(
         value=value,
         bits_key=bits_key,
         bits_value=bits_value,
-        slot_w_k=key_cache.shape[-1],
-        slot_w_v=value_cache.shape[-1],
+        slot_w_k=slot_w_k,
+        slot_w_v=slot_w_v,
     )
-    if torch_npu is None:
-        raise RuntimeError("torch_npu is required for TurboQuant cache scatter.")
-    torch_npu._npu_reshape_and_cache(
-        key=packed_k,
-        value=packed_v,
+    _scatter_packed_kv_to_cache(
+        packed_k=packed_k,
+        packed_v=packed_v,
         key_cache=key_cache,
         value_cache=value_cache,
-        slot_indices=slot_mapping,
+        slot_mapping=slot_mapping,
     )
 
 

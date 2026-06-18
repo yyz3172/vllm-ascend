@@ -23,11 +23,8 @@
 #include "acl/acl_rt.h"
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <optional>
 #include <vector>
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <ATen/ops/view_ops.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/framework/utils/OpPreparation.h>
@@ -69,7 +66,10 @@
 #include "turboquant_rotate_matmul_probe/op_host/aclnn_turboquant_rotate_matmul_probe.h"
 #include "turboquant_pack_kv_for_cache_fused/op_host/aclnn_turboquant_pack_kv_for_cache_fused.h"
 #include "turboquant_pack_kv_for_cache_v2/op_host/aclnn_turboquant_pack_kv_for_cache_v2.h"
+#include "turboquant_pack_kv_for_cache_v2_to_cache/op_host/aclnn_turboquant_pack_kv_for_cache_v2_to_cache.h"
 #include "turboquant_pack_kv_for_cache_v3/op_host/aclnn_turboquant_pack_kv_for_cache_v3.h"
+#include "turboquant_pack_kv_for_cache_v3_to_cache/op_host/aclnn_turboquant_pack_kv_for_cache_v3_to_cache.h"
+#include "turboquant_pack_kv_for_cache_to_cache/op_host/aclnn_turboquant_pack_kv_for_cache_to_cache.h"
 #include <mutex>
 #include <unordered_map>
 #include "turboquant_fused_infer_attention_score8bit/op_host/aclnn_turboquant_fused_infer_attention_score8bit.h"
@@ -329,37 +329,6 @@ TurboquantPackTableEntry &GetTurboquantPackTables(const at::Tensor &ref) {
     return g_turboquant_pack_tables[ref.device().index()];
 }
 
-void ReshapeAndCache(
-    const at::Tensor &key,
-    const at::Tensor &value,
-    at::Tensor &key_cache,
-    at::Tensor &value_cache,
-    const at::Tensor &slot_mapping) {
-    using ReshapeAndCacheOp = void(
-        const at::Tensor &,
-        const at::Tensor &,
-        at::Tensor &,
-        at::Tensor &,
-        const at::Tensor &);
-
-    static auto reshape_and_cache_op =
-        c10::Dispatcher::singleton()
-            .findSchemaOrThrow("atb::_npu_reshape_and_cache", "")
-            .typed<ReshapeAndCacheOp>();
-    reshape_and_cache_op.call(key, value, key_cache, value_cache, slot_mapping);
-}
-
-at::Tensor Int8ByteView(const at::Tensor &tensor) {
-    return at::_ops::view_dtype::call(tensor, at::kChar);
-}
-
-bool UseTurboquantPackV3() {
-    const char* value = std::getenv("VLLM_ASCEND_TURBOQUANT_PACK_OP");
-    return value != nullptr &&
-        (std::strcmp(value, "v3") == 0 || std::strcmp(value, "3") == 0 ||
-         std::strcmp(value, "aiv") == 0);
-}
-
 }  // namespace
 
 void turboquant_pack_register_tables(
@@ -594,6 +563,220 @@ std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache_v3(
     return std::make_tuple(packed_k, packed_v);
 }
 
+namespace {
+
+void turboquant_pack_kv_for_cache_v2_to_cache_impl(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
+    TORCH_CHECK(slot_mapping.is_privateuseone(), "slot_mapping must be on NPU");
+    TORCH_CHECK(key_cache.is_privateuseone() && value_cache.is_privateuseone(),
+                "key_cache/value_cache must be on NPU");
+    TORCH_CHECK(key.device() == value.device() && key.device() == slot_mapping.device() &&
+                    key.device() == key_cache.device() && key.device() == value_cache.device(),
+                "key/value/slot_mapping/caches must be on the same NPU device");
+    TORCH_CHECK(key.scalar_type() == value.scalar_type(),
+                "key and value must have the same dtype");
+    TORCH_CHECK(key.scalar_type() == at::kHalf || key.scalar_type() == at::kBFloat16,
+                "pack v2-to-cache accepts fp16/bf16 key/value");
+    TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "slot_mapping must be int32");
+    TORCH_CHECK(key_cache.scalar_type() == at::kByte && value_cache.scalar_type() == at::kByte,
+                "key_cache/value_cache must be uint8 views");
+    TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+                "key_cache/value_cache must be [num_blocks, block_size, num_heads, slot_w]");
+    TORCH_CHECK(key_cache.size(0) == value_cache.size(0) && key_cache.size(1) == value_cache.size(1) &&
+                    key_cache.size(2) == value_cache.size(2),
+                "key_cache/value_cache leading dims must match");
+    TORCH_CHECK(key_cache.size(3) == slot_w_k && value_cache.size(3) == slot_w_v,
+                "cache last dim must match slot_w_k/slot_w_v");
+
+    const int64_t head_size = key.size(-1);
+    TORCH_CHECK(value.size(-1) == head_size, "key/value head_size mismatch");
+    TORCH_CHECK(head_size == 128, "pack v2-to-cache supports head_size=128 only");
+    TORCH_CHECK(slot_w_k >= head_size + 2, "slot_w_k must be >= head_size+2 for 8-bit");
+    TORCH_CHECK(slot_w_v >= head_size + 2, "slot_w_v must be >= head_size+2 for 8-bit");
+    TORCH_CHECK(key.numel() % head_size == 0 && value.numel() % head_size == 0,
+                "key/value numel must align with head_size");
+    const int64_t n_vec = key.numel() / head_size;
+    TORCH_CHECK(value.numel() / head_size == n_vec, "key/value row count mismatch");
+    const int64_t num_heads = key_cache.size(2);
+    TORCH_CHECK(num_heads > 0 && key.size(-2) == num_heads && value.size(-2) == num_heads,
+                "key/value num_heads must match cache num_heads");
+    const int64_t token_count = (n_vec + num_heads - 1) / num_heads;
+    TORCH_CHECK(slot_mapping.numel() >= token_count, "slot_mapping length is smaller than token count");
+
+    auto &tables = GetTurboquantPackTables(key);
+    TORCH_CHECK(tables.valid,
+                "turboquant pack tables not registered; call turboquant_pack_register_tables first");
+
+    at::Tensor key_work = key;
+    at::Tensor value_work = value;
+    at::Tensor slot_work = slot_mapping;
+    if (!key_work.is_contiguous()) {
+        key_work = key_work.contiguous();
+    }
+    if (!value_work.is_contiguous()) {
+        value_work = value_work.contiguous();
+    }
+    if (!slot_work.is_contiguous()) {
+        slot_work = slot_work.contiguous();
+    }
+    TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous(),
+                "key_cache/value_cache uint8 views must be contiguous");
+
+    const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
+
+    uint32_t vec_per_core = 128;
+    if (n_vec < 128) {
+        vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
+        if (vec_per_core == 0) {
+            vec_per_core = 16;
+        }
+    }
+    const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
+    const int64_t cache_slots = key_cache.size(0) * key_cache.size(1);
+
+    EXEC_NPU_CMD(
+        aclnnTurboquantPackKvForCacheV2ToCache,
+        key_work,
+        value_work,
+        tables.codebook,
+        tables.rotation_t,
+        slot_work,
+        n_vec,
+        slot_w_k,
+        slot_w_v,
+        vec_per_core_i64,
+        num_heads,
+        cache_slots,
+        key_cache,
+        value_cache);
+}
+
+void turboquant_pack_kv_for_cache_v3_to_cache_impl(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
+    TORCH_CHECK(slot_mapping.is_privateuseone(), "slot_mapping must be on NPU");
+    TORCH_CHECK(key_cache.is_privateuseone() && value_cache.is_privateuseone(),
+                "key_cache/value_cache must be on NPU");
+    TORCH_CHECK(key.device() == value.device() && key.device() == slot_mapping.device() &&
+                    key.device() == key_cache.device() && key.device() == value_cache.device(),
+                "key/value/slot_mapping/caches must be on the same NPU device");
+    TORCH_CHECK(key.scalar_type() == value.scalar_type(),
+                "key and value must have the same dtype");
+    TORCH_CHECK(key.scalar_type() == at::kHalf || key.scalar_type() == at::kBFloat16,
+                "pack v3-to-cache accepts fp16/bf16 key/value");
+    TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "slot_mapping must be int32");
+    TORCH_CHECK(key_cache.scalar_type() == at::kByte && value_cache.scalar_type() == at::kByte,
+                "key_cache/value_cache must be uint8 views");
+    TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+                "key_cache/value_cache must be [num_blocks, block_size, num_heads, slot_w]");
+    TORCH_CHECK(key_cache.size(0) == value_cache.size(0) && key_cache.size(1) == value_cache.size(1) &&
+                    key_cache.size(2) == value_cache.size(2),
+                "key_cache/value_cache leading dims must match");
+    TORCH_CHECK(key_cache.size(3) == slot_w_k && value_cache.size(3) == slot_w_v,
+                "cache last dim must match slot_w_k/slot_w_v");
+
+    const int64_t head_size = key.size(-1);
+    TORCH_CHECK(value.size(-1) == head_size, "key/value head_size mismatch");
+    TORCH_CHECK(head_size == 128, "pack v3-to-cache supports head_size=128 only");
+    TORCH_CHECK(slot_w_k >= head_size + 2, "slot_w_k must be >= head_size+2 for 8-bit");
+    TORCH_CHECK(slot_w_v >= head_size + 2, "slot_w_v must be >= head_size+2 for 8-bit");
+    TORCH_CHECK(key.numel() % head_size == 0 && value.numel() % head_size == 0,
+                "key/value numel must align with head_size");
+    const int64_t n_vec = key.numel() / head_size;
+    TORCH_CHECK(value.numel() / head_size == n_vec, "key/value row count mismatch");
+    const int64_t num_heads = key_cache.size(2);
+    TORCH_CHECK(num_heads > 0 && key.size(-2) == num_heads && value.size(-2) == num_heads,
+                "key/value num_heads must match cache num_heads");
+    const int64_t token_count = (n_vec + num_heads - 1) / num_heads;
+    TORCH_CHECK(slot_mapping.numel() >= token_count, "slot_mapping length is smaller than token count");
+
+    auto &tables = GetTurboquantPackTables(key);
+    TORCH_CHECK(tables.valid,
+                "turboquant pack tables not registered; call turboquant_pack_register_tables first");
+
+    at::Tensor key_work = key;
+    at::Tensor value_work = value;
+    at::Tensor slot_work = slot_mapping;
+    if (!key_work.is_contiguous()) {
+        key_work = key_work.contiguous();
+    }
+    if (!value_work.is_contiguous()) {
+        value_work = value_work.contiguous();
+    }
+    if (!slot_work.is_contiguous()) {
+        slot_work = slot_work.contiguous();
+    }
+    TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous(),
+                "key_cache/value_cache uint8 views must be contiguous");
+
+    const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
+
+    uint32_t vec_per_core = 128;
+    if (n_vec < 128) {
+        vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
+        if (vec_per_core == 0) {
+            vec_per_core = 16;
+        }
+    }
+    const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
+    const int64_t cache_slots = key_cache.size(0) * key_cache.size(1);
+
+    EXEC_NPU_CMD(
+        aclnnTurboquantPackKvForCacheV3ToCache,
+        key_work,
+        value_work,
+        tables.codebook,
+        tables.rotation_t,
+        slot_work,
+        n_vec,
+        slot_w_k,
+        slot_w_v,
+        vec_per_core_i64,
+        num_heads,
+        cache_slots,
+        key_cache,
+        value_cache);
+}
+
+}  // namespace
+
+void turboquant_pack_kv_for_cache_v2_to_cache(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    turboquant_pack_kv_for_cache_v2_to_cache_impl(
+        key, value, slot_mapping, key_cache, value_cache, slot_w_k, slot_w_v);
+}
+
+void turboquant_pack_kv_for_cache_v3_to_cache(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    turboquant_pack_kv_for_cache_v3_to_cache_impl(
+        key, value, slot_mapping, key_cache, value_cache, slot_w_k, slot_w_v);
+}
+
 void turboquant_pack_kv_for_cache_to_cache(
     const at::Tensor &key,
     const at::Tensor &value,
@@ -602,6 +785,8 @@ void turboquant_pack_kv_for_cache_to_cache(
     at::Tensor &value_cache,
     int64_t slot_w_k,
     int64_t slot_w_v) {
+    const bool no_kfc = std::getenv("VLLM_ASCEND_TURBOQUANT_NO_KFC") != nullptr;
+
     TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
     TORCH_CHECK(slot_mapping.is_privateuseone(), "slot_mapping must be on NPU");
     TORCH_CHECK(key_cache.is_privateuseone() && value_cache.is_privateuseone(),
@@ -638,26 +823,55 @@ void turboquant_pack_kv_for_cache_to_cache(
                 "key/value num_heads must match cache num_heads");
     const int64_t token_count = (n_vec + num_heads - 1) / num_heads;
     TORCH_CHECK(slot_mapping.numel() >= token_count, "slot_mapping length is smaller than token count");
-    TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous(),
-                "key_cache/value_cache uint8 views must be contiguous");
 
+    auto &tables = GetTurboquantPackTables(key);
+    TORCH_CHECK(tables.valid,
+                "turboquant pack tables not registered; call turboquant_pack_register_tables first");
+
+    at::Tensor key_work = key;
+    at::Tensor value_work = value;
     at::Tensor slot_work = slot_mapping;
+    if (!key_work.is_contiguous()) {
+        key_work = key_work.contiguous();
+    }
+    if (!value_work.is_contiguous()) {
+        value_work = value_work.contiguous();
+    }
     if (!slot_work.is_contiguous()) {
         slot_work = slot_work.contiguous();
     }
-    auto packed = UseTurboquantPackV3()
-        ? turboquant_pack_kv_for_cache_v3(key, value, slot_w_k, slot_w_v)
-        : turboquant_pack_kv_for_cache_v2(key, value, slot_w_k, slot_w_v);
-    at::Tensor packed_k = Int8ByteView(std::get<0>(packed));
-    at::Tensor packed_v = Int8ByteView(std::get<1>(packed));
-    at::Tensor key_cache_int8 = Int8ByteView(key_cache);
-    at::Tensor value_cache_int8 = Int8ByteView(value_cache);
-    ReshapeAndCache(
-        packed_k,
-        packed_v,
-        key_cache_int8,
-        value_cache_int8,
-        slot_work);
+    TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous(),
+                "key_cache/value_cache uint8 views must be contiguous");
+
+    const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
+
+    uint32_t vec_per_core = 128;
+    if (n_vec < 128) {
+        vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
+        if (vec_per_core == 0) {
+            vec_per_core = 16;
+        }
+    }
+    const int64_t pack_mode = no_kfc ? 1 : 0;
+    const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
+    const int64_t cache_slots = key_cache.size(0) * key_cache.size(1);
+
+    EXEC_NPU_CMD(
+        aclnnTurboquantPackKvForCacheToCache,
+        key_work,
+        value_work,
+        tables.codebook,
+        tables.rotation_t,
+        slot_work,
+        pack_mode,
+        n_vec,
+        slot_w_k,
+        slot_w_v,
+        vec_per_core_i64,
+        num_heads,
+        cache_slots,
+        key_cache,
+        value_cache);
 }
 
 // TurboQuant decode (packed uint8 -> fp16/bf16).
@@ -3426,6 +3640,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "turboquant_pack_kv_for_cache_v3(Tensor key, Tensor value, int slot_w_k, int slot_w_v) -> (Tensor, Tensor)");
     ops.impl("turboquant_pack_kv_for_cache_v3", torch::kPrivateUse1,
              &vllm_ascend::turboquant_pack_kv_for_cache_v3);
+
+    ops.def(
+        "turboquant_pack_kv_for_cache_v2_to_cache(Tensor key, Tensor value, Tensor slot_mapping, "
+        "Tensor! key_cache, Tensor! value_cache, int slot_w_k, int slot_w_v) -> ()");
+    ops.impl("turboquant_pack_kv_for_cache_v2_to_cache", torch::kPrivateUse1,
+             &vllm_ascend::turboquant_pack_kv_for_cache_v2_to_cache);
+
+    ops.def(
+        "turboquant_pack_kv_for_cache_v3_to_cache(Tensor key, Tensor value, Tensor slot_mapping, "
+        "Tensor! key_cache, Tensor! value_cache, int slot_w_k, int slot_w_v) -> ()");
+    ops.impl("turboquant_pack_kv_for_cache_v3_to_cache", torch::kPrivateUse1,
+             &vllm_ascend::turboquant_pack_kv_for_cache_v3_to_cache);
 
     ops.def(
         "turboquant_pack_kv_for_cache_to_cache(Tensor key, Tensor value, Tensor slot_mapping, "
