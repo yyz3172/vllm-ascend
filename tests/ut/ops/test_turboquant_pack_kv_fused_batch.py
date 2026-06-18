@@ -15,12 +15,15 @@
 
 """Accuracy and profiling tests for ``turboquant_pack_kv_for_cache_to_cache``.
 
-Matches the production path in ``attention_v1.py``.  Accuracy compares the fused
-pack-to-cache kernel against the decomposed fallback:
+Matches the production path in ``attention_v1.py``.  With ``PACK_OP=v2`` (default),
+Python routes to the monolithic C++ ``aclnnTurboquantPackKvForCacheV2ToCache`` kernel.
 
-    ``turboquant_pack_kv_for_cache`` + ``_npu_reshape_and_cache``
+Accuracy compares the v2-to-cache binding against the legacy decomposed fallback:
 
-(same reference as ``test_turboquant_pack_kv_for_cache_to_cache_matches_old_path``).
+    ``turboquant_pack_kv_for_cache``  +  ``_npu_reshape_and_cache``
+
+Tests pin ``VLLM_ASCEND_TURBOQUANT_PACK_OP=v2`` so the binding uses the v2
+monolithic to_cache kernel.
 
 Batch sizes (``num_tokens``):
 
@@ -31,6 +34,7 @@ Batch sizes (``num_tokens``):
 Accuracy: byte-exact match on paged KV cache contents.
 Profiling: uses ``torch_npu.profiler`` with Python call stacks (``with_stack`` /
 ``with_modules``); traces saved under TRACE_DIR for TensorBoard / msprof.
+Expect ``TurboquantPackKvForCacheV2ToCache`` (v2 monolithic); no ReshapeAndCache.
 
 Run:
 
@@ -44,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +82,9 @@ BITS = 8
 
 BATCH_SIZES = (1, 512, 2048)
 
+# Pin pack kernel so Python routing uses the v2 monolithic to_cache op.
+DEFAULT_PACK_OP = "v2"
+
 # Target physical device via ASCEND_RT_VISIBLE_DEVICES.  When the env var
 # is set, physical device 4 appears as npu:0 inside the process.
 DEVICE = torch.device("npu:0")
@@ -92,6 +100,34 @@ TRACE_DIR = "/root/yyz/pytorch_profiler/TurboQuant/pack_kv_to_cache_batch"
 def _sync_device() -> None:
     if DEVICE.type == "npu":
         torch.npu.synchronize()
+
+
+def _turboquant_test_env(*, pack_op: str = DEFAULT_PACK_OP) -> dict[str, str]:
+    return {
+        "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1",
+        "VLLM_ASCEND_TURBOQUANT_PACK_OP": pack_op,
+    }
+
+
+def _require_pack_to_cache_ops(pack_op: str = DEFAULT_PACK_OP) -> None:
+    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_to_cache"):
+        pytest.skip("turboquant_pack_kv_for_cache_to_cache routing entry not available")
+    if pack_op == "v2":
+        if not _c_ascend_turboquant_op_available(
+            "turboquant_pack_kv_for_cache_v2_to_cache"
+        ):
+            pytest.skip("turboquant_pack_kv_for_cache_v2_to_cache op not available")
+        if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache"):
+            pytest.skip("turboquant_pack_kv_for_cache op not available")
+        return
+    if pack_op == "fused":
+        if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache"):
+            pytest.skip("turboquant_pack_kv_for_cache op not available")
+        return
+    pack_op_name = f"turboquant_pack_kv_for_cache_{pack_op}"
+    if not _c_ascend_turboquant_op_available(pack_op_name):
+        pytest.skip(f"{pack_op_name} op not available")
 
 
 def _make_paged_cache(
@@ -126,7 +162,7 @@ def _pack_to_cache_reference(
     slot_w_k: int,
     slot_w_v: int,
 ) -> None:
-    """``turboquant_pack_kv_for_cache`` + ``_npu_reshape_and_cache`` fallback path."""
+    """Legacy pack + ``_npu_reshape_and_cache`` reference path."""
     import torch_npu  # type: ignore
 
     packed_k, packed_v = turboquant_pack_kv_for_cache(
@@ -149,7 +185,7 @@ def _pack_to_cache_reference(
     _sync_device()
 
 
-def _pack_to_cache_fused(
+def _pack_to_cache_binding(
     *,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -158,15 +194,12 @@ def _pack_to_cache_fused(
     slot_mapping: torch.Tensor,
     bits_key: int,
     bits_value: int,
+    pack_op: str = DEFAULT_PACK_OP,
 ) -> None:
-    """Run ``turboquant_pack_kv_for_cache_to_cache`` (production fused kernel)."""
-    env = {
-        "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
-        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1",
-    }
+    """Run ``turboquant_pack_kv_for_cache_to_cache`` (Python routing to v2 C++ op)."""
     key_cache.zero_()
     value_cache.zero_()
-    with patch.dict(os.environ, env, clear=False):
+    with patch.dict(os.environ, _turboquant_test_env(pack_op=pack_op), clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
@@ -179,88 +212,36 @@ def _pack_to_cache_fused(
     _sync_device()
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _normalize_trace_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-@pytest.mark.parametrize("num_tokens", BATCH_SIZES)
-@requires_npu
-def test_pack_kv_fused_accuracy(num_tokens: int) -> None:
-    """Fused pack-to-cache must match ``pack`` + ``_npu_reshape_and_cache``."""
-    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_to_cache"):
-        pytest.skip("turboquant_pack_kv_for_cache_to_cache op not available")
-    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache"):
-        pytest.skip("turboquant_pack_kv_for_cache op not available")
-
-    dtype = torch.float16
-    T = num_tokens
-    H = NUM_KV_HEADS
-    D = HEAD_SIZE
-
-    slot_w_k = turboquant_packed_bytes_per_vector(D, bits=BITS)
-    slot_w_v = turboquant_packed_bytes_per_vector(D, bits=BITS)
-
-    torch.manual_seed(42)
-    key = torch.randn(T, H, D, dtype=dtype, device=DEVICE).contiguous()
-    value = torch.randn(T, H, D, dtype=dtype, device=DEVICE).contiguous()
-
-    ensure_turboquant_pack_tables_registered(DEVICE, D, BITS)
-
-    key_cache_ref, value_cache_ref, slot_mapping = _make_paged_cache(T, H, slot_w_k)
-    key_cache_fused = torch.zeros_like(key_cache_ref)
-    value_cache_fused = torch.zeros_like(value_cache_ref)
-
-    # Reference: pack + scatter (attention_v1 fallback when to_cache unavailable)
-    _pack_to_cache_reference(
-        key=key,
-        value=value,
-        key_cache=key_cache_ref,
-        value_cache=value_cache_ref,
-        slot_mapping=slot_mapping,
-        bits_key=BITS,
-        bits_value=BITS,
-        slot_w_k=slot_w_k,
-        slot_w_v=slot_w_v,
-    )
-
-    # Fused: turboquant_pack_kv_for_cache_to_cache (production path)
-    _pack_to_cache_fused(
-        key=key,
-        value=value,
-        key_cache=key_cache_fused,
-        value_cache=value_cache_fused,
-        slot_mapping=slot_mapping,
-        bits_key=BITS,
-        bits_value=BITS,
-    )
-
-    ref_k_u8 = key_cache_ref.view(torch.uint8)
-    ref_v_u8 = value_cache_ref.view(torch.uint8)
-    fused_k_u8 = key_cache_fused.view(torch.uint8)
-    fused_v_u8 = value_cache_fused.view(torch.uint8)
-
-    max_diff_k = (fused_k_u8.to(torch.int16) - ref_k_u8.to(torch.int16)).abs().max().item()
-    max_diff_v = (fused_v_u8.to(torch.int16) - ref_v_u8.to(torch.int16)).abs().max().item()
-
-    print(
-        f"\n[Accuracy] num_tokens={T} num_kv_heads={H} bits={BITS}\n"
-        f"  key_cache   max_abs_diff = {max_diff_k}\n"
-        f"  value_cache max_abs_diff = {max_diff_v}"
-    )
-
-    torch.testing.assert_close(fused_k_u8, ref_k_u8, rtol=0, atol=0)
-    torch.testing.assert_close(fused_v_u8, ref_v_u8, rtol=0, atol=0)
+def _classify_trace_op(name: str) -> str | None:
+    """Return ``fused_pack`` / ``pack`` / ``scatter`` / ``other_turboquant`` or None."""
+    norm = _normalize_trace_name(name)
+    # Monolithic pack+scatter kernels (check *tocache before bare v2/v3).
+    if (
+        "turboquantpackkvforcachev2tocache" in norm
+        or "turboquantpackkvforcachev3tocache" in norm
+        or "turboquantpackkvforcachetocache" in norm
+    ):
+        return "fused_pack"
+    if "turboquantpackkvforcachev2" in norm or "turboquantpackkvforcachev3" in norm:
+        return "pack"
+    if "reshapeandcache" in norm or "reshapecache" in norm:
+        return "scatter"
+    if "turboquant" in norm:
+        return "other_turboquant"
+    return None
 
 
 def _parse_chrome_trace_op_stats(
     trace_path: str,
 ) -> list[dict]:
-    """Parse a Chrome-trace JSON and return Turboquant-related NPU op events.
+    """Parse Chrome trace JSON and return pack/scatter/TurboQuant op events.
 
-    Each returned dict contains: ``name``, ``dur_us``, ``cat``.
+    Each dict contains: ``name``, ``dur_us``, ``cat``, ``kind``.
     """
-    # export_chrome_trace produces <dir>/<dir>.json
     json_path = trace_path
     if not json_path.endswith(".json"):
         json_path = os.path.join(trace_path, os.path.basename(trace_path) + ".json")
@@ -274,14 +255,91 @@ def _parse_chrome_trace_op_stats(
     results: list[dict] = []
     for evt in events:
         name = evt.get("name", "")
-        if "Turboquant" not in name and "turboquant" not in name:
+        kind = _classify_trace_op(name)
+        if kind is None:
             continue
-        # Chrome-trace 'dur' is in microseconds
         dur = evt.get("dur", 0.0)
         cat = evt.get("cat", "")
-        results.append({"name": name, "dur_us": dur, "cat": cat})
+        results.append({"name": name, "dur_us": dur, "cat": cat, "kind": kind})
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_tokens", BATCH_SIZES)
+@requires_npu
+def test_pack_kv_fused_accuracy(num_tokens: int) -> None:
+    """v2-to-cache binding must match legacy pack + scatter."""
+    _require_pack_to_cache_ops(DEFAULT_PACK_OP)
+
+    dtype = torch.float16
+    T = num_tokens
+    H = NUM_KV_HEADS
+    D = HEAD_SIZE
+
+    slot_w_k = turboquant_packed_bytes_per_vector(D, bits=BITS)
+    slot_w_v = turboquant_packed_bytes_per_vector(D, bits=BITS)
+
+    torch.manual_seed(42)
+    key = torch.randn(T, H, D, dtype=dtype, device=DEVICE).contiguous()
+    value = torch.randn(T, H, D, dtype=dtype, device=DEVICE).contiguous()
+
+    with patch.dict(os.environ, _turboquant_test_env(), clear=False):
+        ensure_turboquant_pack_tables_registered(DEVICE, D, BITS)
+
+    key_cache_ref, value_cache_ref, slot_mapping = _make_paged_cache(T, H, slot_w_k)
+    key_cache_binding = torch.zeros_like(key_cache_ref)
+    value_cache_binding = torch.zeros_like(value_cache_ref)
+
+    # Reference: legacy pack + _npu_reshape_and_cache
+    _pack_to_cache_reference(
+        key=key,
+        value=value,
+        key_cache=key_cache_ref,
+        value_cache=value_cache_ref,
+        slot_mapping=slot_mapping,
+        bits_key=BITS,
+        bits_value=BITS,
+        slot_w_k=slot_w_k,
+        slot_w_v=slot_w_v,
+    )
+
+    # Binding: v2 monolithic to_cache (production default path)
+    _pack_to_cache_binding(
+        key=key,
+        value=value,
+        key_cache=key_cache_binding,
+        value_cache=value_cache_binding,
+        slot_mapping=slot_mapping,
+        bits_key=BITS,
+        bits_value=BITS,
+    )
+
+    ref_k_u8 = key_cache_ref.view(torch.uint8)
+    ref_v_u8 = value_cache_ref.view(torch.uint8)
+    binding_k_u8 = key_cache_binding.view(torch.uint8)
+    binding_v_u8 = value_cache_binding.view(torch.uint8)
+
+    max_diff_k = (
+        (binding_k_u8.to(torch.int16) - ref_k_u8.to(torch.int16)).abs().max().item()
+    )
+    max_diff_v = (
+        (binding_v_u8.to(torch.int16) - ref_v_u8.to(torch.int16)).abs().max().item()
+    )
+
+    print(
+        f"\n[Accuracy] num_tokens={T} num_kv_heads={H} bits={BITS} "
+        f"pack_op={DEFAULT_PACK_OP}\n"
+        f"  key_cache   max_abs_diff = {max_diff_k}\n"
+        f"  value_cache max_abs_diff = {max_diff_v}"
+    )
+
+    torch.testing.assert_close(binding_k_u8, ref_k_u8, rtol=0, atol=0)
+    torch.testing.assert_close(binding_v_u8, ref_v_u8, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", BATCH_SIZES)
@@ -290,13 +348,8 @@ def test_pack_kv_fused_profiling(
     num_tokens: int,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Profile ``turboquant_pack_kv_for_cache_to_cache`` with ``torch_npu.profiler``.
-
-    Collects operator-level timing plus Python call stacks (``with_stack``,
-    ``with_modules``).  The full trace is saved for offline analysis.
-    """
-    if not _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_to_cache"):
-        pytest.skip("turboquant_pack_kv_for_cache_to_cache op not available")
+    """Profile v2-to-cache binding (monolithic TurboquantPackKvForCacheV2ToCache)."""
+    _require_pack_to_cache_ops(DEFAULT_PACK_OP)
 
     import torch_npu  # type: ignore
     import torch_npu.profiler  # type: ignore
@@ -311,11 +364,12 @@ def test_pack_kv_fused_profiling(
     torch.manual_seed(42)
     key = torch.randn(T, H, D, dtype=dtype, device=DEVICE).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=DEVICE).contiguous()
-    ensure_turboquant_pack_tables_registered(DEVICE, D, BITS)
+    with patch.dict(os.environ, _turboquant_test_env(), clear=False):
+        ensure_turboquant_pack_tables_registered(DEVICE, D, BITS)
     key_cache, value_cache, slot_mapping = _make_paged_cache(T, H, slot_w_k)
 
     # Warmup
-    _pack_to_cache_fused(
+    _pack_to_cache_binding(
         key=key,
         value=value,
         key_cache=key_cache,
@@ -326,8 +380,7 @@ def test_pack_kv_fused_profiling(
     )
     _sync_device()
 
-    # Profile
-    tag = f"pack_kv_to_cache_tokens{T}"
+    tag = f"pack_kv_to_cache_{DEFAULT_PACK_OP}_tokens{T}"
     trace_dir = f"{TRACE_DIR}/{tag}"
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
@@ -355,7 +408,7 @@ def test_pack_kv_fused_profiling(
         with_modules=True,
         experimental_config=experimental_config,
     ) as prof:
-        _pack_to_cache_fused(
+        _pack_to_cache_binding(
             key=key,
             value=value,
             key_cache=key_cache,
@@ -365,34 +418,48 @@ def test_pack_kv_fused_profiling(
             bits_value=BITS,
         )
 
-    # Also export Chrome-trace JSON for programmatic parsing
     chrome_path = f"{trace_dir}/chrome_trace.json"
     os.makedirs(trace_dir, exist_ok=True)
     prof.export_chrome_trace(chrome_path)
 
-    # Parse Chrome trace to extract Turboquant op durations
     op_stats = _parse_chrome_trace_op_stats(chrome_path)
+    fused_ops = [s for s in op_stats if s["kind"] == "fused_pack"]
+    scatter_ops = [s for s in op_stats if s["kind"] == "scatter"]
 
-    out = f"\n[PackKV-to-Cache Profiling] num_tokens={T} num_kv_heads={H} bits={BITS}\n"
+    out = (
+        f"\n[PackKV-to-Cache Profiling] num_tokens={T} num_kv_heads={H} "
+        f"bits={BITS} pack_op={DEFAULT_PACK_OP}\n"
+    )
     out += f"  trace_dir: {trace_dir}\n"
     out += "  python stacks: enabled (with_stack=True, with_modules=True)\n"
+    out += "  expected ops: TurboquantPackKvForCacheV2ToCache (no ReshapeAndCache)\n"
 
     if op_stats:
-        out += f"  {'Name':<45} {'Duration (us)':>14} {'Category':<15}\n"
-        out += f"  {'-'*45} {'-'*14} {'-'*15}\n"
+        out += f"  {'Name':<45} {'Duration (us)':>14} {'Kind':<12} {'Category':<15}\n"
+        out += f"  {'-'*45} {'-'*14} {'-'*12} {'-'*15}\n"
         for s in op_stats:
             out += (
-                f"  {s['name']:<45} {s['dur_us']:>14.3f} {s['cat']:<15}\n"
+                f"  {s['name']:<45} {s['dur_us']:>14.3f} "
+                f"{s['kind']:<12} {s['cat']:<15}\n"
             )
+        fused_us = sum(s["dur_us"] for s in fused_ops)
+        scatter_us = sum(s["dur_us"] for s in scatter_ops)
+        out += f"  monolithic pack subtotal (us): {fused_us:.3f}\n"
+        out += f"  scatter subtotal (us):       {scatter_us:.3f}\n"
     else:
-        out += "  (No Turboquant events found in Chrome trace.\n"
-        out += "   Check the full trace under trace_dir with msprof or TensorBoard.)\n"
+        out += (
+            "  (No pack/scatter events found in Chrome trace.\n"
+            "   Check kernel_detail.csv under trace_dir with msprof.)\n"
+        )
 
     with capsys.disabled():
         print(out, end="")
 
-    # Sanity: at least one Turboquant event should appear
-    assert len(op_stats) > 0, (
-        f"No Turboquant events found in {chrome_path}. "
-        "Check that the fused kernel was actually invoked."
+    assert len(fused_ops) > 0, (
+        f"No TurboquantPackKvForCacheV2ToCache events in {chrome_path}. "
+        f"pack_op={DEFAULT_PACK_OP}"
+    )
+    assert len(scatter_ops) == 0, (
+        f"Unexpected ReshapeAndCache events in {chrome_path} for v2 pack_op. "
+        "v2_to_cache should not call scatter separately."
     )
