@@ -13,9 +13,8 @@
   system workspace。
 - 前端 Python 调用不变；`turboquant_pack_kv_for_cache_to_cache` 在 Python 层按
   `VLLM_ASCEND_TURBOQUANT_PACK_OP` 路由：默认 `fused` 走单体
-  `aclnnTurboquantPackKvForCacheToCache`；`v2`/`v3` 分别优先调用
-  `aclnnTurboquantPackKvForCacheV2ToCache` /
-  `aclnnTurboquantPackKvForCacheV3ToCache`，不可用时回退 pack + scatter。
+  `aclnnTurboquantPackKvForCacheToCache`；`v2`/`v3` 分别调用对应 pack op 再
+  `_npu_reshape_and_cache`。
 
 ## 数据流
 
