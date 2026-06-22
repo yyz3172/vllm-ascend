@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -8,7 +9,18 @@ from vllm_ascend.attention.attention_v1 import (AscendAttentionBackend,
                                                 AscendAttentionMetadataBuilder,
                                                 AscendAttentionState)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.ops.turboquant_kv_cache import refresh_turboquant_env_cache
 from vllm_ascend.utils import AscendDeviceType
+
+
+@contextmanager
+def _patched_turboquant_env(*args, **kwargs):
+    with patch.dict(*args, **kwargs):
+        refresh_turboquant_env_cache()
+        try:
+            yield
+        finally:
+            refresh_turboquant_env_cache()
 
 
 class TestAscendAttentionBackend(TestBase):
@@ -44,6 +56,40 @@ class TestAscendAttentionBackend(TestBase):
     def test_get_kv_cache_shape_not(self):
         result = AscendAttentionBackend.get_kv_cache_shape(10, 20, 30, 40)
         self.assertEqual(result, (2, 10, 20, 30, 40))
+
+    def test_get_turboquant_kv_cache_shape_legacy(self):
+        mock_ascend_config = MagicMock()
+        mock_ascend_config.turboquant_kv_bits_key = 4
+        mock_ascend_config.turboquant_kv_bits_value = 4
+        with _patched_turboquant_env(
+                "os.environ",
+                {
+                    "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "0",
+                    "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+                },
+                clear=False), patch(
+                    'vllm_ascend.attention.attention_v1.get_ascend_config',
+                    return_value=mock_ascend_config):
+            result = AscendAttentionBackend.get_kv_cache_shape(
+                10, 128, 2, 128, cache_dtype_str="turboquant")
+        self.assertEqual(result, (2, 10, 128, 2, 66))
+
+    def test_get_turboquant_kv_cache_shape_4bit_slab(self):
+        mock_ascend_config = MagicMock()
+        mock_ascend_config.turboquant_kv_bits_key = 4
+        mock_ascend_config.turboquant_kv_bits_value = 4
+        with _patched_turboquant_env(
+                "os.environ",
+                {
+                    "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
+                    "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+                },
+                clear=False), patch(
+                    'vllm_ascend.attention.attention_v1.get_ascend_config',
+                    return_value=mock_ascend_config):
+            result = AscendAttentionBackend.get_kv_cache_shape(
+                10, 128, 2, 128, cache_dtype_str="turboquant")
+        self.assertEqual(result, (2, 10, 2, 128 * 66))
 
     def test_swap_blocks(self):
         src_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]

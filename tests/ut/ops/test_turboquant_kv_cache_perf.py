@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 from unittest.mock import patch
@@ -54,13 +55,19 @@ import torch
 
 from vllm_ascend.ops.turboquant_kv_cache import (
     _c_ascend_turboquant_op_available,
+    _turboquant_pack_tables,
+    _turboquant_slab_group4_to_row_format,
     ensure_turboquant_pack_tables_registered,
+    refresh_turboquant_env_cache,
     turboquant_decode_kv_cache_compact,
     turboquant_dequantize_from_packed_bytes,
     turboquant_pack_kv_for_cache,
     turboquant_pack_kv_for_cache_to_cache,
     turboquant_packed_bytes_per_vector,
     turboquant_quantize_to_packed_bytes,
+    turboquant_slab_block_size,
+    turboquant_slab_row_bytes,
+    unpack_uint4,
 )
 
 try:
@@ -85,6 +92,16 @@ TURBOQUANT_KV_BITS = (4, 8)
 
 # Supported total KV cache capacities in token slots (num_blocks = slots // KV_BLOCK_SIZE).
 CACHE_TOKEN_SLOTS = (2048, 4096)
+
+
+@contextmanager
+def _patched_turboquant_env(*args: Any, **kwargs: Any):
+    with patch.dict(*args, **kwargs):
+        refresh_turboquant_env_cache()
+        try:
+            yield
+        finally:
+            refresh_turboquant_env_cache()
 
 
 @requires_npu
@@ -129,7 +146,7 @@ def test_turboquant_pack_kv_for_cache_encode_op0_vs_fused():
 
     def _pack_with_optional_profile(encode_op: str, trace_tag: str):
         env = {**mse_env, "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": encode_op}
-        with patch.dict(os.environ, env):
+        with _patched_turboquant_env(os.environ, env):
             if profile:
                 trace_dir = f"{profile_root}/{trace_tag}"
                 with torch_npu.profiler.profile(
@@ -289,6 +306,218 @@ def test_turboquant_pack_kv_for_cache_to_cache_matches_old_path():
     torch.testing.assert_close(value_cache_new.view(torch.uint8), value_cache_old.view(torch.uint8), rtol=0, atol=0)
 
 
+def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
+    device = torch.device("cpu")
+    dtype = torch.float16
+    B, BS, H, D = 2, KV_BLOCK_SIZE, 2, KV_HEAD_DIM
+    bits = 4
+    row_w = turboquant_slab_row_bytes(D, bits=bits)
+    T = 7
+    slot_mapping = torch.tensor([0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device)
+    key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+    value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+
+    key_cache_slab = torch.zeros(B, H, BS * row_w, dtype=torch.uint8, device=device)
+    value_cache_slab = torch.zeros_like(key_cache_slab)
+    key_cache_row = torch.zeros(B, BS, H, row_w, dtype=torch.uint8, device=device)
+    value_cache_row = torch.zeros_like(key_cache_row)
+
+    env = {
+        "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0",
+        "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+        "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+    }
+    with _patched_turboquant_env(os.environ, env, clear=False):
+        packed_k, packed_v = turboquant_pack_kv_for_cache(
+            key=key,
+            value=value,
+            bits_key=bits,
+            bits_value=bits,
+            slot_w_k=row_w,
+            slot_w_v=row_w,
+        )
+        turboquant_pack_kv_for_cache_to_cache(
+            key=key,
+            value=value,
+            key_cache=key_cache_slab,
+            value_cache=value_cache_slab,
+            slot_mapping=slot_mapping,
+            bits_key=bits,
+            bits_value=bits,
+        )
+
+        slot = slot_mapping.to(torch.int64)
+        valid = slot >= 0
+        tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+        block_idx = torch.div(slot[valid], BS, rounding_mode="floor")
+        block_off = slot[valid] - block_idx * BS
+        head_idx = torch.arange(H, device=device, dtype=torch.int64)
+        key_rows = _turboquant_slab_group4_to_row_format(
+            key_cache_slab, head_size=D, bits=bits
+        )
+        value_rows = _turboquant_slab_group4_to_row_format(
+            value_cache_slab, head_size=D, bits=bits
+        )
+        torch.testing.assert_close(
+            key_rows[block_idx[:, None], block_off[:, None], head_idx[None, :], :],
+            packed_k[tok_idx].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            value_rows[block_idx[:, None], block_off[:, None], head_idx[None, :], :],
+            packed_v[tok_idx].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+        key_cache_row[block_idx[:, None], block_off[:, None], head_idx[None, :], :] = (
+            packed_k[tok_idx].view(torch.uint8)
+        )
+        value_cache_row[block_idx[:, None], block_off[:, None], head_idx[None, :], :] = (
+            packed_v[tok_idx].view(torch.uint8)
+        )
+
+        bt = torch.tensor([[0, 1, -1]], dtype=torch.int64, device=device)
+        k_slab, v_slab, bt_slab = turboquant_decode_kv_cache_compact(
+            key_cache=key_cache_slab,
+            value_cache=value_cache_slab,
+            block_tables=bt,
+            head_size=D,
+            dtype=dtype,
+            bits=bits,
+        )
+        k_row, v_row, bt_row = turboquant_decode_kv_cache_compact(
+            key_cache=key_cache_row,
+            value_cache=value_cache_row,
+            block_tables=bt,
+            head_size=D,
+            dtype=dtype,
+            bits=bits,
+        )
+
+    assert turboquant_slab_block_size(key_cache_slab, head_size=D, bits=bits) == BS
+    torch.testing.assert_close(k_slab, k_row, rtol=0, atol=0)
+    torch.testing.assert_close(v_slab, v_row, rtol=0, atol=0)
+    torch.testing.assert_close(bt_slab, bt_row, rtol=0, atol=0)
+
+
+@requires_npu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
+    dtype: torch.dtype,
+) -> None:
+    if not _c_ascend_turboquant_op_available(
+        "turboquant_pack_kv_for_cache_4bit"
+    ):
+        pytest.skip("turboquant_pack_kv_for_cache_4bit op not available")
+
+    device = torch.device("npu:0")
+    B, BS, H, D = 2, KV_BLOCK_SIZE, 2, KV_HEAD_DIM
+    bits = 4
+    row_w = turboquant_slab_row_bytes(D, bits=bits)
+    T = 7
+    slot_mapping = torch.tensor(
+        [0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device
+    )
+    torch.manual_seed(1234)
+    key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+    value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
+    key_cache_ref = torch.zeros(B, H, BS * row_w, dtype=torch.uint8, device=device)
+    value_cache_ref = torch.zeros_like(key_cache_ref)
+    key_cache_op = torch.zeros_like(key_cache_ref)
+    value_cache_op = torch.zeros_like(value_cache_ref)
+    env = {
+        "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0",
+        "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+        "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+    }
+    with _patched_turboquant_env(os.environ, env, clear=False):
+        turboquant_pack_kv_for_cache_to_cache(
+            key=key,
+            value=value,
+            key_cache=key_cache_ref,
+            value_cache=value_cache_ref,
+            slot_mapping=slot_mapping,
+            bits_key=bits,
+            bits_value=bits,
+        )
+        torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+            key.contiguous(),
+            value.contiguous(),
+            slot_mapping,
+            *_turboquant_pack_tables(device, D, bits, dtype),
+            key_cache_op,
+            value_cache_op,
+            BS,
+        )
+        torch.npu.synchronize()
+
+    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
+    tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
+    block_idx = torch.div(slot_cpu, BS, rounding_mode="floor").to(device)
+    block_off = (slot_cpu - torch.div(slot_cpu, BS, rounding_mode="floor") * BS).to(
+        device
+    )
+    head_idx = torch.arange(H, device=device, dtype=torch.int64)
+
+    def _assert_4bit_pack_close(
+        name: str,
+        op_cache: torch.Tensor,
+        ref_cache: torch.Tensor,
+    ) -> None:
+        op_rows = _turboquant_slab_group4_to_row_format(
+            op_cache, head_size=D, bits=bits
+        )
+        ref_rows = _turboquant_slab_group4_to_row_format(
+            ref_cache, head_size=D, bits=bits
+        )
+        op_logical = op_rows[
+            block_idx[:, None], block_off[:, None], head_idx[None, :], :
+        ]
+        ref_logical = ref_rows[
+            block_idx[:, None], block_off[:, None], head_idx[None, :], :
+        ]
+
+        op_indices = unpack_uint4(op_logical[..., : row_w - 2], D).to(torch.int16)
+        ref_indices = unpack_uint4(ref_logical[..., : row_w - 2], D).to(torch.int16)
+        index_diff = (op_indices - ref_indices).abs()
+        assert int((index_diff > 1).sum().item()) == 0
+        assert int((index_diff != 0).sum().item()) <= max(
+            32, int(ref_indices.numel() * 0.02)
+        )
+        torch.testing.assert_close(
+            op_logical[..., row_w - 2 : row_w],
+            ref_logical[..., row_w - 2 : row_w],
+            rtol=0,
+            atol=0,
+        )
+
+        with _patched_turboquant_env(
+            os.environ,
+            {
+                "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+                "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+            },
+            clear=False,
+        ):
+            op_decoded = turboquant_dequantize_from_packed_bytes(
+                op_logical.reshape(-1, row_w), head_size=D, dtype=dtype, bits=bits
+            )
+            ref_decoded = turboquant_dequantize_from_packed_bytes(
+                ref_logical.reshape(-1, row_w), head_size=D, dtype=dtype, bits=bits
+            )
+            torch.npu.synchronize()
+        max_err = float((op_decoded.float() - ref_decoded.float()).abs().max().cpu())
+        assert max_err <= 0.25, f"{name} decoded max error too large: {max_err}"
+
+    _assert_4bit_pack_close("key_cache", key_cache_op, key_cache_ref)
+    _assert_4bit_pack_close("value_cache", value_cache_op, value_cache_ref)
+
+
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
     if total_token_slots % block_size != 0:
         raise ValueError(f"cache_token_slots {total_token_slots} must divide block_size {block_size}")
@@ -422,7 +651,9 @@ def run_turboquant_kv_benchmark(
 ) -> dict[str, float | str | int]:
     """Time store + compact decode for TurboQuant vs FP16 baseline. Pure timing helper."""
 
-    with patch.dict(os.environ, {"VLLM_ASCEND_TURBOQUANT_MSE_IMPL": config.mse_impl}):
+    with _patched_turboquant_env(
+        os.environ, {"VLLM_ASCEND_TURBOQUANT_MSE_IMPL": config.mse_impl}
+    ):
         B = config.num_blocks
         BS = config.block_size
         H = config.num_heads
@@ -536,7 +767,7 @@ def run_turboquant_quantize_benchmark(
 
     def make_do_quantize(encode_op: str) -> Callable[[], None]:
         def fn() -> None:
-            with patch.dict(
+            with _patched_turboquant_env(
                 os.environ,
                 {
                     "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": config.mse_impl,
@@ -584,7 +815,7 @@ def _turboquant_qdq_fp16(
         "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": str(encode_op),
         "VLLM_ASCEND_TURBOQUANT_DECODE_OP": str(decode_op),
     }
-    with patch.dict(os.environ, env, clear=False):
+    with _patched_turboquant_env(os.environ, env, clear=False):
         packed = turboquant_quantize_to_packed_bytes(x, bits=bits)
         return turboquant_dequantize_from_packed_bytes(
             packed, head_size=head_size, dtype=x.dtype, bits=bits
@@ -687,7 +918,7 @@ def test_turboquant_kv_compact_matches_full_decode(
     value = torch.randn(T, H, D, dtype=dtype, device=device)
     slot_mapping = torch.arange(T, device=device, dtype=torch.int64)
     env = {"VLLM_ASCEND_TURBOQUANT_MSE_IMPL": mse_impl}
-    with patch.dict(os.environ, env, clear=False):
+    with _patched_turboquant_env(os.environ, env, clear=False):
         _turboquant_pack_and_scatter(
             key=key,
             value=value,
@@ -735,7 +966,9 @@ def test_turboquant_kv_performance_vs_fp16(
     cfg = TurboQuantKvBenchConfig(
         cache_token_slots=cache_token_slots, mse_impl=mse_impl, bits=tq_bits
     )
-    with patch.dict(os.environ, {"VLLM_ASCEND_TURBOQUANT_DECODE_OP": decode_op}, clear=False):
+    with _patched_turboquant_env(
+        os.environ, {"VLLM_ASCEND_TURBOQUANT_DECODE_OP": decode_op}, clear=False
+    ):
         stats = run_turboquant_kv_benchmark(cfg, device=device)
 
     out = (
@@ -777,7 +1010,7 @@ def test_turboquant_kv_roundtrip_cpu_reference(
     key = torch.randn(T, H, D, dtype=dtype, device=device)
     value = torch.randn(T, H, D, dtype=dtype, device=device)
     slot_mapping = torch.randint(0, B * BS, (T,), dtype=torch.int64)
-    with patch.dict(
+    with _patched_turboquant_env(
         os.environ,
         {
             "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
@@ -828,7 +1061,7 @@ def test_turboquant_kv_mixed_key_value_bits_cpu() -> None:
     key = torch.randn(T, H, D, dtype=dtype, device=device)
     value = torch.randn(T, H, D, dtype=dtype, device=device)
     slot_mapping = torch.randint(0, B * BS, (T,), dtype=torch.int64)
-    with patch.dict(
+    with _patched_turboquant_env(
         os.environ,
         {"VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0", "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1"},
         clear=False,

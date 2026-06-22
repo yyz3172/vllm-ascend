@@ -105,12 +105,13 @@ private:
 
         auto packedLocal = packedBuf_.Get<uint8_t>();
 
-        for (uint32_t b = 0; b < headSize_ / 2; ++b) {
-            float y0 = (float)yLocal.GetValue(b * 2);
-            float y1 = (float)yLocal.GetValue(b * 2 + 1);
-            uint8_t hi = ArgminAbsL1(y0, codebookLocal);
-            uint8_t lo = ArgminAbsL1(y1, codebookLocal);
-            packedLocal.SetValue(b, static_cast<uint8_t>((hi << 4) | (lo & 0x0F)));
+        const uint32_t halfHead = headSize_ / 2;
+        for (uint32_t b = 0; b < halfHead; ++b) {
+            float yLow = (float)yLocal.GetValue(b);
+            float yHigh = (float)yLocal.GetValue(b + halfHead);
+            uint8_t low = ArgminAbsL1(yLow, codebookLocal);
+            uint8_t high = ArgminAbsL1(yHigh, codebookLocal);
+            packedLocal.SetValue(b, static_cast<uint8_t>((low & 0x0F) | ((high & 0x0F) << 4)));
         }
 
         auto normHalfLocal = normHalfBuf_.Get<half>();

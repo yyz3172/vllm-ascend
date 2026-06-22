@@ -6,6 +6,7 @@
 # probe_mode:
 #   0 = MIX 1C2V KFC REGIST_MATMUL_OBJ only (matches fused pack handshake)
 #   1 = pure AIC GM [M_pad,128]@[128,128] matmul via mm.Init (no REGIST)
+#   2 = MIX 1C2V KFC A(VECOUT)@B(GM)->C(VECIN) matmul, copied back for verification
 #
 # Build (torch binding + aclnn in libopapi.so — ``build_ext`` alone is not enough):
 #   cd vllm-ascend && COMPILE_CUSTOM_KERNELS=1 python setup.py build_ext --inplace
@@ -123,6 +124,31 @@ def test_turboquant_rotate_matmul_probe_matmul_correctness(m: int):
         pytest.fail(
             f"m={m}: probe output contains NaN (kernel likely did not write c; "
             "check plog for [TQ_MM_PROBE_OP] mode=1 enter/after gm matmul)"
+        )
+    max_err = (c.float() - ref).abs().max().item()
+    assert max_err < 0.25, f"m={m} max_err={max_err}"
+
+
+@requires_npu
+@pytest.mark.parametrize("m", [1, 16, 32])
+def test_turboquant_rotate_matmul_probe_kfc_vecin_correctness(m: int):
+    """Mode 2: KFC matmul writes C to VECIN; compare copied result with torch.matmul."""
+
+    if not _c_ascend_turboquant_op_available("turboquant_rotate_matmul_probe"):
+        pytest.skip("turboquant_rotate_matmul_probe not built")
+
+    device = torch.device("npu")
+    torch.manual_seed(142 + m)
+    a = torch.randn(m, D, dtype=torch.float16, device=device).contiguous()
+    b = torch.randn(D, D, dtype=torch.float16, device=device).contiguous()
+
+    c = _run_probe(a, b, probe_mode=2)
+
+    ref = (a.float() @ b.float()).to(torch.float16)
+    if torch.isnan(c).any().item():
+        pytest.fail(
+            f"m={m}: KFC VECIN probe output contains NaN; "
+            "check plog for [TQ_MM_PROBE_OP] mode=2"
         )
     max_err = (c.float() - ref).abs().max().item()
     assert max_err < 0.25, f"m={m} max_err={max_err}"

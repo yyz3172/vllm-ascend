@@ -104,6 +104,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # ``{"key": 8, "value": 4}`` (each 4 or 8).
     "VLLM_ASCEND_TURBOQUANT_MSE_IMPL":
     lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_MSE_IMPL", "v1").lower().strip(),
+    # Use the exploratory 4-bit slab KV cache layout for symmetric 4-bit
+    # TurboQuant. Default OFF: 0 keeps the legacy row-major cache
+    # [num_blocks, block_size, num_kv_heads, packed_width]. Set to 1 to use
+    # [num_blocks, num_kv_heads, block_size * packed_width], where packed_width
+    # is head_size / 2 + 2 bytes. Not sensitive.
+    "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE", "0"))),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),

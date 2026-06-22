@@ -4,6 +4,7 @@
  * TurboQuant rotate matmul probe:
  *   probe_mode=0: MIX 1C2V KFC REGIST_MATMUL_OBJ handshake only (matches fused pack path)
  *   probe_mode=1: pure AIC GM matmul C=A@B via mm.Init (no KFC / no REGIST)
+ *   probe_mode=2: MIX 1C2V KFC matmul A(VECOUT)@B(GM)->C(VECIN), then copy C to GM
  */
 
 #include "kernel_operator.h"
@@ -16,6 +17,16 @@ namespace {
 
 static constexpr uint32_t TQ_PROBE_K = 128;
 static constexpr uint32_t TQ_PROBE_N = 128;
+static constexpr uint32_t TQ_PROBE_KFC_MAX_M = 32;
+static constexpr uint32_t TQ_PROBE_KFC_MAX_ELEMS = TQ_PROBE_KFC_MAX_M * TQ_PROBE_K;
+
+template <AscendC::HardEvent EVT>
+__aicore__ inline void ProbeSync()
+{
+    event_t event = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVT));
+    AscendC::SetFlag<EVT>(event);
+    AscendC::WaitFlag<EVT>(event);
+}
 
 // Fused rotate matmul types (VECOUT/GM/VECIN) for KFC registration.
 using ProbeKfcAT = MatmulType<TPosition::VECOUT, CubeFormat::ND, half>;
@@ -36,30 +47,75 @@ using ProbeGmMatmulOp = matmul::MatmulImpl<ProbeGmAT, ProbeGmBT, ProbeGmCT, Prob
 #define PROBE_KFC_REGIST_ONLY()                                                                                        \
     do {                                                                                                               \
         GET_TILING_DATA(tilingData, tiling);                                                                           \
-        if ASCEND_IS_AIV {                                                                                             \
-            AscendC::printf("[TQ_MM_PROBE_OP] mode=0 aiv enter block=%u sub=%u m=%u M=%d\n",                         \
-                            AscendC::GetBlockIdx(), AscendC::GetSubBlockIdx(), tilingData.m,                           \
-                            tilingData.cubeTiling.M);                                                                  \
-        } else {                                                                                                       \
-            AscendC::printf("[TQ_MM_PROBE_OP] mode=0 aic enter block=%u sub=%u m=%u M=%d\n",                           \
-                            AscendC::GetBlockIdx(), AscendC::GetSubBlockIdx(), tilingData.m,                           \
-                            tilingData.cubeTiling.M);                                                                  \
-        }                                                                                                              \
         AscendC::SetSysWorkspace(workspace);                                                                           \
         if (GetSysWorkSpacePtr() == nullptr) {                                                                         \
-            AscendC::printf("[TQ_MM_PROBE_OP] mode=0 sys workspace null\n");                                           \
             return;                                                                                                    \
         }                                                                                                              \
         AscendC::TPipe pipe;                                                                                           \
         ProbeKfcMatmulOp mm;                                                                                           \
         TCubeTiling cubeTiling = tilingData.cubeTiling;                                                                \
-        AscendC::printf("[TQ_MM_PROBE_OP] mode=0 before REGIST_MATMUL_OBJ block=%u sub=%u\n",                          \
-                        AscendC::GetBlockIdx(), AscendC::GetSubBlockIdx());                                            \
         REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &cubeTiling);                                               \
-        if ASCEND_IS_AIV {                                                                                             \
-            AscendC::printf("[TQ_MM_PROBE_OP] mode=0 after REGIST_MATMUL_OBJ aiv block=%u sub=%u\n",                   \
-                            AscendC::GetBlockIdx(), AscendC::GetSubBlockIdx());                                        \
+    } while (0)
+
+#define PROBE_KFC_MATMUL_VECIN()                                                                                       \
+    do {                                                                                                               \
+        GET_TILING_DATA(tilingData, tiling);                                                                           \
+        AscendC::SetSysWorkspace(workspace);                                                                           \
+        if (GetSysWorkSpacePtr() == nullptr) {                                                                         \
+            return;                                                                                                    \
         }                                                                                                              \
+        AscendC::TPipe pipe;                                                                                           \
+        ProbeKfcMatmulOp mm;                                                                                           \
+        TCubeTiling cubeTiling = tilingData.cubeTiling;                                                                \
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &cubeTiling);                                               \
+        if ASCEND_IS_AIC {                                                                                             \
+            return;                                                                                                    \
+        }                                                                                                              \
+        if ((AscendC::GetSubBlockIdx() % 2) != 0) {                                                                    \
+            return;                                                                                                    \
+        }                                                                                                              \
+        AscendC::TQue<AscendC::TPosition::VECIN, 1> inputQue;                                                          \
+        AscendC::TQue<AscendC::TPosition::VECOUT, 1> aQue;                                                             \
+        AscendC::TQue<AscendC::TPosition::VECIN, 1> cQue;                                                              \
+        AscendC::TBuf<AscendC::TPosition::VECCALC> mmWorkspace;                                                        \
+        pipe.InitBuffer(inputQue, 1, TQ_PROBE_KFC_MAX_ELEMS * sizeof(half));                                           \
+        pipe.InitBuffer(aQue, 1, TQ_PROBE_KFC_MAX_ELEMS * sizeof(half));                                               \
+        pipe.InitBuffer(cQue, 1, TQ_PROBE_KFC_MAX_ELEMS * sizeof(half));                                               \
+        pipe.InitBuffer(mmWorkspace, TQ_PROBE_KFC_MAX_ELEMS * sizeof(half));                                           \
+        GlobalTensor<half> aGm;                                                                                        \
+        GlobalTensor<half> bGm;                                                                                        \
+        GlobalTensor<half> cGm;                                                                                        \
+        const uint32_t mPad = static_cast<uint32_t>(tilingData.cubeTiling.M);                                          \
+        aGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(a),                                                         \
+                            (uint64_t)mPad * TQ_PROBE_K);                                                             \
+        bGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(b), (uint64_t)TQ_PROBE_K * TQ_PROBE_N);                    \
+        cGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(c),                                                         \
+                            (uint64_t)mPad * TQ_PROBE_N);                                                             \
+        auto inputLocal = inputQue.AllocTensor<half>();                                                                \
+        DataCopy(inputLocal, aGm, mPad * TQ_PROBE_K);                                                                  \
+        inputQue.EnQue(inputLocal);                                                                                    \
+        auto inputReady = inputQue.DeQue<half>();                                                                      \
+        auto aLocal = aQue.AllocTensor<half>();                                                                        \
+        AscendC::Adds(aLocal, inputReady, static_cast<half>(0), mPad * TQ_PROBE_K);                                    \
+        AscendC::PipeBarrier<PIPE_V>();                                                                                \
+        inputQue.FreeTensor(inputReady);                                                                               \
+        aQue.EnQue(aLocal);                                                                                            \
+        auto aReady = aQue.DeQue<half>();                                                                              \
+        auto cLocal = cQue.AllocTensor<half>();                                                                        \
+        mm.SetOrgShape(mPad, TQ_PROBE_N, TQ_PROBE_K);                                                                  \
+        mm.SetSingleShape(tilingData.m, TQ_PROBE_N, TQ_PROBE_K);                                                       \
+        mm.SetTensorA(aReady, false);                                                                                  \
+        mm.SetTensorB(bGm, false);                                                                                     \
+        mm.SetLocalWorkspace(mmWorkspace.Get<uint8_t>());                                                              \
+        mm.IterateAll(cLocal);                                                                                         \
+        mm.End();                                                                                                      \
+        aQue.FreeTensor(aReady);                                                                                       \
+        cQue.EnQue(cLocal);                                                                                            \
+        auto cReady = cQue.DeQue<half>();                                                                              \
+        ProbeSync<AscendC::HardEvent::V_MTE3>();                                                                       \
+        DataCopy(cGm, cReady, tilingData.m * TQ_PROBE_N);                                                              \
+        ProbeSync<AscendC::HardEvent::MTE3_MTE2>();                                                                    \
+        cQue.FreeTensor(cReady);                                                                                       \
     } while (0)
 
 #define PROBE_GM_MATMUL()                                                                                              \
@@ -71,9 +127,6 @@ using ProbeGmMatmulOp = matmul::MatmulImpl<ProbeGmAT, ProbeGmBT, ProbeGmCT, Prob
         if (AscendC::GetBlockIdx() != 0) {                                                                             \
             return;                                                                                                    \
         }                                                                                                              \
-        AscendC::printf("[TQ_MM_PROBE_OP] mode=1 enter aic block=%u m=%u M=%d usedCore=%d\n",                          \
-                        AscendC::GetBlockIdx(), tilingData.m, tilingData.cubeTiling.M,                                 \
-                        tilingData.cubeTiling.usedCoreNum);                                                            \
         AscendC::TPipe pipe;                                                                                           \
         ProbeGmMatmulOp mm;                                                                                            \
         mm.Init(&tilingData.cubeTiling, &pipe);                                                                          \
@@ -91,7 +144,6 @@ using ProbeGmMatmulOp = matmul::MatmulImpl<ProbeGmAT, ProbeGmBT, ProbeGmCT, Prob
         mm.SetTensorB(bGm, false);                                                                                     \
         mm.template IterateAll<false>(cGm, 0);                                                                         \
         mm.End();                                                                                                      \
-        AscendC::printf("[TQ_MM_PROBE_OP] mode=1 after gm matmul m=%u\n", tilingData.m);                               \
     } while (0)
 
 }  // namespace
@@ -109,7 +161,8 @@ extern "C" __global__ __aicore__ void turboquant_rotate_matmul_probe(
     } else if (TILING_KEY_IS(1)) {
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_AIC_ONLY);
         PROBE_GM_MATMUL();
-    } else {
-        AscendC::printf("[TQ_MM_PROBE_OP] unknown tiling key block=%u\n", AscendC::GetBlockIdx());
+    } else if (TILING_KEY_IS(2)) {
+        KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
+        PROBE_KFC_MATMUL_VECIN();
     }
 }

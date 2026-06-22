@@ -35,8 +35,11 @@ namespace {
 static constexpr int TQ_PACK_D = 128;
 static constexpr int TQ_PACK_K = 256;
 static constexpr uint32_t TQ_UB_ALIGN = 32;
-// Max rows per batch for UB batch buffers.
+// Micro-batch rows per core. Queue depth stays at one because this kernel does
+// not overlap copy/compute/copy-out across batches; using double-buffered TQue
+// here only consumes UB and can overflow the bf16 path.
 static constexpr uint32_t TQ_MAX_BATCH_M = 64;
+static constexpr uint32_t TQ_QUEUE_DEPTH = 1;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr float TQ_NORM_EPS_F = 1e-10f;
 static constexpr uint32_t TQ_REDUCE_MASK = 64;  // max mask for float WholeReduceMin
@@ -190,11 +193,10 @@ public:
         packedVGm_.SetGlobalBuffer(packed_v, (uint64_t)nVec_ * slot_w_v_);
 
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
-        pipe_->InitBuffer(xBatchQue_, 2, batchElems * sizeof(half));
-        pipe_->InitBuffer(aBatchQue_, 2, batchElems * sizeof(half));
-        pipe_->InitBuffer(yBatchQue_, 2, batchElems * sizeof(half));
+        pipe_->InitBuffer(xBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(half));
+        pipe_->InitBuffer(yBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(half));
         if constexpr (TqInputTraits<TqInputT>::isBf16) {
-            pipe_->InitBuffer(xBatchInputQue_, 2, batchElems * sizeof(TqInputT));
+            pipe_->InitBuffer(xBatchInputQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(TqInputT));
             pipe_->InitBuffer(bf16SquareBuf_, TQ_PACK_D * sizeof(float));
         }
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
@@ -210,7 +212,7 @@ public:
         pipe_->InitBuffer(argminResultBuf_, TQ_REDUCE_BATCHES * 2 * sizeof(float));
         // NormalizeBatch: fp32 row + fp32 ReduceSum tmp (2 * TQ_PACK_D floats).
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
-        pipe_->InitBuffer(packedRowQue_, 2, TQ_MAX_BATCH_M * packedStride_ * sizeof(uint8_t));
+        pipe_->InitBuffer(packedRowQue_, TQ_QUEUE_DEPTH, TQ_MAX_BATCH_M * packedStride_ * sizeof(uint8_t));
         if (TqIsAiv()) {
             LoadStaticTablesToUb();
         }
@@ -222,8 +224,8 @@ public:
         }
         // On 910B3 each blockIdx is one AIV (sub-block indices alternate
         // 0,1,0,1… — all are independent workers).  Use blockIdx directly.
-        // K/V rows are distributed evenly and each core loops in sub-batches
-        // of vecPerCore_ rows.
+        // K/V rows are distributed evenly and each core loops in bounded
+        // micro-batches of vecPerCore_ rows.
         const uint32_t dataCores = 16;
         const uint32_t core = AscendC::GetBlockIdx();
         const uint32_t totalRows = nVec_ * 2;
@@ -235,7 +237,7 @@ public:
         const uint32_t coreEnd = coreStart + rowsPerCore > totalRows
             ? totalRows : coreStart + rowsPerCore;
 
-        // Process assigned rows in sub-batches of up to vecPerCore_ (64).
+        // Process assigned rows in bounded micro-batches.
         for (uint32_t batchStart = coreStart; batchStart < coreEnd;
              batchStart += vecPerCore_) {
             const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
@@ -358,7 +360,7 @@ private:
         }
     }
 
-    // Vector rotate matmul: half A(VECOUT) x half B(UB) -> half C(VECIN).
+    // Vector rotate matmul: half A(VECIN) x half B(UB) -> half C(VECIN).
     // It keeps the same output layout as the v2 Cube path for comparison.
     __aicore__ inline void RotateBatchMatmulVector(
         AscendC::LocalTensor<half>& xUnitBatch,
@@ -391,10 +393,10 @@ private:
     // Python equivalent: d = (y.unsqueeze(-1) - codebook.view(1,1,-1)).abs(); idx = d.argmin(dim=-1)
     //
     // Optimization: tile D_TILE dimensions at a time to amortize sync overhead.
-    //   - Batch-read all y values into stack array (1 V→S + 1 S→V sync pair)
+    //   - Batch-read all y values into stack array (1 V->S + 1 S->V sync pair)
     //   - Per tile: Duplicate/Sub/Abs for D_TILE rows, then WholeReduceMin per row
     //   - Batch-read results, batch-write indices
-    //   - No PipeBarrier between consecutive V ops (Duplicate→Sub→Abs)
+    //   - No PipeBarrier between consecutive V ops (Duplicate->Sub->Abs)
     __aicore__ inline void EncodeBatch(
         AscendC::LocalTensor<half>& yBatch,
         AscendC::LocalTensor<half>& norms,
@@ -411,9 +413,10 @@ private:
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
+
             auto packedRow = packedBatch[i * packedStride_];
 
-            // Cast y row half → float, then batch-read all values
+            // Cast y row half -> float, then batch-read all values.
             AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, dCount);
             AscendC::PipeBarrier<PIPE_V>();
             TqSyncVToS();
@@ -423,12 +426,12 @@ private:
             }
             TqSyncSToV();
 
-            // Process dimensions in tiles of D_TILE
+            // Process dimensions in tiles of D_TILE.
             for (uint32_t tileStart = 0; tileStart < dCount; tileStart += TQ_D_TILE) {
                 const uint32_t tileCnt = (tileStart + TQ_D_TILE <= dCount)
                     ? TQ_D_TILE : (dCount - tileStart);
 
-                // Phase 1: compute distance vectors for this tile
+                // Phase 1: compute distance vectors for this tile.
                 for (uint32_t dl = 0; dl < tileCnt; ++dl) {
                     auto distRow = distTile[dl * TQ_PACK_K];
                     AscendC::Duplicate(distRow, yVals[tileStart + dl], TQ_PACK_K);
@@ -509,14 +512,7 @@ private:
         auto norms = normsBuf_.Get<half>();
 
         NormalizeMergedBatch<TqInputT>(xBatch, norms, m);
-        auto aBatch = aBatchQue_.AllocTensor<half>();
-        AscendC::Adds(aBatch, xBatch, static_cast<half>(0.0), m * TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        aBatchQue_.EnQue(aBatch);
-        auto aReady = aBatchQue_.DeQue<half>();
-
-        RotateBatchMatmulVector(aReady, yBatch, m, 0, TQ_PACK_D);
-        aBatchQue_.FreeTensor(aReady);
+        RotateBatchMatmulVector(xBatch, yBatch, m, 0, TQ_PACK_D);
         yBatchQue_.EnQue(yBatch);
         auto yReady = yBatchQue_.DeQue<half>();
         EncodeBatch(yReady, norms, packedBatch, m, 0, TQ_PACK_D, true);
@@ -542,7 +538,6 @@ private:
     uint32_t vecPerCore_ = 1;
 
     AscendC::TQue<AscendC::TPosition::VECIN, 2> xBatchQue_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, 2> aBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, 2> yBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, 2> xBatchInputQue_;
     AscendC::TQue<AscendC::TPosition::VECOUT, 2> packedRowQue_;

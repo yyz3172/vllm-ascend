@@ -618,7 +618,13 @@ class NPUWorker(WorkerBase):
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
             with_stack=False,
-            schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=3, repeat=1, skip_first=1),
+            schedule=torch_npu.profiler.schedule(
+                wait=profiler_config.wait_iterations,
+                warmup=profiler_config.warmup_iterations,
+                active=profiler_config.active_iterations,
+                repeat=1,
+                skip_first=profiler_config.delay_iterations,
+            ),
             profile_memory=profiler_config.torch_profiler_with_memory,
             # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
             # The with_stack option in torch_npu.profiler introduces significant time overhead.

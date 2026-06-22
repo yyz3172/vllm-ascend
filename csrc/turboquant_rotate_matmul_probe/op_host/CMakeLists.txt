@@ -1,6 +1,7 @@
 add_ops_compile_options(
         OP_NAME TurboquantRotateMatmulProbe
         OPTIONS --cce-auto-sync=on
+                -DASCENDC_DUMP=0
                 -Wno-deprecated-declarations
                 -Werror
 )
