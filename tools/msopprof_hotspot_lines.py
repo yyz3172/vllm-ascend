@@ -65,7 +65,33 @@ def find_objdump(explicit: str | None) -> str:
 
 
 def is_opprof_op_dir(path: Path) -> bool:
-    return (path / "dump/fdata").is_file() and (path / "dump/aicore_binary.o").is_file()
+    return (
+        (path / "dump/fdata").is_file()
+        and (
+            (path / "dump/aicore_binary.o").is_file()
+            or (path / "dump/kernel_data/aicore_binary.o").is_file()
+        )
+    )
+
+
+def op_dir_matches_filter(path: Path, op_filter: str | None) -> bool:
+    if not op_filter:
+        return True
+    if op_filter in str(path):
+        return True
+
+    op_basic_path = find_first(path, ("OpBasicInfo*.csv",))
+    for row in read_csv_rows(op_basic_path):
+        if op_filter in row.get("Op Name", ""):
+            return True
+
+    text_path = path / "dump/op_basic_info.txt"
+    if text_path.is_file():
+        try:
+            return op_filter in text_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+    return False
 
 
 def discover_op_dirs(root: Path, op_filter: str | None) -> list[Path]:
@@ -75,7 +101,7 @@ def discover_op_dirs(root: Path, op_filter: str | None) -> list[Path]:
         dirs = sorted({p.parent.parent for p in root.rglob("dump/fdata")
                        if (p.parent / "aicore_binary.o").is_file()})
     if op_filter:
-        dirs = [p for p in dirs if op_filter in str(p)]
+        dirs = [p for p in dirs if op_dir_matches_filter(p, op_filter)]
     return dirs
 
 
@@ -228,16 +254,20 @@ def collect_op(
     source_root: Path,
     timeout_s: int,
     top_bb: int,
+    debug_elf: Path | None,
 ) -> dict[str, Any]:
     dump_dir = op_dir / "dump"
     fdata_path = dump_dir / "fdata"
     elf_path = dump_dir / "aicore_binary.o"
+    if not elf_path.is_file():
+        elf_path = dump_dir / "kernel_data/aicore_binary.o"
     op_basic_path = find_first(op_dir, ("OpBasicInfo*.csv",))
     pipe_path = find_first(op_dir, ("PipeUtilization*.csv",))
 
     fdata = parse_fdata(fdata_path)
     bbbmap = parse_bbbmap(dump_dir)
-    objdump_output = run_objdump(objdump, elf_path, timeout_s)
+    line_elf_path = debug_elf if debug_elf is not None else elf_path
+    objdump_output = run_objdump(objdump, line_elf_path, timeout_s)
     sorted_addrs, addr_to_source = parse_objdump_lines(objdump_output)
 
     lines: dict[str, dict[str, Any]] = {}
@@ -283,6 +313,8 @@ def collect_op(
     hot_records = sorted(hot_records, key=lambda x: x["count"], reverse=True)[:top_bb]
     return {
         "op_dir": str(op_dir),
+        "profile_elf": str(elf_path),
+        "line_elf": str(line_elf_path),
         "op_basic": read_csv_rows(op_basic_path),
         "pipe": summarize_pipe(read_csv_rows(pipe_path)),
         "fdata_records": len(fdata),
@@ -303,6 +335,8 @@ def compact_line(line: dict[str, Any]) -> dict[str, Any]:
 
 def print_op_summary(op: dict[str, Any], top_lines: int, top_repo_lines: int) -> None:
     print(f"\nOP dir: {op['op_dir']}")
+    print(f"  profile_elf={op['profile_elf']}")
+    print(f"  line_elf={op['line_elf']}")
     if op["op_basic"]:
         for row in op["op_basic"]:
             print(
@@ -371,6 +405,14 @@ def main() -> int:
     parser.add_argument("--top-bb", type=int, default=16)
     parser.add_argument("--source-root", default=str(Path.cwd()))
     parser.add_argument("--llvm-objdump", help="Path to CANN llvm-objdump")
+    parser.add_argument(
+        "--debug-elf",
+        help=(
+            "Use this object for addr2line while keeping fdata from OPPROF. "
+            "Useful when the profiled dump object is stripped but a same-hash "
+            "debug-line build object is available."
+        ),
+    )
     parser.add_argument("--objdump-timeout", type=int, default=120)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -378,18 +420,30 @@ def main() -> int:
     root = Path(args.opprof_dir).resolve()
     source_root = Path(args.source_root).resolve()
     objdump = find_objdump(args.llvm_objdump)
+    debug_elf = Path(args.debug_elf).resolve() if args.debug_elf else None
+    if debug_elf is not None and not debug_elf.is_file():
+        raise FileNotFoundError(f"--debug-elf does not exist: {debug_elf}")
     op_dirs = discover_op_dirs(root, args.op_filter)
     if not op_dirs:
         raise FileNotFoundError(f"No OPPROF op dirs found under {root}")
+
+    ops = [
+        collect_op(
+            op_dir,
+            objdump,
+            source_root,
+            args.objdump_timeout,
+            args.top_bb,
+            debug_elf,
+        )
+        for op_dir in op_dirs
+    ]
 
     result = {
         "opprof_root": str(root),
         "source_root": str(source_root),
         "llvm_objdump": objdump,
-        "ops": [
-            collect_op(op_dir, objdump, source_root, args.objdump_timeout, args.top_bb)
-            for op_dir in op_dirs
-        ],
+        "ops": ops,
     }
 
     if args.json:

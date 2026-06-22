@@ -65,23 +65,6 @@ def extract_events_exact(trace_data: list, name: str) -> list[dict]:
     ]
 
 
-def extract_events_pattern(trace_data: list, pattern: str) -> list[dict]:
-    """Extract durations for events matching the given name pattern.
-
-    Args:
-        trace_data: List of trace events.
-        pattern: Pattern to match against event names.
-
-    Returns:
-        List of matching trace events.
-    """
-    return [
-        event
-        for event in trace_data
-        if pattern in event.get("name", "") and "dur" in event
-    ]
-
-
 def extract_events_regex(trace_data: list, pattern: Pattern[str]) -> list[dict]:
     """Extract events whose name matches a regex pattern."""
     return [
@@ -158,7 +141,6 @@ def analyze_profile(base_dir: str) -> None:
             re.compile(
                 r"^vllm_ascend/attention/attention_v1\.py\(\d+\): forward$"
             ),
-            None,
         ),
         (
             "vllm_ascend/attention/attention_v1.py(...): reshape_and_cache",
@@ -167,7 +149,6 @@ def analyze_profile(base_dir: str) -> None:
                 r"^vllm_ascend/attention/attention_v1\.py\(\d+\): "
                 r"reshape_and_cache$"
             ),
-            None,
         ),
         (
             "vllm_ascend/ops/turboquant_kv_cache.py(...): turboquant_pack_kv_for_cache_to_cache",
@@ -176,31 +157,24 @@ def analyze_profile(base_dir: str) -> None:
                 r"^vllm_ascend/ops/turboquant_kv_cache\.py\(\d+\): "
                 r"turboquant_pack_kv_for_cache_to_cache$"
             ),
-            None,
         ),
-        ("TurboquantPackKvForCache4bit", "TurboquantPackKvForCache4bit", None, None),
-        ("TurboquantAttentionPaged4bit", "TurboquantAttentionPaged4bit", None, None),
-        ("TurboquantAttentionPaged8bit", "TurboquantAttentionPaged8bit", None, None),
-        (
-            "TurboquantPackKvForCacheFused",
-            "TurboquantPackKvForCacheFused",
-            None,
-            "TurboquantPackKvForCache",
-        ),
+        ("TurboquantPackKvForCache4bit", "TurboquantPackKvForCache4bit", None),
+        ("TurboquantAttentionPaged4bit", "TurboquantAttentionPaged4bit", None),
+        ("TurboquantAttentionPaged8bit", "TurboquantAttentionPaged8bit", None),
+        ("TurboquantPackKvForCacheFused", "TurboquantPackKvForCacheFused", None),
         (
             "TurboquantPackKvForCacheToCache",
             "TurboquantPackKvForCacheToCache",
             None,
-            None,
         ),
-        ("TurboquantPackKvForCacheV2", "TurboquantPackKvForCacheV2", None, None),
-        ("TurboquantPackKvForCacheV3", "TurboquantPackKvForCacheV3", None, None),
+        ("TurboquantPackKvForCacheV2", "TurboquantPackKvForCacheV2", None),
+        ("TurboquantPackKvForCacheV3", "TurboquantPackKvForCacheV3", None),
     ]
 
     print(f"Analyzing profile data from: {trace_path}")
     print("=" * 60)
 
-    for label, exact, regex_pattern, partial in patterns:
+    for label, exact, regex_pattern in patterns:
         events = extract_events_exact(trace_data, exact)
 
         print(f"\nPattern: {label}")
@@ -215,12 +189,6 @@ def analyze_profile(base_dir: str) -> None:
                 print("  Regex match found:")
                 print_duration_summary(events, indent="    ")
                 continue
-
-        if partial is not None:
-            events = extract_events_pattern(trace_data, partial)
-            if events:
-                print("  Partial match found:")
-                print_duration_summary(events, indent="    ")
 
 
 def main() -> None:
