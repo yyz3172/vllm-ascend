@@ -11,6 +11,8 @@ constexpr uint32_t TQ_PROBE_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PROBE_TILING_KEY_KFC = 0;
 constexpr uint32_t TQ_PROBE_TILING_KEY_GM = 1;
+constexpr uint32_t TQ_PROBE_TILING_KEY_KFC_MATMUL = 2;
+constexpr uint32_t TQ_PROBE_KFC_MATMUL_MAX_M = 32;
 constexpr int32_t TQ_PROBE_BEST_BASEN = 256;
 constexpr uint64_t TQ_PROBE_DOUBLE_BUFFER_L0A_L0B = 2;
 constexpr uint64_t TQ_PROBE_DOUBLE_BUFFER_STEPKA_STEPKB = 2;
@@ -163,14 +165,18 @@ static ge::graphStatus TurboquantRotateMatmulProbeTilingFunc(gert::TilingContext
         return ge::GRAPH_FAILED;
     }
     const uint32_t probeMode = static_cast<uint32_t>(*probeModePtr);
-    if (probeMode > 1) {
-        OPS_LOG_E(nodeName, "probe_mode must be 0 (KFC regist) or 1 (GM matmul)");
+    if (probeMode > 2) {
+        OPS_LOG_E(nodeName, "probe_mode must be 0 (KFC regist), 1 (GM matmul), or 2 (KFC matmul)");
         return ge::GRAPH_FAILED;
     }
 
     const uint32_t m = static_cast<uint32_t>(*mAttrPtr);
     if (m < 1 || m > 128) {
         OPS_LOG_E(nodeName, "m must be in [1, 128]");
+        return ge::GRAPH_FAILED;
+    }
+    if (probeMode == 2 && m > TQ_PROBE_KFC_MATMUL_MAX_M) {
+        OPS_LOG_E(nodeName, "probe_mode=2 supports m <= %u", TQ_PROBE_KFC_MATMUL_MAX_M);
         return ge::GRAPH_FAILED;
     }
     const uint32_t mPad = AlignUp16(m);
@@ -182,7 +188,7 @@ static ge::graphStatus TurboquantRotateMatmulProbeTilingFunc(gert::TilingContext
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     matmul_tiling::MultiCoreMatmulTiling tilingApi(ascendcPlatform);
 
-    if (probeMode == 0) {
+    if (probeMode != 1) {
         // Match fused TurboQuant rotate: 2 AIV clients + AIC for KFC handshake.
         tilingApi.SetDim(2);
         tilingApi.SetAType(
@@ -224,7 +230,7 @@ static ge::graphStatus TurboquantRotateMatmulProbeTilingFunc(gert::TilingContext
 
     TurboquantRotateMatmulProbeTilingData tilingData {};
     ge::graphStatus tilingStatus = ge::GRAPH_FAILED;
-    if (probeMode == 0) {
+    if (probeMode != 1) {
         tilingStatus = FillKfcCubeTiling(tilingApi, mPad, tilingData.cubeTiling);
     } else {
         tilingStatus = FillGmCubeTiling(ascendcPlatform, mPad, tilingData.cubeTiling);
@@ -237,7 +243,7 @@ static ge::graphStatus TurboquantRotateMatmulProbeTilingFunc(gert::TilingContext
     tilingData.set_probeMode(probeMode);
 
     uint32_t blockDim = 1;
-    if (probeMode == 0) {
+    if (probeMode != 1) {
         // MIX 1C2V: one AIC + two AIV (SetDim(2)). TSCH block dim must reflect AIC/AIV ratio.
         const uint32_t kfcAicNum = 1;
         const uint32_t kfcAivNum = 2;
@@ -259,7 +265,13 @@ static ge::graphStatus TurboquantRotateMatmulProbeTilingFunc(gert::TilingContext
     }
     workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
-    context->SetTilingKey(probeMode == 0 ? TQ_PROBE_TILING_KEY_KFC : TQ_PROBE_TILING_KEY_GM);
+    if (probeMode == 0) {
+        context->SetTilingKey(TQ_PROBE_TILING_KEY_KFC);
+    } else if (probeMode == 1) {
+        context->SetTilingKey(TQ_PROBE_TILING_KEY_GM);
+    } else {
+        context->SetTilingKey(TQ_PROBE_TILING_KEY_KFC_MATMUL);
+    }
     return ge::GRAPH_SUCCESS;
 }
 

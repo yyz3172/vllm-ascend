@@ -71,6 +71,8 @@ from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 from vllm_ascend.ops.turboquant_kv_cache import (
     _try_8bit_decode_paged,
+    turboquant_4bit_slab_cache_enabled,
+    turboquant_attention_paged4bit,
     turboquant_attention_paged8bit,
     ensure_turboquant_pack_tables_registered,
     turboquant_decode_kv_cache_compact,
@@ -78,12 +80,72 @@ from vllm_ascend.ops.turboquant_kv_cache import (
     turboquant_pack_kv_for_cache,
     turboquant_pack_kv_for_cache_to_cache,
     turboquant_packed_bytes_per_vector,
+    turboquant_slab_block_size_or_none,
+    warm_up_turboquant_4bit_pack_op,
+    warm_up_turboquant_4bit_tables,
 )
 from vllm_ascend.ascend_config import get_ascend_config
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_TURBOQUANT_FIA_WARMED: set[tuple[int, torch.dtype, int, int, int]] = set()
+
+
+def _normalize_npu_device(device: torch.device) -> torch.device:
+    if device.type not in ("npu", "privateuseone") or device.index is not None:
+        return device
+    try:
+        return torch.device(device.type, torch.npu.current_device())
+    except Exception:
+        return torch.device(device.type, 0)
+
+
+def _sync_npu(device: torch.device) -> None:
+    if device.type not in ("npu", "privateuseone"):
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+
+
+def _warm_up_turboquant_fia_op(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> None:
+    """Pre-launch FIA once so smoke profile does not include ACL cold start."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        return
+    device = _normalize_npu_device(device)
+    device_index = device.index if device.index is not None else 0
+    warm_key = (device_index, dtype, head_size, num_heads, num_kv_heads)
+    if warm_key in _TURBOQUANT_FIA_WARMED:
+        return
+
+    query = torch.zeros((1, num_heads, head_size), device=device, dtype=dtype)
+    key = torch.zeros((1, num_kv_heads, head_size), device=device, dtype=dtype)
+    value = torch.zeros_like(key)
+    torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        input_layout="TND",
+        actual_seq_lengths=[1],
+        actual_seq_lengths_kv=[1],
+        num_key_value_heads=num_kv_heads,
+        num_heads=num_heads,
+        scale=scale,
+        sparse_mode=3,
+    )
+    _sync_npu(device)
+    _TURBOQUANT_FIA_WARMED.add(warm_key)
+
 
 def _turboquant_kv_packed_slot_width(head_size: int) -> int:
     """Per-vector packed byte width for K/V cache rows (``max(P_k, P_v)``)."""
@@ -136,6 +198,17 @@ class AscendAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
         if cache_dtype_str == "turboquant":
+            try:
+                cfg = get_ascend_config()
+                bits_key = cfg.turboquant_kv_bits_key
+                bits_value = cfg.turboquant_kv_bits_value
+            except Exception:
+                bits_key = bits_value = None
+            if turboquant_4bit_slab_cache_enabled(
+                bits_key, bits_value
+            ):
+                packed = turboquant_packed_bytes_per_vector(head_size, bits=4)
+                return (2, num_blocks, num_kv_heads, block_size * packed)
             packed = _turboquant_kv_packed_slot_width(head_size)
             return (2, num_blocks, block_size, num_kv_heads, packed)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
@@ -469,6 +542,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     head_size,
                     self.turboquant_kv_bits_key,
                 )
+                warm_up_turboquant_4bit_tables(
+                    torch.device("npu"),
+                    head_size,
+                    self.turboquant_kv_bits_key,
+                    self.turboquant_kv_bits_value,
+                    self.vllm_config.model_config.dtype,
+                )
+                block_size = self.vllm_config.cache_config.block_size
+                warm_up_turboquant_4bit_pack_op(
+                    device=torch.device("npu"),
+                    dtype=self.vllm_config.model_config.dtype,
+                    head_size=head_size,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                if (
+                    self.turboquant_kv_bits_key == 4
+                    and self.turboquant_kv_bits_value == 4
+                ):
+                    _warm_up_turboquant_fia_op(
+                        device=torch.device("npu"),
+                        dtype=self.vllm_config.model_config.dtype,
+                        head_size=head_size,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        scale=self.scale,
+                    )
             except Exception:
                 pass
         else:
@@ -1231,6 +1333,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return output
 
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):
+        def _cache_view_for_fia(cache: torch.Tensor) -> tuple[int, torch.Tensor]:
+            if self.kv_cache_dtype == "turboquant":
+                slab_block_size = turboquant_slab_block_size_or_none(
+                    cache,
+                    head_size=self.head_size,
+                    bits=self.turboquant_kv_bits_key,
+                )
+                if slab_block_size is not None:
+                    # Slab cache must be decoded before FIA; this view is only a
+                    # shape-safe placeholder for paths that immediately decode.
+                    return slab_block_size, cache.view(
+                        cache.shape[0], slab_block_size, -1
+                    )
+            num_block, block_size, _, _ = cache.shape
+            return block_size, cache.view(num_block, block_size, -1)
+
         # PrefillNoCache doesn't need key_cache, but other modes do
         # Only initialize/require cache for modes that actually use it
         if attn_metadata.attn_state != AscendAttentionState.PrefillNoCache:
@@ -1259,33 +1377,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
             batch_size = attn_metadata.seq_lens.shape[0]
             block_table = attn_metadata.block_tables[:batch_size, :]
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
+            block_size, key = _cache_view_for_fia(self.key_cache)  # type: ignore[arg-type]
+            _, value = _cache_view_for_fia(self.value_cache)  # type: ignore[arg-type]
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
+            block_size, key = _cache_view_for_fia(self.key_cache)  # type: ignore[arg-type]
+            _, value = _cache_view_for_fia(self.value_cache)  # type: ignore[arg-type]
             block_table = attn_metadata.block_tables
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         # chunked prefill.
         else:
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
+            block_size, key = _cache_view_for_fia(self.key_cache)  # type: ignore[arg-type]
+            _, value = _cache_view_for_fia(self.value_cache)  # type: ignore[arg-type]
             block_table = attn_metadata.block_tables
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
@@ -1370,9 +1473,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
+            slab_block_size = turboquant_slab_block_size_or_none(
+                self.key_cache,
+                head_size=self.head_size,
+                bits=self.turboquant_kv_bits_key,
+            )
+            use_slab_cache = slab_block_size is not None
             # Scheme B kernel supports DecodeOnly and ChunkedPrefill (mixed
             # prefill/decode) with per-token causal KV bounds.
-            if attn_metadata.attn_state in (
+            if not use_slab_cache and attn_metadata.attn_state in (
                 AscendAttentionState.DecodeOnly,
                 AscendAttentionState.ChunkedPrefill,
             ):
@@ -1394,20 +1503,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if attn_output is not None:
                     output[:num_tokens] = attn_output[:num_tokens]
                     return output
+            if use_slab_cache and attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.ChunkedPrefill,
+            ):
+                attn_output = turboquant_attention_paged4bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                if attn_output is not None:
+                    output[:num_tokens] = attn_output[:num_tokens]
+                    return output
             # Phase 1 / scheme A: decode packed 8-bit KV -> compact fp16 via the
             # fused paged decode op (opt-in), then fall through to the standard
             # FIA below. Returns None (and we keep the old paths) when disabled or
             # the op/conditions are not met.
-            fast = _try_8bit_decode_paged(
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                block_table=block_table,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                head_size=self.head_size,
-                dtype=query.dtype,
-                bits_key=self.turboquant_kv_bits_key,
-                bits_value=self.turboquant_kv_bits_value,
-            )
+            fast = None
+            if not use_slab_cache:
+                fast = _try_8bit_decode_paged(
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_table=block_table,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    dtype=query.dtype,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
             if fast is not None:
                 key_ws, value_ws, block_table = fast
                 key = key_ws.flatten(2, 3).contiguous()
@@ -1641,6 +1774,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if len(kv_cache) > 1:
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                if self.kv_cache_dtype == "turboquant":
+                    try:
+                        block_size = turboquant_slab_block_size_or_none(
+                            self.key_cache,
+                            head_size=self.head_size,
+                            bits=self.turboquant_kv_bits_key,
+                        )
+                        if block_size is not None:
+                            warm_up_turboquant_4bit_pack_op(
+                                device=key.device,
+                                dtype=key.dtype,
+                                head_size=self.head_size,
+                                num_kv_heads=self.num_kv_heads,
+                                block_size=block_size,
+                                bits_key=self.turboquant_kv_bits_key,
+                                bits_value=self.turboquant_kv_bits_value,
+                            )
+                    except Exception:
+                        pass
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
             

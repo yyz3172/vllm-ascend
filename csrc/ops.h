@@ -24,17 +24,18 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
-  // TurboQuant unpack+lookup+scale kernel:
-  // packed [N, P] uint8 -> y_hat [N, D] fp16, where y_hat = codebook[idx] * norm.
+  // TurboQuant 4-bit unpack+lookup+scale kernel:
+  // packed [N, P] uint8 -> y_hat [N, D] fp16/bf16, where y_hat = codebook[idx] * norm.
   extern void turboquant_unpack_lookup_scale_impl(
     void *stream,
     void *packed,        // uint8
-    void *codebook,      // fp16
-    void *y_hat,         // fp16
+    void *codebook,      // fp16/bf16
+    void *y_hat,         // fp16/bf16
     uint32_t nVec,
     uint32_t headSize,
     uint32_t packedBytes,
-    uint32_t vecPerCore);
+    uint32_t vecPerCore,
+    uint32_t dtypeCode);
 
   // TurboQuant pack+nearest-centroid kernel:
   // y [N, D] fp16 + codebook [16] fp16 + norms [N, 1] fp16 -> packed [N, P] uint8.

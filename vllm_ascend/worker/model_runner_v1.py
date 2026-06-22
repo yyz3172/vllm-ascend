@@ -133,6 +133,7 @@ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.kv_specs import turboquant_attention_spec_cls
 from vllm_ascend.ops.turboquant_kv_cache import (
     log_turboquant_kv_banner_once,
+    turboquant_4bit_slab_cache_enabled,
     turboquant_packed_bytes_per_vector,
 )
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -242,6 +243,10 @@ def _tq_full_attention_spec_ctor_kwargs(
         else:
             out["kv_quant_mode"] = _KQM.NONE
     return out
+
+
+def _turboquant_4bit_slab_cache_enabled_for_bits(bits_key: int, bits_value: int) -> bool:
+    return turboquant_4bit_slab_cache_enabled(bits_key, bits_value)
 
 @dataclass
 class GraphCaptureContext:
@@ -4193,7 +4198,14 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
                     turboquant_var_width_sizes: tuple[int, int] | None = None
+                    turboquant_slab_layout = False
                     if not self.model_config.use_mla and self.cache_config.cache_dtype == "turboquant":
+                        turboquant_slab_layout = (
+                            _turboquant_4bit_slab_cache_enabled_for_bits(
+                                self.ascend_config.turboquant_kv_bits_key,
+                                self.ascend_config.turboquant_kv_bits_value,
+                            )
+                        )
                         sp_any = self._attention_spec_for_layer(
                             layer_name, kv_cache_config)
                         assert isinstance(sp_any, AttentionSpec)
@@ -4208,7 +4220,8 @@ class NPUModelRunner(GPUModelRunner):
                         sum_slot = pk + pv
                         tqs = getattr(sp_any, "tq_slot_size", 0)
                         sz_i = kv_cache_tensor.size
-                        if tqs > 0 and tqs == sum_slot and sz_i > 0:
+                        if (not turboquant_slab_layout and tqs > 0
+                                and tqs == sum_slot and sz_i > 0):
                             k_part = sz_i * pk // sum_slot
                             turboquant_var_width_sizes = (
                                 k_part,
@@ -4674,10 +4687,17 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.head_size,
                         )
                     turboquant_asym = False
+                    turboquant_slab_layout = False
                     pk_tq: int | None = None
                     pv_tq: int | None = None
                     if (self.cache_config.cache_dtype == "turboquant"
                             and isinstance(current_kv_cache_spec, AttentionSpec)):
+                        turboquant_slab_layout = (
+                            _turboquant_4bit_slab_cache_enabled_for_bits(
+                                self.ascend_config.turboquant_kv_bits_key,
+                                self.ascend_config.turboquant_kv_bits_value,
+                            )
+                        )
                         pk_tq = turboquant_packed_bytes_per_vector(
                             current_kv_cache_spec.head_size,
                             bits=self.ascend_config.turboquant_kv_bits_key,
@@ -4687,10 +4707,24 @@ class NPUModelRunner(GPUModelRunner):
                             bits=self.ascend_config.turboquant_kv_bits_value,
                         )
                         tqs = getattr(current_kv_cache_spec, "tq_slot_size", 0)
-                        if (tqs > 0 and tqs == pk_tq + pv_tq
+                        if (not turboquant_slab_layout
+                                and tqs > 0 and tqs == pk_tq + pv_tq
                                 and not self.model_config.use_mla):
                             turboquant_asym = True
-                    if turboquant_asym and pk_tq is not None and pv_tq is not None:
+                    if (turboquant_slab_layout and pk_tq is not None
+                            and pv_tq is not None):
+                        if pk_tq != pv_tq:
+                            raise ValueError(
+                                "4-bit TurboQuant slab layout requires symmetric "
+                                f"K/V packed widths, got {pk_tq} and {pv_tq}."
+                            )
+                        k_shape = (
+                            kv_cache_shape[1],
+                            kv_cache_shape[2],
+                            kv_cache_shape[3],
+                        )
+                        v_shape = k_shape
+                    elif turboquant_asym and pk_tq is not None and pv_tq is not None:
                         base = kv_cache_shape[1:-1]
                         k_shape = (*base, pk_tq)
                         v_shape = (*base, pv_tq)
