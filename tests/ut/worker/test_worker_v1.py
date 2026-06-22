@@ -548,14 +548,18 @@ class TestNPUWorker(TestBase):
             profiler="torch",
             torch_profiler_dir="/path/to/traces",
             torch_profiler_with_stack=True,
-            torch_profiler_with_memory=True
+            torch_profiler_with_memory=True,
+            delay_iterations=4,
+            warmup_iterations=0,
+            active_iterations=17,
+            wait_iterations=2,
         )
         vllm_config_mock = MagicMock()
         vllm_config_mock.profiler_config = profiler_config
 
         mock_export_type.Text = "Text"
         mock_profiler_level.Level1 = "Level1"
-        mock_aic_metrics.AiCoreNone = "AiCoreNone"
+        mock_aic_metrics.PipeUtilization = "PipeUtilization"
         mock_profiler_activity.CPU = "CPU"
         mock_profiler_activity.NPU = "NPU"
 
@@ -565,13 +569,16 @@ class TestNPUWorker(TestBase):
         mock_trace_handler.return_value = mock_trace_handler_instance
         mock_profiler_instance = MagicMock()
         mock_profile.return_value = mock_profiler_instance
+        mock_schedule_instance = MagicMock()
 
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
             worker.profiler_config = profiler_config
             worker.vllm_config = vllm_config_mock
 
-            result = worker._create_profiler("warmup_dp0_pp0_tp0_dcp0_ep0_rank0")
+            with patch("torch_npu.profiler.schedule",
+                       return_value=mock_schedule_instance) as mock_schedule:
+                result = worker._create_profiler("warmup_dp0_pp0_tp0_dcp0_ep0_rank0")
 
             mock_experimental_config.assert_called_once()
             config_call = mock_experimental_config.call_args
@@ -580,7 +587,7 @@ class TestNPUWorker(TestBase):
                 "export_type": "Text",
                 "profiler_level": "Level1",
                 "msprof_tx": False,
-                "aic_metrics": "AiCoreNone",
+                "aic_metrics": "PipeUtilization",
                 "l2_cache": False,
                 "op_attr": False,
                 "data_simplification": True,
@@ -601,8 +608,16 @@ class TestNPUWorker(TestBase):
             expected_activities = ["CPU", "NPU"]
             self.assertEqual(profile_kwargs["activities"], expected_activities)
             self.assertTrue(profile_kwargs["profile_memory"])
+            self.assertEqual(profile_kwargs["schedule"], mock_schedule_instance)
             self.assertEqual(profile_kwargs["on_trace_ready"], mock_trace_handler_instance)
             self.assertEqual(result, mock_profiler_instance)
+            mock_schedule.assert_called_once_with(
+                wait=2,
+                warmup=0,
+                active=17,
+                repeat=1,
+                skip_first=4,
+            )
 
     def test_create_profiler_disabled(self):
         """Test _create_profiler raises when profiler disabled"""
