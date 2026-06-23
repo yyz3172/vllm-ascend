@@ -1022,6 +1022,34 @@ def _turboquant_pack_op_ready() -> bool:
     return ready
 
 
+def _turboquant_pack_v3_ops_ready() -> bool:
+    global _turboquant_pack_v3_ops_available
+    if _turboquant_pack_v3_ops_available is not True:
+        _turboquant_pack_v3_ops_available = (
+            _c_ascend_turboquant_op_available("turboquant_pack_kv_for_cache_v3")
+            and _c_ascend_turboquant_op_available("turboquant_pack_register_tables")
+        )
+    return _turboquant_pack_v3_ops_available
+
+
+def _turboquant_pack_v2_to_cache_op_ready() -> bool:
+    global _turboquant_pack_v2_to_cache_op_available
+    if _turboquant_pack_v2_to_cache_op_available is not True:
+        _turboquant_pack_v2_to_cache_op_available = _c_ascend_turboquant_op_available(
+            "turboquant_pack_kv_for_cache_v2_to_cache"
+        )
+    return _turboquant_pack_v2_to_cache_op_available
+
+
+def _turboquant_pack_v3_to_cache_op_ready() -> bool:
+    global _turboquant_pack_v3_to_cache_op_available
+    if _turboquant_pack_v3_to_cache_op_available is not True:
+        _turboquant_pack_v3_to_cache_op_available = _c_ascend_turboquant_op_available(
+            "turboquant_pack_kv_for_cache_v3_to_cache"
+        )
+    return _turboquant_pack_v3_to_cache_op_available
+
+
 def _turboquant_pack_to_cache_op_ready() -> bool:
     global _turboquant_pack_to_cache_op_available
     if _turboquant_pack_to_cache_op_available is not True:
@@ -1158,8 +1186,7 @@ def turboquant_pack_kv_for_cache(
             _pad_packed_to_slot_width(packed_v, slot_w_v).view(dtype=torch.int8),
         )
 
-    use_v2 = False
-    try_v2 = (
+    try_registered_pack = (
         codebook is None
         and rotation is None
         and codebook_value is None
@@ -1300,7 +1327,11 @@ def turboquant_pack_kv_for_cache_to_cache(
         )
         return
 
-    use_to_cache = (
+    slot_w_k = key_cache.shape[-1]
+    slot_w_v = value_cache.shape[-1]
+    pack_mode = _normalize_turboquant_pack_op()
+
+    can_use_registered = (
         bits_key == bits_value == 8
         and head_size == 128
         and key.dtype in (torch.float16, torch.bfloat16)
