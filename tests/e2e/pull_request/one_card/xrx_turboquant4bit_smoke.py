@@ -27,7 +27,7 @@ from vllm_ascend.ascend_config import clear_ascend_config
 MODEL_PATH = os.getenv("TQ_SMOKE_MODEL_PATH", "../model/Qwen3-0.6B")
 PROFILE_DIR = os.getenv("TQ_SMOKE_PROFILE_DIR", "perflog")
 PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_WARMUP_ITERATIONS", "2"))
-PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_ACTIVE_ITERATIONS", "5"))
+PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_ACTIVE_ITERATIONS", "2"))
 
 
 @contextlib.contextmanager
