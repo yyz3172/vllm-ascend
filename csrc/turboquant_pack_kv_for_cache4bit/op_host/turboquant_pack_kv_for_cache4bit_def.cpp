@@ -45,7 +45,8 @@ public:
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        // 0 = MIX KFC batched pack. Other values are rejected by tiling.
+        // 0 = general physical-group owner path, 1 = decode-only direct path,
+        // 2 = logical full-group fast path plus physical-owner fallback.
         this->Attr("pack_mode").Int();
         this->Attr("n_vec").Int();
         this->Attr("vec_per_core").Int();

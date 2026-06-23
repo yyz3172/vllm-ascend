@@ -66,6 +66,9 @@ static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
 static constexpr uint32_t TQ_COMPARE_MASK_BYTES = 256;
 static constexpr float TQ_FY_LINEAR = 0.020799f;
 static constexpr float TQ_FY_CUBIC = 0.0001926f;
+static constexpr uint32_t TQ_PACK_MODE_GENERAL = 0;
+static constexpr uint32_t TQ_PACK_MODE_DECODE_DIRECT = 1;
+static constexpr uint32_t TQ_PACK_MODE_LOGICAL_FAST_FALLBACK = 2;
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
@@ -278,7 +281,8 @@ public:
         uint32_t numHeads,
         uint32_t blockSize,
         uint32_t numBlocks,
-        uint32_t dataCores) {
+        uint32_t dataCores,
+        uint32_t packMode) {
         nVec_ = nVec;
         vecPerCore_ = vecPerCore;
         numHeads_ = numHeads == 0 ? 1 : numHeads;
@@ -287,6 +291,7 @@ public:
         numBlocks_ = numBlocks;
         cacheSlots_ = blockSize_ * numBlocks_;
         dataCores_ = dataCores == 0 ? 1 : dataCores;
+        packMode_ = packMode;
         if (vecPerCore_ > TQ_MAX_BATCH_M) {
             vecPerCore_ = TQ_MAX_BATCH_M;
         }
@@ -335,6 +340,14 @@ public:
         // other core can race on the same packed group RMW.
         const uint32_t worker = AscendC::GetBlockIdx();
         if (worker >= GetActiveWorkers()) {
+            return;
+        }
+        if (packMode_ == TQ_PACK_MODE_DECODE_DIRECT) {
+            ProcessCachePairByDirectTasks(worker);
+            return;
+        }
+        if (packMode_ == TQ_PACK_MODE_LOGICAL_FAST_FALLBACK) {
+            ProcessCachePairByLogicalFastFallback(worker);
             return;
         }
         ProcessCachePairByOwnedGroups(worker);
@@ -703,6 +716,51 @@ private:
         return true;
     }
 
+    __aicore__ inline bool ResolveTokenSlotU(
+        uint32_t tokenIdx,
+        uint32_t& slotU) {
+        if (tokenIdx >= tokenCount_) {
+            return false;
+        }
+        const int32_t slot = slotMappingGm_.GetValue(tokenIdx);
+        if (slot < 0 || static_cast<uint32_t>(slot) >= cacheSlots_) {
+            return false;
+        }
+        slotU = static_cast<uint32_t>(slot);
+        return true;
+    }
+
+    __aicore__ inline bool TryResolveFullPhysicalGroupStart(
+        uint32_t tokenIdx,
+        uint32_t& blockIdx,
+        uint32_t& groupInBlock) {
+        if (tokenIdx + TQ_GROUP_ROWS > tokenCount_ || cacheSlots_ < TQ_GROUP_ROWS) {
+            return false;
+        }
+
+        uint32_t slot0 = 0;
+        if (!ResolveTokenSlotU(tokenIdx, slot0) ||
+            slot0 > cacheSlots_ - TQ_GROUP_ROWS) {
+            return false;
+        }
+        blockIdx = slot0 / blockSize_;
+        const uint32_t blockOff = slot0 - blockIdx * blockSize_;
+        if ((blockOff % TQ_GROUP_ROWS) != 0 ||
+            blockOff + TQ_GROUP_ROWS > blockSize_) {
+            return false;
+        }
+
+        for (uint32_t groupRow = 1; groupRow < TQ_GROUP_ROWS; ++groupRow) {
+            uint32_t slot = 0;
+            if (!ResolveTokenSlotU(tokenIdx + groupRow, slot) ||
+                slot != slot0 + groupRow) {
+                return false;
+            }
+        }
+        groupInBlock = blockOff / TQ_GROUP_ROWS;
+        return true;
+    }
+
     __aicore__ inline uint32_t MakePhysicalGroupTask(
         uint32_t blockIdx,
         uint32_t groupInBlock,
@@ -728,6 +786,142 @@ private:
         }
         PackCacheIndexedTask(keyGm_, keyCacheGm_, vecIndices, groupBases, groupRows, rows);
         PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, rows);
+    }
+
+    __aicore__ inline void GetWorkerTokenRange(
+        uint32_t worker,
+        uint32_t activeWorkers,
+        uint32_t& tokenStart,
+        uint32_t& tokenEnd) const {
+        const uint32_t baseTokens = tokenCount_ / activeWorkers;
+        const uint32_t extraTokens = tokenCount_ - baseTokens * activeWorkers;
+        const uint32_t priorExtra = worker < extraTokens ? worker : extraTokens;
+        tokenStart = worker * baseTokens + priorExtra;
+        tokenEnd = tokenStart + baseTokens + (worker < extraTokens ? 1 : 0);
+    }
+
+    __aicore__ inline void AppendFullGroupHeadTask(
+        uint32_t tokenIdx,
+        uint32_t blockIdx,
+        uint32_t groupInBlock,
+        uint32_t headIdx,
+        uint32_t* vecIndices,
+        uint64_t* groupBases,
+        uint32_t* groupRows,
+        uint32_t& rows) {
+        const uint32_t fullGroupRows = TQ_GROUP_ROWS;
+        if (rows + fullGroupRows > TQ_MAX_BATCH_M) {
+            FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+            rows = 0;
+        }
+
+        const uint64_t groupBase = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+        for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
+            const uint32_t vecIdx = MakeVecIndex(tokenIdx + groupRow, headIdx);
+            if (vecIdx >= nVec_) {
+                continue;
+            }
+            vecIndices[rows] = vecIdx;
+            groupBases[rows] = groupBase;
+            groupRows[rows] = groupRow;
+            ++rows;
+        }
+    }
+
+    __aicore__ inline void ProcessLogicalFullGroupsByRange(
+        uint32_t worker,
+        uint32_t activeWorkers) {
+        uint32_t tokenStart = 0;
+        uint32_t tokenEnd = 0;
+        GetWorkerTokenRange(worker, activeWorkers, tokenStart, tokenEnd);
+
+        uint32_t vecIndices[TQ_MAX_BATCH_M];
+        uint64_t groupBases[TQ_MAX_BATCH_M];
+        uint32_t groupRows[TQ_MAX_BATCH_M];
+        uint32_t rows = 0;
+        uint32_t tokenIdx = tokenStart;
+        while (tokenIdx < tokenEnd) {
+            uint32_t blockIdx = 0;
+            uint32_t groupInBlock = 0;
+            if (!TryResolveFullPhysicalGroupStart(tokenIdx, blockIdx, groupInBlock)) {
+                ++tokenIdx;
+                continue;
+            }
+
+            for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
+                AppendFullGroupHeadTask(
+                    tokenIdx,
+                    blockIdx,
+                    groupInBlock,
+                    headIdx,
+                    vecIndices,
+                    groupBases,
+                    groupRows,
+                    rows);
+                FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+                rows = 0;
+            }
+            tokenIdx += TQ_GROUP_ROWS;
+        }
+        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+    }
+
+    __aicore__ inline void ProcessFallbackByOwnedGroupsSkippingFullGroups(uint32_t worker) {
+        const uint32_t activeWorkers = GetActiveWorkers();
+        uint32_t vecIndices[TQ_MAX_BATCH_M];
+        uint64_t groupBases[TQ_MAX_BATCH_M];
+        uint32_t groupRows[TQ_MAX_BATCH_M];
+        uint32_t rows = 0;
+        uint32_t tokenIdx = 0;
+        while (tokenIdx < tokenCount_) {
+            uint32_t fullBlockIdx = 0;
+            uint32_t fullGroupInBlock = 0;
+            if (TryResolveFullPhysicalGroupStart(tokenIdx, fullBlockIdx, fullGroupInBlock)) {
+                tokenIdx += TQ_GROUP_ROWS;
+                continue;
+            }
+
+            uint32_t blockIdx = 0;
+            uint32_t groupInBlock = 0;
+            uint32_t groupRow = 0;
+            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock, groupRow)) {
+                ++tokenIdx;
+                continue;
+            }
+
+            for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
+                const uint32_t physicalGroupTask =
+                    MakePhysicalGroupTask(blockIdx, groupInBlock, headIdx);
+                if ((physicalGroupTask % activeWorkers) != worker) {
+                    continue;
+                }
+
+                const uint32_t vecIdx = MakeVecIndex(tokenIdx, headIdx);
+                if (vecIdx >= nVec_) {
+                    continue;
+                }
+                vecIndices[rows] = vecIdx;
+                groupBases[rows] = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+                groupRows[rows] = groupRow;
+                ++rows;
+                if (rows == vecPerCore_) {
+                    FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+                    rows = 0;
+                }
+            }
+            ++tokenIdx;
+        }
+        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+    }
+
+    __aicore__ inline void ProcessCachePairByLogicalFastFallback(uint32_t worker) {
+        const uint32_t activeWorkers = GetActiveWorkers();
+        if (activeWorkers == 0 || worker >= activeWorkers) {
+            return;
+        }
+
+        ProcessLogicalFullGroupsByRange(worker, activeWorkers);
+        ProcessFallbackByOwnedGroupsSkippingFullGroups(worker);
     }
 
     __aicore__ inline void ProcessCachePairByOwnedGroups(uint32_t worker) {
@@ -772,6 +966,43 @@ private:
         FlushVecBatch(vecIndices, groupBases, groupRows, rows);
     }
 
+    __aicore__ inline void ProcessCachePairByDirectTasks(uint32_t worker) {
+        const uint32_t activeWorkers = GetActiveWorkers();
+        if (activeWorkers == 0 || worker >= activeWorkers) {
+            return;
+        }
+
+        uint32_t vecIndices[TQ_MAX_BATCH_M];
+        uint64_t groupBases[TQ_MAX_BATCH_M];
+        uint32_t groupRows[TQ_MAX_BATCH_M];
+        uint32_t rows = 0;
+        const uint32_t taskCount = tokenCount_ * numHeads_;
+        for (uint32_t taskIdx = worker; taskIdx < taskCount; taskIdx += activeWorkers) {
+            const uint32_t tokenIdx = taskIdx / numHeads_;
+            const uint32_t headIdx = taskIdx - tokenIdx * numHeads_;
+            uint32_t blockIdx = 0;
+            uint32_t groupInBlock = 0;
+            uint32_t groupRow = 0;
+            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock, groupRow)) {
+                continue;
+            }
+
+            const uint32_t vecIdx = MakeVecIndex(tokenIdx, headIdx);
+            if (vecIdx >= nVec_) {
+                continue;
+            }
+            vecIndices[rows] = vecIdx;
+            groupBases[rows] = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+            groupRows[rows] = groupRow;
+            ++rows;
+            if (rows == vecPerCore_) {
+                FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+                rows = 0;
+            }
+        }
+        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+    }
+
 private:
     AscendC::TPipe* pipe_ = nullptr;
     RotateMmT* rotateMm_ = nullptr;
@@ -783,6 +1014,7 @@ private:
     uint32_t numBlocks_ = 0;
     uint32_t cacheSlots_ = 0;
     uint32_t dataCores_ = 1;
+    uint32_t packMode_ = TQ_PACK_MODE_GENERAL;
     bool matmulReady_ = false;
 
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
@@ -857,6 +1089,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
         tilingData.numHeads,
         tilingData.blockSize,
         tilingData.numBlocks,
-        tilingData.dataCores);
+        tilingData.dataCores,
+        tilingData.packMode);
     op.Process();
 }
