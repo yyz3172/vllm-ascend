@@ -1231,6 +1231,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         key_in = key
                         value_in = value
                         cache_slots = slots
+                    pack_mode = 0
+                    if not encoder_decoder:
+                        if (
+                            attn_metadata.attn_state
+                            == AscendAttentionState.DecodeOnly
+                            and attn_metadata.num_actual_tokens
+                            == attn_metadata.num_decodes
+                        ):
+                            pack_mode = 1
+                        else:
+                            pack_mode = 2
                     turboquant_pack_kv_for_cache_to_cache(
                         key=key_in,
                         value=value_in,
@@ -1239,6 +1250,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         slot_mapping=cache_slots,
                         bits_key=self.turboquant_kv_bits_key,
                         bits_value=self.turboquant_kv_bits_value,
+                        pack_mode=pack_mode,
                     )
                 if self.is_kv_producer:
                     attn_metadata.reshape_cache_event.record()

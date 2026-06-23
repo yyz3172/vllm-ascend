@@ -633,7 +633,8 @@ void turboquant_pack_kv_for_cache_4bit(
     const at::Tensor &rotation_t,
     at::Tensor &key_cache,
     at::Tensor &value_cache,
-    int64_t block_size) {
+    int64_t block_size,
+    int64_t pack_mode = 0) {
     constexpr int64_t kHeadSize = 128;
     constexpr int64_t kRowBytes = kHeadSize / 2 + 2;
     TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
@@ -666,6 +667,9 @@ void turboquant_pack_kv_for_cache_4bit(
                     key_cache.size(2) == value_cache.size(2),
                 "key/value slab cache shapes must match");
     TORCH_CHECK(block_size > 0, "block_size must be > 0");
+    TORCH_CHECK(pack_mode == 0 || pack_mode == 1 || pack_mode == 2,
+                "4-bit pack-to-cache pack_mode must be 0 (general), "
+                "1 (decode direct), or 2 (logical fast fallback)");
     TORCH_CHECK(key_cache.size(2) == block_size * kRowBytes,
                 "slab cache last dim must equal block_size * 66");
     TORCH_CHECK(block_size % 4 == 0,
@@ -721,7 +725,6 @@ void turboquant_pack_kv_for_cache_4bit(
             vec_per_core = 16;
         }
     }
-    const int64_t pack_mode = 0;
     const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
     const int64_t num_blocks = key_cache.size(0);
     const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
@@ -1999,7 +2002,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "turboquant_pack_kv_for_cache_4bit(Tensor key, Tensor value, Tensor slot_mapping, "
-        "Tensor codebook, Tensor rotation_t, Tensor! key_cache, Tensor! value_cache, int block_size) -> ()");
+        "Tensor codebook, Tensor rotation_t, Tensor! key_cache, Tensor! value_cache, "
+        "int block_size, int pack_mode=0) -> ()");
     ops.impl("turboquant_pack_kv_for_cache_4bit", torch::kPrivateUse1,
              &vllm_ascend::turboquant_pack_kv_for_cache_4bit);
 
