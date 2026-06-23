@@ -342,30 +342,6 @@ public:
 
 private:
 
-    __aicore__ inline bool ResolveCacheGroup(
-        uint32_t tokenIdx,
-        uint32_t headIdx,
-        uint64_t& groupBase,
-        uint32_t& groupRow,
-        uint32_t& physicalGroupTask) {
-        if (tokenIdx >= tokenCount_ || headIdx >= numHeads_) {
-            return false;
-        }
-        const int32_t slot = slotMappingGm_.GetValue(tokenIdx);
-        if (slot < 0 || static_cast<uint32_t>(slot) >= cacheSlots_) {
-            return false;
-        }
-        const uint32_t slotU = static_cast<uint32_t>(slot);
-        const uint32_t blockIdx = slotU / blockSize_;
-        const uint32_t blockOff = slotU - blockIdx * blockSize_;
-        const uint32_t groupInBlock = blockOff / TQ_GROUP_ROWS;
-        groupRow = blockOff - groupInBlock * TQ_GROUP_ROWS;
-        physicalGroupTask = ((blockIdx * (blockSize_ / TQ_GROUP_ROWS)) + groupInBlock) * numHeads_ + headIdx;
-        groupBase = ((uint64_t)blockIdx * numHeads_ + headIdx) * blockSize_ * TQ_ROW_BYTES
-                    + static_cast<uint64_t>(groupInBlock) * TQ_GROUP_BYTES;
-        return true;
-    }
-
     // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
     // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids 16-bit overflow.
     __aicore__ inline void NormalizeBatch(uint32_t m) {
@@ -518,36 +494,10 @@ private:
         yBatchQue_.FreeTensor(yBatch);
     }
 
-    __aicore__ inline void ResolveVecRow(
-        uint32_t vecIdx,
-        uint32_t& tokenIdx,
-        uint32_t& headIdx) {
-        tokenIdx = vecIdx / numHeads_;
-        headIdx = vecIdx - tokenIdx * numHeads_;
-    }
-
     __aicore__ inline uint32_t MakeVecIndex(
         uint32_t tokenIdx,
         uint32_t headIdx) const {
         return tokenIdx * numHeads_ + headIdx;
-    }
-
-    __aicore__ inline void CopyInTask(
-        const AscendC::GlobalTensor<T>& xGm,
-        uint32_t vecStart,
-        uint32_t rows,
-        uint32_t& m) {
-        if (rows == 0) {
-            m = 0;
-            return;
-        }
-        auto xBatch = xBatchQue_.AllocTensor<T>();
-        AscendC::DataCopy(
-            xBatch,
-            xGm[static_cast<uint64_t>(vecStart) * TQ_PACK_D],
-            rows * TQ_PACK_D);
-        m = rows;
-        xBatchQue_.EnQue(xBatch);
     }
 
     __aicore__ inline void CopyInIndexedTask(
@@ -633,36 +583,47 @@ private:
         const uint8_t* validRows,
         uint32_t m) {
         auto packedGroup = packedRowBuf_.Get<uint8_t>();
+        uint32_t sortedRows[TQ_MAX_BATCH_M];
         uint32_t rowForGroup[TQ_GROUP_ROWS];
+        uint32_t validCount = 0;
 
         for (uint32_t row = 0; row < m; ++row) {
             if (validRows[row] == 0) {
                 continue;
             }
-            bool groupSeen = false;
-            for (uint32_t prev = 0; prev < row; ++prev) {
-                if (validRows[prev] != 0 && groupBases[prev] == groupBases[row]) {
-                    groupSeen = true;
+            sortedRows[validCount] = row;
+            ++validCount;
+        }
+
+        for (uint32_t i = 1; i < validCount; ++i) {
+            const uint32_t row = sortedRows[i];
+            uint32_t pos = i;
+            while (pos > 0) {
+                const uint32_t prevRow = sortedRows[pos - 1];
+                if (groupBases[prevRow] < groupBases[row] ||
+                    (groupBases[prevRow] == groupBases[row] && groupRows[prevRow] <= groupRows[row])) {
                     break;
                 }
+                sortedRows[pos] = prevRow;
+                --pos;
             }
-            if (groupSeen) {
-                continue;
-            }
+            sortedRows[pos] = row;
+        }
 
-            const uint64_t groupBase = groupBases[row];
+        uint32_t row = 0;
+        while (row < validCount) {
+            const uint64_t groupBase = groupBases[sortedRows[row]];
             uint32_t rowMask = 0;
             for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
                 rowForGroup[groupRow] = TQ_MAX_BATCH_M;
             }
-            for (uint32_t srcRow = row; srcRow < m; ++srcRow) {
-                if (validRows[srcRow] == 0 || groupBases[srcRow] != groupBase) {
-                    continue;
-                }
+            do {
+                const uint32_t srcRow = sortedRows[row];
                 const uint32_t groupRow = groupRows[srcRow];
                 rowForGroup[groupRow] = srcRow;
                 rowMask |= (1u << groupRow);
-            }
+                ++row;
+            } while (row < validCount && groupBases[sortedRows[row]] == groupBase);
 
             if (rowMask == ((1u << TQ_GROUP_ROWS) - 1u)) {
                 ClearPackedGroup(packedGroup);
@@ -685,76 +646,28 @@ private:
         }
     }
 
-    __aicore__ inline void CopyOutTask(
+    __aicore__ inline void CopyOutResolvedTask(
         AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint32_t vecStart,
+        const uint64_t* groupBases,
+        const uint32_t* groupRows,
         uint32_t m) {
         auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
-        uint64_t groupBases[TQ_MAX_BATCH_M];
-        uint32_t groupRows[TQ_MAX_BATCH_M];
         uint8_t validRows[TQ_MAX_BATCH_M];
 
         for (uint32_t row = 0; row < m; ++row) {
-            const uint32_t vecIdx = vecStart + row;
-            uint32_t tokenIdx = 0;
-            uint32_t headIdx = 0;
-            ResolveVecRow(vecIdx, tokenIdx, headIdx);
-
-            uint64_t groupBase = 0;
-            uint32_t groupRow = 0;
-            uint32_t physicalGroupTask = 0;
-            validRows[row] = ResolveCacheGroup(
-                tokenIdx, headIdx, groupBase, groupRow, physicalGroupTask) ? 1 : 0;
-            groupBases[row] = groupBase;
-            groupRows[row] = groupRow;
-        }
-        FlushResolvedGroups(packedGm, encodedBatch, groupBases, groupRows, validRows, m);
-        encodedBatchQue_.FreeTensor(encodedBatch);
-    }
-
-    __aicore__ inline void CopyOutIndexedTask(
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        const uint32_t* vecIndices,
-        uint32_t m) {
-        auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
-        uint64_t groupBases[TQ_MAX_BATCH_M];
-        uint32_t groupRows[TQ_MAX_BATCH_M];
-        uint8_t validRows[TQ_MAX_BATCH_M];
-
-        for (uint32_t row = 0; row < m; ++row) {
-            const uint32_t vecIdx = vecIndices[row];
-            uint32_t tokenIdx = 0;
-            uint32_t headIdx = 0;
-            ResolveVecRow(vecIdx, tokenIdx, headIdx);
-
-            uint32_t physicalGroupTask = 0;
-            validRows[row] = ResolveCacheGroup(
-                tokenIdx, headIdx, groupBases[row], groupRows[row], physicalGroupTask) ? 1 : 0;
+            validRows[row] = 1;
         }
 
         FlushResolvedGroups(packedGm, encodedBatch, groupBases, groupRows, validRows, m);
         encodedBatchQue_.FreeTensor(encodedBatch);
-    }
-
-    __aicore__ inline void PackCacheTask(
-        const AscendC::GlobalTensor<T>& xGm,
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint32_t vecStart,
-        uint32_t rows) {
-        uint32_t m = 0;
-        CopyInTask(xGm, vecStart, rows, m);
-        if (m == 0) {
-            return;
-        }
-
-        ComputeBatch(m);
-        CopyOutTask(packedGm, vecStart, m);
     }
 
     __aicore__ inline void PackCacheIndexedTask(
         const AscendC::GlobalTensor<T>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const uint32_t* vecIndices,
+        const uint64_t* groupBases,
+        const uint32_t* groupRows,
         uint32_t rows) {
         uint32_t m = 0;
         CopyInIndexedTask(xGm, vecIndices, rows, m);
@@ -763,7 +676,7 @@ private:
         }
 
         ComputeBatch(m);
-        CopyOutIndexedTask(packedGm, vecIndices, m);
+        CopyOutResolvedTask(packedGm, groupBases, groupRows, m);
     }
 
     __aicore__ inline uint32_t GetActiveWorkers() const {
@@ -773,7 +686,8 @@ private:
     __aicore__ inline bool ResolveTokenSlot(
         uint32_t tokenIdx,
         uint32_t& blockIdx,
-        uint32_t& groupInBlock) {
+        uint32_t& groupInBlock,
+        uint32_t& groupRow) {
         if (tokenIdx >= tokenCount_) {
             return false;
         }
@@ -785,6 +699,7 @@ private:
         blockIdx = slotU / blockSize_;
         const uint32_t blockOff = slotU - blockIdx * blockSize_;
         groupInBlock = blockOff / TQ_GROUP_ROWS;
+        groupRow = blockOff - groupInBlock * TQ_GROUP_ROWS;
         return true;
     }
 
@@ -795,14 +710,24 @@ private:
         return ((blockIdx * (blockSize_ / TQ_GROUP_ROWS)) + groupInBlock) * numHeads_ + headIdx;
     }
 
+    __aicore__ inline uint64_t MakeGroupBase(
+        uint32_t blockIdx,
+        uint32_t groupInBlock,
+        uint32_t headIdx) const {
+        return ((uint64_t)blockIdx * numHeads_ + headIdx) * blockSize_ * TQ_ROW_BYTES
+               + static_cast<uint64_t>(groupInBlock) * TQ_GROUP_BYTES;
+    }
+
     __aicore__ inline void FlushVecBatch(
         const uint32_t* vecIndices,
+        const uint64_t* groupBases,
+        const uint32_t* groupRows,
         uint32_t rows) {
         if (rows == 0) {
             return;
         }
-        PackCacheIndexedTask(keyGm_, keyCacheGm_, vecIndices, rows);
-        PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, rows);
+        PackCacheIndexedTask(keyGm_, keyCacheGm_, vecIndices, groupBases, groupRows, rows);
+        PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, rows);
     }
 
     __aicore__ inline void ProcessCachePairByOwnedGroups(uint32_t worker) {
@@ -812,11 +737,14 @@ private:
         }
 
         uint32_t vecIndices[TQ_MAX_BATCH_M];
+        uint64_t groupBases[TQ_MAX_BATCH_M];
+        uint32_t groupRows[TQ_MAX_BATCH_M];
         uint32_t rows = 0;
         for (uint32_t tokenIdx = 0; tokenIdx < tokenCount_; ++tokenIdx) {
             uint32_t blockIdx = 0;
             uint32_t groupInBlock = 0;
-            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock)) {
+            uint32_t groupRow = 0;
+            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock, groupRow)) {
                 continue;
             }
 
@@ -832,14 +760,16 @@ private:
                     continue;
                 }
                 vecIndices[rows] = vecIdx;
+                groupBases[rows] = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+                groupRows[rows] = groupRow;
                 ++rows;
                 if (rows == vecPerCore_) {
-                    FlushVecBatch(vecIndices, rows);
+                    FlushVecBatch(vecIndices, groupBases, groupRows, rows);
                     rows = 0;
                 }
             }
         }
-        FlushVecBatch(vecIndices, rows);
+        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
     }
 
 private:

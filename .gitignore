@@ -1,6 +1,9 @@
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/
+tools/
+mytmp/
+tips/
 
 # egg-info
 vllm_ascend.egg-info/
