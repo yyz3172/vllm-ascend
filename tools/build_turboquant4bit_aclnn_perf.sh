@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-OUT=${1:-"${ROOT_DIR}/mytmp/turboquant4bit_aclnn_perf"}
+OUT=${1:-"${ROOT_DIR}/mytmp/turboquant4bit_aclnn_perf/turboquant4bit_aclnn_perf"}
 
 ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}
 if [[ ! -d "${ASCEND_HOME_PATH}" && -d /usr/local/Ascend/cann-8.5.1 ]]; then
