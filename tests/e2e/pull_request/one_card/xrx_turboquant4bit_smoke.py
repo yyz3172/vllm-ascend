@@ -23,8 +23,8 @@ from vllm import LLM, SamplingParams
 
 from vllm_ascend.ascend_config import clear_ascend_config
 
-MODEL_PATH = "/root/x00827378/model/Qwen3-0.6B"
-PROFILE_DIR = "/root/x00827378/perflog2"
+MODEL_PATH = os.getenv("TQ_SMOKE_MODEL_PATH", "../model/Qwen3-0.6B")
+PROFILE_DIR = os.getenv("TQ_SMOKE_PROFILE_DIR", "perflog2")
 PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_WARMUP_ITERATIONS", "2"))
 PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_ACTIVE_ITERATIONS", "5"))
 
