@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 
 import torch
 from vllm import LLM, SamplingParams
 
 from vllm_ascend.ascend_config import clear_ascend_config
 
-MODEL_PATH = "/root/x00827378/model/Qwen3-0.6B"
-PROFILE_DIR = "/root/x00827378/perflog2"
+MODEL_PATH = os.getenv("TQ_SMOKE_MODEL_PATH", "../model/Qwen3-0.6B")
+PROFILE_DIR = os.getenv("TQ_SMOKE_PROFILE_DIR", "perflog")
+PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_WARMUP_ITERATIONS", "2"))
+PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_TQ4BIT_PROFILE_ACTIVE_ITERATIONS", "5"))
 
 
 @contextlib.contextmanager
@@ -61,14 +64,19 @@ def main() -> None:
                 "profiler": "torch",
                 "torch_profiler_dir": PROFILE_DIR,
                 "torch_profiler_with_stack": True,
+                "warmup_iterations": PROFILE_WARMUP_ITERATIONS,
+                "active_iterations": PROFILE_ACTIVE_ITERATIONS,
             }
+        seed_cur = 0 # time.time_ns() % (2**31)
+        print("llm seed is ", seed_cur)
         llm = LLM(
             model=MODEL_PATH,
+            seed=seed_cur,
             trust_remote_code=True,
             max_model_len=256,
             block_size=16,
             kv_cache_dtype="turboquant",
-            gpu_memory_utilization=0.10,
+            gpu_memory_utilization=0.05,
             additional_config={"turboquant_kv_bits": [4, 4]},
             enforce_eager=True,
             enable_chunked_prefill=True,

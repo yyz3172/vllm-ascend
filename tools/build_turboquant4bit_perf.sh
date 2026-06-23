@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-OUT=${1:-"${ROOT_DIR}/tools/turboquant4bit_perf"}
+OUT=${1:-"${ROOT_DIR}/mytmp/turboquant4bit_perf"}
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 TORCH_INFO=$("${PYTHON_BIN}" - <<'PY'
