@@ -12,6 +12,7 @@
 # Features:
 # - Load balances requests to multiple prefiller and decoder servers.
 # - Supports OpenAI-compatible /v1/completions and /v1/chat/completions endpoints.
+# - Passthrough /release_kv_cache to the prefiller holding the session KV cache.
 # - Streams responses from backend servers to clients.
 #
 # Prerequisites:
@@ -128,8 +129,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
     from vllm.logger import init_logger
@@ -156,22 +157,31 @@ class InstanceType:
 
 
 TAINT_PRIORITY = 1e15
+# jiuwen affinity release API lives at the server root, not under /v1.
+RELEASE_KV_CACHE_PATH = "/release_kv_cache"
 
 
 class ServerState:
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.url = f"http://{host}:{port}/v1"
+        self.root_url = f"http://{host}:{port}"
+        self.url = f"{self.root_url}/v1"
         try:
             ip = ipaddress.ip_address(self.host)
             if isinstance(ip, ipaddress.IPv6Address):
-                self.url = f"http://[{host}]:{port}/v1"
+                self.root_url = f"http://[{host}]:{port}"
+                self.url = f"{self.root_url}/v1"
         except Exception:
             pass
         self.client = httpx.AsyncClient(
             timeout=None,
             base_url=self.url,
+            limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
+        )
+        self.root_client = httpx.AsyncClient(
+            timeout=None,
+            base_url=self.root_url,
             limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
         )
         self.active_tokens = 0
@@ -203,6 +213,8 @@ class ProxyState:
         self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
         self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
         self.req_to_prefiller = {}
+        self.session_to_prefiller: dict[str, int] = {}
+        self.session_lock = asyncio.Lock()
         self.req_id_lock = asyncio.Lock()
         # Removed selection locks - no longer needed for synchronous methods
 
@@ -252,6 +264,18 @@ class ProxyState:
         aborted_requests = self.prefillers[server_idx].aborted_requests.copy()
         self.prefillers[server_idx].aborted_requests.clear()
         return aborted_requests
+
+    async def bind_session_prefiller(self, cache_salt, prefiller_idx: int) -> None:
+        if cache_salt is None:
+            return
+        async with self.session_lock:
+            self.session_to_prefiller[str(cache_salt)] = prefiller_idx
+
+    async def get_session_prefiller(self, cache_salt) -> int | None:
+        if cache_salt is None:
+            return None
+        async with self.session_lock:
+            return self.session_to_prefiller.get(str(cache_salt))
 
     async def next_req_id(self):
         async with self.req_id_lock:
@@ -524,6 +548,12 @@ def parse_args():
         default=10,
         help="Check interval (seconds) for waiting nodes to be started",
     )
+    parser.add_argument(
+        "--release-timeout",
+        type=float,
+        default=1000,
+        help="Timeout (seconds) for /release_kv_cache passthrough requests",
+    )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
@@ -542,8 +572,10 @@ async def lifespan(app: FastAPI):
     yield
     for p in proxy_state.prefillers:
         await p.client.aclose()
+        await p.root_client.aclose()
     for d in proxy_state.decoders:
         await d.client.aclose()
+        await d.root_client.aclose()
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -581,7 +613,7 @@ async def send_request_to_service(
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
-):
+) -> tuple[httpx.Response, float]:
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
     req_data["kv_transfer_params"] = {
@@ -604,9 +636,11 @@ async def send_request_to_service(
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
+            prefill_start = time.perf_counter()
             response = await client.post(endpoint, json=req_data, headers=headers)
+            prefill_time_ms = (time.perf_counter() - prefill_start) * 1000
             response.raise_for_status()
-            return response
+            return response, prefill_time_ms
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
             last_exc = e
@@ -663,8 +697,9 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     # Select prefiller
     prefiller_idx = proxy_state.select_prefiller(prefiller_score)
     prefiller = proxy_state.prefillers[prefiller_idx]
+    await proxy_state.bind_session_prefiller(req_data.get("cache_salt"), prefiller_idx)
     # Send request to prefiller
-    response = await send_request_to_service(
+    response, prefill_time_ms = await send_request_to_service(
         prefiller.client,
         prefiller_idx,
         api,
@@ -693,6 +728,30 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
         decoder=decoder,
         decoder_idx=decoder_idx,
         decoder_score=decoder_score,
+        prefill_time_ms=prefill_time_ms,
+    )
+
+
+def _log_prefill_ttft(
+    request_id: str,
+    cache_salt,
+    prefill_time_ms: float,
+    retry_count: int = 0,
+    total_prefill_time_ms: float | None = None,
+) -> None:
+    total = total_prefill_time_ms if total_prefill_time_ms is not None else prefill_time_ms
+    logger.info(
+        "[PREFILL_TTFT] request_id=%s cache_salt=%s retry=%s prefill_time_ms=%.3f total_prefill_time_ms=%.3f",
+        request_id,
+        cache_salt,
+        retry_count,
+        prefill_time_ms,
+        total,
+    )
+    print(
+        f"[PREFILL_TTFT] request_id={request_id} cache_salt={cache_salt} "
+        f"retry={retry_count} prefill_time_ms={prefill_time_ms:.3f} "
+        f"total_prefill_time_ms={total:.3f}"
     )
 
 
@@ -705,6 +764,7 @@ class InstanceInfo:
     decoder_idx: int
     decoder_score: float
     decoder: ServerState
+    prefill_time_ms: float = 0.0
 
 
 async def _handle_completions(api: str, request: Request):
@@ -714,6 +774,14 @@ async def _handle_completions(api: str, request: Request):
         req_body = await request.body()
         request_length = len(req_body)
         instance_info = await _handle_select_instance(api, req_data, request_length)
+        total_prefill_time_ms = instance_info.prefill_time_ms
+        _log_prefill_ttft(
+            instance_info.request_id,
+            req_data.get("cache_salt"),
+            instance_info.prefill_time_ms,
+            retry_count=0,
+            total_prefill_time_ms=total_prefill_time_ms,
+        )
         stream_flag = bool(req_data.get("stream", False))
         chat_flag = "messages" in req_data
 
@@ -728,7 +796,7 @@ async def _handle_completions(api: str, request: Request):
         origin_max_tokens = req_data.get("max_tokens", 16)
 
         async def generate_stream():
-            nonlocal instance_info
+            nonlocal instance_info, total_prefill_time_ms
             generated_token = ""
             released_kv = False
             retry_count = 0
@@ -794,6 +862,14 @@ async def _handle_completions(api: str, request: Request):
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+                            total_prefill_time_ms += instance_info.prefill_time_ms
+                            _log_prefill_ttft(
+                                instance_info.request_id,
+                                req_data.get("cache_salt"),
+                                instance_info.prefill_time_ms,
+                                retry_count=retry_count,
+                                total_prefill_time_ms=total_prefill_time_ms,
+                            )
                             break
                         if retry_count > 0 and not stream_flag:
                             if chat_flag:
@@ -816,7 +892,13 @@ async def _handle_completions(api: str, request: Request):
 
         # Determine the correct media type based on stream flag
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        return StreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            headers={
+                "X-Prefill-Time-Ms": f"{total_prefill_time_ms:.3f}",
+            },
+        )
     except Exception as e:
         import traceback
 
@@ -876,6 +958,84 @@ def trans_instances(instances: list[str]) -> list[ServerState]:
         h, p = instance.split(":")
         server_list.append(ServerState(h, int(p)))
     return server_list
+
+
+async def _resolve_release_prefiller(cache_salt) -> int:
+    prefiller_idx = await proxy_state.get_session_prefiller(cache_salt)
+    if prefiller_idx is not None:
+        return prefiller_idx
+    if len(proxy_state.prefillers) == 1:
+        return 0
+    logger.warning(
+        "No prefiller mapping for cache_salt=%s, forwarding release to prefiller 0",
+        cache_salt,
+    )
+    return 0
+
+
+async def _handle_release_kv_cache(request: Request):
+    if not proxy_state.prefillers:
+        raise HTTPException(status_code=503, detail="No prefiller servers available")
+
+    req_data = await request.json()
+    prefiller_idx = await _resolve_release_prefiller(req_data.get("cache_salt"))
+    prefiller = proxy_state.prefillers[prefiller_idx]
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+    last_exc = None
+
+    for attempt in range(1, global_args.max_retries + 1):
+        try:
+            target_url = f"{prefiller.root_url}{RELEASE_KV_CACHE_PATH}"
+            logger.info(
+                "Forwarding release to %s (cache_salt=%s)",
+                target_url,
+                req_data.get("cache_salt"),
+            )
+            response = await prefiller.root_client.post(
+                RELEASE_KV_CACHE_PATH,
+                json=req_data,
+                headers=headers,
+                timeout=global_args.release_timeout,
+            )
+            if response.status_code >= 400:
+                logger.warning(
+                    "Release attempt %s failed for cache_salt=%s on %s: %s",
+                    attempt,
+                    req_data.get("cache_salt"),
+                    prefiller.root_url,
+                    response.text,
+                )
+                if attempt < global_args.max_retries:
+                    await asyncio.sleep(global_args.retry_delay * (2 ** (attempt - 1)))
+                    continue
+            return JSONResponse(
+                content=response.json(),
+                status_code=response.status_code,
+            )
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as e:
+            logger.warning(
+                "Release attempt %s failed for cache_salt=%s on %s: %s",
+                attempt,
+                req_data.get("cache_salt"),
+                prefiller.root_url,
+                str(e),
+            )
+            last_exc = e
+            if attempt < global_args.max_retries:
+                await asyncio.sleep(global_args.retry_delay * (2 ** (attempt - 1)))
+
+    logger.error(
+        "All %s release attempts failed for cache_salt=%s on %s",
+        global_args.max_retries,
+        req_data.get("cache_salt"),
+        prefiller.root_url,
+    )
+    raise HTTPException(status_code=502, detail=str(last_exc))
+
+
+@app.post(RELEASE_KV_CACHE_PATH)
+async def handle_release_kv_cache(request: Request):
+    return await _handle_release_kv_cache(request)
 
 
 @app.post("/v1/completions")
