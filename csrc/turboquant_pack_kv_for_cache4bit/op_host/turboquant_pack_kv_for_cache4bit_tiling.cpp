@@ -9,10 +9,10 @@ constexpr uint32_t TQ_PACK_M_ALIGN = 16;
 constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
-constexpr uint32_t TQ_PACK_TILING_KEY_KFC = 0;
-constexpr uint32_t TQ_PACK_MODE_KFC = 0;
-constexpr uint32_t TQ_PACK_MODE_DECODE_DIRECT = 1;
-constexpr uint32_t TQ_PACK_MODE_LOGICAL_FAST_FALLBACK = 2;
+constexpr uint32_t TQ_PACK_TILING_KEY_DEFAULT = 0;
+constexpr uint32_t TQ_PACK_MODE_SLOT_MAPPING_GROUP_OWNER = 0;
+constexpr uint32_t TQ_PACK_MODE_DECODE_VEC_TASKS = 1;
+constexpr uint32_t TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK = 2;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
 constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
 
@@ -106,13 +106,14 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     const uint32_t numHeads = static_cast<uint32_t>(*numHeadsPtr);
     const uint32_t blockSize = static_cast<uint32_t>(*blockSizePtr);
     const uint32_t numBlocks = static_cast<uint32_t>(*numBlocksPtr);
-    if ((packMode != TQ_PACK_MODE_KFC &&
-         packMode != TQ_PACK_MODE_DECODE_DIRECT &&
-         packMode != TQ_PACK_MODE_LOGICAL_FAST_FALLBACK) ||
+    if ((packMode != TQ_PACK_MODE_SLOT_MAPPING_GROUP_OWNER &&
+         packMode != TQ_PACK_MODE_DECODE_VEC_TASKS &&
+         packMode != TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK) ||
         nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
         blockSize < 1 || numBlocks < 1) {
         OPS_LOG_E(nodeName,
-                  "invalid pack attrs: 4-bit pack-to-cache supports pack_mode 0, 1, or 2");
+                  "invalid pack attrs: pack_mode 0=slot-mapping-group-owner, "
+                  "1=decode-vec-tasks, 2=contiguous-group-fast-fallback");
         return ge::GRAPH_FAILED;
     }
     if (blockSize % 4 != 0) {
@@ -212,7 +213,7 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     // KFC message queues and CANN internal workspace.
     workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
-    context->SetTilingKey(TQ_PACK_TILING_KEY_KFC);
+    context->SetTilingKey(TQ_PACK_TILING_KEY_DEFAULT);
     return ge::GRAPH_SUCCESS;
 }
 

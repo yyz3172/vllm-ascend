@@ -69,9 +69,9 @@ static constexpr uint32_t TQ_QUANT_CODE_BYTES =
     TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
 static constexpr float TQ_FY_LINEAR = 0.020799f;
 static constexpr float TQ_FY_CUBIC = 0.0001926f;
-static constexpr uint32_t TQ_PACK_MODE_GENERAL = 0;
-static constexpr uint32_t TQ_PACK_MODE_DECODE_DIRECT = 1;
-static constexpr uint32_t TQ_PACK_MODE_LOGICAL_FAST_FALLBACK = 2;
+static constexpr uint32_t TQ_PACK_MODE_SLOT_MAPPING_GROUP_OWNER = 0;
+static constexpr uint32_t TQ_PACK_MODE_DECODE_VEC_TASKS = 1;
+static constexpr uint32_t TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK = 2;
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
@@ -289,8 +289,29 @@ using TqRotateMatmulOp =
 template <typename T, typename RotateMmT>
 class TurboquantPackKVForCache4bitToCache {
 public:
-    __aicore__ inline explicit TurboquantPackKVForCache4bitToCache(AscendC::TPipe* pipe, RotateMmT* rotateMm)
-        : pipe_(pipe), rotateMm_(rotateMm) {}
+    __aicore__ inline explicit TurboquantPackKVForCache4bitToCache(
+        AscendC::TPipe* pipe,
+        RotateMmT* rotateMm,
+        __gm__ uint8_t* rawWorkspace,
+        uint32_t nVec,
+        uint32_t vecPerCore,
+        uint32_t numHeads,
+        uint32_t blockSize,
+        uint32_t numBlocks,
+        uint32_t dataCores,
+        uint32_t packMode)
+        : pipe_(pipe),
+          rotateMm_(rotateMm),
+          nVec_(nVec),
+          vecPerCore_(vecPerCore > TQ_MAX_BATCH_M ? TQ_MAX_BATCH_M : vecPerCore),
+          numHeads_(numHeads == 0 ? 1 : numHeads),
+          tokenCount_((nVec + (numHeads == 0 ? 1 : numHeads) - 1) / (numHeads == 0 ? 1 : numHeads)),
+          blockSize_(blockSize == 0 ? 1 : blockSize),
+          numBlocks_(numBlocks),
+          cacheSlots_((blockSize == 0 ? 1 : blockSize) * numBlocks),
+          dataCores_(dataCores == 0 ? 1 : dataCores),
+          packMode_(packMode),
+          matmulReady_(rawWorkspace != nullptr) {}
 
     __aicore__ inline void Init(
         GM_ADDR key,
@@ -299,28 +320,7 @@ public:
         __gm__ T* rotation_t,
         __gm__ int32_t* slot_mapping,
         __gm__ uint8_t* key_cache,
-        __gm__ uint8_t* value_cache,
-        __gm__ uint8_t* rawWorkspace,
-        uint32_t nVec,
-        uint32_t vecPerCore,
-        uint32_t numHeads,
-        uint32_t blockSize,
-        uint32_t numBlocks,
-        uint32_t dataCores,
-        uint32_t packMode) {
-        nVec_ = nVec;
-        vecPerCore_ = vecPerCore;
-        numHeads_ = numHeads == 0 ? 1 : numHeads;
-        tokenCount_ = (nVec_ + numHeads_ - 1) / numHeads_;
-        blockSize_ = blockSize == 0 ? 1 : blockSize;
-        numBlocks_ = numBlocks;
-        cacheSlots_ = blockSize_ * numBlocks_;
-        dataCores_ = dataCores == 0 ? 1 : dataCores;
-        packMode_ = packMode;
-        if (vecPerCore_ > TQ_MAX_BATCH_M) {
-            vecPerCore_ = TQ_MAX_BATCH_M;
-        }
-
+        __gm__ uint8_t* value_cache) {
         (void)codebook;
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key), (uint64_t)nVec_ * TQ_PACK_D);
         valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value), (uint64_t)nVec_ * TQ_PACK_D);
@@ -350,8 +350,6 @@ public:
         pipe_->InitBuffer(encodedBatchQue_, TQ_QUEUE_DEPTH,
                           TQ_MAX_BATCH_M * TQ_ENCODED_ROW_STRIDE_BYTES);
         pipe_->InitBuffer(rotateWorkBuf_, TQ_ROT_LOCAL_WORKSPACE_BYTES);
-
-        matmulReady_ = (rawWorkspace != nullptr);
     }
 
     __aicore__ inline void Process() {
@@ -361,22 +359,25 @@ public:
         if ASCEND_IS_AIC {
             return;
         }
-        // Assign each physical 4-row cache group to exactly one worker.  A
-        // worker then gathers all token-major input rows for its groups, so no
-        // other core can race on the same packed group RMW.
+        // Writeback strategy:
+        //   mode 0: safe baseline. Resolve every token through slot_mapping and
+        //           assign each physical 4-row cache group to one worker.
+        //   mode 1: decode fast path. Split token/head vector tasks directly.
+        //   mode 2: prefill fast path. Write physically contiguous 4-token
+        //           groups first, then fall back to mode 0 for the rest.
         const uint32_t worker = AscendC::GetBlockIdx();
         if (worker >= GetActiveWorkers()) {
             return;
         }
-        if (packMode_ == TQ_PACK_MODE_DECODE_DIRECT) {
-            ProcessCachePairByDirectTasks(worker);
+        if (packMode_ == TQ_PACK_MODE_DECODE_VEC_TASKS) {
+            ProcessCachePairByVecTaskStride(worker);
             return;
         }
-        if (packMode_ == TQ_PACK_MODE_LOGICAL_FAST_FALLBACK) {
-            ProcessCachePairByLogicalFastFallback(worker);
+        if (packMode_ == TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK) {
+            ProcessCachePairByContiguousGroupFastPathThenFallback(worker);
             return;
         }
-        ProcessCachePairByOwnedGroups(worker);
+        ProcessCachePairBySlotMappingGroupOwners(worker);
     }
 
 private:
@@ -456,7 +457,7 @@ private:
 
     template <int CODE>
     __aicore__ inline void FillQuantCodeVector(
-        AscendC::LocalTensor<float>& quantCodes) {
+        AscendC::LocalTensor<float>& quantCodes) const {
         float codeFloat = static_cast<float>(CODE);
         AscendC::Duplicate(
             quantCodes[(CODE - 1) * TQ_PACK_D],
@@ -466,7 +467,7 @@ private:
     }
 
     __aicore__ inline void FillQuantCodeVectors(
-        AscendC::LocalTensor<float>& quantCodes) {
+        AscendC::LocalTensor<float>& quantCodes) const {
         FillQuantCodeVector<1>(quantCodes);
         FillQuantCodeVector<2>(quantCodes);
         FillQuantCodeVector<3>(quantCodes);
@@ -489,7 +490,7 @@ private:
         AscendC::LocalTensor<float>& qFloat,
         AscendC::LocalTensor<uint8_t>& quantMask,
         AscendC::LocalTensor<float>& yFp32,
-        const AscendC::LocalTensor<float>& quantCodes) {
+        const AscendC::LocalTensor<float>& quantCodes) const {
         float threshold = TqFyScalar(static_cast<float>(CODE - 8));
         AscendC::CompareScalar(
             quantMask,
@@ -622,7 +623,7 @@ private:
     //                  bits  8..11 = row2 idx[d]
     //                  bits 12..15 = row3 idx[d]
     //   norm bytes are appended as row0,row1,row2,row3 after the 256B index group.
-    __aicore__ inline void ClearPackedGroup(AscendC::LocalTensor<uint8_t>& packedGroup) {
+    __aicore__ inline void ClearPackedGroup(AscendC::LocalTensor<uint8_t>& packedGroup) const {
         auto packedU16 = packedGroup.template ReinterpretCast<uint16_t>();
         AscendC::Duplicate(
             packedU16,
@@ -752,7 +753,7 @@ private:
         encodedBatchQue_.FreeTensor(encodedBatch);
     }
 
-    __aicore__ inline void CopyOutFullGroupTask(
+    __aicore__ inline void CopyOutContiguousCacheGroup(
         AscendC::GlobalTensor<uint8_t>& packedGm,
         uint64_t groupBase) {
         auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
@@ -783,7 +784,7 @@ private:
         CopyOutResolvedTask(packedGm, groupBases, groupRows, m);
     }
 
-    __aicore__ inline void PackCacheFullGroupTask(
+    __aicore__ inline void PackContiguousCacheGroup(
         const AscendC::GlobalTensor<T>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const uint32_t* vecIndices,
@@ -795,7 +796,7 @@ private:
         }
 
         ComputeBatch(m);
-        CopyOutFullGroupTask(packedGm, groupBase);
+        CopyOutContiguousCacheGroup(packedGm, groupBase);
     }
 
     __aicore__ inline uint32_t GetActiveWorkers() const {
@@ -806,7 +807,7 @@ private:
         uint32_t tokenIdx,
         uint32_t& blockIdx,
         uint32_t& groupInBlock,
-        uint32_t& groupRow) {
+        uint32_t& groupRow) const {
         if (tokenIdx >= tokenCount_) {
             return false;
         }
@@ -824,7 +825,7 @@ private:
 
     __aicore__ inline bool ResolveTokenSlotU(
         uint32_t tokenIdx,
-        uint32_t& slotU) {
+        uint32_t& slotU) const {
         if (tokenIdx >= tokenCount_) {
             return false;
         }
@@ -836,10 +837,10 @@ private:
         return true;
     }
 
-    __aicore__ inline bool TryResolveFullPhysicalGroupStart(
+    __aicore__ inline bool TryResolveContiguousPhysicalGroup(
         uint32_t tokenIdx,
         uint32_t& blockIdx,
-        uint32_t& groupInBlock) {
+        uint32_t& groupInBlock) const {
         if (tokenIdx + TQ_GROUP_ROWS > tokenCount_ || cacheSlots_ < TQ_GROUP_ROWS) {
             return false;
         }
@@ -867,14 +868,14 @@ private:
         return true;
     }
 
-    __aicore__ inline uint32_t MakePhysicalGroupTask(
+    __aicore__ inline uint32_t MakeCacheGroupOwnerTaskId(
         uint32_t blockIdx,
         uint32_t groupInBlock,
         uint32_t headIdx) const {
         return ((blockIdx * (blockSize_ / TQ_GROUP_ROWS)) + groupInBlock) * numHeads_ + headIdx;
     }
 
-    __aicore__ inline uint64_t MakeGroupBase(
+    __aicore__ inline uint64_t MakeCacheGroupBaseOffset(
         uint32_t blockIdx,
         uint32_t groupInBlock,
         uint32_t headIdx) const {
@@ -894,11 +895,11 @@ private:
         PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, rows);
     }
 
-    __aicore__ inline void FlushFullGroupBatch(
+    __aicore__ inline void FlushContiguousCacheGroupBatch(
         const uint32_t* vecIndices,
         uint64_t groupBase) {
-        PackCacheFullGroupTask(keyGm_, keyCacheGm_, vecIndices, groupBase);
-        PackCacheFullGroupTask(valueGm_, valueCacheGm_, vecIndices, groupBase);
+        PackContiguousCacheGroup(keyGm_, keyCacheGm_, vecIndices, groupBase);
+        PackContiguousCacheGroup(valueGm_, valueCacheGm_, vecIndices, groupBase);
     }
 
     __aicore__ inline void GetWorkerTokenRange(
@@ -913,10 +914,10 @@ private:
         tokenEnd = tokenStart + baseTokens + (worker < extraTokens ? 1 : 0);
     }
 
-    __aicore__ inline uint32_t BuildFullGroupHeadTask(
+    __aicore__ inline uint32_t BuildContiguousGroupVecIndices(
         uint32_t tokenIdx,
         uint32_t headIdx,
-        uint32_t* vecIndices) {
+        uint32_t* vecIndices) const {
         uint32_t rows = 0;
         for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
             const uint32_t vecIdx = MakeVecIndex(tokenIdx + groupRow, headIdx);
@@ -929,7 +930,7 @@ private:
         return rows;
     }
 
-    __aicore__ inline void ProcessLogicalFullGroupsByRange(
+    __aicore__ inline void ProcessContiguousPhysicalGroupsInTokenRange(
         uint32_t worker,
         uint32_t activeWorkers) {
         uint32_t tokenStart = 0;
@@ -941,25 +942,25 @@ private:
         while (tokenIdx < tokenEnd) {
             uint32_t blockIdx = 0;
             uint32_t groupInBlock = 0;
-            if (!TryResolveFullPhysicalGroupStart(tokenIdx, blockIdx, groupInBlock)) {
+            if (!TryResolveContiguousPhysicalGroup(tokenIdx, blockIdx, groupInBlock)) {
                 ++tokenIdx;
                 continue;
             }
 
             for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                const uint32_t rows = BuildFullGroupHeadTask(tokenIdx, headIdx, vecIndices);
+                const uint32_t rows = BuildContiguousGroupVecIndices(tokenIdx, headIdx, vecIndices);
                 if (rows != TQ_GROUP_ROWS) {
                     continue;
                 }
-                FlushFullGroupBatch(
+                FlushContiguousCacheGroupBatch(
                     vecIndices,
-                    MakeGroupBase(blockIdx, groupInBlock, headIdx));
+                    MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx));
             }
             tokenIdx += TQ_GROUP_ROWS;
         }
     }
 
-    __aicore__ inline void ProcessFallbackByOwnedGroupsSkippingFullGroups(uint32_t worker) {
+    __aicore__ inline void ProcessSlotMappingGroupOwnerFallbackSkippingContiguousGroups(uint32_t worker) {
         const uint32_t activeWorkers = GetActiveWorkers();
         uint32_t vecIndices[TQ_MAX_BATCH_M];
         uint64_t groupBases[TQ_MAX_BATCH_M];
@@ -969,7 +970,7 @@ private:
         while (tokenIdx < tokenCount_) {
             uint32_t fullBlockIdx = 0;
             uint32_t fullGroupInBlock = 0;
-            if (TryResolveFullPhysicalGroupStart(tokenIdx, fullBlockIdx, fullGroupInBlock)) {
+            if (TryResolveContiguousPhysicalGroup(tokenIdx, fullBlockIdx, fullGroupInBlock)) {
                 tokenIdx += TQ_GROUP_ROWS;
                 continue;
             }
@@ -984,7 +985,7 @@ private:
 
             for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
                 const uint32_t physicalGroupTask =
-                    MakePhysicalGroupTask(blockIdx, groupInBlock, headIdx);
+                    MakeCacheGroupOwnerTaskId(blockIdx, groupInBlock, headIdx);
                 if ((physicalGroupTask % activeWorkers) != worker) {
                     continue;
                 }
@@ -994,7 +995,7 @@ private:
                     continue;
                 }
                 vecIndices[rows] = vecIdx;
-                groupBases[rows] = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+                groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
                 groupRows[rows] = groupRow;
                 ++rows;
                 if (rows == vecPerCore_) {
@@ -1007,17 +1008,17 @@ private:
         FlushVecBatch(vecIndices, groupBases, groupRows, rows);
     }
 
-    __aicore__ inline void ProcessCachePairByLogicalFastFallback(uint32_t worker) {
+    __aicore__ inline void ProcessCachePairByContiguousGroupFastPathThenFallback(uint32_t worker) {
         const uint32_t activeWorkers = GetActiveWorkers();
         if (activeWorkers == 0 || worker >= activeWorkers) {
             return;
         }
 
-        ProcessLogicalFullGroupsByRange(worker, activeWorkers);
-        ProcessFallbackByOwnedGroupsSkippingFullGroups(worker);
+        ProcessContiguousPhysicalGroupsInTokenRange(worker, activeWorkers);
+        ProcessSlotMappingGroupOwnerFallbackSkippingContiguousGroups(worker);
     }
 
-    __aicore__ inline void ProcessCachePairByOwnedGroups(uint32_t worker) {
+    __aicore__ inline void ProcessCachePairBySlotMappingGroupOwners(uint32_t worker) {
         const uint32_t activeWorkers = GetActiveWorkers();
         if (activeWorkers == 0 || worker >= activeWorkers) {
             return;
@@ -1037,7 +1038,7 @@ private:
 
             for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
                 const uint32_t physicalGroupTask =
-                    MakePhysicalGroupTask(blockIdx, groupInBlock, headIdx);
+                    MakeCacheGroupOwnerTaskId(blockIdx, groupInBlock, headIdx);
                 if ((physicalGroupTask % activeWorkers) != worker) {
                     continue;
                 }
@@ -1047,7 +1048,7 @@ private:
                     continue;
                 }
                 vecIndices[rows] = vecIdx;
-                groupBases[rows] = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+                groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
                 groupRows[rows] = groupRow;
                 ++rows;
                 if (rows == vecPerCore_) {
@@ -1059,7 +1060,7 @@ private:
         FlushVecBatch(vecIndices, groupBases, groupRows, rows);
     }
 
-    __aicore__ inline void ProcessCachePairByDirectTasks(uint32_t worker) {
+    __aicore__ inline void ProcessCachePairByVecTaskStride(uint32_t worker) {
         const uint32_t activeWorkers = GetActiveWorkers();
         if (activeWorkers == 0 || worker >= activeWorkers) {
             return;
@@ -1085,7 +1086,7 @@ private:
                 continue;
             }
             vecIndices[rows] = vecIdx;
-            groupBases[rows] = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+            groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
             groupRows[rows] = groupRow;
             ++rows;
             if (rows == vecPerCore_) {
@@ -1097,18 +1098,18 @@ private:
     }
 
 private:
-    AscendC::TPipe* pipe_ = nullptr;
-    RotateMmT* rotateMm_ = nullptr;
-    uint32_t nVec_ = 0;
-    uint32_t vecPerCore_ = 1;
-    uint32_t numHeads_ = 1;
-    uint32_t tokenCount_ = 0;
-    uint32_t blockSize_ = 1;
-    uint32_t numBlocks_ = 0;
-    uint32_t cacheSlots_ = 0;
-    uint32_t dataCores_ = 1;
-    uint32_t packMode_ = TQ_PACK_MODE_GENERAL;
-    bool matmulReady_ = false;
+    AscendC::TPipe* const pipe_;
+    RotateMmT* const rotateMm_;
+    const uint32_t nVec_;
+    const uint32_t vecPerCore_;
+    const uint32_t numHeads_;
+    const uint32_t tokenCount_;
+    const uint32_t blockSize_;
+    const uint32_t numBlocks_;
+    const uint32_t cacheSlots_;
+    const uint32_t dataCores_;
+    const uint32_t packMode_;
+    const bool matmulReady_;
 
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> aBatchQue_;
@@ -1167,15 +1168,9 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
     AscendC::TPipe pipe;
     TqRotateMatmulOp<TqDataT> rotateMm;
     REGIST_MATMUL_OBJ_STATIC(&pipe, GetSysWorkSpacePtr(), rotateMm, (TCubeTiling*)nullptr);
-    TurboquantPackKVForCache4bitToCache<TqDataT, TqRotateMatmulOp<TqDataT>> op(&pipe, &rotateMm);
-    op.Init(
-        key,
-        value,
-        codebookPtr,
-        rotationPtr,
-        slotMappingPtr,
-        keyCachePtr,
-        valueCachePtr,
+    TurboquantPackKVForCache4bitToCache<TqDataT, TqRotateMatmulOp<TqDataT>> op(
+        &pipe,
+        &rotateMm,
         wsPtr,
         tilingData.nVec,
         tilingData.vecPerCore,
@@ -1184,5 +1179,13 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
         tilingData.numBlocks,
         tilingData.dataCores,
         tilingData.packMode);
+    op.Init(
+        key,
+        value,
+        codebookPtr,
+        rotationPtr,
+        slotMappingPtr,
+        keyCachePtr,
+        valueCachePtr);
     op.Process();
 }
