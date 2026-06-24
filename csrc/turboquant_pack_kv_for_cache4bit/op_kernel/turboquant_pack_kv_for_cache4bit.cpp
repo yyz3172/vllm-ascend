@@ -257,9 +257,31 @@ using TqRotateCT = MatmulType<TPosition::VECIN, CubeFormat::ND, T>;
 template <typename T>
 using TqRotateBiasT = MatmulType<TPosition::GM, CubeFormat::ND, T>;
 
+__aicore__ inline constexpr MatmulConfig TqRotateMatmulConfig() {
+    constexpr MatmulShapeParams shapeParams = {
+        TQ_MAX_BATCH_M, TQ_ROT_N, TQ_ROT_K,
+        TQ_MAX_BATCH_M, TQ_ROT_N, TQ_ROT_K};
+    constexpr MatmulBiasParams biasParams = {false};
+    return GetMMConfig<MatmulConfigMode::CONFIG_MDL>(shapeParams, biasParams);
+}
+
+template <typename T>
+__aicore__ inline constexpr MatmulApiStaticTiling TqRotateMatmulTiling() {
+    MatmulApiStaticTiling tiling =
+        GetMatmulApiTiling<TqRotateAT<T>, TqRotateBT<T>, TqRotateCT<T>, TqRotateBiasT<T>>(
+            TqRotateMatmulConfig());
+    // Each AIV worker issues its own KFC matmul request.
+    tiling.usedCoreNum = 1;
+    return tiling;
+}
+
+template <typename T>
+static constexpr MatmulApiStaticTiling TQ_ROTATE_MATMUL_TILING = TqRotateMatmulTiling<T>();
+
 template <typename T>
 using TqRotateMatmulOp =
-    AscendC::Matmul<TqRotateAT<T>, TqRotateBT<T>, TqRotateCT<T>, TqRotateBiasT<T>>;
+    AscendC::Matmul<TqRotateAT<T>, TqRotateBT<T>, TqRotateCT<T>, TqRotateBiasT<T>,
+                    TQ_ROTATE_MATMUL_TILING<T>>;
 
 template <typename T, typename RotateMmT>
 class TurboquantPackKVForCache4bitToCache {
@@ -675,6 +697,20 @@ private:
         encodedBatchQue_.FreeTensor(encodedBatch);
     }
 
+    __aicore__ inline void CopyOutFullGroupTask(
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        uint64_t groupBase) {
+        auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
+        auto packedGroup = packedRowBuf_.Get<uint8_t>();
+
+        ClearPackedGroup(packedGroup);
+        for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
+            MergeEncodedRowToGroup(packedGroup, encodedBatch, groupRow, groupRow, false);
+        }
+        copy_packed_ub_to_gm(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+        encodedBatchQue_.FreeTensor(encodedBatch);
+    }
+
     __aicore__ inline void PackCacheIndexedTask(
         const AscendC::GlobalTensor<T>& xGm,
         AscendC::GlobalTensor<uint8_t>& packedGm,
@@ -690,6 +726,21 @@ private:
 
         ComputeBatch(m);
         CopyOutResolvedTask(packedGm, groupBases, groupRows, m);
+    }
+
+    __aicore__ inline void PackCacheFullGroupTask(
+        const AscendC::GlobalTensor<T>& xGm,
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        const uint32_t* vecIndices,
+        uint64_t groupBase) {
+        uint32_t m = 0;
+        CopyInIndexedTask(xGm, vecIndices, TQ_GROUP_ROWS, m);
+        if (m == 0) {
+            return;
+        }
+
+        ComputeBatch(m);
+        CopyOutFullGroupTask(packedGm, groupBase);
     }
 
     __aicore__ inline uint32_t GetActiveWorkers() const {
@@ -788,6 +839,13 @@ private:
         PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, rows);
     }
 
+    __aicore__ inline void FlushFullGroupBatch(
+        const uint32_t* vecIndices,
+        uint64_t groupBase) {
+        PackCacheFullGroupTask(keyGm_, keyCacheGm_, vecIndices, groupBase);
+        PackCacheFullGroupTask(valueGm_, valueCacheGm_, vecIndices, groupBase);
+    }
+
     __aicore__ inline void GetWorkerTokenRange(
         uint32_t worker,
         uint32_t activeWorkers,
@@ -800,32 +858,20 @@ private:
         tokenEnd = tokenStart + baseTokens + (worker < extraTokens ? 1 : 0);
     }
 
-    __aicore__ inline void AppendFullGroupHeadTask(
+    __aicore__ inline uint32_t BuildFullGroupHeadTask(
         uint32_t tokenIdx,
-        uint32_t blockIdx,
-        uint32_t groupInBlock,
         uint32_t headIdx,
-        uint32_t* vecIndices,
-        uint64_t* groupBases,
-        uint32_t* groupRows,
-        uint32_t& rows) {
-        const uint32_t fullGroupRows = TQ_GROUP_ROWS;
-        if (rows + fullGroupRows > TQ_MAX_BATCH_M) {
-            FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-            rows = 0;
-        }
-
-        const uint64_t groupBase = MakeGroupBase(blockIdx, groupInBlock, headIdx);
+        uint32_t* vecIndices) {
+        uint32_t rows = 0;
         for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
             const uint32_t vecIdx = MakeVecIndex(tokenIdx + groupRow, headIdx);
             if (vecIdx >= nVec_) {
                 continue;
             }
             vecIndices[rows] = vecIdx;
-            groupBases[rows] = groupBase;
-            groupRows[rows] = groupRow;
             ++rows;
         }
+        return rows;
     }
 
     __aicore__ inline void ProcessLogicalFullGroupsByRange(
@@ -835,10 +881,7 @@ private:
         uint32_t tokenEnd = 0;
         GetWorkerTokenRange(worker, activeWorkers, tokenStart, tokenEnd);
 
-        uint32_t vecIndices[TQ_MAX_BATCH_M];
-        uint64_t groupBases[TQ_MAX_BATCH_M];
-        uint32_t groupRows[TQ_MAX_BATCH_M];
-        uint32_t rows = 0;
+        uint32_t vecIndices[TQ_GROUP_ROWS];
         uint32_t tokenIdx = tokenStart;
         while (tokenIdx < tokenEnd) {
             uint32_t blockIdx = 0;
@@ -849,21 +892,16 @@ private:
             }
 
             for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                AppendFullGroupHeadTask(
-                    tokenIdx,
-                    blockIdx,
-                    groupInBlock,
-                    headIdx,
+                const uint32_t rows = BuildFullGroupHeadTask(tokenIdx, headIdx, vecIndices);
+                if (rows != TQ_GROUP_ROWS) {
+                    continue;
+                }
+                FlushFullGroupBatch(
                     vecIndices,
-                    groupBases,
-                    groupRows,
-                    rows);
-                FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-                rows = 0;
+                    MakeGroupBase(blockIdx, groupInBlock, headIdx));
             }
             tokenIdx += TQ_GROUP_ROWS;
         }
-        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
     }
 
     __aicore__ inline void ProcessFallbackByOwnedGroupsSkippingFullGroups(uint32_t worker) {
@@ -1072,8 +1110,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
     }
     AscendC::TPipe pipe;
     TqRotateMatmulOp<TqDataT> rotateMm;
-    TCubeTiling cubeTiling = tilingData.cubeTiling;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &cubeTiling);
+    REGIST_MATMUL_OBJ_STATIC(&pipe, GetSysWorkSpacePtr(), rotateMm, (TCubeTiling*)nullptr);
     TurboquantPackKVForCache4bitToCache<TqDataT, TqRotateMatmulOp<TqDataT>> op(&pipe, &rotateMm);
     op.Init(
         key,

@@ -64,9 +64,11 @@ struct Options {
     int64_t num_kv_heads = 8;
     int64_t block_size = 128;
     int64_t pack_tokens = 1;
+    int64_t pack_mode = 0;
     int warmup = 10;
     int repeat = 100;
     double scale = 1.0 / std::sqrt(static_cast<double>(kHeadSize));
+    std::string slot_pattern = "contiguous";
     bool run_pack = true;
     bool run_attention = true;
     bool fill_cache = true;
@@ -107,6 +109,28 @@ int64_t ParseInt64(const char* text, const char* name)
     return static_cast<int64_t>(value);
 }
 
+int64_t ParsePackMode(const char* text)
+{
+    const std::string value(text);
+    if (value == "general" || value == "owned-groups") {
+        return 0;
+    }
+    if (value == "direct" || value == "decode-direct") {
+        return 1;
+    }
+    if (value == "logical-fast" || value == "logical-fast-fallback" ||
+        value == "logical") {
+        return 2;
+    }
+    return ParseInt64(text, "--pack-mode");
+}
+
+bool IsKnownSlotPattern(const std::string& pattern)
+{
+    return pattern == "contiguous" || pattern == "swap-pairs" ||
+           pattern == "scatter-groups" || pattern == "reverse";
+}
+
 void PrintUsage(const char* argv0)
 {
     std::cout
@@ -120,6 +144,8 @@ void PrintUsage(const char* argv0)
         << "  --kv-heads N         KV heads, default 8\n"
         << "  --block-size N       Paged cache block size, default 128\n"
         << "  --pack-tokens N      Tokens per pack call, default 1\n"
+        << "  --pack-mode MODE     Pack branch: 0/general, 1/direct, 2/logical-fast, default 0\n"
+        << "  --slot-pattern NAME  Slot mapping: contiguous, swap-pairs, scatter-groups, reverse, default contiguous\n"
         << "  --warmup N           Warmup iterations, default 10\n"
         << "  --repeat N           Timed iterations, default 100\n"
         << "  --pack-only          Run pack benchmark only\n"
@@ -159,6 +185,10 @@ Options ParseArgs(int argc, char** argv)
             opt.block_size = ParseInt64(need_value("--block-size"), "--block-size");
         } else if (arg == "--pack-tokens") {
             opt.pack_tokens = ParseInt64(need_value("--pack-tokens"), "--pack-tokens");
+        } else if (arg == "--pack-mode") {
+            opt.pack_mode = ParsePackMode(need_value("--pack-mode"));
+        } else if (arg == "--slot-pattern") {
+            opt.slot_pattern = need_value("--slot-pattern");
         } else if (arg == "--warmup") {
             opt.warmup = static_cast<int>(ParseInt64(need_value("--warmup"), "--warmup"));
         } else if (arg == "--repeat") {
@@ -195,6 +225,12 @@ Options ParseArgs(int argc, char** argv)
     }
     if (opt.pack_tokens > opt.batch_size * opt.seq_len) {
         Fail("--pack-tokens must be <= --batch-size * --seq-len");
+    }
+    if (opt.pack_mode < 0 || opt.pack_mode > 2) {
+        Fail("--pack-mode must be 0/general, 1/direct, or 2/logical-fast");
+    }
+    if (!IsKnownSlotPattern(opt.slot_pattern)) {
+        Fail("--slot-pattern must be one of: contiguous, swap-pairs, scatter-groups, reverse");
     }
     return opt;
 }
@@ -534,6 +570,7 @@ void RunPack4bit(
     const AclTensorGuard& rotation_t,
     const AclTensorGuard& key_cache,
     const AclTensorGuard& value_cache,
+    int64_t pack_mode,
     int64_t n_vec,
     int64_t vec_per_core,
     int64_t num_heads,
@@ -550,7 +587,7 @@ void RunPack4bit(
             codebook.tensor,
             rotation_t.tensor,
             slot_mapping.tensor,
-            0,
+            pack_mode,
             n_vec,
             vec_per_core,
             num_heads,
@@ -566,6 +603,26 @@ void RunPack4bit(
     CheckAclnn(
         aclnnTurboquantPackKvForCache4bit(workspace.ptr, workspace_size, executor, stream),
         "aclnnTurboquantPackKvForCache4bit");
+}
+
+int64_t SlotPositionForPattern(
+    int64_t pos,
+    int64_t seq_len,
+    const std::string& slot_pattern)
+{
+    if (slot_pattern == "swap-pairs") {
+        if ((pos % 2) == 0) {
+            return (pos + 1 < seq_len) ? pos + 1 : pos;
+        }
+        return pos - 1;
+    }
+    if (slot_pattern == "scatter-groups") {
+        return (pos * 5) % seq_len;
+    }
+    if (slot_pattern == "reverse") {
+        return seq_len - 1 - pos;
+    }
+    return pos;
 }
 
 void RunAttention4bit(
@@ -674,8 +731,10 @@ int main(int argc, char** argv)
         for (int64_t seq = 0; seq < opt.batch_size; ++seq) {
             const int64_t slot_base = seq * blocks_per_seq * opt.block_size;
             for (int64_t pos = 0; pos < opt.seq_len; ++pos) {
+                const int64_t slot_pos =
+                    SlotPositionForPattern(pos, opt.seq_len, opt.slot_pattern);
                 slot_mapping_host[static_cast<size_t>(seq * opt.seq_len + pos)] =
-                    static_cast<int32_t>(slot_base + pos);
+                    static_cast<int32_t>(slot_base + slot_pos);
             }
         }
         std::vector<int32_t> block_table_host(static_cast<size_t>(opt.batch_size * blocks_per_seq));
@@ -794,6 +853,8 @@ int main(int argc, char** argv)
                   << " blocks_per_seq=" << blocks_per_seq
                   << " total_blocks=" << total_blocks
                   << " pack_tokens=" << opt.pack_tokens
+                  << " pack_mode=" << opt.pack_mode
+                  << " slot_pattern=" << opt.slot_pattern
                   << " fill_cache=" << static_cast<int>(opt.fill_cache)
                   << " warmup=" << opt.warmup
                   << " repeat=" << opt.repeat
@@ -809,6 +870,7 @@ int main(int argc, char** argv)
                 rotation_acl,
                 key_cache_acl,
                 value_cache_acl,
+                0,
                 full_n_vec,
                 128,
                 opt.num_kv_heads,
@@ -830,6 +892,7 @@ int main(int argc, char** argv)
                         rotation_acl,
                         pack_key_cache_acl,
                         pack_value_cache_acl,
+                        opt.pack_mode,
                         pack_n_vec,
                         vec_per_core,
                         opt.num_kv_heads,

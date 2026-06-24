@@ -34,7 +34,10 @@
 
 namespace turboquant {
 
+using namespace AscendC;
+
 static constexpr uint32_t TQ_DECODE_HEAD_SIZE = 128;
+static constexpr uint32_t TQ_DECODE_MAX_M = 64;
 static constexpr uint32_t TQ_DECODE_INDEX_BYTES = TQ_DECODE_HEAD_SIZE / 2;  // uint4 packed indices in GM
 static constexpr uint32_t TQ_DECODE_PACKED_BYTES = TQ_DECODE_INDEX_BYTES + 2;  // 66-byte slab row
 static constexpr uint32_t TQ_DECODE_COMPACT_BYTES = TQ_DECODE_HEAD_SIZE + 2;  // UB: 128 idx + 2 norm
@@ -64,9 +67,33 @@ using TqDecodeRotateCT = AscendC::MatmulType<AscendC::TPosition::VECIN, CubeForm
 template <typename T>
 using TqDecodeRotateBiasT = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, T>;
 
+__aicore__ inline constexpr MatmulConfig TqDecodeRotateMatmulConfig() {
+    constexpr MatmulShapeParams shapeParams = {
+        TQ_DECODE_MAX_M, TQ_DECODE_HEAD_SIZE, TQ_DECODE_HEAD_SIZE,
+        TQ_DECODE_MAX_M, TQ_DECODE_HEAD_SIZE, TQ_DECODE_HEAD_SIZE};
+    constexpr MatmulBiasParams biasParams = {false};
+    return GetMMConfig<MatmulConfigMode::CONFIG_MDL>(shapeParams, biasParams);
+}
+
+template <typename T>
+__aicore__ inline constexpr MatmulApiStaticTiling TqDecodeRotateMatmulTiling() {
+    MatmulApiStaticTiling tiling =
+        GetMatmulApiTiling<TqDecodeRotateAT<T>, TqDecodeRotateBT<T>,
+                           TqDecodeRotateCT<T>, TqDecodeRotateBiasT<T>>(
+            TqDecodeRotateMatmulConfig());
+    // Each AIV worker issues its own KFC matmul request.
+    tiling.usedCoreNum = 1;
+    return tiling;
+}
+
+template <typename T>
+static constexpr MatmulApiStaticTiling TQ_DECODE_ROTATE_MATMUL_TILING =
+    TqDecodeRotateMatmulTiling<T>();
+
 template <typename T>
 using TqDecodeRotateMatmulOp =
-    AscendC::Matmul<TqDecodeRotateAT<T>, TqDecodeRotateBT<T>, TqDecodeRotateCT<T>, TqDecodeRotateBiasT<T>>;
+    AscendC::Matmul<TqDecodeRotateAT<T>, TqDecodeRotateBT<T>, TqDecodeRotateCT<T>,
+                    TqDecodeRotateBiasT<T>, TQ_DECODE_ROTATE_MATMUL_TILING<T>>;
 
 // csrc/kernels build has no PipeSync helpers; use SetFlag+WaitFlag (pack op style).
 // HardEvent is a compile-time template arg for SetFlag/WaitFlag.
