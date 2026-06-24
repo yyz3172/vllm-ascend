@@ -112,14 +112,17 @@ int64_t ParseInt64(const char* text, const char* name)
 int64_t ParsePackMode(const char* text)
 {
     const std::string value(text);
-    if (value == "general" || value == "owned-groups") {
+    if (value == "general" || value == "owned-groups" ||
+        value == "slot-mapping-group-owner" || value == "group-owner") {
         return 0;
     }
-    if (value == "direct" || value == "decode-direct") {
+    if (value == "direct" || value == "decode-direct" ||
+        value == "decode-vec-tasks" || value == "vec-tasks") {
         return 1;
     }
     if (value == "logical-fast" || value == "logical-fast-fallback" ||
-        value == "logical") {
+        value == "logical" || value == "contiguous-group-fast-fallback" ||
+        value == "contiguous-fast") {
         return 2;
     }
     return ParseInt64(text, "--pack-mode");
@@ -144,7 +147,8 @@ void PrintUsage(const char* argv0)
         << "  --kv-heads N         KV heads, default 8\n"
         << "  --block-size N       Paged cache block size, default 128\n"
         << "  --pack-tokens N      Tokens per pack call, default 1\n"
-        << "  --pack-mode MODE     Pack branch: 0/general, 1/direct, 2/logical-fast, default 0\n"
+        << "  --pack-mode MODE     Pack writeback: 0/slot-mapping-group-owner, "
+           "1/decode-vec-tasks, 2/contiguous-group-fast-fallback, default 0\n"
         << "  --slot-pattern NAME  Slot mapping: contiguous, swap-pairs, scatter-groups, reverse, default contiguous\n"
         << "  --warmup N           Warmup iterations, default 10\n"
         << "  --repeat N           Timed iterations, default 100\n"
@@ -227,7 +231,8 @@ Options ParseArgs(int argc, char** argv)
         Fail("--pack-tokens must be <= --batch-size * --seq-len");
     }
     if (opt.pack_mode < 0 || opt.pack_mode > 2) {
-        Fail("--pack-mode must be 0/general, 1/direct, or 2/logical-fast");
+        Fail("--pack-mode must be 0/slot-mapping-group-owner, "
+             "1/decode-vec-tasks, or 2/contiguous-group-fast-fallback");
     }
     if (!IsKnownSlotPattern(opt.slot_pattern)) {
         Fail("--slot-pattern must be one of: contiguous, swap-pairs, scatter-groups, reverse");
