@@ -1410,8 +1410,7 @@ extern "C" __global__ __aicore__ void turboquant_attention_paged4bit(
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     TqRotateMm rotateMm;
-    TCubeTiling decodeTiling = tilingData.decodeRotateTiling;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &decodeTiling);
+    REGIST_MATMUL_OBJ_STATIC(&pipe, GetSysWorkSpacePtr(), rotateMm, (TCubeTiling*)nullptr);
     if constexpr (TILING_KEY_IS(5)) {
         INVOKE_TQ_ATTN_KERNEL(true, TQ_UB_Q_TILE_GQA2_CAP, TQ_UB_Q_TILE_SMALL_GQA_CAP);
     } else if constexpr (TILING_KEY_IS(4)) {

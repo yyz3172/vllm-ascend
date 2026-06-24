@@ -10,6 +10,9 @@ constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PACK_TILING_KEY_KFC = 0;
+constexpr uint32_t TQ_PACK_MODE_KFC = 0;
+constexpr uint32_t TQ_PACK_MODE_DECODE_DIRECT = 1;
+constexpr uint32_t TQ_PACK_MODE_LOGICAL_FAST_FALLBACK = 2;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
 constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
 
@@ -103,9 +106,13 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     const uint32_t numHeads = static_cast<uint32_t>(*numHeadsPtr);
     const uint32_t blockSize = static_cast<uint32_t>(*blockSizePtr);
     const uint32_t numBlocks = static_cast<uint32_t>(*numBlocksPtr);
-    if (packMode != 0 || nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
+    if ((packMode != TQ_PACK_MODE_KFC &&
+         packMode != TQ_PACK_MODE_DECODE_DIRECT &&
+         packMode != TQ_PACK_MODE_LOGICAL_FAST_FALLBACK) ||
+        nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
         blockSize < 1 || numBlocks < 1) {
-        OPS_LOG_E(nodeName, "invalid pack attrs: 4-bit pack-to-cache only supports KFC pack_mode=0");
+        OPS_LOG_E(nodeName,
+                  "invalid pack attrs: 4-bit pack-to-cache supports pack_mode 0, 1, or 2");
         return ge::GRAPH_FAILED;
     }
     if (blockSize % 4 != 0) {
