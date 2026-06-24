@@ -64,6 +64,9 @@ static constexpr uint32_t TQ_ARGMIN_INDEX_BYTES = TQ_PACK_D * sizeof(int32_t);
 static constexpr uint32_t TQ_ARGMIN_INDEX_U16_BYTES = TQ_PACK_D * sizeof(int16_t);
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
 static constexpr uint32_t TQ_COMPARE_MASK_BYTES = 256;
+static constexpr uint32_t TQ_QUANT_CODE_VECTORS = TQ_PACK_K - 1;
+static constexpr uint32_t TQ_QUANT_CODE_BYTES =
+    TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
 static constexpr float TQ_FY_LINEAR = 0.020799f;
 static constexpr float TQ_FY_CUBIC = 0.0001926f;
 static constexpr uint32_t TQ_PACK_MODE_GENERAL = 0;
@@ -334,6 +337,7 @@ public:
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * TQ_NORM_STRIDE * sizeof(T));
         pipe_->InitBuffer(quantMaskBuf_, TQ_COMPARE_MASK_BYTES);
         pipe_->InitBuffer(distBuf_, TQ_DIST_TILE_ELEMS * sizeof(float));
+        pipe_->InitBuffer(quantCodeBuf_, TQ_QUANT_CODE_BYTES);
         // yFp32Buf: fp32 y row [D=128]
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(argminIndexBuf_, TQ_ARGMIN_INDEX_BYTES);
@@ -450,6 +454,60 @@ private:
         aBatchQue_.FreeTensor(aBatch);
     }
 
+    template <int CODE>
+    __aicore__ inline void FillQuantCodeVector(
+        AscendC::LocalTensor<float>& quantCodes) {
+        float codeFloat = static_cast<float>(CODE);
+        AscendC::Duplicate(
+            quantCodes[(CODE - 1) * TQ_PACK_D],
+            codeFloat,
+            TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void FillQuantCodeVectors(
+        AscendC::LocalTensor<float>& quantCodes) {
+        FillQuantCodeVector<1>(quantCodes);
+        FillQuantCodeVector<2>(quantCodes);
+        FillQuantCodeVector<3>(quantCodes);
+        FillQuantCodeVector<4>(quantCodes);
+        FillQuantCodeVector<5>(quantCodes);
+        FillQuantCodeVector<6>(quantCodes);
+        FillQuantCodeVector<7>(quantCodes);
+        FillQuantCodeVector<8>(quantCodes);
+        FillQuantCodeVector<9>(quantCodes);
+        FillQuantCodeVector<10>(quantCodes);
+        FillQuantCodeVector<11>(quantCodes);
+        FillQuantCodeVector<12>(quantCodes);
+        FillQuantCodeVector<13>(quantCodes);
+        FillQuantCodeVector<14>(quantCodes);
+        FillQuantCodeVector<15>(quantCodes);
+    }
+
+    template <int CODE>
+    __aicore__ inline void ApplyQuantCode(
+        AscendC::LocalTensor<float>& qFloat,
+        AscendC::LocalTensor<uint8_t>& quantMask,
+        AscendC::LocalTensor<float>& yFp32,
+        const AscendC::LocalTensor<float>& quantCodes) {
+        float threshold = TqFyScalar(static_cast<float>(CODE - 8));
+        AscendC::CompareScalar(
+            quantMask,
+            yFp32,
+            threshold,
+            AscendC::CMPMODE::GT,
+            TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            qFloat,
+            quantMask,
+            quantCodes[(CODE - 1) * TQ_PACK_D],
+            qFloat,
+            SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
     // Encoded local row layout used between Compute and CopyOut:
     //   uint16[0..127] = uint4 index widened to uint16 for vector pack merge
     //   uint16[128] = norm bits matching T
@@ -460,13 +518,14 @@ private:
         auto yFp32 = yFp32Buf_.Get<float>();
         auto qFloat = distBuf_.Get<float>();
         auto argminIndex = argminIndexBuf_.Get<int32_t>();
-        auto qCandidate = argminIndex.template ReinterpretCast<float>();
         auto argminIndexU16 = argminIndexU16Buf_.Get<int16_t>();
         auto quantMask = quantMaskBuf_.Get<uint8_t>();
         auto argminMask = packMaskBuf_.Get<int16_t>();
+        auto quantCodes = quantCodeBuf_.Get<float>();
 
         AscendC::Duplicate(argminMask, static_cast<int16_t>(0x000F), TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
+        FillQuantCodeVectors(quantCodes);
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
@@ -476,25 +535,21 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Duplicate(qFloat, 0.0f, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            for (uint32_t code = 1; code < TQ_PACK_K; ++code) {
-                AscendC::CompareScalar(
-                    quantMask,
-                    yFp32,
-                    TqQuantThreshold(code),
-                    AscendC::CMPMODE::GT,
-                    TQ_PACK_D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate(qCandidate, TqCodeAsFloat(code), TQ_PACK_D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Select(
-                    qFloat,
-                    quantMask,
-                    qCandidate,
-                    qFloat,
-                    SELMODE::VSEL_TENSOR_TENSOR_MODE,
-                    TQ_PACK_D);
-                AscendC::PipeBarrier<PIPE_V>();
-            }
+            ApplyQuantCode<1>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<2>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<3>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<4>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<5>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<6>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<7>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<8>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<9>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<10>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<11>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<12>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<13>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<14>(qFloat, quantMask, yFp32, quantCodes);
+            ApplyQuantCode<15>(qFloat, quantMask, yFp32, quantCodes);
             AscendC::Cast(
                 argminIndex,
                 qFloat,
@@ -1069,6 +1124,7 @@ private:
     AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> encodedBatchQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> distBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> quantCodeBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexU16Buf_;
     AscendC::GlobalTensor<T> keyGm_;
