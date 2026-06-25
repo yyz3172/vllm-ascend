@@ -830,7 +830,7 @@ private:
         uint32_t tokenStartIdx,
         uint32_t qRows,
         uint32_t kvHead,
-        LocalTensor<float> sState,
+        float* sStateScalar,
         LocalTensor<float> outAcc,
         uint32_t gqaStart,
         uint32_t gqaCount)
@@ -841,7 +841,7 @@ private:
             const uint32_t stateBase = QTileCompactStateOffset(q, gqaCount);
             const uint32_t outBaseQ = QTileCompactGroupOffset(q, gqaCount);
             for (uint32_t g = 0; g < gqaCount; ++g) {
-                const float sum = sState.GetValue(stateBase + g);
+                const float sum = sStateScalar[stateBase + g];
                 const float invS = (sum > 0.f) ? (1.f / sum) : 0.f;
                 const uint32_t outBase = outBaseQ + g * TQ_HEAD;
                 AscendC::Muls(outAcc[outBase], outAcc[outBase], invS, TQ_HEAD);
@@ -896,11 +896,15 @@ private:
         }
         RotateRowsInPlace(qTile, rotationGm_, qRows * gqaCount);
 
-        auto mStateTile = this->qTileMStateBuf_.template Get<float>();
-        auto sStateTile = this->qTileSStateBuf_.template Get<float>();
+        // m/s states as Scalar arrays — eliminates GetValue/SetValue V↔S sync.
+        const uint32_t compactStateSize = qRows * gqaCount;
+        float mStateScalar[QTileCap * QTileGqaCap];
+        float sStateScalar[QTileCap * QTileGqaCap];
+        for (uint32_t i = 0; i < compactStateSize; ++i) {
+            mStateScalar[i] = -3.402823466e+38f;
+            sStateScalar[i] = 0.f;
+        }
         auto outAccTile = this->qTileOutAccBuf_.template Get<float>();
-        AscendC::Duplicate(mStateTile, -3.402823466e+38f, qRows * gqaCount);
-        AscendC::Duplicate(sStateTile, 0.f, qRows * gqaCount);
         AscendC::Duplicate(outAccTile, 0.f, qRows * gqaCount * TQ_HEAD);
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -981,35 +985,37 @@ private:
                 const uint32_t activeRows =
                     (pos + computeRows <= causalKvEnd) ? computeRows : (causalKvEnd - pos);
                 if (preScaleTile) {
-                    turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaled(
+                    turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledScalar(
                         qTileScore[QTileCompactScoreOffset(q, gqaCount)], tileFloat,
-                        mStateTile[QTileCompactStateOffset(q, gqaCount)],
-                        sStateTile[QTileCompactStateOffset(q, gqaCount)],
+                        mStateScalar + QTileCompactStateOffset(q, gqaCount),
+                        sStateScalar + QTileCompactStateOffset(q, gqaCount),
                         outAccTile[QTileCompactGroupOffset(q, gqaCount)],
                         expLocal, attnTmp0, attnTmp1,
                         gqaCount, activeRows);
                 } else {
                     if constexpr (QTileGqaCap == TQ_UB_Q_TILE_SMALL_GQA_CAP) {
                         if (gqaCount == TQ_UB_Q_TILE_SMALL_GQA_CAP) {
-                            turboquant_attn::OnlineSoftmaxUpdateTileFloatGqa2(
+                            turboquant_attn::OnlineSoftmaxUpdateTileFloatGqa2Scalar(
                                 qTileScore[QTileCompactScoreOffset(q, gqaCount)], tileFloat,
-                                kNorm, mStateTile[QTileCompactStateOffset(q, gqaCount)],
-                                sStateTile[QTileCompactStateOffset(q, gqaCount)],
+                                kNorm,
+                                mStateScalar + QTileCompactStateOffset(q, gqaCount),
+                                sStateScalar + QTileCompactStateOffset(q, gqaCount),
                                 outAccTile[QTileCompactGroupOffset(q, gqaCount)],
                                 expLocal, attnTmp0, activeRows);
                         } else {
-                            turboquant_attn::OnlineSoftmaxUpdateTileFloat(
+                            turboquant_attn::OnlineSoftmaxUpdateTileFloatScalar(
                                 qTileScore[QTileCompactScoreOffset(q, gqaCount)], tileFloat,
-                                kNorm, mStateTile[QTileCompactStateOffset(q, gqaCount)],
-                                sStateTile[QTileCompactStateOffset(q, gqaCount)],
+                                kNorm,
+                                mStateScalar + QTileCompactStateOffset(q, gqaCount),
+                                sStateScalar + QTileCompactStateOffset(q, gqaCount),
                                 outAccTile[QTileCompactGroupOffset(q, gqaCount)],
                                 expLocal, attnTmp0, attnTmp1, gqaCount, activeRows);
                         }
                     } else {
-                        turboquant_attn::OnlineSoftmaxUpdateTileFloat(
+                        turboquant_attn::OnlineSoftmaxUpdateTileFloatScalar(
                             qTileScore[QTileCompactScoreOffset(q, gqaCount)], tileFloat, kNorm,
-                            mStateTile[QTileCompactStateOffset(q, gqaCount)],
-                            sStateTile[QTileCompactStateOffset(q, gqaCount)],
+                            mStateScalar + QTileCompactStateOffset(q, gqaCount),
+                            sStateScalar + QTileCompactStateOffset(q, gqaCount),
                             outAccTile[QTileCompactGroupOffset(q, gqaCount)],
                             expLocal, attnTmp0, attnTmp1, gqaCount, activeRows);
                     }
@@ -1018,7 +1024,7 @@ private:
             pos += computeRows;
         }
 
-        WriteFinalOutputQTile(tokenStartIdx, qRows, kvHead, sStateTile, outAccTile,
+        WriteFinalOutputQTile(tokenStartIdx, qRows, kvHead, sStateScalar, outAccTile,
                               gqaStart, gqaCount);
     }
 
@@ -1065,11 +1071,14 @@ private:
         LoadQGroup(tokenIdx, kvHead, gqaStart, gqaCount, qGroup);
         RotateRowsInPlace(qGroup, rotationGm_, gqaCount);
 
-        auto mState = mStateBuf_.Get<float>();
-        auto sState = sStateBuf_.Get<float>();
+        // m/s states as Scalar arrays — eliminates GetValue/SetValue V↔S sync.
+        float mStateScalar[TQ_UB_GQA_CAP];
+        float sStateScalar[TQ_UB_GQA_CAP];
+        for (uint32_t g = 0; g < gqaCount; ++g) {
+            mStateScalar[g] = -3.402823466e+38f;
+            sStateScalar[g] = 0.f;
+        }
         auto outAcc = outAccBuf_.Get<float>();
-        AscendC::Duplicate(mState, -3.402823466e+38f, gqaCount);
-        AscendC::Duplicate(sState, 0.f, gqaCount);
         AscendC::Duplicate(outAcc, 0.f, gqaCount * TQ_HEAD);
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -1117,21 +1126,21 @@ private:
             }
 
             if (preScaleTile) {
-                turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaled(
-                    scoreTile, tileFloat, mState, sState, outAcc, expLocal,
+                turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledScalar(
+                    scoreTile, tileFloat, mStateScalar, sStateScalar, outAcc, expLocal,
                     attnTmp0, attnTmp1, gqaCount, computeRows);
             } else {
-                turboquant_attn::OnlineSoftmaxUpdateTileFloat(
-                    scoreTile, tileFloat, kNorm, mState, sState, outAcc, expLocal,
+                turboquant_attn::OnlineSoftmaxUpdateTileFloatScalar(
+                    scoreTile, tileFloat, kNorm, mStateScalar, sStateScalar, outAcc, expLocal,
                     attnTmp0, attnTmp1, gqaCount, computeRows);
             }
             pos += computeRows;
         }
 
         if (writePartial) {
-            WritePartial(tokenIdx, kvHead, segIdx, mState, sState, outAcc, gqaStart, gqaCount);
+            WritePartial(tokenIdx, kvHead, segIdx, mStateScalar, sStateScalar, outAcc, gqaStart, gqaCount);
         } else {
-            WriteFinalOutput(tokenIdx, kvHead, sState, outAcc, gqaStart, gqaCount);
+            WriteFinalOutput(tokenIdx, kvHead, sStateScalar, outAcc, gqaStart, gqaCount);
         }
     }
 
@@ -1156,7 +1165,7 @@ private:
     __aicore__ inline void WriteFinalOutput(
         uint32_t tokenIdx,
         uint32_t kvHead,
-        LocalTensor<float> sState,
+        float* sStateScalar,
         LocalTensor<float> outAcc,
         uint32_t gqaStart,
         uint32_t gqaCount)
@@ -1164,7 +1173,7 @@ private:
         const uint32_t qBaseHead = kvHead * gqaGroup_ + gqaStart;
         auto outLocal = qGroupBuf_.Get<QueryT>();
         for (uint32_t g = 0; g < gqaCount; ++g) {
-            const float sum = sState.GetValue(g);
+            const float sum = sStateScalar[g];
             const float invS = (sum > 0.f) ? (1.f / sum) : 0.f;
             const uint32_t outBase = g * TQ_HEAD;
             AscendC::Muls(outAcc[outBase], outAcc[outBase], invS, TQ_HEAD);
@@ -1214,8 +1223,8 @@ private:
         uint32_t tokenIdx,
         uint32_t kvHead,
         uint32_t segIdx,
-        LocalTensor<float> mState,
-        LocalTensor<float> sState,
+        float* mStateScalar,
+        float* sStateScalar,
         LocalTensor<float> outAcc,
         uint32_t gqaStart,
         uint32_t gqaCount)
@@ -1227,8 +1236,8 @@ private:
         for (uint32_t g = 0; g < gqaCount; ++g) {
             const uint32_t headIdx = qBaseHead + g;
             const uint32_t partIdx = (tokenIdx * numHeads_ + headIdx) * kvSplitPart_ + segIdx;
-            const float maxVal = mState.GetValue(g);
-            const float sumVal = sState.GetValue(g);
+            const float maxVal = mStateScalar[g];
+            const float sumVal = sStateScalar[g];
             partialLseGm_.SetValue(partIdx * 2, maxVal);
             partialLseGm_.SetValue(partIdx * 2 + 1, sumVal);
         }
