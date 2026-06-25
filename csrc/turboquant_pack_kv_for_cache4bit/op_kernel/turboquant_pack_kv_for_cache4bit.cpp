@@ -69,9 +69,6 @@ static constexpr uint32_t TQ_QUANT_CODE_BYTES =
     TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
 static constexpr float TQ_FY_LINEAR = 0.020799f;
 static constexpr float TQ_FY_CUBIC = 0.0001926f;
-static constexpr uint32_t TQ_PACK_MODE_SLOT_MAPPING_GROUP_OWNER = 0;
-static constexpr uint32_t TQ_PACK_MODE_DECODE_VEC_TASKS = 1;
-static constexpr uint32_t TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK = 2;
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
@@ -299,7 +296,7 @@ public:
         uint32_t blockSize,
         uint32_t numBlocks,
         uint32_t dataCores,
-        uint32_t packMode)
+        uint32_t numReqs)
         : pipe_(pipe),
           rotateMm_(rotateMm),
           nVec_(nVec),
@@ -310,7 +307,7 @@ public:
           numBlocks_(numBlocks),
           cacheSlots_((blockSize == 0 ? 1 : blockSize) * numBlocks),
           dataCores_(dataCores == 0 ? 1 : dataCores),
-          packMode_(packMode),
+          numReqs_(numReqs),
           matmulReady_(rawWorkspace != nullptr) {}
 
     __aicore__ inline void Init(
@@ -319,6 +316,7 @@ public:
         __gm__ T* codebook,
         __gm__ T* rotation_t,
         __gm__ int32_t* slot_mapping,
+        __gm__ int32_t* query_start_loc,
         __gm__ uint8_t* key_cache,
         __gm__ uint8_t* value_cache) {
         (void)codebook;
@@ -326,6 +324,7 @@ public:
         valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value), (uint64_t)nVec_ * TQ_PACK_D);
         rotationTGm_.SetGlobalBuffer(rotation_t, (uint64_t)TQ_PACK_D * TQ_PACK_D);
         slotMappingGm_.SetGlobalBuffer(slot_mapping, tokenCount_);
+        queryStartLocGm_.SetGlobalBuffer(query_start_loc, static_cast<uint64_t>(numReqs_) + 1);
         keyCacheGm_.SetGlobalBuffer(key_cache, (uint64_t)numBlocks_ * numHeads_ * blockSize_ * TQ_ROW_BYTES);
         valueCacheGm_.SetGlobalBuffer(value_cache, (uint64_t)numBlocks_ * numHeads_ * blockSize_ * TQ_ROW_BYTES);
 
@@ -359,25 +358,11 @@ public:
         if ASCEND_IS_AIC {
             return;
         }
-        // Writeback strategy:
-        //   mode 0: safe baseline. Resolve every token through slot_mapping and
-        //           assign each physical 4-row cache group to one worker.
-        //   mode 1: decode fast path. Split token/head vector tasks directly.
-        //   mode 2: prefill fast path. Write physically contiguous 4-token
-        //           groups first, then fall back to mode 0 for the rest.
         const uint32_t worker = AscendC::GetBlockIdx();
         if (worker >= GetActiveWorkers()) {
             return;
         }
-        if (packMode_ == TQ_PACK_MODE_DECODE_VEC_TASKS) {
-            ProcessCachePairByVecTaskStride(worker);
-            return;
-        }
-        if (packMode_ == TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK) {
-            ProcessCachePairByContiguousGroupFastPathThenFallback(worker);
-            return;
-        }
-        ProcessCachePairBySlotMappingGroupOwners(worker);
+        ProcessCachePairBySequenceContiguousSegments(worker);
     }
 
 private:
@@ -671,6 +656,7 @@ private:
         AscendC::LocalTensor<uint16_t>& encodedBatch,
         const uint64_t* groupBases,
         const uint32_t* groupRows,
+        const uint8_t* preserveRows,
         const uint8_t* validRows,
         uint32_t m) {
         auto packedGroup = packedRowBuf_.Get<uint8_t>();
@@ -705,6 +691,7 @@ private:
         while (row < validCount) {
             const uint64_t groupBase = groupBases[sortedRows[row]];
             uint32_t rowMask = 0;
+            bool preserveExisting = false;
             for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
                 rowForGroup[groupRow] = TQ_MAX_BATCH_M;
             }
@@ -712,13 +699,17 @@ private:
                 const uint32_t srcRow = sortedRows[row];
                 const uint32_t groupRow = groupRows[srcRow];
                 rowForGroup[groupRow] = srcRow;
+                preserveExisting = preserveExisting || preserveRows[srcRow] != 0;
                 rowMask |= (1u << groupRow);
                 ++row;
             } while (row < validCount && groupBases[sortedRows[row]] == groupBase);
 
-            if (rowMask == ((1u << TQ_GROUP_ROWS) - 1u)) {
+            if (rowMask == ((1u << TQ_GROUP_ROWS) - 1u) || !preserveExisting) {
                 ClearPackedGroup(packedGroup);
                 for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
+                    if ((rowMask & (1u << groupRow)) == 0) {
+                        continue;
+                    }
                     MergeEncodedRowToGroup(
                         packedGroup, encodedBatch, rowForGroup[groupRow], groupRow, false);
                 }
@@ -741,6 +732,7 @@ private:
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const uint64_t* groupBases,
         const uint32_t* groupRows,
+        const uint8_t* preserveRows,
         uint32_t m) {
         auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
         uint8_t validRows[TQ_MAX_BATCH_M];
@@ -749,21 +741,7 @@ private:
             validRows[row] = 1;
         }
 
-        FlushResolvedGroups(packedGm, encodedBatch, groupBases, groupRows, validRows, m);
-        encodedBatchQue_.FreeTensor(encodedBatch);
-    }
-
-    __aicore__ inline void CopyOutContiguousCacheGroup(
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        uint64_t groupBase) {
-        auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
-        auto packedGroup = packedRowBuf_.Get<uint8_t>();
-
-        ClearPackedGroup(packedGroup);
-        for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
-            MergeEncodedRowToGroup(packedGroup, encodedBatch, groupRow, groupRow, false);
-        }
-        copy_packed_ub_to_gm(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+        FlushResolvedGroups(packedGm, encodedBatch, groupBases, groupRows, preserveRows, validRows, m);
         encodedBatchQue_.FreeTensor(encodedBatch);
     }
 
@@ -773,6 +751,7 @@ private:
         const uint32_t* vecIndices,
         const uint64_t* groupBases,
         const uint32_t* groupRows,
+        const uint8_t* preserveRows,
         uint32_t rows) {
         uint32_t m = 0;
         CopyInIndexedTask(xGm, vecIndices, rows, m);
@@ -781,46 +760,11 @@ private:
         }
 
         ComputeBatch(m);
-        CopyOutResolvedTask(packedGm, groupBases, groupRows, m);
-    }
-
-    __aicore__ inline void PackContiguousCacheGroup(
-        const AscendC::GlobalTensor<T>& xGm,
-        AscendC::GlobalTensor<uint8_t>& packedGm,
-        const uint32_t* vecIndices,
-        uint64_t groupBase) {
-        uint32_t m = 0;
-        CopyInIndexedTask(xGm, vecIndices, TQ_GROUP_ROWS, m);
-        if (m == 0) {
-            return;
-        }
-
-        ComputeBatch(m);
-        CopyOutContiguousCacheGroup(packedGm, groupBase);
+        CopyOutResolvedTask(packedGm, groupBases, groupRows, preserveRows, m);
     }
 
     __aicore__ inline uint32_t GetActiveWorkers() const {
         return dataCores_ * TQ_AIV_SUB_BLOCKS;
-    }
-
-    __aicore__ inline bool ResolveTokenSlot(
-        uint32_t tokenIdx,
-        uint32_t& blockIdx,
-        uint32_t& groupInBlock,
-        uint32_t& groupRow) const {
-        if (tokenIdx >= tokenCount_) {
-            return false;
-        }
-        const int32_t slot = slotMappingGm_.GetValue(tokenIdx);
-        if (slot < 0 || static_cast<uint32_t>(slot) >= cacheSlots_) {
-            return false;
-        }
-        const uint32_t slotU = static_cast<uint32_t>(slot);
-        blockIdx = slotU / blockSize_;
-        const uint32_t blockOff = slotU - blockIdx * blockSize_;
-        groupInBlock = blockOff / TQ_GROUP_ROWS;
-        groupRow = blockOff - groupInBlock * TQ_GROUP_ROWS;
-        return true;
     }
 
     __aicore__ inline bool ResolveTokenSlotU(
@@ -834,37 +778,6 @@ private:
             return false;
         }
         slotU = static_cast<uint32_t>(slot);
-        return true;
-    }
-
-    __aicore__ inline bool TryResolveContiguousPhysicalGroup(
-        uint32_t tokenIdx,
-        uint32_t& blockIdx,
-        uint32_t& groupInBlock) const {
-        if (tokenIdx + TQ_GROUP_ROWS > tokenCount_ || cacheSlots_ < TQ_GROUP_ROWS) {
-            return false;
-        }
-
-        uint32_t slot0 = 0;
-        if (!ResolveTokenSlotU(tokenIdx, slot0) ||
-            slot0 > cacheSlots_ - TQ_GROUP_ROWS) {
-            return false;
-        }
-        blockIdx = slot0 / blockSize_;
-        const uint32_t blockOff = slot0 - blockIdx * blockSize_;
-        if ((blockOff % TQ_GROUP_ROWS) != 0 ||
-            blockOff + TQ_GROUP_ROWS > blockSize_) {
-            return false;
-        }
-
-        for (uint32_t groupRow = 1; groupRow < TQ_GROUP_ROWS; ++groupRow) {
-            uint32_t slot = 0;
-            if (!ResolveTokenSlotU(tokenIdx + groupRow, slot) ||
-                slot != slot0 + groupRow) {
-                return false;
-            }
-        }
-        groupInBlock = blockOff / TQ_GROUP_ROWS;
         return true;
     }
 
@@ -887,180 +800,190 @@ private:
         const uint32_t* vecIndices,
         const uint64_t* groupBases,
         const uint32_t* groupRows,
+        const uint8_t* preserveRows,
         uint32_t rows) {
         if (rows == 0) {
             return;
         }
-        PackCacheIndexedTask(keyGm_, keyCacheGm_, vecIndices, groupBases, groupRows, rows);
-        PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, rows);
+        PackCacheIndexedTask(keyGm_, keyCacheGm_, vecIndices, groupBases, groupRows, preserveRows, rows);
+        PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, preserveRows, rows);
     }
 
-    __aicore__ inline void FlushContiguousCacheGroupBatch(
-        const uint32_t* vecIndices,
-        uint64_t groupBase) {
-        PackContiguousCacheGroup(keyGm_, keyCacheGm_, vecIndices, groupBase);
-        PackContiguousCacheGroup(valueGm_, valueCacheGm_, vecIndices, groupBase);
+    __aicore__ inline void FlushSequenceBatch(
+        uint32_t* vecIndices,
+        uint64_t* groupBases,
+        uint32_t* groupRows,
+        uint8_t* preserveRows,
+        uint32_t& rows) {
+        FlushVecBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
+        rows = 0;
     }
 
-    __aicore__ inline void GetWorkerTokenRange(
+    __aicore__ inline void EnsureSequenceBatchCapacity(
+        uint32_t requiredRows,
+        uint32_t* vecIndices,
+        uint64_t* groupBases,
+        uint32_t* groupRows,
+        uint8_t* preserveRows,
+        uint32_t& rows) {
+        if (rows + requiredRows <= vecPerCore_) {
+            return;
+        }
+        FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
+    }
+
+    __aicore__ inline void AppendPhysicalCacheGroupRows(
+        uint32_t tokenStart,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t groupInBlock,
+        uint32_t firstGroupRow,
+        uint32_t headIdx,
+        bool preserveExisting,
         uint32_t worker,
         uint32_t activeWorkers,
+        uint32_t* vecIndices,
+        uint64_t* groupBases,
+        uint32_t* groupRows,
+        uint8_t* preserveRows,
+        uint32_t& rows) {
+        if (rowCount == 0) {
+            return;
+        }
+        const uint32_t ownerTask = MakeCacheGroupOwnerTaskId(blockIdx, groupInBlock, headIdx);
+        if ((ownerTask % activeWorkers) != worker) {
+            return;
+        }
+
+        EnsureSequenceBatchCapacity(
+            rowCount, vecIndices, groupBases, groupRows, preserveRows, rows);
+        const uint64_t groupBase = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
+        for (uint32_t row = 0; row < rowCount; ++row) {
+            const uint32_t vecIdx = MakeVecIndex(tokenStart + row, headIdx);
+            if (vecIdx >= nVec_) {
+                continue;
+            }
+            vecIndices[rows] = vecIdx;
+            groupBases[rows] = groupBase;
+            groupRows[rows] = firstGroupRow + row;
+            preserveRows[rows] = preserveExisting ? 1 : 0;
+            ++rows;
+        }
+    }
+
+    __aicore__ inline bool ResolveRequestTokenRange(
+        uint32_t reqIdx,
         uint32_t& tokenStart,
         uint32_t& tokenEnd) const {
-        const uint32_t baseTokens = tokenCount_ / activeWorkers;
-        const uint32_t extraTokens = tokenCount_ - baseTokens * activeWorkers;
-        const uint32_t priorExtra = worker < extraTokens ? worker : extraTokens;
-        tokenStart = worker * baseTokens + priorExtra;
-        tokenEnd = tokenStart + baseTokens + (worker < extraTokens ? 1 : 0);
-    }
-
-    __aicore__ inline uint32_t BuildContiguousGroupVecIndices(
-        uint32_t tokenIdx,
-        uint32_t headIdx,
-        uint32_t* vecIndices) const {
-        uint32_t rows = 0;
-        for (uint32_t groupRow = 0; groupRow < TQ_GROUP_ROWS; ++groupRow) {
-            const uint32_t vecIdx = MakeVecIndex(tokenIdx + groupRow, headIdx);
-            if (vecIdx >= nVec_) {
-                continue;
-            }
-            vecIndices[rows] = vecIdx;
-            ++rows;
+        if (reqIdx >= numReqs_) {
+            return false;
         }
-        return rows;
+        const int32_t start = queryStartLocGm_.GetValue(reqIdx);
+        const int32_t end = queryStartLocGm_.GetValue(reqIdx + 1);
+        if (start < 0 || end < start) {
+            return false;
+        }
+        tokenStart = static_cast<uint32_t>(start);
+        tokenEnd = static_cast<uint32_t>(end);
+        if (tokenStart > tokenCount_ || tokenEnd > tokenCount_) {
+            return false;
+        }
+        return tokenStart < tokenEnd;
     }
 
-    __aicore__ inline void ProcessContiguousPhysicalGroupsInTokenRange(
+    __aicore__ inline void ProcessSequenceBlockRange(
+        uint32_t tokenStart,
+        uint32_t blockIdx,
+        uint32_t blockOffset,
+        uint32_t rowsInBlock,
         uint32_t worker,
-        uint32_t activeWorkers) {
-        uint32_t tokenStart = 0;
-        uint32_t tokenEnd = 0;
-        GetWorkerTokenRange(worker, activeWorkers, tokenStart, tokenEnd);
+        uint32_t activeWorkers,
+        uint32_t* vecIndices,
+        uint64_t* groupBases,
+        uint32_t* groupRows,
+        uint8_t* preserveRows,
+        uint32_t& rows) {
+        uint32_t consumedRows = 0;
+        uint32_t currentOffset = blockOffset;
+        uint32_t remainingRows = rowsInBlock;
 
-        uint32_t vecIndices[TQ_GROUP_ROWS];
-        uint32_t tokenIdx = tokenStart;
-        while (tokenIdx < tokenEnd) {
-            uint32_t blockIdx = 0;
-            uint32_t groupInBlock = 0;
-            if (!TryResolveContiguousPhysicalGroup(tokenIdx, blockIdx, groupInBlock)) {
-                ++tokenIdx;
-                continue;
+        const uint32_t leadingGroupRow = currentOffset % TQ_GROUP_ROWS;
+        if (leadingGroupRow != 0 && remainingRows > 0) {
+            uint32_t leadingRows = TQ_GROUP_ROWS - leadingGroupRow;
+            if (leadingRows > remainingRows) {
+                leadingRows = remainingRows;
             }
-
+            const uint32_t groupInBlock = currentOffset / TQ_GROUP_ROWS;
             for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                const uint32_t rows = BuildContiguousGroupVecIndices(tokenIdx, headIdx, vecIndices);
-                if (rows != TQ_GROUP_ROWS) {
-                    continue;
-                }
-                FlushContiguousCacheGroupBatch(
+                AppendPhysicalCacheGroupRows(
+                    tokenStart,
+                    leadingRows,
+                    blockIdx,
+                    groupInBlock,
+                    leadingGroupRow,
+                    headIdx,
+                    true,
+                    worker,
+                    activeWorkers,
                     vecIndices,
-                    MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx));
+                    groupBases,
+                    groupRows,
+                    preserveRows,
+                    rows);
             }
-            tokenIdx += TQ_GROUP_ROWS;
+            consumedRows += leadingRows;
+            currentOffset += leadingRows;
+            remainingRows -= leadingRows;
         }
-    }
 
-    __aicore__ inline void ProcessSlotMappingGroupOwnerFallbackSkippingContiguousGroups(uint32_t worker) {
-        const uint32_t activeWorkers = GetActiveWorkers();
-        uint32_t vecIndices[TQ_MAX_BATCH_M];
-        uint64_t groupBases[TQ_MAX_BATCH_M];
-        uint32_t groupRows[TQ_MAX_BATCH_M];
-        uint32_t rows = 0;
-        uint32_t tokenIdx = 0;
-        while (tokenIdx < tokenCount_) {
-            uint32_t fullBlockIdx = 0;
-            uint32_t fullGroupInBlock = 0;
-            if (TryResolveContiguousPhysicalGroup(tokenIdx, fullBlockIdx, fullGroupInBlock)) {
-                tokenIdx += TQ_GROUP_ROWS;
-                continue;
-            }
-
-            uint32_t blockIdx = 0;
-            uint32_t groupInBlock = 0;
-            uint32_t groupRow = 0;
-            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock, groupRow)) {
-                ++tokenIdx;
-                continue;
-            }
-
+        while (remainingRows >= TQ_GROUP_ROWS) {
+            const uint32_t groupInBlock = currentOffset / TQ_GROUP_ROWS;
             for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                const uint32_t physicalGroupTask =
-                    MakeCacheGroupOwnerTaskId(blockIdx, groupInBlock, headIdx);
-                if ((physicalGroupTask % activeWorkers) != worker) {
-                    continue;
-                }
-
-                const uint32_t vecIdx = MakeVecIndex(tokenIdx, headIdx);
-                if (vecIdx >= nVec_) {
-                    continue;
-                }
-                vecIndices[rows] = vecIdx;
-                groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
-                groupRows[rows] = groupRow;
-                ++rows;
-                if (rows == vecPerCore_) {
-                    FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-                    rows = 0;
-                }
+                AppendPhysicalCacheGroupRows(
+                    tokenStart + consumedRows,
+                    TQ_GROUP_ROWS,
+                    blockIdx,
+                    groupInBlock,
+                    0,
+                    headIdx,
+                    false,
+                    worker,
+                    activeWorkers,
+                    vecIndices,
+                    groupBases,
+                    groupRows,
+                    preserveRows,
+                    rows);
             }
-            ++tokenIdx;
+            consumedRows += TQ_GROUP_ROWS;
+            currentOffset += TQ_GROUP_ROWS;
+            remainingRows -= TQ_GROUP_ROWS;
         }
-        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-    }
 
-    __aicore__ inline void ProcessCachePairByContiguousGroupFastPathThenFallback(uint32_t worker) {
-        const uint32_t activeWorkers = GetActiveWorkers();
-        if (activeWorkers == 0 || worker >= activeWorkers) {
+        if (remainingRows == 0) {
             return;
         }
-
-        ProcessContiguousPhysicalGroupsInTokenRange(worker, activeWorkers);
-        ProcessSlotMappingGroupOwnerFallbackSkippingContiguousGroups(worker);
+        const uint32_t groupInBlock = currentOffset / TQ_GROUP_ROWS;
+        for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
+            AppendPhysicalCacheGroupRows(
+                tokenStart + consumedRows,
+                remainingRows,
+                blockIdx,
+                groupInBlock,
+                0,
+                headIdx,
+                false,
+                worker,
+                activeWorkers,
+                vecIndices,
+                groupBases,
+                groupRows,
+                preserveRows,
+                rows);
+        }
     }
 
-    __aicore__ inline void ProcessCachePairBySlotMappingGroupOwners(uint32_t worker) {
-        const uint32_t activeWorkers = GetActiveWorkers();
-        if (activeWorkers == 0 || worker >= activeWorkers) {
-            return;
-        }
-
-        uint32_t vecIndices[TQ_MAX_BATCH_M];
-        uint64_t groupBases[TQ_MAX_BATCH_M];
-        uint32_t groupRows[TQ_MAX_BATCH_M];
-        uint32_t rows = 0;
-        for (uint32_t tokenIdx = 0; tokenIdx < tokenCount_; ++tokenIdx) {
-            uint32_t blockIdx = 0;
-            uint32_t groupInBlock = 0;
-            uint32_t groupRow = 0;
-            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock, groupRow)) {
-                continue;
-            }
-
-            for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                const uint32_t physicalGroupTask =
-                    MakeCacheGroupOwnerTaskId(blockIdx, groupInBlock, headIdx);
-                if ((physicalGroupTask % activeWorkers) != worker) {
-                    continue;
-                }
-
-                const uint32_t vecIdx = MakeVecIndex(tokenIdx, headIdx);
-                if (vecIdx >= nVec_) {
-                    continue;
-                }
-                vecIndices[rows] = vecIdx;
-                groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
-                groupRows[rows] = groupRow;
-                ++rows;
-                if (rows == vecPerCore_) {
-                    FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-                    rows = 0;
-                }
-            }
-        }
-        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-    }
-
-    __aicore__ inline void ProcessCachePairByVecTaskStride(uint32_t worker) {
+    __aicore__ inline void ProcessCachePairBySequenceContiguousSegments(uint32_t worker) {
         const uint32_t activeWorkers = GetActiveWorkers();
         if (activeWorkers == 0 || worker >= activeWorkers) {
             return;
@@ -1069,32 +992,47 @@ private:
         uint32_t vecIndices[TQ_MAX_BATCH_M];
         uint64_t groupBases[TQ_MAX_BATCH_M];
         uint32_t groupRows[TQ_MAX_BATCH_M];
+        uint8_t preserveRows[TQ_MAX_BATCH_M];
         uint32_t rows = 0;
-        const uint32_t taskCount = tokenCount_ * numHeads_;
-        for (uint32_t taskIdx = worker; taskIdx < taskCount; taskIdx += activeWorkers) {
-            const uint32_t tokenIdx = taskIdx / numHeads_;
-            const uint32_t headIdx = taskIdx - tokenIdx * numHeads_;
-            uint32_t blockIdx = 0;
-            uint32_t groupInBlock = 0;
-            uint32_t groupRow = 0;
-            if (!ResolveTokenSlot(tokenIdx, blockIdx, groupInBlock, groupRow)) {
+
+        for (uint32_t reqIdx = 0; reqIdx < numReqs_; ++reqIdx) {
+            uint32_t seqStart = 0;
+            uint32_t seqEnd = 0;
+            if (!ResolveRequestTokenRange(reqIdx, seqStart, seqEnd)) {
                 continue;
             }
 
-            const uint32_t vecIdx = MakeVecIndex(tokenIdx, headIdx);
-            if (vecIdx >= nVec_) {
-                continue;
-            }
-            vecIndices[rows] = vecIdx;
-            groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
-            groupRows[rows] = groupRow;
-            ++rows;
-            if (rows == vecPerCore_) {
-                FlushVecBatch(vecIndices, groupBases, groupRows, rows);
-                rows = 0;
+            uint32_t tokenIdx = seqStart;
+            while (tokenIdx < seqEnd) {
+                uint32_t firstSlot = 0;
+                if (!ResolveTokenSlotU(tokenIdx, firstSlot)) {
+                    ++tokenIdx;
+                    continue;
+                }
+                const uint32_t blockIdx = firstSlot / blockSize_;
+                const uint32_t blockOffset = firstSlot - blockIdx * blockSize_;
+                uint32_t rowsInBlock = blockSize_ - blockOffset;
+                const uint32_t remainingSeqRows = seqEnd - tokenIdx;
+                if (rowsInBlock > remainingSeqRows) {
+                    rowsInBlock = remainingSeqRows;
+                }
+
+                ProcessSequenceBlockRange(
+                    tokenIdx,
+                    blockIdx,
+                    blockOffset,
+                    rowsInBlock,
+                    worker,
+                    activeWorkers,
+                    vecIndices,
+                    groupBases,
+                    groupRows,
+                    preserveRows,
+                    rows);
+                tokenIdx += rowsInBlock;
             }
         }
-        FlushVecBatch(vecIndices, groupBases, groupRows, rows);
+        FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
     }
 
 private:
@@ -1108,7 +1046,7 @@ private:
     const uint32_t numBlocks_;
     const uint32_t cacheSlots_;
     const uint32_t dataCores_;
-    const uint32_t packMode_;
+    const uint32_t numReqs_;
     const bool matmulReady_;
 
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
@@ -1132,6 +1070,7 @@ private:
     AscendC::GlobalTensor<T> valueGm_;
     AscendC::GlobalTensor<T> rotationTGm_;
     AscendC::GlobalTensor<int32_t> slotMappingGm_;
+    AscendC::GlobalTensor<int32_t> queryStartLocGm_;
     AscendC::GlobalTensor<uint8_t> keyCacheGm_;
     AscendC::GlobalTensor<uint8_t> valueCacheGm_;
 };
@@ -1144,6 +1083,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
     GM_ADDR codebook,
     GM_ADDR rotation_t,
     GM_ADDR slot_mapping,
+    GM_ADDR query_start_loc,
     GM_ADDR key_cache,
     GM_ADDR value_cache,
     GM_ADDR workspace,
@@ -1153,6 +1093,7 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
     auto* codebookPtr = reinterpret_cast<__gm__ TqDataT*>(codebook);
     auto* rotationPtr = reinterpret_cast<__gm__ TqDataT*>(rotation_t);
     auto* slotMappingPtr = reinterpret_cast<__gm__ int32_t*>(slot_mapping);
+    auto* queryStartLocPtr = reinterpret_cast<__gm__ int32_t*>(query_start_loc);
     auto* keyCachePtr = reinterpret_cast<__gm__ uint8_t*>(key_cache);
     auto* valueCachePtr = reinterpret_cast<__gm__ uint8_t*>(value_cache);
 
@@ -1178,13 +1119,14 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
         tilingData.blockSize,
         tilingData.numBlocks,
         tilingData.dataCores,
-        tilingData.packMode);
+        tilingData.numReqs);
     op.Init(
         key,
         value,
         codebookPtr,
         rotationPtr,
         slotMappingPtr,
+        queryStartLocPtr,
         keyCachePtr,
         valueCachePtr);
     op.Process();

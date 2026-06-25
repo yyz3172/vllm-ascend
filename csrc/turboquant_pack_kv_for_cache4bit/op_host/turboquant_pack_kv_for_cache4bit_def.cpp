@@ -35,6 +35,12 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
+        this->Input("query_start_loc")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32, ge::DT_INT32})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("key_cache")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
@@ -45,14 +51,12 @@ public:
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        // 0 = slot_mapping group-owner path, 1 = decode vector-task path,
-        // 2 = contiguous cache-group fast path plus slot_mapping fallback.
-        this->Attr("pack_mode").Int();
         this->Attr("n_vec").Int();
         this->Attr("vec_per_core").Int();
         this->Attr("num_heads").Int();
         this->Attr("block_size").Int();
         this->Attr("num_blocks").Int();
+        this->Attr("num_reqs").Int();
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

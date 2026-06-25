@@ -271,6 +271,7 @@ def test_turboquant_pack_kv_for_cache_to_cache_matches_old_path():
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     slot_mapping = torch.tensor([0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
     key_cache_old = torch.zeros(B, BS, H, P, dtype=torch.int8, device=device)
     value_cache_old = torch.zeros_like(key_cache_old)
     key_cache_new = torch.zeros_like(key_cache_old)
@@ -298,6 +299,8 @@ def test_turboquant_pack_kv_for_cache_to_cache_matches_old_path():
         key_cache=key_cache_new,
         value_cache=value_cache_new,
         slot_mapping=slot_mapping,
+        query_start_loc=query_start_loc,
+        num_reqs=1,
         bits_key=bits_key,
         bits_value=bits_value,
     )
@@ -314,6 +317,7 @@ def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     T = 7
     slot_mapping = torch.tensor([0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
 
@@ -343,6 +347,8 @@ def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
             key_cache=key_cache_slab,
             value_cache=value_cache_slab,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=1,
             bits_key=bits,
             bits_value=bits,
         )
@@ -418,9 +424,8 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
     bits = 4
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     T = 7
-    slot_mapping = torch.tensor(
-        [0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device
-    )
+    slot_mapping = torch.arange(T, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
     torch.manual_seed(1234)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
@@ -441,6 +446,8 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
             key_cache=key_cache_ref,
             value_cache=value_cache_ref,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=1,
             bits_key=bits,
             bits_value=bits,
         )
@@ -448,9 +455,11 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
             key.contiguous(),
             value.contiguous(),
             slot_mapping,
+            query_start_loc,
             *_turboquant_pack_tables(device, D, bits, dtype),
             key_cache_op,
             value_cache_op,
+            1,
             BS,
         )
         torch.npu.synchronize()
@@ -520,7 +529,7 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
 
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
+def test_turboquant_4bit_pack_to_cache_seq_aware_decode_matches_reference(
     dtype: torch.dtype,
 ) -> None:
     if not _c_ascend_turboquant_op_available(
@@ -533,11 +542,12 @@ def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
     bits = 4
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     slot_mapping = torch.tensor(
-        [0, 4, 8, 128, 132, 136, -1],
+        [0, 4, 8, 128, 132, 136],
         dtype=torch.int32,
         device=device,
     )
     T = int(slot_mapping.numel())
+    query_start_loc = torch.arange(T + 1, dtype=torch.int32, device=device)
     torch.manual_seed(4321)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
@@ -546,33 +556,38 @@ def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
     key_cache_direct = torch.zeros_like(key_cache_general)
     value_cache_direct = torch.zeros_like(value_cache_general)
 
-    env = {
+    ref_env = {
         "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
-        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0",
         "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
     }
-    with _patched_turboquant_env(os.environ, env, clear=False):
+    op_env = dict(ref_env)
+    op_env["VLLM_ASCEND_TURBOQUANT_ENCODE_OP"] = "1"
+    with _patched_turboquant_env(os.environ, ref_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_general,
             value_cache=value_cache_general,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=T,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=0,
         )
+    with _patched_turboquant_env(os.environ, op_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_direct,
             value_cache=value_cache_direct,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=T,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=1,
         )
-        torch.npu.synchronize()
+    torch.npu.synchronize()
 
     torch.testing.assert_close(key_cache_direct, key_cache_general, rtol=0, atol=0)
     torch.testing.assert_close(value_cache_direct, value_cache_general, rtol=0, atol=0)
@@ -580,7 +595,7 @@ def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
 
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_turboquant_4bit_pack_to_cache_logical_fast_matches_general(
+def test_turboquant_4bit_pack_to_cache_seq_aware_prefill_matches_reference(
     dtype: torch.dtype,
 ) -> None:
     if not _c_ascend_turboquant_op_available(
@@ -593,11 +608,12 @@ def test_turboquant_4bit_pack_to_cache_logical_fast_matches_general(
     bits = 4
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     slot_mapping = torch.tensor(
-        [0, 1, 2, 3, 8, 9, 10, 11, 64, 66, 68, 70, -1],
+        [1, 2, 3, 128, 129, 130, 131, 132, 133],
         dtype=torch.int32,
         device=device,
     )
     T = int(slot_mapping.numel())
+    query_start_loc = torch.tensor([0, 3, T], dtype=torch.int32, device=device)
     torch.manual_seed(5678)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
@@ -606,33 +622,38 @@ def test_turboquant_4bit_pack_to_cache_logical_fast_matches_general(
     key_cache_fast = torch.zeros_like(key_cache_general)
     value_cache_fast = torch.zeros_like(value_cache_general)
 
-    env = {
+    ref_env = {
         "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
-        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0",
         "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
     }
-    with _patched_turboquant_env(os.environ, env, clear=False):
+    op_env = dict(ref_env)
+    op_env["VLLM_ASCEND_TURBOQUANT_ENCODE_OP"] = "1"
+    with _patched_turboquant_env(os.environ, ref_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_general,
             value_cache=value_cache_general,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=2,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=0,
         )
+    with _patched_turboquant_env(os.environ, op_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_fast,
             value_cache=value_cache_fast,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=2,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=2,
         )
-        torch.npu.synchronize()
+    torch.npu.synchronize()
 
     torch.testing.assert_close(key_cache_fast, key_cache_general, rtol=0, atol=0)
     torch.testing.assert_close(value_cache_fast, value_cache_general, rtol=0, atol=0)

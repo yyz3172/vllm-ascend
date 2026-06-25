@@ -23,6 +23,7 @@
 #include "turboquant_attention_paged4bit/op_host/aclnn_turboquant_attention_paged4bit.h"
 #include "turboquant_pack_kv_for_cache4bit/op_host/aclnn_turboquant_pack_kv_for_cache4bit.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -120,9 +121,8 @@ int64_t ParsePackMode(const char* text)
         value == "decode-vec-tasks" || value == "vec-tasks") {
         return 1;
     }
-    if (value == "logical-fast" || value == "logical-fast-fallback" ||
-        value == "logical" || value == "contiguous-group-fast-fallback" ||
-        value == "contiguous-fast") {
+    if (value == "logical-fast" || value == "logical" ||
+        value == "contiguous-group-fast" || value == "contiguous-fast") {
         return 2;
     }
     return ParseInt64(text, "--pack-mode");
@@ -147,8 +147,7 @@ void PrintUsage(const char* argv0)
         << "  --kv-heads N         KV heads, default 8\n"
         << "  --block-size N       Paged cache block size, default 128\n"
         << "  --pack-tokens N      Tokens per pack call, default 1\n"
-        << "  --pack-mode MODE     Pack writeback: 0/slot-mapping-group-owner, "
-           "1/decode-vec-tasks, 2/contiguous-group-fast-fallback, default 0\n"
+        << "  --pack-mode MODE     Ignored; pack uses seq-aware writeback only\n"
         << "  --slot-pattern NAME  Slot mapping: contiguous, swap-pairs, scatter-groups, reverse, default contiguous\n"
         << "  --warmup N           Warmup iterations, default 10\n"
         << "  --repeat N           Timed iterations, default 100\n"
@@ -229,10 +228,6 @@ Options ParseArgs(int argc, char** argv)
     }
     if (opt.pack_tokens > opt.batch_size * opt.seq_len) {
         Fail("--pack-tokens must be <= --batch-size * --seq-len");
-    }
-    if (opt.pack_mode < 0 || opt.pack_mode > 2) {
-        Fail("--pack-mode must be 0/slot-mapping-group-owner, "
-             "1/decode-vec-tasks, or 2/contiguous-group-fast-fallback");
     }
     if (!IsKnownSlotPattern(opt.slot_pattern)) {
         Fail("--slot-pattern must be one of: contiguous, swap-pairs, scatter-groups, reverse");
@@ -571,11 +566,12 @@ void RunPack4bit(
     const AclTensorGuard& key,
     const AclTensorGuard& value,
     const AclTensorGuard& slot_mapping,
+    const AclTensorGuard& query_start_loc,
     const AclTensorGuard& codebook,
     const AclTensorGuard& rotation_t,
     const AclTensorGuard& key_cache,
     const AclTensorGuard& value_cache,
-    int64_t pack_mode,
+    int64_t num_reqs,
     int64_t n_vec,
     int64_t vec_per_core,
     int64_t num_heads,
@@ -592,12 +588,13 @@ void RunPack4bit(
             codebook.tensor,
             rotation_t.tensor,
             slot_mapping.tensor,
-            pack_mode,
+            query_start_loc.tensor,
             n_vec,
             vec_per_core,
             num_heads,
             block_size,
             num_blocks,
+            num_reqs,
             key_cache.tensor,
             value_cache.tensor,
             &workspace_size,
@@ -749,6 +746,21 @@ int main(int argc, char** argv)
                     static_cast<int32_t>(seq * blocks_per_seq + block);
             }
         }
+        std::vector<int32_t> full_query_start_loc_host(static_cast<size_t>(opt.batch_size + 1), 0);
+        for (int64_t seq = 0; seq < opt.batch_size; ++seq) {
+            full_query_start_loc_host[static_cast<size_t>(seq + 1)] =
+                static_cast<int32_t>((seq + 1) * opt.seq_len);
+        }
+        std::vector<int32_t> pack_query_start_loc_host {0};
+        int64_t remaining_pack_tokens = opt.pack_tokens;
+        for (int64_t seq = 0; seq < opt.batch_size && remaining_pack_tokens > 0; ++seq) {
+            const int64_t rows_for_seq = std::min<int64_t>(opt.seq_len, remaining_pack_tokens);
+            pack_query_start_loc_host.push_back(
+                pack_query_start_loc_host.back() + static_cast<int32_t>(rows_for_seq));
+            remaining_pack_tokens -= rows_for_seq;
+        }
+        const int64_t pack_num_reqs =
+            static_cast<int64_t>(pack_query_start_loc_host.size()) - 1;
 
         phase = "allocate device buffers";
         DeviceBuffer key_dev(key_host.size() * sizeof(uint16_t));
@@ -757,6 +769,8 @@ int main(int argc, char** argv)
         DeviceBuffer codebook_dev(codebook_host.size() * sizeof(uint16_t));
         DeviceBuffer rotation_dev(rotation_host.size() * sizeof(uint16_t));
         DeviceBuffer slot_mapping_dev(slot_mapping_host.size() * sizeof(int32_t));
+        DeviceBuffer full_query_start_loc_dev(full_query_start_loc_host.size() * sizeof(int32_t));
+        DeviceBuffer pack_query_start_loc_dev(pack_query_start_loc_host.size() * sizeof(int32_t));
         DeviceBuffer block_table_dev(block_table_host.size() * sizeof(int32_t));
         DeviceBuffer key_cache_dev(total_blocks * opt.num_kv_heads * cache_row_span);
         DeviceBuffer value_cache_dev(total_blocks * opt.num_kv_heads * cache_row_span);
@@ -771,6 +785,10 @@ int main(int argc, char** argv)
         codebook_dev.CopyFromHost(codebook_host.data(), codebook_dev.bytes);
         rotation_dev.CopyFromHost(rotation_host.data(), rotation_dev.bytes);
         slot_mapping_dev.CopyFromHost(slot_mapping_host.data(), slot_mapping_dev.bytes);
+        full_query_start_loc_dev.CopyFromHost(
+            full_query_start_loc_host.data(), full_query_start_loc_dev.bytes);
+        pack_query_start_loc_dev.CopyFromHost(
+            pack_query_start_loc_host.data(), pack_query_start_loc_dev.bytes);
         block_table_dev.CopyFromHost(block_table_host.data(), block_table_dev.bytes);
         key_cache_dev.MemsetZero();
         value_cache_dev.MemsetZero();
@@ -812,6 +830,10 @@ int main(int argc, char** argv)
             slot_mapping_dev.ptr, ACL_INT32, {cache_fill_tokens}, {1});
         AclTensorGuard pack_slot_mapping_acl(
             slot_mapping_dev.ptr, ACL_INT32, {opt.pack_tokens}, {1});
+        AclTensorGuard full_query_start_loc_acl(
+            full_query_start_loc_dev.ptr, ACL_INT32, {opt.batch_size + 1}, {1});
+        AclTensorGuard pack_query_start_loc_acl(
+            pack_query_start_loc_dev.ptr, ACL_INT32, {pack_num_reqs + 1}, {1});
         AclTensorGuard block_table_acl(
             block_table_dev.ptr, ACL_INT32, {opt.batch_size, blocks_per_seq}, {blocks_per_seq, 1});
         AclTensorGuard key_cache_acl(
@@ -858,7 +880,8 @@ int main(int argc, char** argv)
                   << " blocks_per_seq=" << blocks_per_seq
                   << " total_blocks=" << total_blocks
                   << " pack_tokens=" << opt.pack_tokens
-                  << " pack_mode=" << opt.pack_mode
+                  << " pack_num_reqs=" << pack_num_reqs
+                  << " pack_mode=" << opt.pack_mode << "(ignored)"
                   << " slot_pattern=" << opt.slot_pattern
                   << " fill_cache=" << static_cast<int>(opt.fill_cache)
                   << " warmup=" << opt.warmup
@@ -871,11 +894,12 @@ int main(int argc, char** argv)
                 key_acl,
                 value_acl,
                 slot_mapping_acl,
+                full_query_start_loc_acl,
                 codebook_acl,
                 rotation_acl,
                 key_cache_acl,
                 value_cache_acl,
-                0,
+                opt.batch_size,
                 full_n_vec,
                 128,
                 opt.num_kv_heads,
@@ -893,11 +917,12 @@ int main(int argc, char** argv)
                         pack_key_acl,
                         pack_value_acl,
                         pack_slot_mapping_acl,
+                        pack_query_start_loc_acl,
                         codebook_acl,
                         rotation_acl,
                         pack_key_cache_acl,
                         pack_value_cache_acl,
-                        opt.pack_mode,
+                        pack_num_reqs,
                         pack_n_vec,
                         vec_per_core,
                         opt.num_kv_heads,

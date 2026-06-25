@@ -993,7 +993,6 @@ _turboquant_pack_v2_to_cache_op_available: bool | None = None
 _turboquant_pack_v3_to_cache_op_available: bool | None = None
 _turboquant_pack_to_cache_op_available: bool | None = None
 _turboquant_pack_4bit_to_cache_op_available: bool | None = None
-_turboquant_pack_4bit_has_pack_mode: bool | None = None
 
 
 def _turboquant_pack_reg_key(
@@ -1103,24 +1102,6 @@ def _turboquant_pack_4bit_to_cache_op_ready() -> bool:
             )
         )
     return _turboquant_pack_4bit_to_cache_op_available
-
-
-def _turboquant_pack_4bit_accepts_pack_mode() -> bool:
-    global _turboquant_pack_4bit_has_pack_mode
-    if not _turboquant_pack_4bit_to_cache_op_ready():
-        return False
-    if _turboquant_pack_4bit_has_pack_mode is not None:
-        return _turboquant_pack_4bit_has_pack_mode
-    try:
-        op = torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit
-        _turboquant_pack_4bit_has_pack_mode = "pack_mode" in str(op.default._schema)
-    except Exception:
-        _turboquant_pack_4bit_has_pack_mode = False
-    return _turboquant_pack_4bit_has_pack_mode
-
-
-def _turboquant_pack_4bit_decode_direct_ready() -> bool:
-    return _turboquant_pack_4bit_accepts_pack_mode()
 
 
 def ensure_turboquant_pack_tables_registered(
@@ -1255,9 +1236,10 @@ def turboquant_pack_kv_for_cache_to_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
     bits_key: int,
     bits_value: int,
-    pack_mode: int = 0,
 ) -> None:
     if key.numel() == 0:
         return
@@ -1265,6 +1247,17 @@ def turboquant_pack_kv_for_cache_to_cache(
         raise ValueError("Key/value dtypes must match for turboquant.")
     if slot_mapping.dtype != torch.int32:
         raise ValueError("TurboQuant fused pack-to-cache expects int32 slot_mapping.")
+    if query_start_loc.dtype != torch.int32:
+        raise ValueError("TurboQuant fused pack-to-cache expects int32 query_start_loc.")
+    if num_reqs <= 0:
+        raise ValueError("TurboQuant fused pack-to-cache expects num_reqs > 0.")
+    if query_start_loc.dim() != 1 or query_start_loc.numel() < num_reqs + 1:
+        raise ValueError(
+            "TurboQuant fused pack-to-cache expects query_start_loc length "
+            "at least num_reqs + 1."
+        )
+    if not query_start_loc.is_contiguous():
+        query_start_loc = query_start_loc.contiguous()
 
     head_size = key.shape[-1]
     key_slab_block_size = _turboquant_slab_block_size_or_none(
@@ -1304,41 +1297,21 @@ def turboquant_pack_kv_for_cache_to_cache(
             and _turboquant_pack_4bit_to_cache_op_ready()
         )
         if use_4bit_to_cache:
-            if pack_mode not in (0, 1, 2):
-                raise ValueError(
-                    "4-bit TurboQuant pack_mode must be 0 (general), 1 "
-                    f"(decode direct), or 2 (logical fast fallback), got {pack_mode}."
-                )
-            effective_pack_mode = int(pack_mode)
-            has_pack_mode = _turboquant_pack_4bit_accepts_pack_mode()
-            if effective_pack_mode == 1 and not has_pack_mode:
-                effective_pack_mode = 0
             cb_k, rot_t_k = _turboquant_pack_tables(
                 key.device, head_size, bits_key, key.dtype
             )
-            if has_pack_mode:
-                torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
-                    key,
-                    value,
-                    slot_mapping,
-                    cb_k,
-                    rot_t_k,
-                    _uint8_storage_view(key_cache),
-                    _uint8_storage_view(value_cache),
-                    int(block_size),
-                    effective_pack_mode,
-                )
-            else:
-                torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
-                    key,
-                    value,
-                    slot_mapping,
-                    cb_k,
-                    rot_t_k,
-                    _uint8_storage_view(key_cache),
-                    _uint8_storage_view(value_cache),
-                    int(block_size),
-                )
+            torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+                key,
+                value,
+                slot_mapping,
+                query_start_loc,
+                cb_k,
+                rot_t_k,
+                _uint8_storage_view(key_cache),
+                _uint8_storage_view(value_cache),
+                int(num_reqs),
+                int(block_size),
+            )
             return
         row_w_k = turboquant_slab_row_bytes(head_size, bits=bits_key)
         row_w_v = turboquant_slab_row_bytes(head_size, bits=bits_value)
@@ -1922,6 +1895,7 @@ def warm_up_turboquant_4bit_pack_op(
     key = torch.zeros((1, num_kv_heads, head_size), device=device, dtype=dtype)
     value = torch.zeros_like(key)
     slot_mapping = torch.zeros((1,), device=device, dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1], device=device, dtype=torch.int32)
     key_cache = torch.zeros(
         (1, num_kv_heads, block_size * row_width),
         device=device,
@@ -1933,10 +1907,12 @@ def warm_up_turboquant_4bit_pack_op(
         key,
         value,
         slot_mapping,
+        query_start_loc,
         cb_k,
         rot_t_k,
         key_cache,
         value_cache,
+        1,
         int(block_size),
     )
     _sync_npu_if_needed(device)

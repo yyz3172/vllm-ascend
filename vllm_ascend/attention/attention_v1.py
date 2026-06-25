@@ -262,6 +262,7 @@ class AscendMetadata:
     num_prefills: int = 0
     num_decodes: int = 0
     num_decodes_flatten: int = 0
+    num_reqs: int = 0
 
     # The sequence length per sequence. Sequence length means the computed
     # tokens + new tokens (is None if it is a decoding).
@@ -372,6 +373,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        pack_num_reqs = 0
+        while (
+            pack_num_reqs < num_reqs
+            and query_start_loc_cpu[pack_num_reqs].item() < num_actual_tokens
+        ):
+            pack_num_reqs += 1
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.decode_threshold
@@ -416,6 +423,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
+            num_reqs=pack_num_reqs,
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -1231,26 +1239,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         key_in = key
                         value_in = value
                         cache_slots = slots
-                    pack_mode = 0
-                    if not encoder_decoder:
-                        if (
-                            attn_metadata.attn_state
-                            == AscendAttentionState.DecodeOnly
-                            and attn_metadata.num_actual_tokens
-                            == attn_metadata.num_decodes
-                        ):
-                            pack_mode = 1
-                        else:
-                            pack_mode = 2
                     turboquant_pack_kv_for_cache_to_cache(
                         key=key_in,
                         value=value_in,
                         key_cache=self.key_cache,
                         value_cache=self.value_cache,
                         slot_mapping=cache_slots,
+                        query_start_loc=attn_metadata.query_start_loc,
+                        num_reqs=attn_metadata.num_reqs,
                         bits_key=self.turboquant_kv_bits_key,
                         bits_value=self.turboquant_kv_bits_value,
-                        pack_mode=pack_mode,
                     )
                 if self.is_kv_producer:
                     attn_metadata.reshape_cache_event.record()

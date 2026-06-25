@@ -199,6 +199,11 @@ def _pack_to_cache_binding(
     """Run ``turboquant_pack_kv_for_cache_to_cache`` (Python routing to v2 C++ op)."""
     key_cache.zero_()
     value_cache.zero_()
+    query_start_loc = torch.tensor(
+        [0, key.shape[0]],
+        device=slot_mapping.device,
+        dtype=torch.int32,
+    )
     with patch.dict(os.environ, _turboquant_test_env(pack_op=pack_op), clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
@@ -206,6 +211,8 @@ def _pack_to_cache_binding(
             key_cache=key_cache,
             value_cache=value_cache,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=1,
             bits_key=bits_key,
             bits_value=bits_value,
         )

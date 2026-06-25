@@ -10,9 +10,6 @@ constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PACK_TILING_KEY_DEFAULT = 0;
-constexpr uint32_t TQ_PACK_MODE_SLOT_MAPPING_GROUP_OWNER = 0;
-constexpr uint32_t TQ_PACK_MODE_DECODE_VEC_TASKS = 1;
-constexpr uint32_t TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK = 2;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
 constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
 
@@ -88,32 +85,29 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
         OPS_LOG_E(nodeName, "attrs is null");
         return ge::GRAPH_FAILED;
     }
-    const int64_t* packModePtr = attrs->GetAttrPointer<int64_t>(0);
-    const int64_t* nVecPtr = attrs->GetAttrPointer<int64_t>(1);
-    const int64_t* vecPerCorePtr = attrs->GetAttrPointer<int64_t>(2);
-    const int64_t* numHeadsPtr = attrs->GetAttrPointer<int64_t>(3);
-    const int64_t* blockSizePtr = attrs->GetAttrPointer<int64_t>(4);
-    const int64_t* numBlocksPtr = attrs->GetAttrPointer<int64_t>(5);
-    if (packModePtr == nullptr || nVecPtr == nullptr || vecPerCorePtr == nullptr ||
-        numHeadsPtr == nullptr || blockSizePtr == nullptr || numBlocksPtr == nullptr) {
+    const int64_t* nVecPtr = attrs->GetAttrPointer<int64_t>(0);
+    const int64_t* vecPerCorePtr = attrs->GetAttrPointer<int64_t>(1);
+    const int64_t* numHeadsPtr = attrs->GetAttrPointer<int64_t>(2);
+    const int64_t* blockSizePtr = attrs->GetAttrPointer<int64_t>(3);
+    const int64_t* numBlocksPtr = attrs->GetAttrPointer<int64_t>(4);
+    const int64_t* numReqsPtr = attrs->GetAttrPointer<int64_t>(5);
+    if (nVecPtr == nullptr || vecPerCorePtr == nullptr || numHeadsPtr == nullptr ||
+        blockSizePtr == nullptr || numBlocksPtr == nullptr || numReqsPtr == nullptr) {
         OPS_LOG_E(nodeName, "required attrs are null");
         return ge::GRAPH_FAILED;
     }
 
-    const uint32_t packMode = static_cast<uint32_t>(*packModePtr);
     const uint32_t nVec = static_cast<uint32_t>(*nVecPtr);
     uint32_t vecPerCore = static_cast<uint32_t>(*vecPerCorePtr);
     const uint32_t numHeads = static_cast<uint32_t>(*numHeadsPtr);
     const uint32_t blockSize = static_cast<uint32_t>(*blockSizePtr);
     const uint32_t numBlocks = static_cast<uint32_t>(*numBlocksPtr);
-    if ((packMode != TQ_PACK_MODE_SLOT_MAPPING_GROUP_OWNER &&
-         packMode != TQ_PACK_MODE_DECODE_VEC_TASKS &&
-         packMode != TQ_PACK_MODE_CONTIGUOUS_GROUP_FAST_FALLBACK) ||
-        nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
-        blockSize < 1 || numBlocks < 1) {
+    const uint32_t numReqs = static_cast<uint32_t>(*numReqsPtr);
+    if (nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
+        blockSize < 1 || numBlocks < 1 || numReqs < 1) {
         OPS_LOG_E(nodeName,
-                  "invalid pack attrs: pack_mode 0=slot-mapping-group-owner, "
-                  "1=decode-vec-tasks, 2=contiguous-group-fast-fallback");
+                  "invalid pack attrs: n_vec/vec_per_core/num_heads/block_size/"
+                  "num_blocks/num_reqs must be positive");
         return ge::GRAPH_FAILED;
     }
     if (blockSize % 4 != 0) {
@@ -177,10 +171,10 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
 
     tilingData.set_nVec(nVec);
     tilingData.set_vecPerCore(vecPerCore);
-    tilingData.set_packMode(packMode);
     tilingData.set_numHeads(numHeads);
     tilingData.set_blockSize(blockSize);
     tilingData.set_numBlocks(numBlocks);
+    tilingData.set_numReqs(numReqs);
 
     // MIX 1C2V per data-parallel group.  Use all physical groups that the
     // current SOC can provide instead of fixing the kernel to 16 groups.
