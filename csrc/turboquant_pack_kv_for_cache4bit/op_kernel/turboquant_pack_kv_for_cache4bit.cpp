@@ -296,7 +296,13 @@ public:
         uint32_t blockSize,
         uint32_t numBlocks,
         uint32_t dataCores,
-        uint32_t numReqs)
+        uint32_t numReqs,
+        uint32_t keyStrideToken,
+        uint32_t keyStrideHead,
+        uint32_t valueStrideToken,
+        uint32_t valueStrideHead,
+        uint64_t keyStorageOffset,
+        uint64_t valueStorageOffset)
         : pipe_(pipe),
           rotateMm_(rotateMm),
           nVec_(nVec),
@@ -308,6 +314,14 @@ public:
           cacheSlots_((blockSize == 0 ? 1 : blockSize) * numBlocks),
           dataCores_(dataCores == 0 ? 1 : dataCores),
           numReqs_(numReqs),
+          keyStrideToken_(keyStrideToken),
+          keyStrideHead_(keyStrideHead),
+          valueStrideToken_(valueStrideToken),
+          valueStrideHead_(valueStrideHead),
+          keyStorageOffset_(keyStorageOffset),
+          valueStorageOffset_(valueStorageOffset),
+          keySpan_(MakeInputSpan(keyStorageOffset, keyStrideToken, keyStrideHead)),
+          valueSpan_(MakeInputSpan(valueStorageOffset, valueStrideToken, valueStrideHead)),
           matmulReady_(rawWorkspace != nullptr) {}
 
     __aicore__ inline void Init(
@@ -320,8 +334,8 @@ public:
         __gm__ uint8_t* key_cache,
         __gm__ uint8_t* value_cache) {
         (void)codebook;
-        keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key), (uint64_t)nVec_ * TQ_PACK_D);
-        valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value), (uint64_t)nVec_ * TQ_PACK_D);
+        keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key), keySpan_);
+        valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value), valueSpan_);
         rotationTGm_.SetGlobalBuffer(rotation_t, (uint64_t)TQ_PACK_D * TQ_PACK_D);
         slotMappingGm_.SetGlobalBuffer(slot_mapping, tokenCount_);
         queryStartLocGm_.SetGlobalBuffer(query_start_loc, static_cast<uint64_t>(numReqs_) + 1);
@@ -576,6 +590,31 @@ private:
         return tokenIdx * numHeads_ + headIdx;
     }
 
+    __aicore__ inline uint64_t MakeInputSpan(
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead) const {
+        if (tokenCount_ == 0 || numHeads_ == 0) {
+            return storageOffset;
+        }
+        return storageOffset +
+               static_cast<uint64_t>(tokenCount_ - 1) * strideToken +
+               static_cast<uint64_t>(numHeads_ - 1) * strideHead +
+               TQ_PACK_D;
+    }
+
+    __aicore__ inline uint64_t MakeInputOffset(
+        uint32_t vecIdx,
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead) const {
+        const uint32_t tokenIdx = vecIdx / numHeads_;
+        const uint32_t headIdx = vecIdx - tokenIdx * numHeads_;
+        return storageOffset +
+               static_cast<uint64_t>(tokenIdx) * strideToken +
+               static_cast<uint64_t>(headIdx) * strideHead;
+    }
+
     __aicore__ inline void CopyInIndexedTask(
         const AscendC::GlobalTensor<T>& xGm,
         const uint32_t* vecIndices,
@@ -589,7 +628,29 @@ private:
         for (uint32_t row = 0; row < rows; ++row) {
             AscendC::DataCopy(
                 xBatch[row * TQ_PACK_D],
-                xGm[static_cast<uint64_t>(vecIndices[row]) * TQ_PACK_D],
+                xGm[MakeInputOffset(
+                    vecIndices[row], keyStorageOffset_, keyStrideToken_, keyStrideHead_)],
+                TQ_PACK_D);
+        }
+        m = rows;
+        xBatchQue_.EnQue(xBatch);
+    }
+
+    __aicore__ inline void CopyInValueIndexedTask(
+        const AscendC::GlobalTensor<T>& xGm,
+        const uint32_t* vecIndices,
+        uint32_t rows,
+        uint32_t& m) {
+        if (rows == 0) {
+            m = 0;
+            return;
+        }
+        auto xBatch = xBatchQue_.AllocTensor<T>();
+        for (uint32_t row = 0; row < rows; ++row) {
+            AscendC::DataCopy(
+                xBatch[row * TQ_PACK_D],
+                xGm[MakeInputOffset(
+                    vecIndices[row], valueStorageOffset_, valueStrideToken_, valueStrideHead_)],
                 TQ_PACK_D);
         }
         m = rows;
@@ -763,6 +824,24 @@ private:
         CopyOutResolvedTask(packedGm, groupBases, groupRows, preserveRows, m);
     }
 
+    __aicore__ inline void PackValueCacheIndexedTask(
+        const AscendC::GlobalTensor<T>& xGm,
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        const uint32_t* vecIndices,
+        const uint64_t* groupBases,
+        const uint32_t* groupRows,
+        const uint8_t* preserveRows,
+        uint32_t rows) {
+        uint32_t m = 0;
+        CopyInValueIndexedTask(xGm, vecIndices, rows, m);
+        if (m == 0) {
+            return;
+        }
+
+        ComputeBatch(m);
+        CopyOutResolvedTask(packedGm, groupBases, groupRows, preserveRows, m);
+    }
+
     __aicore__ inline uint32_t GetActiveWorkers() const {
         return dataCores_ * TQ_AIV_SUB_BLOCKS;
     }
@@ -806,7 +885,7 @@ private:
             return;
         }
         PackCacheIndexedTask(keyGm_, keyCacheGm_, vecIndices, groupBases, groupRows, preserveRows, rows);
-        PackCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, preserveRows, rows);
+        PackValueCacheIndexedTask(valueGm_, valueCacheGm_, vecIndices, groupBases, groupRows, preserveRows, rows);
     }
 
     __aicore__ inline void FlushSequenceBatch(
@@ -1047,6 +1126,14 @@ private:
     const uint32_t cacheSlots_;
     const uint32_t dataCores_;
     const uint32_t numReqs_;
+    const uint32_t keyStrideToken_;
+    const uint32_t keyStrideHead_;
+    const uint32_t valueStrideToken_;
+    const uint32_t valueStrideHead_;
+    const uint64_t keyStorageOffset_;
+    const uint64_t valueStorageOffset_;
+    const uint64_t keySpan_;
+    const uint64_t valueSpan_;
     const bool matmulReady_;
 
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
@@ -1119,7 +1206,13 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
         tilingData.blockSize,
         tilingData.numBlocks,
         tilingData.dataCores,
-        tilingData.numReqs);
+        tilingData.numReqs,
+        tilingData.keyStrideToken,
+        tilingData.keyStrideHead,
+        tilingData.valueStrideToken,
+        tilingData.valueStrideHead,
+        tilingData.keyStorageOffset,
+        tilingData.valueStorageOffset);
     op.Init(
         key,
         value,

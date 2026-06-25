@@ -91,8 +91,17 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     const int64_t* blockSizePtr = attrs->GetAttrPointer<int64_t>(3);
     const int64_t* numBlocksPtr = attrs->GetAttrPointer<int64_t>(4);
     const int64_t* numReqsPtr = attrs->GetAttrPointer<int64_t>(5);
+    const int64_t* keyStrideTokenPtr = attrs->GetAttrPointer<int64_t>(6);
+    const int64_t* keyStrideHeadPtr = attrs->GetAttrPointer<int64_t>(7);
+    const int64_t* valueStrideTokenPtr = attrs->GetAttrPointer<int64_t>(8);
+    const int64_t* valueStrideHeadPtr = attrs->GetAttrPointer<int64_t>(9);
+    const int64_t* keyStorageOffsetPtr = attrs->GetAttrPointer<int64_t>(10);
+    const int64_t* valueStorageOffsetPtr = attrs->GetAttrPointer<int64_t>(11);
     if (nVecPtr == nullptr || vecPerCorePtr == nullptr || numHeadsPtr == nullptr ||
-        blockSizePtr == nullptr || numBlocksPtr == nullptr || numReqsPtr == nullptr) {
+        blockSizePtr == nullptr || numBlocksPtr == nullptr || numReqsPtr == nullptr ||
+        keyStrideTokenPtr == nullptr || keyStrideHeadPtr == nullptr ||
+        valueStrideTokenPtr == nullptr || valueStrideHeadPtr == nullptr ||
+        keyStorageOffsetPtr == nullptr || valueStorageOffsetPtr == nullptr) {
         OPS_LOG_E(nodeName, "required attrs are null");
         return ge::GRAPH_FAILED;
     }
@@ -103,11 +112,23 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     const uint32_t blockSize = static_cast<uint32_t>(*blockSizePtr);
     const uint32_t numBlocks = static_cast<uint32_t>(*numBlocksPtr);
     const uint32_t numReqs = static_cast<uint32_t>(*numReqsPtr);
+    const uint32_t keyStrideToken = static_cast<uint32_t>(*keyStrideTokenPtr);
+    const uint32_t keyStrideHead = static_cast<uint32_t>(*keyStrideHeadPtr);
+    const uint32_t valueStrideToken = static_cast<uint32_t>(*valueStrideTokenPtr);
+    const uint32_t valueStrideHead = static_cast<uint32_t>(*valueStrideHeadPtr);
+    if (*keyStorageOffsetPtr < 0 || *valueStorageOffsetPtr < 0) {
+        OPS_LOG_E(nodeName, "key/value storage offsets must be non-negative");
+        return ge::GRAPH_FAILED;
+    }
+    const uint64_t keyStorageOffset = static_cast<uint64_t>(*keyStorageOffsetPtr);
+    const uint64_t valueStorageOffset = static_cast<uint64_t>(*valueStorageOffsetPtr);
     if (nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
-        blockSize < 1 || numBlocks < 1 || numReqs < 1) {
+        blockSize < 1 || numBlocks < 1 || numReqs < 1 ||
+        keyStrideToken < 1 || keyStrideHead < 1 ||
+        valueStrideToken < 1 || valueStrideHead < 1) {
         OPS_LOG_E(nodeName,
                   "invalid pack attrs: n_vec/vec_per_core/num_heads/block_size/"
-                  "num_blocks/num_reqs must be positive");
+                  "num_blocks/num_reqs/strides must be positive");
         return ge::GRAPH_FAILED;
     }
     if (blockSize % 4 != 0) {
@@ -175,6 +196,12 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     tilingData.set_blockSize(blockSize);
     tilingData.set_numBlocks(numBlocks);
     tilingData.set_numReqs(numReqs);
+    tilingData.set_keyStrideToken(keyStrideToken);
+    tilingData.set_keyStrideHead(keyStrideHead);
+    tilingData.set_valueStrideToken(valueStrideToken);
+    tilingData.set_valueStrideHead(valueStrideHead);
+    tilingData.set_keyStorageOffset(keyStorageOffset);
+    tilingData.set_valueStorageOffset(valueStorageOffset);
 
     // MIX 1C2V per data-parallel group.  Use all physical groups that the
     // current SOC can provide instead of fixing the kernel to 16 groups.

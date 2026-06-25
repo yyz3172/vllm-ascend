@@ -5,18 +5,21 @@ class TurboquantPackKvForCache4bit : public OpDef {
 public:
     explicit TurboquantPackKvForCache4bit(const char* name) : OpDef(name)
     {
-        // Host binding checks contiguous(); omit AutoContiguous to avoid a
-        // second GM copy inside CANN when layout is already dense ND.
+        // Key/value can be large non-contiguous views. The kernel consumes
+        // explicit strides and storage offsets, so keep CANN from inserting
+        // another GM copy for them.
         this->Input("key")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("value")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("codebook")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
@@ -57,6 +60,12 @@ public:
         this->Attr("block_size").Int();
         this->Attr("num_blocks").Int();
         this->Attr("num_reqs").Int();
+        this->Attr("key_stride_token").Int();
+        this->Attr("key_stride_head").Int();
+        this->Attr("value_stride_token").Int();
+        this->Attr("value_stride_head").Int();
+        this->Attr("key_storage_offset").Int();
+        this->Attr("value_storage_offset").Int();
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

@@ -13,6 +13,12 @@ TILING_DATA_FIELD_DEF(uint32_t, numHeads);
 TILING_DATA_FIELD_DEF(uint32_t, blockSize);
 TILING_DATA_FIELD_DEF(uint32_t, numBlocks);
 TILING_DATA_FIELD_DEF(uint32_t, numReqs);
+TILING_DATA_FIELD_DEF(uint32_t, keyStrideToken);
+TILING_DATA_FIELD_DEF(uint32_t, keyStrideHead);
+TILING_DATA_FIELD_DEF(uint32_t, valueStrideToken);
+TILING_DATA_FIELD_DEF(uint32_t, valueStrideHead);
+TILING_DATA_FIELD_DEF(uint64_t, keyStorageOffset);
+TILING_DATA_FIELD_DEF(uint64_t, valueStorageOffset);
 TILING_DATA_FIELD_DEF(uint32_t, dataCores);
 END_TILING_DATA_DEF;
 
