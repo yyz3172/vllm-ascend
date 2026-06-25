@@ -409,6 +409,76 @@ def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
     torch.testing.assert_close(bt_slab, bt_row, rtol=0, atol=0)
 
 
+def _assert_4bit_slab_cache_close(
+    name: str,
+    op_cache: torch.Tensor,
+    ref_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    head_size: int,
+    bits: int,
+    dtype: torch.dtype,
+) -> None:
+    row_w = turboquant_slab_row_bytes(head_size, bits=bits)
+    block_size = op_cache.shape[-1] // row_w
+    num_heads = op_cache.shape[1]
+    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
+    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
+    if slot_cpu.numel() == 0:
+        torch.testing.assert_close(op_cache, ref_cache, rtol=0, atol=0)
+        return
+
+    block_idx_cpu = torch.div(slot_cpu, block_size, rounding_mode="floor")
+    block_idx = block_idx_cpu.to(op_cache.device)
+    block_off = (slot_cpu - block_idx_cpu * block_size).to(op_cache.device)
+    head_idx = torch.arange(num_heads, device=op_cache.device, dtype=torch.int64)
+
+    op_rows = _turboquant_slab_group4_to_row_format(
+        op_cache, head_size=head_size, bits=bits
+    )
+    ref_rows = _turboquant_slab_group4_to_row_format(
+        ref_cache, head_size=head_size, bits=bits
+    )
+    op_logical = op_rows[
+        block_idx[:, None], block_off[:, None], head_idx[None, :], :
+    ]
+    ref_logical = ref_rows[
+        block_idx[:, None], block_off[:, None], head_idx[None, :], :
+    ]
+
+    op_indices = unpack_uint4(op_logical[..., : row_w - 2], head_size).to(torch.int16)
+    ref_indices = unpack_uint4(ref_logical[..., : row_w - 2], head_size).to(torch.int16)
+    index_diff = (op_indices - ref_indices).abs()
+    assert int((index_diff > 1).sum().item()) == 0
+    assert int((index_diff != 0).sum().item()) <= max(
+        32, int(ref_indices.numel() * 0.02)
+    )
+    torch.testing.assert_close(
+        op_logical[..., row_w - 2 : row_w],
+        ref_logical[..., row_w - 2 : row_w],
+        rtol=0,
+        atol=0,
+    )
+
+    with _patched_turboquant_env(
+        os.environ,
+        {
+            "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+            "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+        },
+        clear=False,
+    ):
+        op_decoded = turboquant_dequantize_from_packed_bytes(
+            op_logical.reshape(-1, row_w), head_size=head_size, dtype=dtype, bits=bits
+        )
+        ref_decoded = turboquant_dequantize_from_packed_bytes(
+            ref_logical.reshape(-1, row_w), head_size=head_size, dtype=dtype, bits=bits
+        )
+        torch.npu.synchronize()
+    max_err = float((op_decoded.float() - ref_decoded.float()).abs().max().cpu())
+    assert max_err <= 0.25, f"{name} decoded max error too large: {max_err}"
+
+
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
@@ -464,67 +534,24 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
         )
         torch.npu.synchronize()
 
-    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
-    tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
-    block_idx = torch.div(slot_cpu, BS, rounding_mode="floor").to(device)
-    block_off = (slot_cpu - torch.div(slot_cpu, BS, rounding_mode="floor") * BS).to(
-        device
+    _assert_4bit_slab_cache_close(
+        "key_cache",
+        key_cache_op,
+        key_cache_ref,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
     )
-    head_idx = torch.arange(H, device=device, dtype=torch.int64)
-
-    def _assert_4bit_pack_close(
-        name: str,
-        op_cache: torch.Tensor,
-        ref_cache: torch.Tensor,
-    ) -> None:
-        op_rows = _turboquant_slab_group4_to_row_format(
-            op_cache, head_size=D, bits=bits
-        )
-        ref_rows = _turboquant_slab_group4_to_row_format(
-            ref_cache, head_size=D, bits=bits
-        )
-        op_logical = op_rows[
-            block_idx[:, None], block_off[:, None], head_idx[None, :], :
-        ]
-        ref_logical = ref_rows[
-            block_idx[:, None], block_off[:, None], head_idx[None, :], :
-        ]
-
-        op_indices = unpack_uint4(op_logical[..., : row_w - 2], D).to(torch.int16)
-        ref_indices = unpack_uint4(ref_logical[..., : row_w - 2], D).to(torch.int16)
-        index_diff = (op_indices - ref_indices).abs()
-        assert int((index_diff > 1).sum().item()) == 0
-        assert int((index_diff != 0).sum().item()) <= max(
-            32, int(ref_indices.numel() * 0.02)
-        )
-        torch.testing.assert_close(
-            op_logical[..., row_w - 2 : row_w],
-            ref_logical[..., row_w - 2 : row_w],
-            rtol=0,
-            atol=0,
-        )
-
-        with _patched_turboquant_env(
-            os.environ,
-            {
-                "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
-                "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
-            },
-            clear=False,
-        ):
-            op_decoded = turboquant_dequantize_from_packed_bytes(
-                op_logical.reshape(-1, row_w), head_size=D, dtype=dtype, bits=bits
-            )
-            ref_decoded = turboquant_dequantize_from_packed_bytes(
-                ref_logical.reshape(-1, row_w), head_size=D, dtype=dtype, bits=bits
-            )
-            torch.npu.synchronize()
-        max_err = float((op_decoded.float() - ref_decoded.float()).abs().max().cpu())
-        assert max_err <= 0.25, f"{name} decoded max error too large: {max_err}"
-
-    _assert_4bit_pack_close("key_cache", key_cache_op, key_cache_ref)
-    _assert_4bit_pack_close("value_cache", value_cache_op, value_cache_ref)
+    _assert_4bit_slab_cache_close(
+        "value_cache",
+        value_cache_op,
+        value_cache_ref,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
 
 
 @requires_npu
@@ -653,11 +680,27 @@ def test_turboquant_4bit_pack_to_cache_seq_aware_decode_matches_reference(
             num_reqs=T,
             bits_key=bits,
             bits_value=bits,
-        )
+    )
     torch.npu.synchronize()
 
-    torch.testing.assert_close(key_cache_direct, key_cache_general, rtol=0, atol=0)
-    torch.testing.assert_close(value_cache_direct, value_cache_general, rtol=0, atol=0)
+    _assert_4bit_slab_cache_close(
+        "key_cache",
+        key_cache_direct,
+        key_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
+    _assert_4bit_slab_cache_close(
+        "value_cache",
+        value_cache_direct,
+        value_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
 
 
 @requires_npu
@@ -719,11 +762,27 @@ def test_turboquant_4bit_pack_to_cache_seq_aware_prefill_matches_reference(
             num_reqs=2,
             bits_key=bits,
             bits_value=bits,
-        )
+    )
     torch.npu.synchronize()
 
-    torch.testing.assert_close(key_cache_fast, key_cache_general, rtol=0, atol=0)
-    torch.testing.assert_close(value_cache_fast, value_cache_general, rtol=0, atol=0)
+    _assert_4bit_slab_cache_close(
+        "key_cache",
+        key_cache_fast,
+        key_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
+    _assert_4bit_slab_cache_close(
+        "value_cache",
+        value_cache_fast,
+        value_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
 
 
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
