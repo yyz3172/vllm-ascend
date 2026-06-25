@@ -50,7 +50,7 @@ static constexpr uint32_t TQ_ENCODED_ROW_STRIDE_BYTES =
 static constexpr uint32_t TQ_ENCODED_ROW_STRIDE_WORDS =
     TQ_ENCODED_ROW_STRIDE_BYTES / sizeof(uint16_t);
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
-// Match the v2 pack kernel: keeps UB pressure low while still amortizing Cube.
+// Lookup-table argmin needs a per-row result buffer, so keep batch M at 32.
 static constexpr uint32_t TQ_MAX_BATCH_M = 32;
 static constexpr uint32_t TQ_QUEUE_DEPTH = 2;
 static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
@@ -59,106 +59,16 @@ static constexpr uint32_t TQ_DTYPE_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_NORM_STRIDE = TQ_UB_ALIGN / TQ_DTYPE_BYTES;
 static constexpr uint32_t TQ_ROT_LOCAL_WORKSPACE_BYTES = TQ_MAX_BATCH_M * TQ_ROT_K * TQ_DTYPE_BYTES;
 static constexpr float TQ_NORM_EPS_F = 1e-10f;
-static constexpr uint32_t TQ_DIST_TILE_ELEMS = TQ_PACK_D;
+static constexpr uint32_t TQ_REDUCE_MASK = 16;
+static constexpr uint32_t TQ_REDUCE_BATCHES = 1;
+static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;
+static constexpr uint32_t TQ_D_TILE = 128;
+static constexpr uint32_t TQ_DIST_TILE_ELEMS = TQ_D_TILE * TQ_PACK_K;
+static constexpr uint32_t TQ_ARGMIN_RESULT_BYTES = TQ_MAX_BATCH_M * TQ_PACK_D * 2 * sizeof(float);
 static constexpr uint32_t TQ_ARGMIN_INDEX_BYTES = TQ_PACK_D * sizeof(int32_t);
 static constexpr uint32_t TQ_ARGMIN_INDEX_U16_BYTES = TQ_PACK_D * sizeof(int16_t);
+static constexpr uint32_t TQ_ARGMIN_OFFSET_BYTES = TQ_PACK_D * sizeof(uint32_t);
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
-static constexpr uint32_t TQ_COMPARE_MASK_BYTES = 256;
-static constexpr uint32_t TQ_QUANT_CODE_VECTORS = TQ_PACK_K - 1;
-static constexpr uint32_t TQ_QUANT_CODE_BYTES =
-    TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
-
-__aicore__ inline float TqQuantThresholdFp16(uint32_t code) {
-    switch (code) {
-        case 1:
-            return -0.195373535156f;
-        case 2:
-            return -0.145141601562f;
-        case 3:
-            return -0.109619140625f;
-        case 4:
-            return -0.0814208984375f;
-        case 5:
-            return -0.0577545166016f;
-        case 6:
-            return -0.0369338989258f;
-        case 7:
-            return -0.0178184509277f;
-        case 8:
-            return 0.000385284423828f;
-        case 9:
-            return 0.0184097290039f;
-        case 10:
-            return 0.0371856689453f;
-        case 11:
-            return 0.0578308105469f;
-        case 12:
-            return 0.0814514160156f;
-        case 13:
-            return 0.109130859375f;
-        case 14:
-            return 0.143432617188f;
-        case 15:
-            return 0.191650390625f;
-        default:
-            return 0.0f;
-    }
-}
-
-__aicore__ inline float TqQuantThresholdBf16(uint32_t code) {
-    switch (code) {
-        case 1:
-            return -0.1953125f;
-        case 2:
-            return -0.14501953125f;
-        case 3:
-            return -0.109619140625f;
-        case 4:
-            return -0.08154296875f;
-        case 5:
-            return -0.057861328125f;
-        case 6:
-            return -0.0369873046875f;
-        case 7:
-            return -0.017822265625f;
-        case 8:
-            return 0.000396728515625f;
-        case 9:
-            return 0.0184020996094f;
-        case 10:
-            return 0.0371704101562f;
-        case 11:
-            return 0.057861328125f;
-        case 12:
-            return 0.08154296875f;
-        case 13:
-            return 0.109130859375f;
-        case 14:
-            return 0.1435546875f;
-        case 15:
-            return 0.19189453125f;
-        default:
-            return 0.0f;
-    }
-}
-
-__aicore__ inline float TqQuantThreshold(uint32_t code) {
-#if defined(ORIG_DTYPE_KEY)
-#if (ORIG_DTYPE_KEY == DT_BF16)
-    return TqQuantThresholdBf16(code);
-#else
-    return TqQuantThresholdFp16(code);
-#endif
-#elif defined(DTYPE_KEY)
-#if (DTYPE_KEY == DT_BF16)
-    return TqQuantThresholdBf16(code);
-#else
-    return TqQuantThresholdFp16(code);
-#endif
-#else
-    return TqQuantThresholdFp16(code);
-#endif
-}
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
@@ -345,9 +255,9 @@ public:
         __gm__ int32_t* query_start_loc,
         __gm__ uint8_t* key_cache,
         __gm__ uint8_t* value_cache) {
-        (void)codebook;
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(key), keySpan_);
         valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(value), valueSpan_);
+        codebookGm_.SetGlobalBuffer(codebook, TQ_PACK_K);
         rotationTGm_.SetGlobalBuffer(rotation_t, (uint64_t)TQ_PACK_D * TQ_PACK_D);
         slotMappingGm_.SetGlobalBuffer(slot_mapping, tokenCount_);
         queryStartLocGm_.SetGlobalBuffer(query_start_loc, static_cast<uint64_t>(numReqs_) + 1);
@@ -360,13 +270,16 @@ public:
         pipe_->InitBuffer(yBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * TQ_NORM_STRIDE * sizeof(T));
-        pipe_->InitBuffer(quantMaskBuf_, TQ_COMPARE_MASK_BYTES);
-        pipe_->InitBuffer(distBuf_, TQ_DIST_TILE_ELEMS * sizeof(float));
-        pipe_->InitBuffer(quantCodeBuf_, TQ_QUANT_CODE_BYTES);
+        pipe_->InitBuffer(codebookBuf_, TQ_PACK_K * sizeof(T));
+        pipe_->InitBuffer(distBuf_, TQ_DIST_TILE_ELEMS * sizeof(float) + 256);
+        pipe_->InitBuffer(cbTileBuf_, TQ_PACK_K * sizeof(float));
+        pipe_->InitBuffer(cbRepeatBuf_, TQ_DIST_TILE_ELEMS * sizeof(float));
+        pipe_->InitBuffer(argminResultBuf_, TQ_ARGMIN_RESULT_BYTES);
         // yFp32Buf: fp32 y row [D=128]
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(argminIndexBuf_, TQ_ARGMIN_INDEX_BYTES);
         pipe_->InitBuffer(argminIndexU16Buf_, TQ_ARGMIN_INDEX_U16_BYTES);
+        pipe_->InitBuffer(argminOffsetBuf_, TQ_ARGMIN_OFFSET_BYTES);
         // NormalizeBatch: fp32 row + fp32 squared row + fp32 ReduceSum tmp.
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 3 * sizeof(float));
         pipe_->InitBuffer(packedRowBuf_, TQ_GROUP_STRIDE * sizeof(uint8_t));
@@ -388,10 +301,35 @@ public:
         if (worker >= GetActiveWorkers()) {
             return;
         }
+        InitArgminOffsets();
+        LoadCodebookToUb();
         ProcessCachePairBySequenceContiguousSegments(worker);
     }
 
 private:
+    __aicore__ inline void InitArgminOffsets() {
+        auto offsets = argminOffsetBuf_.Get<uint32_t>();
+        for (uint32_t d = 0; d < TQ_PACK_D; ++d) {
+            offsets.SetValue(d, d * 2 * sizeof(int32_t));
+        }
+        TqSyncSToV();
+    }
+
+    __aicore__ inline void LoadCodebookToUb() {
+        auto codebookLocal = codebookBuf_.Get<T>();
+        AscendC::DataCopy(codebookLocal, codebookGm_[0], TQ_PACK_K);
+        TqSyncMte2ToV();
+
+        auto cbFp32 = cbTileBuf_.Get<float>();
+        AscendC::Cast(cbFp32, codebookLocal, AscendC::RoundMode::CAST_NONE, TQ_PACK_K);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto cbRepeat = cbRepeatBuf_.Get<float>();
+        for (uint32_t i = 0; i < TQ_D_TILE; ++i) {
+            AscendC::Adds(cbRepeat[i * TQ_PACK_K], cbFp32, 0.0f, TQ_PACK_K);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
 
     // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
     // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids 16-bit overflow.
@@ -466,60 +404,6 @@ private:
         aBatchQue_.FreeTensor(aBatch);
     }
 
-    template <int CODE>
-    __aicore__ inline void FillQuantCodeVector(
-        AscendC::LocalTensor<float>& quantCodes) const {
-        float codeFloat = static_cast<float>(CODE);
-        AscendC::Duplicate(
-            quantCodes[(CODE - 1) * TQ_PACK_D],
-            codeFloat,
-            TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void FillQuantCodeVectors(
-        AscendC::LocalTensor<float>& quantCodes) const {
-        FillQuantCodeVector<1>(quantCodes);
-        FillQuantCodeVector<2>(quantCodes);
-        FillQuantCodeVector<3>(quantCodes);
-        FillQuantCodeVector<4>(quantCodes);
-        FillQuantCodeVector<5>(quantCodes);
-        FillQuantCodeVector<6>(quantCodes);
-        FillQuantCodeVector<7>(quantCodes);
-        FillQuantCodeVector<8>(quantCodes);
-        FillQuantCodeVector<9>(quantCodes);
-        FillQuantCodeVector<10>(quantCodes);
-        FillQuantCodeVector<11>(quantCodes);
-        FillQuantCodeVector<12>(quantCodes);
-        FillQuantCodeVector<13>(quantCodes);
-        FillQuantCodeVector<14>(quantCodes);
-        FillQuantCodeVector<15>(quantCodes);
-    }
-
-    template <int CODE>
-    __aicore__ inline void ApplyQuantCode(
-        AscendC::LocalTensor<float>& qFloat,
-        AscendC::LocalTensor<uint8_t>& quantMask,
-        AscendC::LocalTensor<float>& yFp32,
-        const AscendC::LocalTensor<float>& quantCodes) const {
-        float threshold = TqQuantThreshold(CODE);
-        AscendC::CompareScalar(
-            quantMask,
-            yFp32,
-            threshold,
-            AscendC::CMPMODE::GT,
-            TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Select(
-            qFloat,
-            quantMask,
-            quantCodes[(CODE - 1) * TQ_PACK_D],
-            qFloat,
-            SELMODE::VSEL_TENSOR_TENSOR_MODE,
-            TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
     // Encoded local row layout used between Compute and CopyOut:
     //   uint16[0..127] = uint4 index widened to uint16 for vector pack merge
     //   uint16[128] = norm bits matching T
@@ -527,45 +411,65 @@ private:
         auto yBatch = yBatchQue_.DeQue<T>();
         auto encodedBatch = encodedBatchQue_.AllocTensor<uint16_t>();
         auto norms = normsBuf_.Get<T>();
+        auto cbRepeat = cbRepeatBuf_.Get<float>();
         auto yFp32 = yFp32Buf_.Get<float>();
-        auto qFloat = distBuf_.Get<float>();
+        auto distTile = distBuf_.Get<float>();
+        auto argminRes = argminResultBuf_.Get<float>();
         auto argminIndex = argminIndexBuf_.Get<int32_t>();
         auto argminIndexU16 = argminIndexU16Buf_.Get<int16_t>();
-        auto quantMask = quantMaskBuf_.Get<uint8_t>();
+        auto argminOffsets = argminOffsetBuf_.Get<uint32_t>();
         auto argminMask = packMaskBuf_.Get<int16_t>();
-        auto quantCodes = quantCodeBuf_.Get<float>();
-
-        AscendC::Duplicate(argminMask, static_cast<int16_t>(0x000F), TQ_PACK_D);
-        AscendC::PipeBarrier<PIPE_V>();
-        FillQuantCodeVectors(quantCodes);
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
-            const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
+            const uint32_t argminOff = i * TQ_PACK_D * 2;
 
             AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(qFloat, 0.0f, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            ApplyQuantCode<1>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<2>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<3>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<4>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<5>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<6>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<7>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<8>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<9>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<10>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<11>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<12>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<13>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<14>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<15>(qFloat, quantMask, yFp32, quantCodes);
-            AscendC::Cast(
+
+            for (uint32_t tileStart = 0; tileStart < TQ_PACK_D; tileStart += TQ_D_TILE) {
+                const uint32_t tileCnt = (tileStart + TQ_D_TILE <= TQ_PACK_D)
+                    ? TQ_D_TILE : (TQ_PACK_D - tileStart);
+                const uint8_t brcbRepeats = static_cast<uint8_t>((tileCnt + 7) / 8);
+                AscendC::Brcb(
+                    distTile,
+                    yFp32[tileStart],
+                    brcbRepeats,
+                    AscendC::BrcbRepeatParams(2, 16));
+                AscendC::Brcb(
+                    distTile[8],
+                    yFp32[tileStart],
+                    brcbRepeats,
+                    AscendC::BrcbRepeatParams(2, 16));
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sub(distTile, distTile, cbRepeat, tileCnt * TQ_PACK_K);
+                AscendC::Abs(distTile, distTile, tileCnt * TQ_PACK_K);
+
+                AscendC::WholeReduceMin<float>(
+                    argminRes[argminOff + tileStart * 2],
+                    distTile,
+                    TQ_REDUCE_MASK,
+                    tileCnt,
+                    1,
+                    1,
+                    TQ_REDUCE_SRC_REP_STRIDE,
+                    AscendC::ReduceOrder::ORDER_INDEX_VALUE);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+
+        AscendC::Duplicate(argminMask, static_cast<int16_t>(0x000F), TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
+            const uint32_t argminOff = i * TQ_PACK_D * 2;
+
+            AscendC::Gather(
                 argminIndex,
-                qFloat,
-                AscendC::RoundMode::CAST_RINT,
+                argminRes.template ReinterpretCast<int32_t>(),
+                argminOffsets,
+                argminOff * sizeof(float),
                 TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(
@@ -1153,8 +1057,10 @@ private:
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> yBatchQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> quantMaskBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> codebookBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> yFp32Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> cbTileBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> cbRepeatBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> packedRowBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> packMergeBuf_;
@@ -1162,11 +1068,13 @@ private:
     AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> encodedBatchQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> distBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> quantCodeBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> argminResultBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexU16Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> argminOffsetBuf_;
     AscendC::GlobalTensor<T> keyGm_;
     AscendC::GlobalTensor<T> valueGm_;
+    AscendC::GlobalTensor<T> codebookGm_;
     AscendC::GlobalTensor<T> rotationTGm_;
     AscendC::GlobalTensor<int32_t> slotMappingGm_;
     AscendC::GlobalTensor<int32_t> queryStartLocGm_;
