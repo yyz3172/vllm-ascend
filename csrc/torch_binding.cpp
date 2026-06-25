@@ -23,6 +23,7 @@
 #include "acl/acl_rt.h"
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <vector>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -949,17 +950,33 @@ void turboquant_pack_kv_for_cache_4bit(
     TORCH_CHECK(query_start_loc.numel() >= num_reqs + 1,
                 "query_start_loc length must be at least num_reqs + 1");
 
+    const bool key_strided_copy_supported =
+        key.stride(2) == 1 && key.stride(0) > 0 && key.stride(1) > 0 &&
+        key.storage_offset() == 0;
+    const bool value_strided_copy_supported =
+        value.stride(2) == 1 && value.stride(0) > 0 && value.stride(1) > 0 &&
+        value.storage_offset() == 0;
     at::Tensor key_work = key;
     at::Tensor value_work = value;
     at::Tensor slot_work = slot_mapping;
     at::Tensor query_start_work = query_start_loc;
     at::Tensor codebook_work = codebook;
     at::Tensor rotation_work = rotation_t;
-    if (!key_work.is_contiguous()) {
-        key_work = key_work.contiguous();
+    if (!key_strided_copy_supported) {
+        if (!key_work.is_contiguous()) {
+            key_work = key_work.contiguous();
+        }
+        if (key_work.storage_offset() != 0) {
+            key_work = key_work.clone(at::MemoryFormat::Contiguous);
+        }
     }
-    if (!value_work.is_contiguous()) {
-        value_work = value_work.contiguous();
+    if (!value_strided_copy_supported) {
+        if (!value_work.is_contiguous()) {
+            value_work = value_work.contiguous();
+        }
+        if (value_work.storage_offset() != 0) {
+            value_work = value_work.clone(at::MemoryFormat::Contiguous);
+        }
     }
     if (!slot_work.is_contiguous()) {
         slot_work = slot_work.contiguous();
@@ -983,6 +1000,22 @@ void turboquant_pack_kv_for_cache_4bit(
     }
     const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
     const int64_t num_blocks = key_cache.size(0);
+    const int64_t key_stride_token = key_work.stride(0);
+    const int64_t key_stride_head = key_work.stride(1);
+    const int64_t value_stride_token = value_work.stride(0);
+    const int64_t value_stride_head = value_work.stride(1);
+    const int64_t key_storage_offset = key_work.storage_offset();
+    const int64_t value_storage_offset = value_work.storage_offset();
+    constexpr int64_t kMaxKernelStride = std::numeric_limits<uint32_t>::max();
+    TORCH_CHECK(key_stride_token > 0 && key_stride_head > 0 &&
+                    value_stride_token > 0 && value_stride_head > 0 &&
+                    key_stride_token <= kMaxKernelStride &&
+                    key_stride_head <= kMaxKernelStride &&
+                    value_stride_token <= kMaxKernelStride &&
+                    value_stride_head <= kMaxKernelStride,
+                "key/value strides must be positive and fit uint32_t");
+    TORCH_CHECK(key_storage_offset >= 0 && value_storage_offset >= 0,
+                "key/value storage offsets must be non-negative");
     const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
     EXEC_NPU_CMD(
         aclnnTurboquantPackKvForCache4bit,
@@ -998,6 +1031,12 @@ void turboquant_pack_kv_for_cache_4bit(
         block_size,
         num_blocks,
         num_reqs,
+        key_stride_token,
+        key_stride_head,
+        value_stride_token,
+        value_stride_head,
+        key_storage_offset,
+        value_storage_offset,
         key_cache,
         value_cache);
 }
