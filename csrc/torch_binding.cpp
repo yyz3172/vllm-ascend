@@ -951,11 +951,9 @@ void turboquant_pack_kv_for_cache_4bit(
                 "query_start_loc length must be at least num_reqs + 1");
 
     const bool key_strided_copy_supported =
-        key.stride(2) == 1 && key.stride(0) > 0 && key.stride(1) > 0 &&
-        key.storage_offset() == 0;
+        key.stride(2) == 1 && key.stride(0) > 0 && key.stride(1) > 0;
     const bool value_strided_copy_supported =
-        value.stride(2) == 1 && value.stride(0) > 0 && value.stride(1) > 0 &&
-        value.storage_offset() == 0;
+        value.stride(2) == 1 && value.stride(0) > 0 && value.stride(1) > 0;
     at::Tensor key_work = key;
     at::Tensor value_work = value;
     at::Tensor slot_work = slot_mapping;
@@ -1004,8 +1002,11 @@ void turboquant_pack_kv_for_cache_4bit(
     const int64_t key_stride_head = key_work.stride(1);
     const int64_t value_stride_token = value_work.stride(0);
     const int64_t value_stride_head = value_work.stride(1);
-    const int64_t key_storage_offset = key_work.storage_offset();
-    const int64_t value_storage_offset = value_work.storage_offset();
+    // ConvertType passes tensor storage_offset to ACL, and the GM_ADDR seen by
+    // the AscendC kernel is already at the logical tensor view. Keep the
+    // kernel-side offset at zero to avoid applying storage_offset twice.
+    const int64_t key_storage_offset = 0;
+    const int64_t value_storage_offset = 0;
     constexpr int64_t kMaxKernelStride = std::numeric_limits<uint32_t>::max();
     TORCH_CHECK(key_stride_token > 0 && key_stride_head > 0 &&
                     value_stride_token > 0 && value_stride_head > 0 &&
@@ -1014,8 +1015,6 @@ void turboquant_pack_kv_for_cache_4bit(
                     value_stride_token <= kMaxKernelStride &&
                     value_stride_head <= kMaxKernelStride,
                 "key/value strides must be positive and fit uint32_t");
-    TORCH_CHECK(key_storage_offset >= 0 && value_storage_offset >= 0,
-                "key/value storage offsets must be non-negative");
     const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
     EXEC_NPU_CMD(
         aclnnTurboquantPackKvForCache4bit,
