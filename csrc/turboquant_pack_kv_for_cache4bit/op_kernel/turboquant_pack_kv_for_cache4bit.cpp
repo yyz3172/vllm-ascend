@@ -67,8 +67,98 @@ static constexpr uint32_t TQ_COMPARE_MASK_BYTES = 256;
 static constexpr uint32_t TQ_QUANT_CODE_VECTORS = TQ_PACK_K - 1;
 static constexpr uint32_t TQ_QUANT_CODE_BYTES =
     TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
-static constexpr float TQ_FY_LINEAR = 0.020799f;
-static constexpr float TQ_FY_CUBIC = 0.0001926f;
+
+__aicore__ inline float TqQuantThresholdFp16(uint32_t code) {
+    switch (code) {
+        case 1:
+            return -0.195373535156f;
+        case 2:
+            return -0.145141601562f;
+        case 3:
+            return -0.109619140625f;
+        case 4:
+            return -0.0814208984375f;
+        case 5:
+            return -0.0577545166016f;
+        case 6:
+            return -0.0369338989258f;
+        case 7:
+            return -0.0178184509277f;
+        case 8:
+            return 0.000385284423828f;
+        case 9:
+            return 0.0184097290039f;
+        case 10:
+            return 0.0371856689453f;
+        case 11:
+            return 0.0578308105469f;
+        case 12:
+            return 0.0814514160156f;
+        case 13:
+            return 0.109130859375f;
+        case 14:
+            return 0.143432617188f;
+        case 15:
+            return 0.191650390625f;
+        default:
+            return 0.0f;
+    }
+}
+
+__aicore__ inline float TqQuantThresholdBf16(uint32_t code) {
+    switch (code) {
+        case 1:
+            return -0.1953125f;
+        case 2:
+            return -0.14501953125f;
+        case 3:
+            return -0.109619140625f;
+        case 4:
+            return -0.08154296875f;
+        case 5:
+            return -0.057861328125f;
+        case 6:
+            return -0.0369873046875f;
+        case 7:
+            return -0.017822265625f;
+        case 8:
+            return 0.000396728515625f;
+        case 9:
+            return 0.0184020996094f;
+        case 10:
+            return 0.0371704101562f;
+        case 11:
+            return 0.057861328125f;
+        case 12:
+            return 0.08154296875f;
+        case 13:
+            return 0.109130859375f;
+        case 14:
+            return 0.1435546875f;
+        case 15:
+            return 0.19189453125f;
+        default:
+            return 0.0f;
+    }
+}
+
+__aicore__ inline float TqQuantThreshold(uint32_t code) {
+#if defined(ORIG_DTYPE_KEY)
+#if (ORIG_DTYPE_KEY == DT_BF16)
+    return TqQuantThresholdBf16(code);
+#else
+    return TqQuantThresholdFp16(code);
+#endif
+#elif defined(DTYPE_KEY)
+#if (DTYPE_KEY == DT_BF16)
+    return TqQuantThresholdBf16(code);
+#else
+    return TqQuantThresholdFp16(code);
+#endif
+#else
+    return TqQuantThresholdFp16(code);
+#endif
+}
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
@@ -131,84 +221,6 @@ __aicore__ inline void TqSyncMte3ToMte2() {
     event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
     SetFlag<HardEvent::MTE3_MTE2>(e);
     WaitFlag<HardEvent::MTE3_MTE2>(e);
-}
-
-__aicore__ inline float TqFyScalar(float x) {
-    return TQ_FY_CUBIC * x * x * x + TQ_FY_LINEAR * x;
-}
-
-__aicore__ inline float TqQuantThreshold(uint32_t code) {
-    switch (code) {
-        case 1:
-            return TqFyScalar(-7.0f);
-        case 2:
-            return TqFyScalar(-6.0f);
-        case 3:
-            return TqFyScalar(-5.0f);
-        case 4:
-            return TqFyScalar(-4.0f);
-        case 5:
-            return TqFyScalar(-3.0f);
-        case 6:
-            return TqFyScalar(-2.0f);
-        case 7:
-            return TqFyScalar(-1.0f);
-        case 8:
-            return TqFyScalar(0.0f);
-        case 9:
-            return TqFyScalar(1.0f);
-        case 10:
-            return TqFyScalar(2.0f);
-        case 11:
-            return TqFyScalar(3.0f);
-        case 12:
-            return TqFyScalar(4.0f);
-        case 13:
-            return TqFyScalar(5.0f);
-        case 14:
-            return TqFyScalar(6.0f);
-        case 15:
-            return TqFyScalar(7.0f);
-        default:
-            return TqFyScalar(0.0f);
-    }
-}
-
-__aicore__ inline float TqCodeAsFloat(uint32_t code) {
-    switch (code) {
-        case 1:
-            return 1.0f;
-        case 2:
-            return 2.0f;
-        case 3:
-            return 3.0f;
-        case 4:
-            return 4.0f;
-        case 5:
-            return 5.0f;
-        case 6:
-            return 6.0f;
-        case 7:
-            return 7.0f;
-        case 8:
-            return 8.0f;
-        case 9:
-            return 9.0f;
-        case 10:
-            return 10.0f;
-        case 11:
-            return 11.0f;
-        case 12:
-            return 12.0f;
-        case 13:
-            return 13.0f;
-        case 14:
-            return 14.0f;
-        case 15:
-            return 15.0f;
-        default:
-            return 0.0f;
-    }
 }
 
 template <typename T>
@@ -490,7 +502,7 @@ private:
         AscendC::LocalTensor<uint8_t>& quantMask,
         AscendC::LocalTensor<float>& yFp32,
         const AscendC::LocalTensor<float>& quantCodes) const {
-        float threshold = TqFyScalar(static_cast<float>(CODE - 8));
+        float threshold = TqQuantThreshold(CODE);
         AscendC::CompareScalar(
             quantMask,
             yFp32,

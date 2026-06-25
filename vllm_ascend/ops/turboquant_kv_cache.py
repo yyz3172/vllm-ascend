@@ -350,6 +350,7 @@ def _read_turboquant_env_cache() -> dict[str, bool | int | str]:
         "mse_impl": _normalize_turboquant_mse_impl(
             envs_ascend.VLLM_ASCEND_TURBOQUANT_MSE_IMPL
         ),
+        "codebook_method": envs_ascend.VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD,
     }
 
 
@@ -379,6 +380,13 @@ def _turboquant_8bit_decode_op_mode() -> int:
 
 def _turboquant_4bit_slab_cache_env_enabled() -> bool:
     return bool(_TURBOQUANT_ENV_CACHE["slab_cache_4bit"])
+
+
+def _turboquant_4bit_default_codebook_enabled() -> bool:
+    return (
+        _current_mse_impl() == "v1"
+        and str(_TURBOQUANT_ENV_CACHE["codebook_method"]) == "fast"
+    )
 
 
 def _turboquant_v3_y_hat_from_indices(indices: torch.Tensor, *, bits: int) -> torch.Tensor:
@@ -1293,7 +1301,7 @@ def turboquant_pack_kv_for_cache_to_cache(
             and key.dtype in (torch.float16, torch.bfloat16)
             and key.device.type in ("npu", "privateuseone")
             and _turboquant_encode_op_enabled()
-            and _current_mse_impl() != "v3"
+            and _turboquant_4bit_default_codebook_enabled()
             and _turboquant_pack_4bit_to_cache_op_ready()
         )
         if use_4bit_to_cache:
@@ -1880,7 +1888,7 @@ def warm_up_turboquant_4bit_pack_op(
         or head_size != 128
         or dtype not in (torch.float16, torch.bfloat16)
         or not _turboquant_encode_op_enabled()
-        or _current_mse_impl() == "v3"
+        or not _turboquant_4bit_default_codebook_enabled()
         or not _turboquant_pack_4bit_to_cache_op_ready()
     ):
         return
