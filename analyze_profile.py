@@ -4,6 +4,7 @@
 Extracts and calculates average execution time for:
 - vllm_ascend/attention/attention_v1.py: reshape_and_cache
 - vllm_ascend/ops/turboquant_kv_cache.py: turboquant_pack_kv_for_cache_to_cache
+- aten::contiguous
 - TurboquantPackKvForCacheFused (or TurboquantPackKvForCacheToCache)
 """
 
@@ -158,6 +159,7 @@ def analyze_profile(base_dir: str) -> None:
                 r"turboquant_pack_kv_for_cache_to_cache$"
             ),
         ),
+        ("aten::contiguous", "aten::contiguous", None),
         ("TurboquantPackKvForCache4bit", "TurboquantPackKvForCache4bit", None),
         ("TurboquantAttentionPaged4bit", "TurboquantAttentionPaged4bit", None),
         ("TurboquantAttentionPaged8bit", "TurboquantAttentionPaged8bit", None),

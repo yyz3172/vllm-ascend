@@ -529,6 +529,73 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
 
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_turboquant_4bit_pack_to_cache_accepts_fused_qkv_views(
+    dtype: torch.dtype,
+) -> None:
+    if not _c_ascend_turboquant_op_available(
+        "turboquant_pack_kv_for_cache_4bit"
+    ):
+        pytest.skip("turboquant_pack_kv_for_cache_4bit op not available")
+
+    device = torch.device("npu:0")
+    B, BS, H, D = 2, KV_BLOCK_SIZE, 2, KV_HEAD_DIM
+    q_heads = 4
+    q_size = q_heads * D
+    kv_size = H * D
+    qkv_size = q_size + 2 * kv_size
+    bits = 4
+    row_w = turboquant_slab_row_bytes(D, bits=bits)
+    T = 7
+    slot_mapping = torch.arange(T, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
+    torch.manual_seed(2468)
+    qkv = torch.randn(T, qkv_size, dtype=dtype, device=device)
+    key = qkv[:, q_size : q_size + kv_size].view(T, H, D)
+    value = qkv[:, q_size + kv_size :].view(T, H, D)
+    assert key.stride() == (qkv_size, D, 1)
+    assert value.stride() == (qkv_size, D, 1)
+    assert key.storage_offset() == q_size
+    assert value.storage_offset() == q_size + kv_size
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    key_cache_contig = torch.zeros(B, H, BS * row_w, dtype=torch.uint8, device=device)
+    value_cache_contig = torch.zeros_like(key_cache_contig)
+    key_cache_view = torch.zeros_like(key_cache_contig)
+    value_cache_view = torch.zeros_like(value_cache_contig)
+    cb_k, rot_t_k = _turboquant_pack_tables(device, D, bits, dtype)
+    torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+        key.contiguous(),
+        value.contiguous(),
+        slot_mapping,
+        query_start_loc,
+        cb_k,
+        rot_t_k,
+        key_cache_contig,
+        value_cache_contig,
+        1,
+        BS,
+    )
+    torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+        key,
+        value,
+        slot_mapping,
+        query_start_loc,
+        cb_k,
+        rot_t_k,
+        key_cache_view,
+        value_cache_view,
+        1,
+        BS,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(key_cache_view, key_cache_contig, rtol=0, atol=0)
+    torch.testing.assert_close(value_cache_view, value_cache_contig, rtol=0, atol=0)
+
+
+@requires_npu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_turboquant_4bit_pack_to_cache_seq_aware_decode_matches_reference(
     dtype: torch.dtype,
 ) -> None:
