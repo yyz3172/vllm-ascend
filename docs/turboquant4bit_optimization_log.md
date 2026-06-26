@@ -15,7 +15,7 @@ Hard constraints:
 ## Tools
 
 - Direct op benchmark:
-  `source xrx_infoenvs && tools/turboquant4bit_aclnn_perf ...`
+  `source xrx_infoenvs && mytmp/flex_tq_4bit_perf/flex_tq_4bit_perf ...`
 - Fast custom-op benchmark:
   `source xrx_infoenvs && tools/run_turboquant4bit_op_quick.sh -- ...`
 - OPP source-line hotspot analysis:
@@ -88,7 +88,7 @@ Commands:
 - Build:
   `source xrx_infoenvs && bash csrc/build_aclnn.sh /root/x00827378/vllm-ascend ascend910b1`
 - Direct benchmark:
-  `source xrx_infoenvs && tools/turboquant4bit_aclnn_perf --seq-len <N> --query-tokens 1 --heads 16 --kv-heads 8 --block-size 128 --pack-tokens 1 --warmup 5 --repeat 20`
+  `source xrx_infoenvs && mytmp/flex_tq_4bit_perf/flex_tq_4bit_perf --q-lens 1 --kv-lens <N> --heads 16 --kv-heads 8 --block-size 128 --pack-tokens 1 --warmup 5 --repeat 20`
 - Smoke:
   `source xrx_infoenvs && timeout 600s python tests/e2e/singlecard/xrx_turboquant4bit_smoke.py`
 - Attention-only launch 1 OPP:
@@ -897,9 +897,9 @@ Implementation:
 - Keep pack-side K/V rotation enabled.
 - Keep attention-side 4bit unpack/dequant, Q rotation, and final output
   rotation enabled.
-- Add `--batch-size` support to `tools/turboquant4bit_aclnn_perf.cpp` so the
-  direct op benchmark can reproduce multi-sequence decode pressure without
-  changing existing benchmark scripts.
+- Add mixed-batch coverage through `tools/flex_tq_4bit_perf.cpp` so the direct
+  op benchmark can reproduce multi-sequence decode pressure without changing
+  existing benchmark scripts.
 
 Direct op benchmark result:
 
