@@ -18,11 +18,11 @@
 //
 // Reference (Python):
 //   norms = vector_norm(x, dim=-1, keepdim=True)
-//   y = (x @ R^T) / (norms + eps)        # batched [M, D] @ [D, D]
+//   y = (x / (norms + eps)) @ R^T        # batched [M, D] @ [D, D]
 //   d = (y.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()
 //   idx = d.argmin(dim=-1)
 //
-// Per AICore: compute norms for assigned rows, then ONE matmul [M,128]@[128,128],
+// Per AICore: normalize all assigned rows, then ONE matmul [M,128]@[128,128],
 // not M separate M=1 matmuls (avoids Cube padding waste).
 
 #include "kernel_operator.h"
@@ -43,6 +43,7 @@ static constexpr uint32_t TQ_GROUP_BYTES = TQ_GROUP_ROWS * TQ_ROW_BYTES;
 static constexpr uint32_t TQ_UB_ALIGN = 32;
 static constexpr uint32_t TQ_GROUP_STRIDE =
     (TQ_GROUP_BYTES + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
+static constexpr uint32_t TQ_PACKED_GROUP_BUFFER_COUNT = 64;
 static constexpr uint32_t TQ_ENCODED_ROW_WORDS = TQ_PACK_D + 1;
 static constexpr uint32_t TQ_ENCODED_ROW_BYTES = TQ_ENCODED_ROW_WORDS * sizeof(uint16_t);
 static constexpr uint32_t TQ_ENCODED_ROW_STRIDE_BYTES =
@@ -50,8 +51,8 @@ static constexpr uint32_t TQ_ENCODED_ROW_STRIDE_BYTES =
 static constexpr uint32_t TQ_ENCODED_ROW_STRIDE_WORDS =
     TQ_ENCODED_ROW_STRIDE_BYTES / sizeof(uint16_t);
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
-// Match the v2 pack kernel: keeps UB pressure low while still amortizing Cube.
-static constexpr uint32_t TQ_MAX_BATCH_M = 32;
+// Full-group hot path batches two 4-row cache groups when UB allows it.
+static constexpr uint32_t TQ_MAX_BATCH_M = 64;
 static constexpr uint32_t TQ_QUEUE_DEPTH = 2;
 static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
@@ -59,7 +60,7 @@ static constexpr uint32_t TQ_DTYPE_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_NORM_STRIDE = TQ_UB_ALIGN / TQ_DTYPE_BYTES;
 static constexpr uint32_t TQ_ROT_LOCAL_WORKSPACE_BYTES = TQ_MAX_BATCH_M * TQ_ROT_K * TQ_DTYPE_BYTES;
 static constexpr float TQ_NORM_EPS_F = 1e-10f;
-static constexpr uint32_t TQ_DIST_TILE_ELEMS = TQ_PACK_D;
+static constexpr uint32_t TQ_CODE_INDEX_BYTES = TQ_PACK_D * sizeof(float);
 static constexpr uint32_t TQ_ARGMIN_INDEX_BYTES = TQ_PACK_D * sizeof(int32_t);
 static constexpr uint32_t TQ_ARGMIN_INDEX_U16_BYTES = TQ_PACK_D * sizeof(int16_t);
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
@@ -250,6 +251,23 @@ __aicore__ inline void copy_packed_ub_to_gm(
     TqSyncMte3ToS();
 }
 
+__aicore__ inline void copy_packed_ub_to_gm_async(
+    AscendC::GlobalTensor<uint8_t>& packedGm,
+    uint64_t gm_offset,
+    AscendC::LocalTensor<uint8_t>& packedLocal,
+    uint32_t nbytes) {
+    TqSyncVToMte3();
+    TqSyncSToMte3();
+    AscendC::DataCopyExtParams copyParams{1, nbytes, 0, 0, 0};
+    AscendC::DataCopyPad(packedGm[gm_offset], packedLocal, copyParams);
+}
+
+__aicore__ inline void wait_packed_ub_to_gm_async() {
+    TqSyncMte3ToMte2();
+    TqSyncMte3ToV();
+    TqSyncMte3ToS();
+}
+
 __aicore__ inline void copy_packed_gm_to_ub(
     AscendC::LocalTensor<uint8_t>& packedLocal,
     AscendC::GlobalTensor<uint8_t>& packedGm,
@@ -336,7 +354,9 @@ public:
           valueStorageOffset_(valueStorageOffset),
           keySpan_(MakeInputSpan(keyStorageOffset, keyStrideToken, keyStrideHead)),
           valueSpan_(MakeInputSpan(valueStorageOffset, valueStrideToken, valueStrideHead)),
-          matmulReady_(rawWorkspace != nullptr) {}
+          matmulReady_(rawWorkspace != nullptr),
+          packedWritePending_(false),
+          packedGroupSlot_(0) {}
 
     __aicore__ inline void Init(
         GM_ADDR key,
@@ -358,19 +378,20 @@ public:
 
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
         pipe_->InitBuffer(xBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
+        pipe_->InitBuffer(aBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
         pipe_->InitBuffer(yBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * TQ_NORM_STRIDE * sizeof(T));
         pipe_->InitBuffer(quantMaskBuf_, TQ_COMPARE_MASK_BYTES);
-        pipe_->InitBuffer(distBuf_, TQ_DIST_TILE_ELEMS * sizeof(float));
+        pipe_->InitBuffer(codeIndexBuf_, TQ_CODE_INDEX_BYTES);
         pipe_->InitBuffer(quantCodeBuf_, TQ_QUANT_CODE_BYTES);
         // yFp32Buf: fp32 y row [D=128]
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(argminIndexBuf_, TQ_ARGMIN_INDEX_BYTES);
         pipe_->InitBuffer(argminIndexU16Buf_, TQ_ARGMIN_INDEX_U16_BYTES);
-        // ComputeNormsOnly: fp32 row + fp32 squared row + fp32 ReduceSum tmp.
+        // NormalizeBatch: fp32 row + fp32 squared row + fp32 ReduceSum tmp.
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 3 * sizeof(float));
-        pipe_->InitBuffer(packedRowBuf_, TQ_GROUP_STRIDE * sizeof(uint8_t));
+        pipe_->InitBuffer(packedRowBuf_, TQ_PACKED_GROUP_BUFFER_COUNT * TQ_GROUP_STRIDE * sizeof(uint8_t));
         pipe_->InitBuffer(packMergeBuf_, TQ_GROUP_INDEX_BYTES);
         pipe_->InitBuffer(packMaskBuf_, TQ_GROUP_INDEX_BYTES);
         pipe_->InitBuffer(encodedBatchQue_, TQ_QUEUE_DEPTH,
@@ -394,12 +415,11 @@ public:
 
 private:
 
-    // norms[i] = ||x[i]||; keep xBatch unchanged for Cube matmul.
+    // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
     // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids 16-bit overflow.
-    __aicore__ inline void ComputeNormsOnly(
-        AscendC::LocalTensor<T>& xBatch,
-        uint32_t m,
-        float* invNorms) {
+    __aicore__ inline void NormalizeBatch(uint32_t m) {
+        auto xBatch = xBatchQue_.DeQue<T>();
+        auto aBatch = aBatchQue_.AllocTensor<T>();
         auto norms = normsBuf_.Get<T>();
         auto fp32Row = reduceOutBuf_.Get<float>();
         auto fp32Square = reduceOutBuf_.Get<float>()[TQ_PACK_D];
@@ -418,21 +438,27 @@ private:
             AscendC::Sqrt(normAcc, normAcc, 1);
             TqSyncVToS();
             const float normF = normAcc.GetValue(0);
-            invNorms[i] = 1.0f / (normF + TQ_NORM_EPS_F);
             TqSyncSToV();
 
             AscendC::Cast(norms[i * TQ_NORM_STRIDE], normAcc, AscendC::RoundMode::CAST_RINT, 1);
             AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(fp32Row, fp32Row, 1.0f / (normF + TQ_NORM_EPS_F), TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(aBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
         }
+
+        aBatchQue_.EnQue(aBatch);
+        xBatchQue_.FreeTensor(xBatch);
     }
 
     // Cube Matmul: T A(VECOUT) x T B(GM) -> T C(VECIN).
     // Keep rotate output in local memory, aligned with the v2 pack kernel.
     __aicore__ inline void RotateBatchMatmul(
-        AscendC::LocalTensor<T>& xBatch,
         uint32_t m,
         uint32_t dBase,
         uint32_t dCount) {
+        auto aBatch = aBatchQue_.DeQue<T>();
         auto yBatch = yBatchQue_.AllocTensor<T>();
         uint32_t mPad = AlignUp16(m);
         if (mPad < TQ_CUBE_M_ALIGN) {
@@ -440,7 +466,7 @@ private:
         }
         if (mPad > m) {
             AscendC::Duplicate(
-                xBatch[m * TQ_PACK_D].template ReinterpretCast<uint16_t>(),
+                aBatch[m * TQ_PACK_D].template ReinterpretCast<uint16_t>(),
                 static_cast<uint16_t>(0),
                 (mPad - m) * TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -448,7 +474,7 @@ private:
 
         rotateMm_->SetOrgShape(mPad, TQ_ROT_N, TQ_ROT_K);
         rotateMm_->SetSingleShape(m, dCount, TQ_ROT_K);
-        rotateMm_->SetTensorA(xBatch, false);
+        rotateMm_->SetTensorA(aBatch, false);
         rotateMm_->SetTensorB(rotationTGm_[dBase], false);
         auto rotateWorkspace = rotateWorkBuf_.Get<uint8_t>();
         rotateMm_->SetLocalWorkspace(rotateWorkspace);
@@ -457,16 +483,15 @@ private:
         rotateMm_->End();
 
         yBatchQue_.EnQue(yBatch);
-        xBatchQue_.FreeTensor(xBatch);
+        aBatchQue_.FreeTensor(aBatch);
     }
 
     template <int CODE>
     __aicore__ inline void FillQuantCodeVector(
         AscendC::LocalTensor<float>& quantCodes) const {
-        float codeFloat = static_cast<float>(CODE);
         AscendC::Duplicate(
             quantCodes[(CODE - 1) * TQ_PACK_D],
-            codeFloat,
+            static_cast<float>(CODE),
             TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -517,15 +542,12 @@ private:
     // Encoded local row layout used between Compute and CopyOut:
     //   uint16[0..127] = uint4 index widened to uint16 for vector pack merge
     //   uint16[128] = norm bits matching T
-    __aicore__ inline void NormalizeAndEncode(
-        uint32_t m,
-        const float* invNorms) {
+    __aicore__ inline void EncodeBatch(uint32_t m) {
         auto yBatch = yBatchQue_.DeQue<T>();
         auto encodedBatch = encodedBatchQue_.AllocTensor<uint16_t>();
         auto norms = normsBuf_.Get<T>();
-        auto fp32Row = reduceOutBuf_.Get<float>();
         auto yFp32 = yFp32Buf_.Get<float>();
-        auto qFloat = distBuf_.Get<float>();
+        auto qFloat = codeIndexBuf_.Get<float>();
         auto argminIndex = argminIndexBuf_.Get<int32_t>();
         auto argminIndexU16 = argminIndexU16Buf_.Get<int16_t>();
         auto quantMask = quantMaskBuf_.Get<uint8_t>();
@@ -539,11 +561,8 @@ private:
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
             const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
-            const float invNormF = invNorms[i];
 
-            AscendC::Cast(fp32Row, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(yFp32, fp32Row, invNormF, TQ_PACK_D);
+            AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Duplicate(qFloat, 0.0f, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -676,12 +695,49 @@ private:
         xBatchQue_.EnQue(xBatch);
     }
 
+    __aicore__ inline void CopyInPhysicalGroupRowsTask(
+        const AscendC::GlobalTensor<T>& xGm,
+        uint32_t tokenStart,
+        uint32_t rowCount,
+        uint32_t headStart,
+        uint32_t headCount,
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead,
+        uint32_t& m) {
+        if (rowCount == 0 || headCount == 0) {
+            m = 0;
+            return;
+        }
+
+        auto xBatch = xBatchQue_.AllocTensor<T>();
+        if (headStart == 0 && headCount == numHeads_ &&
+            strideHead == TQ_PACK_D && strideToken == numHeads_ * TQ_PACK_D) {
+            AscendC::DataCopy(
+                xBatch,
+                xGm[storageOffset + static_cast<uint64_t>(tokenStart) * strideToken],
+                rowCount * headCount * TQ_PACK_D);
+        } else {
+            uint32_t dstRow = 0;
+            for (uint32_t row = 0; row < rowCount; ++row) {
+                for (uint32_t headOff = 0; headOff < headCount; ++headOff) {
+                    const uint32_t vecIdx = MakeVecIndex(tokenStart + row, headStart + headOff);
+                    AscendC::DataCopy(
+                        xBatch[dstRow * TQ_PACK_D],
+                        xGm[MakeInputOffset(vecIdx, storageOffset, strideToken, strideHead)],
+                        TQ_PACK_D);
+                    ++dstRow;
+                }
+            }
+        }
+        m = rowCount * headCount;
+        xBatchQue_.EnQue(xBatch);
+    }
+
     __aicore__ inline void ComputeBatch(uint32_t m) {
-        auto xBatch = xBatchQue_.DeQue<T>();
-        float invNorms[TQ_MAX_BATCH_M];
-        ComputeNormsOnly(xBatch, m, invNorms);
-        RotateBatchMatmul(xBatch, m, 0, TQ_PACK_D);
-        NormalizeAndEncode(m, invNorms);
+        NormalizeBatch(m);
+        RotateBatchMatmul(m, 0, TQ_PACK_D);
+        EncodeBatch(m);
     }
 
     // Physical 4-row cache group layout:
@@ -730,6 +786,19 @@ private:
 
         packedU16.SetValue(
             TQ_GROUP_INDEX_BYTES / sizeof(uint16_t) + groupRow,
+            encodedBatch.GetValue(encodedOff + TQ_PACK_D));
+    }
+
+    __aicore__ inline void InitFullGroupFromRow0(
+        AscendC::LocalTensor<uint8_t>& packedGroup,
+        const AscendC::LocalTensor<uint16_t>& encodedBatch,
+        uint32_t encodedRow) {
+        auto packedU16 = packedGroup.template ReinterpretCast<uint16_t>();
+        const uint32_t encodedOff = encodedRow * TQ_ENCODED_ROW_STRIDE_WORDS;
+        AscendC::DataCopy(packedU16, encodedBatch[encodedOff], TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        packedU16.SetValue(
+            TQ_GROUP_INDEX_BYTES / sizeof(uint16_t),
             encodedBatch.GetValue(encodedOff + TQ_PACK_D));
     }
 
@@ -810,6 +879,205 @@ private:
         }
     }
 
+    __aicore__ inline void WaitPendingPackedWrites() {
+        if (!packedWritePending_) {
+            return;
+        }
+        wait_packed_ub_to_gm_async();
+        packedWritePending_ = false;
+        packedGroupSlot_ = 0;
+    }
+
+    __aicore__ inline void MarkPackedWritePending() {
+        packedWritePending_ = true;
+    }
+
+    __aicore__ inline bool CopyOutPhysicalGroupRowsFast(
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        AscendC::LocalTensor<uint16_t>& encodedBatch,
+        const uint64_t* groupBases,
+        const uint32_t* groupRows,
+        const uint8_t* preserveRows,
+        uint32_t m) {
+        if (m == 0) {
+            return true;
+        }
+
+        const uint32_t firstGroupRow = groupRows[0];
+        if (firstGroupRow >= TQ_GROUP_ROWS) {
+            return false;
+        }
+
+        const uint64_t firstGroupBase = groupBases[0];
+        const uint64_t headGroupStride = static_cast<uint64_t>(blockSize_) * TQ_ROW_BYTES;
+        const uint8_t preserveExisting = preserveRows[0];
+        uint32_t headCount = 1;
+        while (headCount < m && groupRows[headCount] == firstGroupRow &&
+               preserveRows[headCount] == preserveExisting &&
+               groupBases[headCount] == firstGroupBase + static_cast<uint64_t>(headCount) * headGroupStride) {
+            ++headCount;
+        }
+        if (headCount == 0 || m % headCount != 0) {
+            return false;
+        }
+
+        const uint32_t rowCount = m / headCount;
+        if (rowCount == 0 || rowCount > TQ_GROUP_ROWS ||
+            firstGroupRow + rowCount > TQ_GROUP_ROWS) {
+            return false;
+        }
+
+        for (uint32_t row = 0; row < rowCount; ++row) {
+            for (uint32_t headOff = 0; headOff < headCount; ++headOff) {
+                const uint32_t srcRow = row * headCount + headOff;
+                if (groupRows[srcRow] != firstGroupRow + row ||
+                    preserveRows[srcRow] != preserveExisting ||
+                    groupBases[srcRow] != firstGroupBase + static_cast<uint64_t>(headOff) * headGroupStride) {
+                    return false;
+                }
+            }
+        }
+
+        const uint32_t rowMask = ((1u << rowCount) - 1u) << firstGroupRow;
+        const bool fullGroup = rowMask == ((1u << TQ_GROUP_ROWS) - 1u);
+        auto packedGroups = packedRowBuf_.Get<uint8_t>();
+        for (uint32_t headOff = 0; headOff < headCount; ++headOff) {
+            const uint64_t groupBase = firstGroupBase + static_cast<uint64_t>(headOff) * headGroupStride;
+            if (packedWritePending_ && packedGroupSlot_ == 0) {
+                WaitPendingPackedWrites();
+            }
+            const uint32_t groupSlot = packedGroupSlot_;
+            ++packedGroupSlot_;
+            if (packedGroupSlot_ >= TQ_PACKED_GROUP_BUFFER_COUNT) {
+                packedGroupSlot_ = 0;
+            }
+            auto packedGroup = packedGroups[groupSlot * TQ_GROUP_STRIDE];
+            if (fullGroup && firstGroupRow == 0 && rowCount == TQ_GROUP_ROWS) {
+                InitFullGroupFromRow0(packedGroup, encodedBatch, headOff);
+                for (uint32_t row = 1; row < TQ_GROUP_ROWS; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch, row * headCount + headOff, row, false);
+                }
+            } else if (fullGroup || preserveExisting == 0) {
+                ClearPackedGroup(packedGroup);
+                for (uint32_t row = 0; row < rowCount; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch, row * headCount + headOff, firstGroupRow + row, false);
+                }
+            } else {
+                WaitPendingPackedWrites();
+                copy_packed_gm_to_ub(packedGroup, packedGm, groupBase, TQ_GROUP_BYTES);
+                for (uint32_t row = 0; row < rowCount; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch, row * headCount + headOff, firstGroupRow + row, true);
+                }
+                copy_packed_ub_to_gm(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+                continue;
+            }
+            copy_packed_ub_to_gm_async(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+            MarkPackedWritePending();
+        }
+        return true;
+    }
+
+    __aicore__ inline void CopyOutPhysicalGroupRowsKnown(
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t groupInBlock,
+        uint32_t firstGroupRow,
+        uint32_t headStart,
+        uint32_t headCount,
+        bool preserveExisting) {
+        auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
+        const uint32_t rowMask = ((1u << rowCount) - 1u) << firstGroupRow;
+        const bool fullGroup = rowMask == ((1u << TQ_GROUP_ROWS) - 1u);
+        auto packedGroups = packedRowBuf_.Get<uint8_t>();
+
+        for (uint32_t headOff = 0; headOff < headCount; ++headOff) {
+            const uint32_t headIdx = headStart + headOff;
+            const uint64_t groupBase = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
+            if (packedWritePending_ && packedGroupSlot_ == 0) {
+                WaitPendingPackedWrites();
+            }
+            const uint32_t groupSlot = packedGroupSlot_;
+            ++packedGroupSlot_;
+            if (packedGroupSlot_ >= TQ_PACKED_GROUP_BUFFER_COUNT) {
+                packedGroupSlot_ = 0;
+            }
+            auto packedGroup = packedGroups[groupSlot * TQ_GROUP_STRIDE];
+            if (fullGroup && firstGroupRow == 0 && rowCount == TQ_GROUP_ROWS) {
+                InitFullGroupFromRow0(packedGroup, encodedBatch, headOff);
+                for (uint32_t row = 1; row < TQ_GROUP_ROWS; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch, row * headCount + headOff, row, false);
+                }
+                copy_packed_ub_to_gm_async(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+                MarkPackedWritePending();
+            } else if (fullGroup || !preserveExisting) {
+                ClearPackedGroup(packedGroup);
+                for (uint32_t row = 0; row < rowCount; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch, row * headCount + headOff, firstGroupRow + row, false);
+                }
+                copy_packed_ub_to_gm_async(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+                MarkPackedWritePending();
+            } else {
+                WaitPendingPackedWrites();
+                copy_packed_gm_to_ub(packedGroup, packedGm, groupBase, TQ_GROUP_BYTES);
+                for (uint32_t row = 0; row < rowCount; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch, row * headCount + headOff, firstGroupRow + row, true);
+                }
+                copy_packed_ub_to_gm(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+            }
+        }
+
+        encodedBatchQue_.FreeTensor(encodedBatch);
+    }
+
+    __aicore__ inline void CopyOutPhysicalFullGroupRunKnown(
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t firstGroupInBlock,
+        uint32_t headStart,
+        uint32_t headCount) {
+        auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
+        auto packedGroups = packedRowBuf_.Get<uint8_t>();
+        const uint32_t groupCount = rowCount / TQ_GROUP_ROWS;
+
+        for (uint32_t groupOff = 0; groupOff < groupCount; ++groupOff) {
+            const uint32_t rowBase = groupOff * TQ_GROUP_ROWS;
+            const uint32_t groupInBlock = firstGroupInBlock + groupOff;
+            for (uint32_t headOff = 0; headOff < headCount; ++headOff) {
+                const uint32_t headIdx = headStart + headOff;
+                const uint64_t groupBase = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
+                if (packedWritePending_ && packedGroupSlot_ == 0) {
+                    WaitPendingPackedWrites();
+                }
+                const uint32_t groupSlot = packedGroupSlot_;
+                ++packedGroupSlot_;
+                if (packedGroupSlot_ >= TQ_PACKED_GROUP_BUFFER_COUNT) {
+                    packedGroupSlot_ = 0;
+                }
+
+                auto packedGroup = packedGroups[groupSlot * TQ_GROUP_STRIDE];
+                const uint32_t encodedRow0 = rowBase * headCount + headOff;
+                InitFullGroupFromRow0(packedGroup, encodedBatch, encodedRow0);
+                for (uint32_t row = 1; row < TQ_GROUP_ROWS; ++row) {
+                    MergeEncodedRowToGroup(
+                        packedGroup, encodedBatch,
+                        encodedRow0 + row * headCount, row, false);
+                }
+                copy_packed_ub_to_gm_async(packedGm, groupBase, packedGroup, TQ_GROUP_BYTES);
+                MarkPackedWritePending();
+            }
+        }
+
+        encodedBatchQue_.FreeTensor(encodedBatch);
+    }
+
     __aicore__ inline void CopyOutResolvedTask(
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const uint64_t* groupBases,
@@ -817,6 +1085,12 @@ private:
         const uint8_t* preserveRows,
         uint32_t m) {
         auto encodedBatch = encodedBatchQue_.DeQue<uint16_t>();
+        if (CopyOutPhysicalGroupRowsFast(packedGm, encodedBatch, groupBases, groupRows, preserveRows, m)) {
+            encodedBatchQue_.FreeTensor(encodedBatch);
+            return;
+        }
+
+        WaitPendingPackedWrites();
         uint8_t validRows[TQ_MAX_BATCH_M];
 
         for (uint32_t row = 0; row < m; ++row) {
@@ -865,6 +1139,136 @@ private:
 
         ComputeBatch(m);
         CopyOutResolvedTask(packedGm, groupBases, groupRows, preserveRows, m);
+    }
+
+    __aicore__ inline void PackCachePhysicalGroupRowsTask(
+        const AscendC::GlobalTensor<T>& xGm,
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        uint32_t tokenStart,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t groupInBlock,
+        uint32_t firstGroupRow,
+        uint32_t headStart,
+        uint32_t headCount,
+        bool preserveExisting,
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead) {
+        uint32_t m = 0;
+        CopyInPhysicalGroupRowsTask(
+            xGm, tokenStart, rowCount, headStart, headCount,
+            storageOffset, strideToken, strideHead, m);
+        if (m == 0) {
+            return;
+        }
+
+        ComputeBatch(m);
+        CopyOutPhysicalGroupRowsKnown(
+            packedGm, rowCount, blockIdx, groupInBlock, firstGroupRow,
+            headStart, headCount, preserveExisting);
+    }
+
+    __aicore__ inline void PackCachePairPhysicalGroupRows(
+        uint32_t tokenStart,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t groupInBlock,
+        uint32_t firstGroupRow,
+        bool preserveExisting) {
+        uint32_t headStart = 0;
+        const uint32_t batchCapacity = GetBatchCapacity();
+        while (headStart < numHeads_) {
+            uint32_t headCount = numHeads_ - headStart;
+            const uint32_t maxHeadsPerBatch = batchCapacity / rowCount;
+            if (maxHeadsPerBatch == 0) {
+                headCount = 1;
+            } else if (headCount > maxHeadsPerBatch) {
+                headCount = maxHeadsPerBatch;
+            }
+
+            PackCachePhysicalGroupRowsTask(
+                keyGm_, keyCacheGm_, tokenStart, rowCount, blockIdx, groupInBlock,
+                firstGroupRow, headStart, headCount, preserveExisting,
+                keyStorageOffset_, keyStrideToken_, keyStrideHead_);
+            PackCachePhysicalGroupRowsTask(
+                valueGm_, valueCacheGm_, tokenStart, rowCount, blockIdx, groupInBlock,
+                firstGroupRow, headStart, headCount, preserveExisting,
+                valueStorageOffset_, valueStrideToken_, valueStrideHead_);
+            headStart += headCount;
+        }
+    }
+
+    __aicore__ inline void PackCachePhysicalFullGroupRunTask(
+        const AscendC::GlobalTensor<T>& xGm,
+        AscendC::GlobalTensor<uint8_t>& packedGm,
+        uint32_t tokenStart,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t firstGroupInBlock,
+        uint32_t headStart,
+        uint32_t headCount,
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead) {
+        uint32_t m = 0;
+        CopyInPhysicalGroupRowsTask(
+            xGm, tokenStart, rowCount, headStart, headCount,
+            storageOffset, strideToken, strideHead, m);
+        if (m == 0) {
+            return;
+        }
+
+        ComputeBatch(m);
+        CopyOutPhysicalFullGroupRunKnown(
+            packedGm, rowCount, blockIdx, firstGroupInBlock, headStart, headCount);
+    }
+
+    __aicore__ inline void PackCachePairPhysicalFullGroupRun(
+        uint32_t tokenStart,
+        uint32_t rowCount,
+        uint32_t blockIdx,
+        uint32_t firstGroupInBlock) {
+        uint32_t consumedRows = 0;
+        const uint32_t batchCapacity = GetBatchCapacity();
+
+        while (consumedRows < rowCount) {
+            uint32_t rowsThisBatch = 0;
+            if (numHeads_ <= batchCapacity) {
+                rowsThisBatch = (batchCapacity / numHeads_) / TQ_GROUP_ROWS * TQ_GROUP_ROWS;
+            }
+            if (rowsThisBatch < TQ_GROUP_ROWS) {
+                PackCachePairPhysicalGroupRows(
+                    tokenStart + consumedRows,
+                    TQ_GROUP_ROWS,
+                    blockIdx,
+                    firstGroupInBlock + consumedRows / TQ_GROUP_ROWS,
+                    0,
+                    false);
+                consumedRows += TQ_GROUP_ROWS;
+                continue;
+            }
+
+            uint32_t remainingRows = rowCount - consumedRows;
+            if (rowsThisBatch > remainingRows) {
+                rowsThisBatch = remainingRows / TQ_GROUP_ROWS * TQ_GROUP_ROWS;
+            }
+            if (rowsThisBatch == 0) {
+                rowsThisBatch = TQ_GROUP_ROWS;
+            }
+
+            PackCachePhysicalFullGroupRunTask(
+                keyGm_, keyCacheGm_, tokenStart + consumedRows,
+                rowsThisBatch, blockIdx,
+                firstGroupInBlock + consumedRows / TQ_GROUP_ROWS,
+                0, numHeads_, keyStorageOffset_, keyStrideToken_, keyStrideHead_);
+            PackCachePhysicalFullGroupRunTask(
+                valueGm_, valueCacheGm_, tokenStart + consumedRows,
+                rowsThisBatch, blockIdx,
+                firstGroupInBlock + consumedRows / TQ_GROUP_ROWS,
+                0, numHeads_, valueStorageOffset_, valueStrideToken_, valueStrideHead_);
+            consumedRows += rowsThisBatch;
+        }
     }
 
     __aicore__ inline uint32_t GetActiveWorkers() const {
@@ -916,6 +1320,10 @@ private:
         rows = 0;
     }
 
+    __aicore__ inline uint32_t GetBatchCapacity() const {
+        return vecPerCore_ == 0 ? TQ_MAX_BATCH_M : vecPerCore_;
+    }
+
     __aicore__ inline void EnsureSequenceBatchCapacity(
         uint32_t requiredRows,
         uint32_t* vecIndices,
@@ -923,7 +1331,7 @@ private:
         uint32_t* groupRows,
         uint8_t* preserveRows,
         uint32_t& rows) {
-        if (rows + requiredRows <= vecPerCore_) {
+        if (rows + requiredRows <= GetBatchCapacity()) {
             return;
         }
         FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
@@ -935,7 +1343,6 @@ private:
         uint32_t blockIdx,
         uint32_t groupInBlock,
         uint32_t firstGroupRow,
-        uint32_t headIdx,
         bool preserveExisting,
         uint32_t* vecIndices,
         uint64_t* groupBases,
@@ -946,19 +1353,41 @@ private:
             return;
         }
 
-        EnsureSequenceBatchCapacity(
-            rowCount, vecIndices, groupBases, groupRows, preserveRows, rows);
-        const uint64_t groupBase = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
-        for (uint32_t row = 0; row < rowCount; ++row) {
-            const uint32_t vecIdx = MakeVecIndex(tokenStart + row, headIdx);
-            if (vecIdx >= nVec_) {
-                continue;
+        const uint32_t batchCapacity = GetBatchCapacity();
+        uint32_t headStart = 0;
+        while (headStart < numHeads_) {
+            uint32_t headCount = numHeads_ - headStart;
+            const uint32_t maxHeadsPerBatch = batchCapacity / rowCount;
+            if (maxHeadsPerBatch == 0) {
+                headCount = 1;
+            } else if (headCount > maxHeadsPerBatch) {
+                headCount = maxHeadsPerBatch;
             }
-            vecIndices[rows] = vecIdx;
-            groupBases[rows] = groupBase;
-            groupRows[rows] = firstGroupRow + row;
-            preserveRows[rows] = preserveExisting ? 1 : 0;
-            ++rows;
+
+            const uint32_t requiredRows = rowCount * headCount;
+            EnsureSequenceBatchCapacity(
+                requiredRows, vecIndices, groupBases, groupRows, preserveRows, rows);
+            for (uint32_t row = 0; row < rowCount; ++row) {
+                if (rows >= batchCapacity) {
+                    FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
+                }
+                for (uint32_t headOff = 0; headOff < headCount; ++headOff) {
+                    if (rows >= batchCapacity) {
+                        FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
+                    }
+                    const uint32_t headIdx = headStart + headOff;
+                    const uint32_t vecIdx = MakeVecIndex(tokenStart + row, headIdx);
+                    if (vecIdx >= nVec_) {
+                        continue;
+                    }
+                    vecIndices[rows] = vecIdx;
+                    groupBases[rows] = MakeCacheGroupBaseOffset(blockIdx, groupInBlock, headIdx);
+                    groupRows[rows] = firstGroupRow + row;
+                    preserveRows[rows] = preserveExisting ? 1 : 0;
+                    ++rows;
+                }
+            }
+            headStart += headCount;
         }
     }
 
@@ -1003,67 +1432,55 @@ private:
                 leadingRows = remainingRows;
             }
             const uint32_t groupInBlock = currentOffset / TQ_GROUP_ROWS;
-            for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                AppendPhysicalCacheGroupRows(
-                    tokenStart,
-                    leadingRows,
-                    blockIdx,
-                    groupInBlock,
-                    leadingGroupRow,
-                    headIdx,
-                    true,
-                    vecIndices,
-                    groupBases,
-                    groupRows,
-                    preserveRows,
-                    rows);
-            }
+            AppendPhysicalCacheGroupRows(
+                tokenStart,
+                leadingRows,
+                blockIdx,
+                groupInBlock,
+                leadingGroupRow,
+                true,
+                vecIndices,
+                groupBases,
+                groupRows,
+                preserveRows,
+                rows);
             consumedRows += leadingRows;
             currentOffset += leadingRows;
             remainingRows -= leadingRows;
         }
 
-        while (remainingRows >= TQ_GROUP_ROWS) {
+        if (remainingRows >= TQ_GROUP_ROWS) {
+            uint32_t fullRows = remainingRows / TQ_GROUP_ROWS * TQ_GROUP_ROWS;
             const uint32_t groupInBlock = currentOffset / TQ_GROUP_ROWS;
-            for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-                AppendPhysicalCacheGroupRows(
-                    tokenStart + consumedRows,
-                    TQ_GROUP_ROWS,
-                    blockIdx,
-                    groupInBlock,
-                    0,
-                    headIdx,
-                    false,
-                    vecIndices,
-                    groupBases,
-                    groupRows,
-                    preserveRows,
-                    rows);
+            if (rows != 0) {
+                FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
             }
-            consumedRows += TQ_GROUP_ROWS;
-            currentOffset += TQ_GROUP_ROWS;
-            remainingRows -= TQ_GROUP_ROWS;
+            PackCachePairPhysicalFullGroupRun(
+                tokenStart + consumedRows,
+                fullRows,
+                blockIdx,
+                groupInBlock);
+            consumedRows += fullRows;
+            currentOffset += fullRows;
+            remainingRows -= fullRows;
         }
 
         if (remainingRows == 0) {
             return;
         }
         const uint32_t groupInBlock = currentOffset / TQ_GROUP_ROWS;
-        for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
-            AppendPhysicalCacheGroupRows(
-                tokenStart + consumedRows,
-                remainingRows,
-                blockIdx,
-                groupInBlock,
-                0,
-                headIdx,
-                false,
-                vecIndices,
-                groupBases,
-                groupRows,
-                preserveRows,
-                rows);
-        }
+        AppendPhysicalCacheGroupRows(
+            tokenStart + consumedRows,
+            remainingRows,
+            blockIdx,
+            groupInBlock,
+            0,
+            false,
+            vecIndices,
+            groupBases,
+            groupRows,
+            preserveRows,
+            rows);
     }
 
     __aicore__ inline void ProcessCachePairBySequenceContiguousSegments(uint32_t worker) {
@@ -1155,6 +1572,7 @@ private:
             }
         }
         FlushSequenceBatch(vecIndices, groupBases, groupRows, preserveRows, rows);
+        WaitPendingPackedWrites();
     }
 
 private:
@@ -1178,8 +1596,11 @@ private:
     const uint64_t keySpan_;
     const uint64_t valueSpan_;
     const bool matmulReady_;
+    bool packedWritePending_;
+    uint32_t packedGroupSlot_;
 
-    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> xBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> aBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> yBatchQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
@@ -1191,7 +1612,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> packMaskBuf_;
     AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> encodedBatchQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> distBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> codeIndexBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> quantCodeBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexU16Buf_;
