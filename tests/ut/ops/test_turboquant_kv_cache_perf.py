@@ -47,6 +47,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
 
@@ -55,6 +56,7 @@ import torch
 
 from vllm_ascend.ops.turboquant_kv_cache import (
     _c_ascend_turboquant_op_available,
+    _get_quantizer,
     _turboquant_pack_tables,
     _turboquant_slab_group4_to_row_format,
     ensure_turboquant_pack_tables_registered,
@@ -92,6 +94,7 @@ TURBOQUANT_KV_BITS = (4, 8)
 
 # Supported total KV cache capacities in token slots (num_blocks = slots // KV_BLOCK_SIZE).
 CACHE_TOKEN_SLOTS = (2048, 4096)
+REAL_SMOKE_DUMP_PATH = Path(__file__).with_name("data") / "tq4bit_real_smoke_dump.pt"
 
 
 @contextmanager
@@ -479,6 +482,69 @@ def _assert_4bit_slab_cache_close(
     assert max_err <= 0.25, f"{name} decoded max error too large: {max_err}"
 
 
+def _gather_4bit_slab_rows_for_test(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    head_size: int,
+    bits: int,
+) -> torch.Tensor:
+    row_w = turboquant_slab_row_bytes(head_size, bits=bits)
+    block_size = cache.shape[-1] // row_w
+    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
+    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
+    block_idx_cpu = torch.div(slot_cpu, block_size, rounding_mode="floor")
+    block_idx = block_idx_cpu.to(cache.device)
+    block_off = (slot_cpu - block_idx_cpu * block_size).to(cache.device)
+    head_idx = torch.arange(cache.shape[1], device=cache.device, dtype=torch.int64)
+    rows = _turboquant_slab_group4_to_row_format(
+        cache, head_size=head_size, bits=bits
+    )
+    return rows[block_idx[:, None], block_off[:, None], head_idx[None, :], :]
+
+
+def _formula_dequantize_4bit_for_test(
+    packed_rows: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    head_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    row_w = turboquant_slab_row_bytes(head_size, bits=4)
+    packed_u8 = packed_rows.view(torch.uint8)[..., :row_w]
+    indices = unpack_uint4(packed_u8[..., : row_w - 2], head_size).to(torch.float32)
+    norm_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float16
+    norms = (
+        packed_u8[..., row_w - 2 : row_w]
+        .contiguous()
+        .view(norm_dtype)
+        .view(*packed_u8.shape[:-1])
+    )
+    delta = indices - 7.5
+    y_hat = 0.0001926 * (delta**3) + 0.020799 * delta
+    out = y_hat @ rotation.to(device=packed_rows.device, dtype=torch.float32)
+    return (out * norms.to(torch.float32).unsqueeze(-1)).to(dtype=dtype)
+
+
+def _reconstruction_stats(
+    original: torch.Tensor,
+    custom_dequant: torch.Tensor,
+    reference_dequant: torch.Tensor,
+) -> dict[str, float]:
+    custom_err = (custom_dequant.to(torch.float32) - original.to(torch.float32)).abs()
+    reference_err = (
+        reference_dequant.to(torch.float32) - original.to(torch.float32)
+    ).abs()
+    return {
+        "custom_mae": float(custom_err.mean().cpu()),
+        "custom_rmse": float(torch.sqrt(custom_err.square().mean()).cpu()),
+        "custom_max": float(custom_err.max().cpu()),
+        "reference_mae": float(reference_err.mean().cpu()),
+        "reference_rmse": float(torch.sqrt(reference_err.square().mean()).cpu()),
+        "reference_max": float(reference_err.max().cpu()),
+    }
+
+
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
@@ -552,6 +618,188 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
         bits=bits,
         dtype=dtype,
     )
+
+
+@requires_npu
+def test_turboquant_4bit_pack_real_smoke_dump_quality_guard() -> None:
+    if not _c_ascend_turboquant_op_available(
+        "turboquant_pack_kv_for_cache_4bit"
+    ):
+        pytest.skip("turboquant_pack_kv_for_cache_4bit op not available")
+    if not REAL_SMOKE_DUMP_PATH.exists():
+        pytest.fail(f"missing real smoke dump fixture: {REAL_SMOKE_DUMP_PATH}")
+
+    try:
+        fixture = torch.load(
+            REAL_SMOKE_DUMP_PATH, map_location="cpu", weights_only=False
+        )
+    except TypeError:
+        fixture = torch.load(REAL_SMOKE_DUMP_PATH, map_location="cpu")
+
+    device = torch.device("npu:0")
+    dtype = torch.bfloat16
+    bits = int(fixture["bits"])
+    D = int(fixture["head_size"])
+    BS = int(fixture["block_size"])
+    row_w = turboquant_slab_row_bytes(D, bits=bits)
+    cb_k, rot_t_k = _turboquant_pack_tables(device, D, bits, dtype)
+    rotation = _get_quantizer(D, bits, device).rotation.to(torch.float32)
+
+    totals = {
+        "key": {
+            "custom_l1": 0.0,
+            "custom_l2": 0.0,
+            "reference_l1": 0.0,
+            "reference_l2": 0.0,
+            "count": 0,
+        },
+        "value": {
+            "custom_l1": 0.0,
+            "custom_l2": 0.0,
+            "reference_l1": 0.0,
+            "reference_l2": 0.0,
+            "count": 0,
+        },
+    }
+
+    env = {
+        "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
+        "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+        "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+    }
+    with _patched_turboquant_env(os.environ, env, clear=False):
+        for sample in fixture["samples"]:
+            key = sample["key_original"].to(device=device, dtype=dtype).contiguous()
+            value = sample["value_original"].to(device=device, dtype=dtype).contiguous()
+            slot_mapping = sample["slot_mapping"].to(device=device, dtype=torch.int32)
+            T, H, _ = key.shape
+            query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
+            B = int(slot_mapping.to(torch.int64).max().item()) // BS + 1
+            key_cache = torch.zeros(B, H, BS * row_w, dtype=torch.uint8, device=device)
+            value_cache = torch.zeros_like(key_cache)
+
+            torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+                key,
+                value,
+                slot_mapping,
+                query_start_loc,
+                cb_k,
+                rot_t_k,
+                key_cache,
+                value_cache,
+                1,
+                BS,
+            )
+            torch.npu.synchronize()
+            key_custom_packed = _gather_4bit_slab_rows_for_test(
+                key_cache, slot_mapping, head_size=D, bits=bits
+            )
+            value_custom_packed = _gather_4bit_slab_rows_for_test(
+                value_cache, slot_mapping, head_size=D, bits=bits
+            )
+            key_reference_packed = turboquant_quantize_to_packed_bytes(
+                key, bits=bits
+            ).view(torch.uint8)
+            value_reference_packed = turboquant_quantize_to_packed_bytes(
+                value, bits=bits
+            ).view(torch.uint8)
+
+            torch.testing.assert_close(
+                key_custom_packed.cpu(),
+                sample["key_custom_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                value_custom_packed.cpu(),
+                sample["value_custom_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                key_reference_packed.cpu(),
+                sample["key_reference_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                value_reference_packed.cpu(),
+                sample["value_reference_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+
+            key_custom_dequant = _formula_dequantize_4bit_for_test(
+                key_custom_packed, rotation, head_size=D, dtype=dtype
+            )
+            value_custom_dequant = _formula_dequantize_4bit_for_test(
+                value_custom_packed, rotation, head_size=D, dtype=dtype
+            )
+            key_reference_dequant = turboquant_dequantize_from_packed_bytes(
+                key_reference_packed, head_size=D, dtype=dtype, bits=bits
+            )
+            value_reference_dequant = turboquant_dequantize_from_packed_bytes(
+                value_reference_packed, head_size=D, dtype=dtype, bits=bits
+            )
+
+            for name, original, custom_dequant, reference_dequant in (
+                ("key", key, key_custom_dequant, key_reference_dequant),
+                ("value", value, value_custom_dequant, value_reference_dequant),
+            ):
+                stats = _reconstruction_stats(
+                    original, custom_dequant, reference_dequant
+                )
+                expected = sample["summary"][name]
+                assert stats["custom_mae"] == pytest.approx(
+                    expected["custom_mae"], rel=0.0, abs=2e-3
+                )
+                assert stats["reference_mae"] == pytest.approx(
+                    expected["reference_mae"], rel=0.0, abs=2e-3
+                )
+                custom_err = (
+                    custom_dequant.to(torch.float32) - original.to(torch.float32)
+                )
+                reference_err = (
+                    reference_dequant.to(torch.float32) - original.to(torch.float32)
+                )
+                totals[name]["custom_l1"] += float(custom_err.abs().sum().cpu())
+                totals[name]["custom_l2"] += float(custom_err.square().sum().cpu())
+                totals[name]["reference_l1"] += float(reference_err.abs().sum().cpu())
+                totals[name]["reference_l2"] += float(reference_err.square().sum().cpu())
+                totals[name]["count"] += int(original.numel())
+
+            key_idx_custom = unpack_uint4(
+                key_custom_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            key_idx_ref = unpack_uint4(
+                key_reference_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            value_idx_custom = unpack_uint4(
+                value_custom_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            value_idx_ref = unpack_uint4(
+                value_reference_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            assert int((key_idx_custom - key_idx_ref).abs().max().item()) <= 1
+            assert int((value_idx_custom - value_idx_ref).abs().max().item()) <= 1
+
+    key_custom_mae = totals["key"]["custom_l1"] / totals["key"]["count"]
+    key_reference_mae = totals["key"]["reference_l1"] / totals["key"]["count"]
+    value_custom_mae = totals["value"]["custom_l1"] / totals["value"]["count"]
+    value_reference_mae = totals["value"]["reference_l1"] / totals["value"]["count"]
+    value_custom_rmse = (
+        totals["value"]["custom_l2"] / totals["value"]["count"]
+    ) ** 0.5
+    value_reference_rmse = (
+        totals["value"]["reference_l2"] / totals["value"]["count"]
+    ) ** 0.5
+
+    # Real smoke K/V shows that custom pack and Python/codebook reference can choose
+    # adjacent indices. The guard keeps those differences bounded and verifies that
+    # value reconstruction is not regressed versus the reference path.
+    assert key_custom_mae <= key_reference_mae * 1.001
+    assert value_custom_mae <= value_reference_mae
+    assert value_custom_rmse <= value_reference_rmse
 
 
 @requires_npu
