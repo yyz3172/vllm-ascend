@@ -1,7 +1,6 @@
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/
-tools/
 mytmp/
 tips/
 
