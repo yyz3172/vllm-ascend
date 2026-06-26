@@ -18,11 +18,11 @@
 //
 // Reference (Python):
 //   norms = vector_norm(x, dim=-1, keepdim=True)
-//   y = (x / (norms + eps)) @ R^T        # batched [M, D] @ [D, D]
+//   y = (x @ R^T) / (norms + eps)        # batched [M, D] @ [D, D]
 //   d = (y.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()
 //   idx = d.argmin(dim=-1)
 //
-// Per AICore: normalize all assigned rows, then ONE matmul [M,128]@[128,128],
+// Per AICore: compute norms for assigned rows, then ONE matmul [M,128]@[128,128],
 // not M separate M=1 matmuls (avoids Cube padding waste).
 
 #include "kernel_operator.h"
@@ -358,7 +358,6 @@ public:
 
         const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
         pipe_->InitBuffer(xBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
-        pipe_->InitBuffer(aBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
         pipe_->InitBuffer(yBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
         pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
         pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * TQ_NORM_STRIDE * sizeof(T));
@@ -369,7 +368,7 @@ public:
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(argminIndexBuf_, TQ_ARGMIN_INDEX_BYTES);
         pipe_->InitBuffer(argminIndexU16Buf_, TQ_ARGMIN_INDEX_U16_BYTES);
-        // NormalizeBatch: fp32 row + fp32 squared row + fp32 ReduceSum tmp.
+        // ComputeNormsOnly: fp32 row + fp32 squared row + fp32 ReduceSum tmp.
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 3 * sizeof(float));
         pipe_->InitBuffer(packedRowBuf_, TQ_GROUP_STRIDE * sizeof(uint8_t));
         pipe_->InitBuffer(packMergeBuf_, TQ_GROUP_INDEX_BYTES);
@@ -395,11 +394,12 @@ public:
 
 private:
 
-    // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
+    // norms[i] = ||x[i]||; keep xBatch unchanged for Cube matmul.
     // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids 16-bit overflow.
-    __aicore__ inline void NormalizeBatch(uint32_t m) {
-        auto xBatch = xBatchQue_.DeQue<T>();
-        auto aBatch = aBatchQue_.AllocTensor<T>();
+    __aicore__ inline void ComputeNormsOnly(
+        AscendC::LocalTensor<T>& xBatch,
+        uint32_t m,
+        float* invNorms) {
         auto norms = normsBuf_.Get<T>();
         auto fp32Row = reduceOutBuf_.Get<float>();
         auto fp32Square = reduceOutBuf_.Get<float>()[TQ_PACK_D];
@@ -418,29 +418,21 @@ private:
             AscendC::Sqrt(normAcc, normAcc, 1);
             TqSyncVToS();
             const float normF = normAcc.GetValue(0);
+            invNorms[i] = 1.0f / (normF + TQ_NORM_EPS_F);
             TqSyncSToV();
 
             AscendC::Cast(norms[i * TQ_NORM_STRIDE], normAcc, AscendC::RoundMode::CAST_RINT, 1);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(fp32Row, fp32Row, 1.0f / (normF + TQ_NORM_EPS_F), TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(xBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
         }
-
-        AscendC::DataCopy(aBatch, xBatch, m * TQ_PACK_D);
-
-        aBatchQue_.EnQue(aBatch);
-        xBatchQue_.FreeTensor(xBatch);
     }
 
     // Cube Matmul: T A(VECOUT) x T B(GM) -> T C(VECIN).
     // Keep rotate output in local memory, aligned with the v2 pack kernel.
     __aicore__ inline void RotateBatchMatmul(
+        AscendC::LocalTensor<T>& xBatch,
         uint32_t m,
         uint32_t dBase,
         uint32_t dCount) {
-        auto aBatch = aBatchQue_.DeQue<T>();
         auto yBatch = yBatchQue_.AllocTensor<T>();
         uint32_t mPad = AlignUp16(m);
         if (mPad < TQ_CUBE_M_ALIGN) {
@@ -448,7 +440,7 @@ private:
         }
         if (mPad > m) {
             AscendC::Duplicate(
-                aBatch[m * TQ_PACK_D].template ReinterpretCast<uint16_t>(),
+                xBatch[m * TQ_PACK_D].template ReinterpretCast<uint16_t>(),
                 static_cast<uint16_t>(0),
                 (mPad - m) * TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -456,7 +448,7 @@ private:
 
         rotateMm_->SetOrgShape(mPad, TQ_ROT_N, TQ_ROT_K);
         rotateMm_->SetSingleShape(m, dCount, TQ_ROT_K);
-        rotateMm_->SetTensorA(aBatch, false);
+        rotateMm_->SetTensorA(xBatch, false);
         rotateMm_->SetTensorB(rotationTGm_[dBase], false);
         auto rotateWorkspace = rotateWorkBuf_.Get<uint8_t>();
         rotateMm_->SetLocalWorkspace(rotateWorkspace);
@@ -465,7 +457,7 @@ private:
         rotateMm_->End();
 
         yBatchQue_.EnQue(yBatch);
-        aBatchQue_.FreeTensor(aBatch);
+        xBatchQue_.FreeTensor(xBatch);
     }
 
     template <int CODE>
@@ -525,10 +517,13 @@ private:
     // Encoded local row layout used between Compute and CopyOut:
     //   uint16[0..127] = uint4 index widened to uint16 for vector pack merge
     //   uint16[128] = norm bits matching T
-    __aicore__ inline void EncodeBatch(uint32_t m) {
+    __aicore__ inline void NormalizeAndEncode(
+        uint32_t m,
+        const float* invNorms) {
         auto yBatch = yBatchQue_.DeQue<T>();
         auto encodedBatch = encodedBatchQue_.AllocTensor<uint16_t>();
         auto norms = normsBuf_.Get<T>();
+        auto fp32Row = reduceOutBuf_.Get<float>();
         auto yFp32 = yFp32Buf_.Get<float>();
         auto qFloat = distBuf_.Get<float>();
         auto argminIndex = argminIndexBuf_.Get<int32_t>();
@@ -544,8 +539,11 @@ private:
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
             const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
+            const float invNormF = invNorms[i];
 
-            AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::Cast(fp32Row, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(yFp32, fp32Row, invNormF, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Duplicate(qFloat, 0.0f, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -679,9 +677,11 @@ private:
     }
 
     __aicore__ inline void ComputeBatch(uint32_t m) {
-        NormalizeBatch(m);
-        RotateBatchMatmul(m, 0, TQ_PACK_D);
-        EncodeBatch(m);
+        auto xBatch = xBatchQue_.DeQue<T>();
+        float invNorms[TQ_MAX_BATCH_M];
+        ComputeNormsOnly(xBatch, m, invNorms);
+        RotateBatchMatmul(xBatch, m, 0, TQ_PACK_D);
+        NormalizeAndEncode(m, invNorms);
     }
 
     // Physical 4-row cache group layout:
@@ -1179,8 +1179,7 @@ private:
     const uint64_t valueSpan_;
     const bool matmulReady_;
 
-    AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> aBatchQue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> yBatchQue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
