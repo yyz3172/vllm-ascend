@@ -11,7 +11,7 @@ constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PACK_TILING_KEY_DEFAULT = 0;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
-constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
+constexpr uint32_t TQ_PACK_MAX_BATCH_M = 64;
 
 uint32_t AlignUp16(uint32_t x)
 {
