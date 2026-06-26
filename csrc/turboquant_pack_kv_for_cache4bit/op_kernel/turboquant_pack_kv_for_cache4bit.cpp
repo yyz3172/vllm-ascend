@@ -133,6 +133,18 @@ __aicore__ inline void TqSyncMte3ToMte2() {
     WaitFlag<HardEvent::MTE3_MTE2>(e);
 }
 
+__aicore__ inline void TqSyncMte3ToV() {
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+    SetFlag<HardEvent::MTE3_V>(e);
+    WaitFlag<HardEvent::MTE3_V>(e);
+}
+
+__aicore__ inline void TqSyncMte3ToS() {
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_S));
+    SetFlag<HardEvent::MTE3_S>(e);
+    WaitFlag<HardEvent::MTE3_S>(e);
+}
+
 __aicore__ inline float TqFyScalar(float x) {
     return TQ_FY_CUBIC * x * x * x + TQ_FY_LINEAR * x;
 }
@@ -234,6 +246,8 @@ __aicore__ inline void copy_packed_ub_to_gm(
     AscendC::DataCopyExtParams copyParams{1, nbytes, 0, 0, 0};
     AscendC::DataCopyPad(packedGm[gm_offset], packedLocal, copyParams);
     TqSyncMte3ToMte2();
+    TqSyncMte3ToV();
+    TqSyncMte3ToS();
 }
 
 __aicore__ inline void copy_packed_gm_to_ub(
@@ -615,43 +629,50 @@ private:
                static_cast<uint64_t>(headIdx) * strideHead;
     }
 
+    __aicore__ inline bool IsContiguousVecBatch(
+        const uint32_t* vecIndices,
+        uint32_t rows,
+        uint32_t strideToken,
+        uint32_t strideHead) const {
+        if (rows == 0 ||
+            strideHead != TQ_PACK_D ||
+            strideToken != numHeads_ * TQ_PACK_D) {
+            return false;
+        }
+        const uint32_t firstVec = vecIndices[0];
+        for (uint32_t row = 1; row < rows; ++row) {
+            if (vecIndices[row] != firstVec + row) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     __aicore__ inline void CopyInIndexedTask(
         const AscendC::GlobalTensor<T>& xGm,
         const uint32_t* vecIndices,
         uint32_t rows,
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead,
         uint32_t& m) {
         if (rows == 0) {
             m = 0;
             return;
         }
         auto xBatch = xBatchQue_.AllocTensor<T>();
-        for (uint32_t row = 0; row < rows; ++row) {
+        if (IsContiguousVecBatch(vecIndices, rows, strideToken, strideHead)) {
             AscendC::DataCopy(
-                xBatch[row * TQ_PACK_D],
-                xGm[MakeInputOffset(
-                    vecIndices[row], keyStorageOffset_, keyStrideToken_, keyStrideHead_)],
-                TQ_PACK_D);
-        }
-        m = rows;
-        xBatchQue_.EnQue(xBatch);
-    }
-
-    __aicore__ inline void CopyInValueIndexedTask(
-        const AscendC::GlobalTensor<T>& xGm,
-        const uint32_t* vecIndices,
-        uint32_t rows,
-        uint32_t& m) {
-        if (rows == 0) {
-            m = 0;
-            return;
-        }
-        auto xBatch = xBatchQue_.AllocTensor<T>();
-        for (uint32_t row = 0; row < rows; ++row) {
-            AscendC::DataCopy(
-                xBatch[row * TQ_PACK_D],
-                xGm[MakeInputOffset(
-                    vecIndices[row], valueStorageOffset_, valueStrideToken_, valueStrideHead_)],
-                TQ_PACK_D);
+                xBatch,
+                xGm[MakeInputOffset(vecIndices[0], storageOffset, strideToken, strideHead)],
+                rows * TQ_PACK_D);
+        } else {
+            for (uint32_t row = 0; row < rows; ++row) {
+                AscendC::DataCopy(
+                    xBatch[row * TQ_PACK_D],
+                    xGm[MakeInputOffset(vecIndices[row], storageOffset, strideToken, strideHead)],
+                    TQ_PACK_D);
+            }
         }
         m = rows;
         xBatchQue_.EnQue(xBatch);
@@ -815,7 +836,9 @@ private:
         const uint8_t* preserveRows,
         uint32_t rows) {
         uint32_t m = 0;
-        CopyInIndexedTask(xGm, vecIndices, rows, m);
+        CopyInIndexedTask(
+            xGm, vecIndices, rows,
+            keyStorageOffset_, keyStrideToken_, keyStrideHead_, m);
         if (m == 0) {
             return;
         }
@@ -833,7 +856,9 @@ private:
         const uint8_t* preserveRows,
         uint32_t rows) {
         uint32_t m = 0;
-        CopyInValueIndexedTask(xGm, vecIndices, rows, m);
+        CopyInIndexedTask(
+            xGm, vecIndices, rows,
+            valueStorageOffset_, valueStrideToken_, valueStrideHead_, m);
         if (m == 0) {
             return;
         }
@@ -858,13 +883,6 @@ private:
         }
         slotU = static_cast<uint32_t>(slot);
         return true;
-    }
-
-    __aicore__ inline uint32_t MakeCacheGroupOwnerTaskId(
-        uint32_t blockIdx,
-        uint32_t groupInBlock,
-        uint32_t headIdx) const {
-        return ((blockIdx * (blockSize_ / TQ_GROUP_ROWS)) + groupInBlock) * numHeads_ + headIdx;
     }
 
     __aicore__ inline uint64_t MakeCacheGroupBaseOffset(
@@ -919,18 +937,12 @@ private:
         uint32_t firstGroupRow,
         uint32_t headIdx,
         bool preserveExisting,
-        uint32_t worker,
-        uint32_t activeWorkers,
         uint32_t* vecIndices,
         uint64_t* groupBases,
         uint32_t* groupRows,
         uint8_t* preserveRows,
         uint32_t& rows) {
         if (rowCount == 0) {
-            return;
-        }
-        const uint32_t ownerTask = MakeCacheGroupOwnerTaskId(blockIdx, groupInBlock, headIdx);
-        if ((ownerTask % activeWorkers) != worker) {
             return;
         }
 
@@ -975,8 +987,6 @@ private:
         uint32_t blockIdx,
         uint32_t blockOffset,
         uint32_t rowsInBlock,
-        uint32_t worker,
-        uint32_t activeWorkers,
         uint32_t* vecIndices,
         uint64_t* groupBases,
         uint32_t* groupRows,
@@ -1002,8 +1012,6 @@ private:
                     leadingGroupRow,
                     headIdx,
                     true,
-                    worker,
-                    activeWorkers,
                     vecIndices,
                     groupBases,
                     groupRows,
@@ -1026,8 +1034,6 @@ private:
                     0,
                     headIdx,
                     false,
-                    worker,
-                    activeWorkers,
                     vecIndices,
                     groupBases,
                     groupRows,
@@ -1052,8 +1058,6 @@ private:
                 0,
                 headIdx,
                 false,
-                worker,
-                activeWorkers,
                 vecIndices,
                 groupBases,
                 groupRows,
@@ -1068,6 +1072,17 @@ private:
             return;
         }
 
+        const uint32_t tokensPerWorker = (tokenCount_ + activeWorkers - 1) / activeWorkers;
+        const uint32_t rawBegin = worker * tokensPerWorker;
+        if (rawBegin >= tokenCount_) {
+            return;
+        }
+        uint32_t rawEnd = rawBegin + tokensPerWorker;
+        if (rawEnd > tokenCount_) {
+            rawEnd = tokenCount_;
+        }
+        const bool lastWorkerRange = rawEnd == tokenCount_ || worker == activeWorkers - 1;
+
         uint32_t vecIndices[TQ_MAX_BATCH_M];
         uint64_t groupBases[TQ_MAX_BATCH_M];
         uint32_t groupRows[TQ_MAX_BATCH_M];
@@ -1081,28 +1096,56 @@ private:
                 continue;
             }
 
-            uint32_t tokenIdx = seqStart;
-            while (tokenIdx < seqEnd) {
-                uint32_t firstSlot = 0;
-                if (!ResolveTokenSlotU(tokenIdx, firstSlot)) {
-                    ++tokenIdx;
-                    continue;
-                }
-                const uint32_t blockIdx = firstSlot / blockSize_;
-                const uint32_t blockOffset = firstSlot - blockIdx * blockSize_;
-                uint32_t rowsInBlock = blockSize_ - blockOffset;
-                const uint32_t remainingSeqRows = seqEnd - tokenIdx;
-                if (rowsInBlock > remainingSeqRows) {
-                    rowsInBlock = remainingSeqRows;
-                }
+            uint32_t firstSlot = 0;
+            if (!ResolveTokenSlotU(seqStart, firstSlot)) {
+                continue;
+            }
 
+            uint32_t segmentStart = rawBegin > seqStart ? rawBegin : seqStart;
+            uint32_t segmentEnd = rawEnd < seqEnd ? rawEnd : seqEnd;
+            if (segmentStart >= segmentEnd) {
+                continue;
+            }
+
+            if (segmentStart > seqStart) {
+                const uint32_t slotAtBegin = firstSlot + (segmentStart - seqStart);
+                uint32_t backRows = slotAtBegin % TQ_GROUP_ROWS;
+                const uint32_t availableRows = segmentStart - seqStart;
+                if (backRows > availableRows) {
+                    backRows = availableRows;
+                }
+                segmentStart -= backRows;
+            }
+            if (!lastWorkerRange && segmentEnd < seqEnd) {
+                const uint32_t slotAtEnd = firstSlot + (segmentEnd - seqStart);
+                segmentEnd -= slotAtEnd % TQ_GROUP_ROWS;
+            }
+            if (segmentStart >= segmentEnd) {
+                continue;
+            }
+
+            uint32_t tokenIdx = segmentStart;
+            while (tokenIdx < segmentEnd) {
+                uint32_t slot = firstSlot + (tokenIdx - seqStart);
+                if (slot >= cacheSlots_) {
+                    break;
+                }
+                const uint32_t blockIdx = slot / blockSize_;
+                const uint32_t blockOffset = slot - blockIdx * blockSize_;
+                uint32_t rowsInBlock = blockSize_ - blockOffset;
+                const uint32_t remainingSegmentRows = segmentEnd - tokenIdx;
+                if (rowsInBlock > remainingSegmentRows) {
+                    rowsInBlock = remainingSegmentRows;
+                }
+                const uint32_t remainingCacheRows = cacheSlots_ - slot;
+                if (rowsInBlock > remainingCacheRows) {
+                    rowsInBlock = remainingCacheRows;
+                }
                 ProcessSequenceBlockRange(
                     tokenIdx,
                     blockIdx,
                     blockOffset,
                     rowsInBlock,
-                    worker,
-                    activeWorkers,
                     vecIndices,
                     groupBases,
                     groupRows,
