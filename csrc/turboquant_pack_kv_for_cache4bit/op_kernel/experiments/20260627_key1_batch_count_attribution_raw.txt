@@ -1,0 +1,44 @@
+token_count 1802
+num_heads 8
+data_cores 20
+active_workers 40
+batch_capacity 64
+rows_per_batch 8
+
+worker_count 40
+total_adjusted_rows_sum 1802
+total_full_rows_sum 1800
+total_full_group_batches_key_only 235
+total_compute_batch_calls_key_value 470
+total_rotate_calls_key_value 470
+avg_batches_per_worker_key_only 5.875
+
+first_8_workers
+(0, 0, 46, 0, 44, 44, 44, 6, False)
+(1, 46, 92, 44, 92, 48, 48, 6, False)
+(2, 92, 138, 92, 136, 44, 44, 6, False)
+(3, 138, 184, 136, 184, 48, 48, 6, False)
+(4, 184, 230, 184, 228, 44, 44, 6, False)
+(5, 230, 276, 228, 276, 48, 48, 6, False)
+(6, 276, 322, 276, 320, 44, 44, 6, False)
+(7, 322, 368, 320, 368, 48, 48, 6, False)
+last_5_workers
+(35, 1610, 1656, 1608, 1656, 48, 48, 6, False)
+(36, 1656, 1702, 1656, 1700, 44, 44, 6, False)
+(37, 1702, 1748, 1700, 1748, 48, 48, 6, False)
+(38, 1748, 1794, 1748, 1792, 44, 44, 6, False)
+(39, 1794, 1802, 1792, 1802, 10, 8, 1, True)
+
+batch_histogram_key_only
+{1: 1, 6: 39}
+
+hyp_rows_per_batch 8 key_batches 235 key_value_compute_calls 470 reduction_vs_current_calls 0
+hyp_rows_per_batch 12 key_batches 157 key_value_compute_calls 314 reduction_vs_current_calls 156
+hyp_rows_per_batch 16 key_batches 118 key_value_compute_calls 236 reduction_vs_current_calls 234
+hyp_rows_per_batch 24 key_batches 79 key_value_compute_calls 158 reduction_vs_current_calls 312
+hyp_rows_per_batch 32 key_batches 79 key_value_compute_calls 158 reduction_vs_current_calls 312
+hyp_rows_per_batch 40 key_batches 79 key_value_compute_calls 158 reduction_vs_current_calls 312
+hyp_rows_per_batch 48 key_batches 40 key_value_compute_calls 80 reduction_vs_current_calls 390
+
+baseline_profile_csv mytmp/perflog_long_route_only_20260627104641/rank0_2516436_20260627104727692_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv
+hot_shape_count 28 avg 820.39 p50 820.72 p90 822.22 max 823.88
