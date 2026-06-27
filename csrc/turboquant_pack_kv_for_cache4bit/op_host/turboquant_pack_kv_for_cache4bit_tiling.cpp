@@ -10,8 +10,11 @@ constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PACK_TILING_KEY_DEFAULT = 0;
+constexpr uint32_t TQ_PACK_TILING_KEY_LARGE_CONTIG = 1;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
 constexpr uint32_t TQ_PACK_MAX_BATCH_M = 64;
+constexpr uint32_t TQ_PACK_LARGE_MIN_TOKENS = 128;
+constexpr uint32_t TQ_PACK_LARGE_MIN_BATCH_M = 32;
 
 uint32_t AlignUp16(uint32_t x)
 {
@@ -22,6 +25,31 @@ matmul_tiling::DataType ToMatmulDtype(ge::DataType dtype)
 {
     return dtype == ge::DT_BF16 ? matmul_tiling::DataType::DT_BF16
                                 : matmul_tiling::DataType::DT_FLOAT16;
+}
+
+bool IsLargeContiguousShape(
+    uint32_t nVec,
+    uint32_t vecPerCore,
+    uint32_t numHeads,
+    uint32_t dataCores,
+    uint32_t keyStrideToken,
+    uint32_t keyStrideHead,
+    uint32_t valueStrideToken,
+    uint32_t valueStrideHead)
+{
+    if (numHeads == 0 || dataCores == 0) {
+        return false;
+    }
+    const uint32_t tokenCount = nVec / numHeads;
+    const bool contiguous =
+        keyStrideHead == TQ_PACK_N &&
+        valueStrideHead == TQ_PACK_N &&
+        keyStrideToken == numHeads * TQ_PACK_N &&
+        valueStrideToken == numHeads * TQ_PACK_N;
+    return contiguous &&
+           tokenCount >= TQ_PACK_LARGE_MIN_TOKENS &&
+           nVec >= dataCores * TQ_PACK_MAX_BATCH_M &&
+           vecPerCore >= TQ_PACK_LARGE_MIN_BATCH_M;
 }
 
 ge::graphStatus FillKfcCubeTiling(
@@ -217,6 +245,17 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     const uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(
         dataCores * kfcAivNum, dataCores * kfcAicNum, dataCores * kfcAivNum);
     tilingData.set_dataCores(dataCores);
+    const uint32_t tilingKey = IsLargeContiguousShape(
+        nVec,
+        vecPerCore,
+        numHeads,
+        dataCores,
+        keyStrideToken,
+        keyStrideHead,
+        valueStrideToken,
+        valueStrideHead)
+        ? TQ_PACK_TILING_KEY_LARGE_CONTIG
+        : TQ_PACK_TILING_KEY_DEFAULT;
 
     auto rawTiling = context->GetRawTilingData();
     if (rawTiling == nullptr || rawTiling->GetCapacity() < tilingData.GetDataSize()) {
@@ -234,7 +273,7 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     // KFC message queues and CANN internal workspace.
     workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
-    context->SetTilingKey(TQ_PACK_TILING_KEY_DEFAULT);
+    context->SetTilingKey(tilingKey);
     return ge::GRAPH_SUCCESS;
 }
 

@@ -1764,6 +1764,13 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
     GM_ADDR value_cache,
     GM_ADDR workspace,
     GM_ADDR tiling) {
+    if (TILING_KEY_IS(0)) {
+        KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
+    } else if (TILING_KEY_IS(1)) {
+        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
+    } else {
+        return;
+    }
     GET_TILING_DATA(tilingData, tiling);
 
     auto* codebookPtr = reinterpret_cast<__gm__ TqDataT*>(codebook);
@@ -1773,10 +1780,6 @@ extern "C" __global__ __aicore__ void turboquant_pack_kv_for_cache4bit(
     auto* keyCachePtr = reinterpret_cast<__gm__ uint8_t*>(key_cache);
     auto* valueCachePtr = reinterpret_cast<__gm__ uint8_t*>(value_cache);
 
-    if (!TILING_KEY_IS(0)) {
-        return;
-    }
-    KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
     auto* wsPtr = reinterpret_cast<__gm__ uint8_t*>(workspace);
     AscendC::SetSysWorkspace(wsPtr);
     if (GetSysWorkSpacePtr() == nullptr) {
