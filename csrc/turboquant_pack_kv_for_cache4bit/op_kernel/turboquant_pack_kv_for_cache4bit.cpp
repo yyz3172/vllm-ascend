@@ -533,14 +533,15 @@ private:
 
     __aicore__ inline void FillQuantThresholdTable(
         AscendC::LocalTensor<float>& quantThresholds) const {
-        for (uint32_t d = 0; d < TQ_PACK_D; ++d) {
-            const uint32_t rowOff = d * TQ_PACK_K;
-            for (uint32_t code = 1; code < TQ_PACK_K; ++code) {
-                quantThresholds.SetValue(rowOff + code - 1, TqQuantThreshold(code));
-            }
-            quantThresholds.SetValue(rowOff + TQ_PACK_K - 1, 1.0e30f);
+        for (uint32_t code = 1; code < TQ_PACK_K; ++code) {
+            quantThresholds.SetValue(code - 1, TqQuantThreshold(code));
         }
+        quantThresholds.SetValue(TQ_PACK_K - 1, 1.0e30f);
         TqSyncSToV();
+        for (uint32_t d = 1; d < TQ_PACK_D; ++d) {
+            AscendC::DataCopy(quantThresholds[d * TQ_PACK_K], quantThresholds, TQ_PACK_K);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void PrepareQuantThresholdTable(
@@ -724,14 +725,16 @@ private:
             }
         }
 
-        TqSyncVToS();
+        auto normWords = norms.template ReinterpretCast<uint16_t>();
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
-            auto normWords = norms.template ReinterpretCast<uint16_t>();
             const uint32_t normOff = i * TQ_NORM_STRIDE;
-            encodedBatch.SetValue(encodedOff + TQ_PACK_D, normWords.GetValue(normOff));
+            AscendC::DataCopy(
+                encodedBatch[encodedOff + TQ_PACK_D],
+                normWords[normOff],
+                TQ_NORM_STRIDE);
         }
-        TqSyncSToV();
+        AscendC::PipeBarrier<PIPE_V>();
 
         encodedBatchQue_.EnQue(encodedBatch);
         yBatchQue_.FreeTensor(yBatch);
