@@ -65,9 +65,15 @@ static constexpr uint32_t TQ_ARGMIN_INDEX_BYTES = TQ_PACK_D * sizeof(int32_t);
 static constexpr uint32_t TQ_ARGMIN_INDEX_U16_BYTES = TQ_PACK_D * sizeof(int16_t);
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
 static constexpr uint32_t TQ_COMPARE_MASK_BYTES = 256;
-static constexpr uint32_t TQ_QUANT_CODE_VECTORS = TQ_PACK_K - 1;
+static constexpr uint32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_PACK_K / 8;
+static constexpr uint32_t TQ_QUANT_CODE_VECTORS = TQ_PACK_K;
 static constexpr uint32_t TQ_QUANT_CODE_BYTES =
     TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
+static constexpr uint32_t TQ_QUANT_TABLE_ELEMS = TQ_PACK_D * TQ_PACK_K;
+static constexpr uint32_t TQ_REDUCE_SUM_MIN_BATCH_ROWS = 16;
+static constexpr uint32_t TQ_QUANT_BUFFER_UNKNOWN = 0;
+static constexpr uint32_t TQ_QUANT_BUFFER_CODES = 1;
+static constexpr uint32_t TQ_QUANT_BUFFER_THRESHOLDS = 2;
 static constexpr float TQ_FY_LINEAR = 0.020799f;
 static constexpr float TQ_FY_CUBIC = 0.0001926f;
 
@@ -356,7 +362,8 @@ public:
           valueSpan_(MakeInputSpan(valueStorageOffset, valueStrideToken, valueStrideHead)),
           matmulReady_(rawWorkspace != nullptr),
           packedWritePending_(false),
-          packedGroupSlot_(0) {}
+          packedGroupSlot_(0),
+          quantBufferMode_(TQ_QUANT_BUFFER_UNKNOWN) {}
 
     __aicore__ inline void Init(
         GM_ADDR key,
@@ -515,6 +522,36 @@ private:
         FillQuantCodeVector<15>(quantCodes);
     }
 
+    __aicore__ inline void PrepareQuantCodeVectors(
+        AscendC::LocalTensor<float>& quantCodes) {
+        if (quantBufferMode_ == TQ_QUANT_BUFFER_CODES) {
+            return;
+        }
+        FillQuantCodeVectors(quantCodes);
+        quantBufferMode_ = TQ_QUANT_BUFFER_CODES;
+    }
+
+    __aicore__ inline void FillQuantThresholdTable(
+        AscendC::LocalTensor<float>& quantThresholds) const {
+        for (uint32_t d = 0; d < TQ_PACK_D; ++d) {
+            const uint32_t rowOff = d * TQ_PACK_K;
+            for (uint32_t code = 1; code < TQ_PACK_K; ++code) {
+                quantThresholds.SetValue(rowOff + code - 1, TqQuantThreshold(code));
+            }
+            quantThresholds.SetValue(rowOff + TQ_PACK_K - 1, 1.0e30f);
+        }
+        TqSyncSToV();
+    }
+
+    __aicore__ inline void PrepareQuantThresholdTable(
+        AscendC::LocalTensor<float>& quantThresholds) {
+        if (quantBufferMode_ == TQ_QUANT_BUFFER_THRESHOLDS) {
+            return;
+        }
+        FillQuantThresholdTable(quantThresholds);
+        quantBufferMode_ = TQ_QUANT_BUFFER_THRESHOLDS;
+    }
+
     template <int CODE>
     __aicore__ inline void ApplyQuantCode(
         AscendC::LocalTensor<float>& qFloat,
@@ -539,6 +576,75 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
+    __aicore__ inline void EncodeQuantCodesByCompare(
+        AscendC::LocalTensor<float>& qFloat,
+        AscendC::LocalTensor<uint8_t>& quantMask,
+        AscendC::LocalTensor<float>& yFp32,
+        const AscendC::LocalTensor<float>& quantCodes) const {
+        AscendC::Duplicate(qFloat, 0.0f, TQ_PACK_D);
+        AscendC::PipeBarrier<PIPE_V>();
+        ApplyQuantCode<1>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<2>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<3>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<4>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<5>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<6>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<7>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<8>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<9>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<10>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<11>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<12>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<13>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<14>(qFloat, quantMask, yFp32, quantCodes);
+        ApplyQuantCode<15>(qFloat, quantMask, yFp32, quantCodes);
+    }
+
+    __aicore__ inline void EncodeQuantCodesByReduceSum(
+        AscendC::LocalTensor<float>& qFloat,
+        AscendC::LocalTensor<uint8_t>& quantMask,
+        AscendC::LocalTensor<float>& yFp32,
+        const AscendC::LocalTensor<float>& quantThresholds) {
+        auto quantOnes = rotateWorkBuf_.Get<float>();
+        AscendC::Brcb(
+            quantOnes,
+            yFp32,
+            TQ_PACK_D / 8,
+            AscendC::BrcbRepeatParams(TQ_REDUCE_SRC_REP_STRIDE, TQ_PACK_K));
+        AscendC::Brcb(
+            quantOnes[8],
+            yFp32,
+            TQ_PACK_D / 8,
+            AscendC::BrcbRepeatParams(TQ_REDUCE_SRC_REP_STRIDE, TQ_PACK_K));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            quantMask,
+            quantOnes,
+            quantThresholds,
+            AscendC::CMPMODE::GT,
+            TQ_QUANT_TABLE_ELEMS);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(quantOnes, 1.0f, TQ_QUANT_TABLE_ELEMS);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            quantOnes,
+            quantMask,
+            quantOnes,
+            0.0f,
+            SELMODE::VSEL_TENSOR_SCALAR_MODE,
+            TQ_QUANT_TABLE_ELEMS);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceSum<float>(
+            qFloat,
+            quantOnes,
+            TQ_PACK_K,
+            TQ_PACK_D,
+            1,
+            1,
+            TQ_REDUCE_SRC_REP_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
     // Encoded local row layout used between Compute and CopyOut:
     //   uint16[0..127] = uint4 index widened to uint16 for vector pack merge
     //   uint16[128] = norm bits matching T
@@ -552,54 +658,70 @@ private:
         auto argminIndexU16 = argminIndexU16Buf_.Get<int16_t>();
         auto quantMask = quantMaskBuf_.Get<uint8_t>();
         auto argminMask = packMaskBuf_.Get<int16_t>();
-        auto quantCodes = quantCodeBuf_.Get<float>();
+        auto quantCodeBuffer = quantCodeBuf_.Get<float>();
 
         AscendC::Duplicate(argminMask, static_cast<int16_t>(0x000F), TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
-        FillQuantCodeVectors(quantCodes);
+        if (m > TQ_REDUCE_SUM_MIN_BATCH_ROWS) {
+            PrepareQuantThresholdTable(quantCodeBuffer);
 
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t yOff = i * TQ_ROT_N;
-            const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
+            for (uint32_t i = 0; i < m; ++i) {
+                const uint32_t yOff = i * TQ_ROT_N;
+                const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
 
-            AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(qFloat, 0.0f, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            ApplyQuantCode<1>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<2>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<3>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<4>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<5>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<6>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<7>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<8>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<9>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<10>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<11>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<12>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<13>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<14>(qFloat, quantMask, yFp32, quantCodes);
-            ApplyQuantCode<15>(qFloat, quantMask, yFp32, quantCodes);
-            AscendC::Cast(
-                argminIndex,
-                qFloat,
-                AscendC::RoundMode::CAST_RINT,
-                TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(
-                argminIndexU16,
-                argminIndex,
-                AscendC::RoundMode::CAST_NONE,
-                TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::And(argminIndexU16, argminIndexU16, argminMask, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::DataCopy(
-                encodedBatch[encodedOff].template ReinterpretCast<int16_t>(),
-                argminIndexU16,
-                TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                EncodeQuantCodesByReduceSum(qFloat, quantMask, yFp32, quantCodeBuffer);
+                AscendC::Cast(
+                    argminIndex,
+                    qFloat,
+                    AscendC::RoundMode::CAST_RINT,
+                    TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(
+                    argminIndexU16,
+                    argminIndex,
+                    AscendC::RoundMode::CAST_NONE,
+                    TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::And(argminIndexU16, argminIndexU16, argminMask, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::DataCopy(
+                    encodedBatch[encodedOff].template ReinterpretCast<int16_t>(),
+                    argminIndexU16,
+                    TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        } else {
+            PrepareQuantCodeVectors(quantCodeBuffer);
+
+            for (uint32_t i = 0; i < m; ++i) {
+                const uint32_t yOff = i * TQ_ROT_N;
+                const uint32_t encodedOff = i * TQ_ENCODED_ROW_STRIDE_WORDS;
+
+                AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                EncodeQuantCodesByCompare(qFloat, quantMask, yFp32, quantCodeBuffer);
+                AscendC::Cast(
+                    argminIndex,
+                    qFloat,
+                    AscendC::RoundMode::CAST_RINT,
+                    TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(
+                    argminIndexU16,
+                    argminIndex,
+                    AscendC::RoundMode::CAST_NONE,
+                    TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::And(argminIndexU16, argminIndexU16, argminMask, TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::DataCopy(
+                    encodedBatch[encodedOff].template ReinterpretCast<int16_t>(),
+                    argminIndexU16,
+                    TQ_PACK_D);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
         }
 
         TqSyncVToS();
@@ -1598,6 +1720,7 @@ private:
     const bool matmulReady_;
     bool packedWritePending_;
     uint32_t packedGroupSlot_;
+    uint32_t quantBufferMode_;
 
     AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
     AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> aBatchQue_;
