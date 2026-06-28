@@ -16,7 +16,8 @@ the code is kept or reverted.
 2. `key1` NormalizeBatch Brcb/vector reciprocal.
    - Goal: remove per-row `TqSyncVToS() + GetValue() + TqSyncSToV()` from
      large-shape normalize without changing cache norm semantics.
-   - Status: rejected and reverted. Report:
+   - Status: accepted and restored. Smoke and long query improved/held, and
+     OPP `Process()` source instructions decreased. Report:
      `20260627_key1_brcb_normalize_report.md`.
 3. `key1` large contiguous CopyIn review.
    - Goal: prove whether full-batch contiguous CopyIn is already optimal.
@@ -113,14 +114,24 @@ For each experiment:
    - Build with `tools/build_debug_perf.sh`.
    - Run smoke and compare output semantics and small-shape pack timing against
      the kept route-only baseline.
+   - If a smoke guard shape does not execute the target tiling key, record its
+     timing as a guard signal, then judge the target path with matching-shape
+     long results and OPP source attribution.
    - Run long query only if smoke passes.
    - Run `tools/op.profile.sh` only if long query improves or the experiment
      specifically targets profile-level evidence.
+   - Treat `tools/op.profile.sh` overall runner/task duration as diagnostic
+     only. For OPP, compare source-level attribution, especially
+     `TurboquantPackKVForCache4bitToCache.Process()` instructions, not total
+     profile runtime.
 4. Decide keep or revert.
    - Keep code only if it improves the target baseline and does not regress
      guarded shapes.
    - Revert code if correctness changes, smoke regresses, long does not
-     improve meaningfully, build fails, or `op.profile.sh` hits `ret=507015`.
+     improve meaningfully, or build fails.
+   - If `op.profile.sh` hits `ret=507015`, treat that as a profiling failure
+     to record and investigate; it is not by itself a runtime correctness or
+     performance rejection unless smoke/long validation also fails.
 5. Write an experiment report.
    - Include commands/log paths, measured numbers, keep/revert conclusion,
      root-cause analysis, and reflection on whether the implementation was the

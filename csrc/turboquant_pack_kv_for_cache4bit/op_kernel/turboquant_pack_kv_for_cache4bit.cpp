@@ -425,6 +425,14 @@ private:
     // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
     // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids 16-bit overflow.
     __aicore__ inline void NormalizeBatch(uint32_t m) {
+        if constexpr (TILING_KEY_IS(1)) {
+            NormalizeBatchBrcbScale(m);
+        } else {
+            NormalizeBatchScalarScale(m);
+        }
+    }
+
+    __aicore__ inline void NormalizeBatchScalarScale(uint32_t m) {
         auto xBatch = xBatchQue_.DeQue<T>();
         auto aBatch = aBatchQue_.AllocTensor<T>();
         auto norms = normsBuf_.Get<T>();
@@ -450,6 +458,52 @@ private:
             AscendC::Cast(norms[i * TQ_NORM_STRIDE], normAcc, AscendC::RoundMode::CAST_RINT, 1);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Muls(fp32Row, fp32Row, 1.0f / (normF + TQ_NORM_EPS_F), TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(aBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
+        aBatchQue_.EnQue(aBatch);
+        xBatchQue_.FreeTensor(xBatch);
+    }
+
+    __aicore__ inline void NormalizeBatchBrcbScale(uint32_t m) {
+        auto xBatch = xBatchQue_.DeQue<T>();
+        auto aBatch = aBatchQue_.AllocTensor<T>();
+        auto norms = normsBuf_.Get<T>();
+        auto fp32Row = reduceOutBuf_.Get<float>();
+        auto scaleBlock = reduceOutBuf_.Get<float>()[TQ_PACK_D];
+        auto fp32Tmp = reduceOutBuf_.Get<float>()[TQ_PACK_D * 2];
+        auto normAcc = normScalarBuf_.Get<float>();
+
+        TqSyncMte2ToV();
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t rowOff = i * TQ_PACK_D;
+
+            AscendC::Cast(fp32Row, xBatch[rowOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(scaleBlock, fp32Row, fp32Row, TQ_PACK_D);
+            AscendC::ReduceSum<float>(normAcc, scaleBlock, fp32Tmp, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sqrt(normAcc, normAcc, 1);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Cast(norms[i * TQ_NORM_STRIDE], normAcc, AscendC::RoundMode::CAST_RINT, 1);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(normAcc, normAcc, TQ_NORM_EPS_F, 1);
+            AscendC::Duplicate(fp32Tmp, 1.0f, 1);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div(normAcc, fp32Tmp, normAcc, 1);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Brcb(scaleBlock, normAcc, 1, AscendC::BrcbRepeatParams(1, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(
+                fp32Row,
+                fp32Row,
+                scaleBlock,
+                static_cast<uint64_t>(TQ_PACK_D / 2),
+                2,
+                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 0));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(aBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
