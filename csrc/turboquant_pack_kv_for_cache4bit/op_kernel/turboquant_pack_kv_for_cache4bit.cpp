@@ -70,6 +70,7 @@ static constexpr uint32_t TQ_QUANT_CODE_VECTORS = TQ_PACK_K;
 static constexpr uint32_t TQ_QUANT_CODE_BYTES =
     TQ_QUANT_CODE_VECTORS * TQ_PACK_D * sizeof(float);
 static constexpr uint32_t TQ_QUANT_TABLE_ELEMS = TQ_PACK_D * TQ_PACK_K;
+static constexpr uint32_t TQ_QUANT_ONES_BYTES = TQ_QUANT_TABLE_ELEMS * sizeof(float);
 static constexpr uint32_t TQ_REDUCE_SUM_MIN_BATCH_ROWS = 16;
 static constexpr uint32_t TQ_QUANT_BUFFER_UNKNOWN = 0;
 static constexpr uint32_t TQ_QUANT_BUFFER_CODES = 1;
@@ -392,6 +393,7 @@ public:
         pipe_->InitBuffer(quantMaskBuf_, TQ_COMPARE_MASK_BYTES);
         pipe_->InitBuffer(codeIndexBuf_, TQ_CODE_INDEX_BYTES);
         pipe_->InitBuffer(quantCodeBuf_, TQ_QUANT_CODE_BYTES);
+        pipe_->InitBuffer(quantOnesBuf_, TQ_QUANT_ONES_BYTES);
         // yFp32Buf: fp32 y row [D=128]
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(argminIndexBuf_, TQ_ARGMIN_INDEX_BYTES);
@@ -660,7 +662,7 @@ private:
         AscendC::LocalTensor<uint8_t>& quantMask,
         AscendC::LocalTensor<float>& yFp32,
         const AscendC::LocalTensor<float>& quantThresholds) {
-        auto quantOnes = rotateWorkBuf_.Get<float>();
+        auto quantOnes = quantOnesBuf_.Get<float>();
         AscendC::Brcb(
             quantOnes,
             yFp32,
@@ -1794,6 +1796,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> rotateWorkBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> codeIndexBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> quantCodeBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> quantOnesBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> argminIndexU16Buf_;
     AscendC::GlobalTensor<T> keyGm_;
