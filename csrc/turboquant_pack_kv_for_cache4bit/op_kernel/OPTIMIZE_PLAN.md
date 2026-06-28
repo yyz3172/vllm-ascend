@@ -70,7 +70,9 @@ Once routing is verified, apply optimizations only under `key=1`:
 ## Key1 Optimization Backlog
 
 `tilingKey = 1` is the large-shape-only route. Keep these items isolated from
-`key0` and `key2` until each item passes correctness and profile gates:
+`key0` and `key2` until each item passes correctness and target-performance
+validation. Use OPP source attribution as a diagnostic, not as a total-time
+gate:
 
 1. CopyOut pack/emit specialization.
    This is the next key1 implementation target. Optimize full physical groups
@@ -106,10 +108,14 @@ Once routing is verified, apply optimizations only under `key=1`:
    `TqSyncVToS() + GetValue() + TqSyncSToV() + Muls(...)`.
    This preserves cache norm semantics while removing the per-row scalar
    engine round trip, and should be tried before larger two-pass rewrites.
-   Status 2026-06-27: V1 and V2 were tried and rejected. V2 improved the long
-   hot shape slightly, but `tools/op.profile.sh` regressed from 557.89 us /
-   287.50 us task duration to 581.54 us / 293.62 us task duration. Do not
-   continue small single-loop Brcb variants without a new source-profile reason.
+   Status 2026-06-28: V1 and V2 were tried; V2 is accepted and restored.
+   V2 matched smoke semantics, held/improved the guarded smoke shape, improved
+   the long hot shape from avg 820.39 us to avg 817.18 us, and reduced OPP
+   `Process()` source instructions from 2,173,794 to 2,149,926. The
+   `tools/op.profile.sh` runner/task duration regressed in that run, but those
+   overall profiler timings are diagnostic only and are not a hard rejection
+   gate. Do not continue small single-loop Brcb variants without a new
+   source-profile reason.
    The next concrete attempt is a 32-row batched scalar-sync version of
    `NormalizeBatch` under `key=1` only:
    - For each chunk of up to 32 rows, cast rows into a fp32 temporary block,
@@ -121,7 +127,7 @@ Once routing is verified, apply optimizations only under `key=1`:
      (`32 * 128 * sizeof(float)`), because it is not needed until
      `RotateBatchMatmul`.
    - Keep `key0` on the current per-row normalize path until the key1
-     experiment passes long, smoke, and `tools/op.profile.sh`.
+     experiment passes long and smoke. Use OPP only for source attribution.
    Alternative lower-UB attempt:
    - Use a two-pass `NormalizeBatch`: first compute all row norms, then read
      all reciprocals with one `V->S` / `S->V` pair, then recast rows and apply
@@ -322,7 +328,7 @@ Validation on the kept route-only state:
   - debug source check: `insight_source_status=ok`
   - default prefill pack runner: `pack4bit_to_cache_avg_us=503.47`.
 
-Rejected experiment:
+Experiment history:
 
 - Tried key1-only batched vector normalize with `WholeReduceSum`.
 - Smoke and long query were roughly neutral:
@@ -382,12 +388,16 @@ Rejected experiment:
     - route-only baseline avg 46.59 us.
   - V2 long hot shape improved slightly to avg 817.18 us versus route-only
     avg 820.39 us.
-  - `tools/op.profile.sh` regressed:
+  - `tools/op.profile.sh` overall timing regressed:
     - route-only refreshed runner 557.89 us, task duration 287.50 us.
     - V2 runner 581.54 us, task duration 293.62 us.
-  - The experiment was reverted. `Div + Brcb + repeat Mul` removed scalar
-    `GetValue`, but did not reduce normalize instructions or end-to-end task
-    duration.
+  - OPP source attribution for
+    `TurboquantPackKVForCache4bitToCache.Process()` improved from 2,173,794
+    to 2,149,926 instructions.
+  - The experiment is accepted and restored. `Div + Brcb + repeat Mul`
+    removed scalar `GetValue`; normalize-local instructions stayed flat, but
+    smoke/long validation and `Process()` instruction attribution support
+    keeping the change.
 - Tried key1 direct packed encode/copyout for physical full-group runs.
   - Design: `experiments/20260627_key1_direct_packed_encode_design.md`
   - Report: `experiments/20260627_key1_direct_packed_encode_report.md`
