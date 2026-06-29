@@ -24,8 +24,8 @@
  *                                              slab cache decode
  *
  * Build:
- *   bash build_test_tq4bit.sh          # compile only
- *   bash build_test_tq4bit.sh --rebuild-op  # rebuild custom op + compile
+ *   bash script/lcy/tq4bit/build_test_tq4bit.sh          # compile only
+ *   bash script/lcy/tq4bit/build_test_tq4bit.sh --rebuild-op  # rebuild custom op + compile
  *
  * Run:
  *   ASCEND_CUSTOM_OPP_PATH=... ./test_tq4bit [options]
