@@ -37,7 +37,6 @@ ARGS=(
     --long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}"
     --trust-remote-code
     --gpu-memory-utilization "${PREFILL_GPU_MEMORY_UTILIZATION}"
-    --enforce-eager
     --kv-transfer-config "{
         \"kv_connector\": \"MooncakeConnectorV1\",
         \"kv_buffer_device\": \"npu\",
