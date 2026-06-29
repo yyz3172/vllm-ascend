@@ -36,7 +36,6 @@ ARGS=(
     --max-num-seqs "${MAX_NUM_SEQS}"
     --trust-remote-code
     --gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION}"
-    --enforce-eager
     --kv-transfer-config "{
         \"kv_connector\": \"MooncakeConnectorV1\",
         \"kv_buffer_device\": \"npu\",
