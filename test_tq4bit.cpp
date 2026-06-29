@@ -369,6 +369,9 @@ int main() {
     std::vector<int32_t> slot_mapping(seq_len);
     for (int64_t i = 0; i < seq_len; i++) slot_mapping[i] = static_cast<int32_t>(i);
 
+    // Pack op request ranges: single request covering all KV tokens.
+    std::vector<int32_t> query_start_loc = {0, static_cast<int32_t>(seq_len)};
+
     // Block table: single sequence, blocks mapped sequentially
     // shape [1, num_blocks]
     std::vector<int32_t> block_table(num_blocks);
@@ -380,13 +383,14 @@ int main() {
     size_t cb_size       = CODEBOOK_SIZE * sizeof(uint16_t);
     size_t rot_size      = HEAD_SIZE * HEAD_SIZE * sizeof(uint16_t);
     size_t slot_size     = seq_len * sizeof(int32_t);
+    size_t query_start_size = query_start_loc.size() * sizeof(int32_t);
     size_t bt_size       = num_blocks * sizeof(int32_t);
     size_t cache_size    = num_blocks * num_kv_heads * block_size * ROW_BYTES_4BIT;
     size_t out_size      = query_tokens * num_heads * HEAD_SIZE * sizeof(uint16_t);
 
     void *d_key = nullptr, *d_value = nullptr, *d_query = nullptr;
     void *d_codebook = nullptr, *d_rotation = nullptr;
-    void *d_slot = nullptr, *d_bt = nullptr;
+    void *d_slot = nullptr, *d_query_start = nullptr, *d_bt = nullptr;
     void *d_key_cache = nullptr, *d_value_cache = nullptr;
     void *d_attn_out = nullptr;
 
@@ -406,6 +410,7 @@ int main() {
     ok &= malloc_dev(&d_codebook,   cb_size,    "codebook");
     ok &= malloc_dev(&d_rotation,   rot_size,   "rotation");
     ok &= malloc_dev(&d_slot,       slot_size,  "slot_mapping");
+    ok &= malloc_dev(&d_query_start, query_start_size, "query_start_loc");
     ok &= malloc_dev(&d_bt,         bt_size,    "block_table");
     ok &= malloc_dev(&d_key_cache,  cache_size, "key_cache");
     ok &= malloc_dev(&d_value_cache,cache_size, "value_cache");
@@ -429,6 +434,7 @@ int main() {
     ok &= h2d(d_codebook,   codebook.data(),       cb_size,    "codebook");
     ok &= h2d(d_rotation,   rotation.data(),       rot_size,   "rotation");
     ok &= h2d(d_slot,       slot_mapping.data(),   slot_size,  "slot_mapping");
+    ok &= h2d(d_query_start, query_start_loc.data(), query_start_size, "query_start_loc");
     ok &= h2d(d_bt,         block_table.data(),    bt_size,    "block_table");
     // Initialize caches to zero
     std::vector<uint8_t> zero_cache(cache_size, 0);
@@ -449,6 +455,7 @@ int main() {
     // codebook:  [16]                                  FP16
     // rotationT: [HEAD_SIZE, HEAD_SIZE]                FP16
     // slotMapping: [seq_len]                            INT32
+    // queryStartLoc: [2]                                INT32
     // keyCache:  [num_blocks, num_kv_heads, block_size*ROW_BYTES_4BIT]  UINT8
     // valueCache: same shape as keyCache                                  UINT8
 
@@ -463,6 +470,8 @@ int main() {
 
     int64_t slot_1d_dims[1] = {seq_len};
     int64_t slot_1d_strides[1] = {1};
+    int64_t query_start_1d_dims[1] = {static_cast<int64_t>(query_start_loc.size())};
+    int64_t query_start_1d_strides[1] = {1};
 
     int64_t cache_3d_dims[3] = {num_blocks, num_kv_heads, block_size * ROW_BYTES_4BIT};
     int64_t cache_3d_strides[3] = {num_kv_heads * block_size * ROW_BYTES_4BIT,
@@ -479,6 +488,9 @@ int main() {
                                               0, ACL_FORMAT_ND, rot_2d_dims, 2, d_rotation);
     aclTensor *t_slotMapping = aclCreateTensor(slot_1d_dims, 1, ACL_INT32, slot_1d_strides,
                                                 0, ACL_FORMAT_ND, slot_1d_dims, 1, d_slot);
+    aclTensor *t_queryStartLoc = aclCreateTensor(query_start_1d_dims, 1, ACL_INT32,
+                                                  query_start_1d_strides, 0, ACL_FORMAT_ND,
+                                                  query_start_1d_dims, 1, d_query_start);
     aclTensor *t_keyCache = aclCreateTensor(cache_3d_dims, 3, ACL_UINT8, cache_3d_strides,
                                              0, ACL_FORMAT_ND, cache_3d_dims, 3, d_key_cache);
     aclTensor *t_valueCache = aclCreateTensor(cache_3d_dims, 3, ACL_UINT8, cache_3d_strides,
@@ -487,7 +499,7 @@ int main() {
     // Pack op tiling parameters
     int64_t nVec = seq_len * num_kv_heads;      // total vectors
     int64_t vecPerCore = 64;                     // tiling granularity (safe default)
-    int64_t packMode = 0;                        // default pack mode
+    int64_t numReqs = 1;                          // single contiguous request
 
     uint64_t pack_workspace_size = 0;
     aclOpExecutor *pack_executor = nullptr;
@@ -498,12 +510,19 @@ int main() {
         t_codebook,
         t_rotationT,
         t_slotMapping,
-        packMode,
+        t_queryStartLoc,
         nVec,
         vecPerCore,
         num_kv_heads,
         block_size,
         num_blocks,
+        numReqs,
+        kv_3d_strides[0],
+        kv_3d_strides[1],
+        kv_3d_strides[0],
+        kv_3d_strides[1],
+        0,
+        0,
         t_keyCache,
         t_valueCache,
         &pack_workspace_size,

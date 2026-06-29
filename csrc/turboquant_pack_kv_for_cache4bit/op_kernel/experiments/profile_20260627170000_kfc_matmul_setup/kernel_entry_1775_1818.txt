@@ -1,0 +1,19 @@
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /root/x00827378/vllm-ascend/mytmp/build_libcust_opapi_nodebug_debug_line/binary/ascend910b/src/turboquant_pack_kv_for_cache4bit/turboquant_pack_kv_for_cache4bit.cpp
+Line  Instructions Executed  Records  Range Count
+1784  180                    1       4
+1785  0                      1       4
+1788  2800                   1       6
+1789  2060                   1       7
+1790  673388                 1       13
+1791  3200                   1       10
+1796  80                     1       2
+1797  40                     1       1
+1798  80                     1       2
+1800  40                     1       1
+1801  80                     1       1
+1803  80                     1       1
+1805  80                     1       2
+1808  12760                  1       2
+1817  2174074                1       1
+1818  17220                  1       4

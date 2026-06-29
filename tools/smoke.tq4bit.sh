@@ -1,0 +1,14 @@
+export PYTHONPATH="/root/x00827378/vllm-ascend:/root/x00827378/code/vllm018/vllm:$PYTHONPATH"
+export VLLM_LOGGING_LEVEL=INFO
+export VLLM_CONFIGURE_LOGGING=1
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_VERSION=0.18.0
+export VLLM_ASCEND_TURBOQUANT_ENCODE_OP=1
+export VLLM_ASCEND_TURBOQUANT_DECODE_OP=1
+export VLLM_ASCEND_TURBOQUANT_PACK_OP=v2
+export XRX_TQ4BIT_PROFILE=1
+
+XRX_TQ4BIT_PROFILE=1 \
+TQ_SMOKE_MODEL_PATH="/root/x00827378/model/Qwen3-0.6B" \
+TQ_SMOKE_PROFILE_DIR="/root/x00827378/vllm-ascend/mytmp/perflog" \
+python tests/e2e/singlecard/xrx_turboquant4bit_smoke.py

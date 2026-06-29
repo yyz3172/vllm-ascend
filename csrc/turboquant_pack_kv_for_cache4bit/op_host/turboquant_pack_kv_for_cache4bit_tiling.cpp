@@ -9,12 +9,12 @@ constexpr uint32_t TQ_PACK_M_ALIGN = 16;
 constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
-constexpr uint32_t TQ_PACK_TILING_KEY_KFC = 0;
-constexpr uint32_t TQ_PACK_MODE_KFC = 0;
-constexpr uint32_t TQ_PACK_MODE_DECODE_DIRECT = 1;
-constexpr uint32_t TQ_PACK_MODE_LOGICAL_FAST_FALLBACK = 2;
+constexpr uint32_t TQ_PACK_TILING_KEY_DEFAULT = 0;
+constexpr uint32_t TQ_PACK_TILING_KEY_LARGE_CONTIG = 1;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
-constexpr uint32_t TQ_PACK_MAX_BATCH_M = 32;
+constexpr uint32_t TQ_PACK_MAX_BATCH_M = 64;
+constexpr uint32_t TQ_PACK_LARGE_MIN_TOKENS = 128;
+constexpr uint32_t TQ_PACK_LARGE_MIN_BATCH_M = 32;
 
 uint32_t AlignUp16(uint32_t x)
 {
@@ -25,6 +25,31 @@ matmul_tiling::DataType ToMatmulDtype(ge::DataType dtype)
 {
     return dtype == ge::DT_BF16 ? matmul_tiling::DataType::DT_BF16
                                 : matmul_tiling::DataType::DT_FLOAT16;
+}
+
+bool IsLargeContiguousShape(
+    uint32_t nVec,
+    uint32_t vecPerCore,
+    uint32_t numHeads,
+    uint32_t dataCores,
+    uint32_t keyStrideToken,
+    uint32_t keyStrideHead,
+    uint32_t valueStrideToken,
+    uint32_t valueStrideHead)
+{
+    if (numHeads == 0 || dataCores == 0) {
+        return false;
+    }
+    const uint32_t tokenCount = nVec / numHeads;
+    const bool contiguous =
+        keyStrideHead == TQ_PACK_N &&
+        valueStrideHead == TQ_PACK_N &&
+        keyStrideToken == numHeads * TQ_PACK_N &&
+        valueStrideToken == numHeads * TQ_PACK_N;
+    return contiguous &&
+           tokenCount >= TQ_PACK_LARGE_MIN_TOKENS &&
+           nVec >= dataCores * TQ_PACK_MAX_BATCH_M &&
+           vecPerCore >= TQ_PACK_LARGE_MIN_BATCH_M;
 }
 
 ge::graphStatus FillKfcCubeTiling(
@@ -88,31 +113,50 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
         OPS_LOG_E(nodeName, "attrs is null");
         return ge::GRAPH_FAILED;
     }
-    const int64_t* packModePtr = attrs->GetAttrPointer<int64_t>(0);
-    const int64_t* nVecPtr = attrs->GetAttrPointer<int64_t>(1);
-    const int64_t* vecPerCorePtr = attrs->GetAttrPointer<int64_t>(2);
-    const int64_t* numHeadsPtr = attrs->GetAttrPointer<int64_t>(3);
-    const int64_t* blockSizePtr = attrs->GetAttrPointer<int64_t>(4);
-    const int64_t* numBlocksPtr = attrs->GetAttrPointer<int64_t>(5);
-    if (packModePtr == nullptr || nVecPtr == nullptr || vecPerCorePtr == nullptr ||
-        numHeadsPtr == nullptr || blockSizePtr == nullptr || numBlocksPtr == nullptr) {
+    const int64_t* nVecPtr = attrs->GetAttrPointer<int64_t>(0);
+    const int64_t* vecPerCorePtr = attrs->GetAttrPointer<int64_t>(1);
+    const int64_t* numHeadsPtr = attrs->GetAttrPointer<int64_t>(2);
+    const int64_t* blockSizePtr = attrs->GetAttrPointer<int64_t>(3);
+    const int64_t* numBlocksPtr = attrs->GetAttrPointer<int64_t>(4);
+    const int64_t* numReqsPtr = attrs->GetAttrPointer<int64_t>(5);
+    const int64_t* keyStrideTokenPtr = attrs->GetAttrPointer<int64_t>(6);
+    const int64_t* keyStrideHeadPtr = attrs->GetAttrPointer<int64_t>(7);
+    const int64_t* valueStrideTokenPtr = attrs->GetAttrPointer<int64_t>(8);
+    const int64_t* valueStrideHeadPtr = attrs->GetAttrPointer<int64_t>(9);
+    const int64_t* keyStorageOffsetPtr = attrs->GetAttrPointer<int64_t>(10);
+    const int64_t* valueStorageOffsetPtr = attrs->GetAttrPointer<int64_t>(11);
+    if (nVecPtr == nullptr || vecPerCorePtr == nullptr || numHeadsPtr == nullptr ||
+        blockSizePtr == nullptr || numBlocksPtr == nullptr || numReqsPtr == nullptr ||
+        keyStrideTokenPtr == nullptr || keyStrideHeadPtr == nullptr ||
+        valueStrideTokenPtr == nullptr || valueStrideHeadPtr == nullptr ||
+        keyStorageOffsetPtr == nullptr || valueStorageOffsetPtr == nullptr) {
         OPS_LOG_E(nodeName, "required attrs are null");
         return ge::GRAPH_FAILED;
     }
 
-    const uint32_t packMode = static_cast<uint32_t>(*packModePtr);
     const uint32_t nVec = static_cast<uint32_t>(*nVecPtr);
     uint32_t vecPerCore = static_cast<uint32_t>(*vecPerCorePtr);
     const uint32_t numHeads = static_cast<uint32_t>(*numHeadsPtr);
     const uint32_t blockSize = static_cast<uint32_t>(*blockSizePtr);
     const uint32_t numBlocks = static_cast<uint32_t>(*numBlocksPtr);
-    if ((packMode != TQ_PACK_MODE_KFC &&
-         packMode != TQ_PACK_MODE_DECODE_DIRECT &&
-         packMode != TQ_PACK_MODE_LOGICAL_FAST_FALLBACK) ||
-        nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
-        blockSize < 1 || numBlocks < 1) {
+    const uint32_t numReqs = static_cast<uint32_t>(*numReqsPtr);
+    const uint32_t keyStrideToken = static_cast<uint32_t>(*keyStrideTokenPtr);
+    const uint32_t keyStrideHead = static_cast<uint32_t>(*keyStrideHeadPtr);
+    const uint32_t valueStrideToken = static_cast<uint32_t>(*valueStrideTokenPtr);
+    const uint32_t valueStrideHead = static_cast<uint32_t>(*valueStrideHeadPtr);
+    if (*keyStorageOffsetPtr < 0 || *valueStorageOffsetPtr < 0) {
+        OPS_LOG_E(nodeName, "key/value storage offsets must be non-negative");
+        return ge::GRAPH_FAILED;
+    }
+    const uint64_t keyStorageOffset = static_cast<uint64_t>(*keyStorageOffsetPtr);
+    const uint64_t valueStorageOffset = static_cast<uint64_t>(*valueStorageOffsetPtr);
+    if (nVec < 1 || vecPerCore < 1 || numHeads < 1 ||
+        blockSize < 1 || numBlocks < 1 || numReqs < 1 ||
+        keyStrideToken < 1 || keyStrideHead < 1 ||
+        valueStrideToken < 1 || valueStrideHead < 1) {
         OPS_LOG_E(nodeName,
-                  "invalid pack attrs: 4-bit pack-to-cache supports pack_mode 0, 1, or 2");
+                  "invalid pack attrs: n_vec/vec_per_core/num_heads/block_size/"
+                  "num_blocks/num_reqs/strides must be positive");
         return ge::GRAPH_FAILED;
     }
     if (blockSize % 4 != 0) {
@@ -176,10 +220,16 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
 
     tilingData.set_nVec(nVec);
     tilingData.set_vecPerCore(vecPerCore);
-    tilingData.set_packMode(packMode);
     tilingData.set_numHeads(numHeads);
     tilingData.set_blockSize(blockSize);
     tilingData.set_numBlocks(numBlocks);
+    tilingData.set_numReqs(numReqs);
+    tilingData.set_keyStrideToken(keyStrideToken);
+    tilingData.set_keyStrideHead(keyStrideHead);
+    tilingData.set_valueStrideToken(valueStrideToken);
+    tilingData.set_valueStrideHead(valueStrideHead);
+    tilingData.set_keyStorageOffset(keyStorageOffset);
+    tilingData.set_valueStorageOffset(valueStorageOffset);
 
     // MIX 1C2V per data-parallel group.  Use all physical groups that the
     // current SOC can provide instead of fixing the kernel to 16 groups.
@@ -195,6 +245,17 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     const uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(
         dataCores * kfcAivNum, dataCores * kfcAicNum, dataCores * kfcAivNum);
     tilingData.set_dataCores(dataCores);
+    const uint32_t tilingKey = IsLargeContiguousShape(
+        nVec,
+        vecPerCore,
+        numHeads,
+        dataCores,
+        keyStrideToken,
+        keyStrideHead,
+        valueStrideToken,
+        valueStrideHead)
+        ? TQ_PACK_TILING_KEY_LARGE_CONTIG
+        : TQ_PACK_TILING_KEY_DEFAULT;
 
     auto rawTiling = context->GetRawTilingData();
     if (rawTiling == nullptr || rawTiling->GetCapacity() < tilingData.GetDataSize()) {
@@ -212,7 +273,7 @@ static ge::graphStatus TurboquantPackKvForCache4bitTilingFunc(gert::TilingContex
     // KFC message queues and CANN internal workspace.
     workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
-    context->SetTilingKey(TQ_PACK_TILING_KEY_KFC);
+    context->SetTilingKey(tilingKey);
     return ge::GRAPH_SUCCESS;
 }
 

@@ -23,7 +23,7 @@ import time
 import torch
 
 MODEL_PATH = os.getenv("XRX_TQ4BIT_MODEL_PATH", "/root/x00827378/model/Qwen3-0.6B")
-PROFILE_DIR = os.getenv("XRX_TQ4BIT_PROFILE_DIR", "/root/x00827378/perflog2")
+PROFILE_DIR = os.getenv("XRX_TQ4BIT_PROFILE_DIR", "/root/x00827378/vllm-ascend/mytmp/perflog")
 
 
 @contextlib.contextmanager
@@ -77,13 +77,13 @@ def main() -> None:
         raise RuntimeError("torch.npu is not available")
 
     prompt_tokens = _int_env("XRX_TQ4BIT_LONG_PROMPT_TOKENS", 2000)
-    num_prompts = _int_env("XRX_TQ4BIT_LONG_NUM_PROMPTS", 1)
+    num_prompts = _int_env("XRX_TQ4BIT_LONG_NUM_PROMPTS", 16)
     max_tokens = _int_env("XRX_TQ4BIT_LONG_OUTPUT_TOKENS", 8)
     max_model_len = _int_env(
         "XRX_TQ4BIT_LONG_MAX_MODEL_LEN",
         max(256, prompt_tokens + max_tokens + 32),
     )
-    gpu_memory_utilization = _float_env("XRX_TQ4BIT_GPU_MEMORY_UTILIZATION", 0.20)
+    gpu_memory_utilization = _float_env("XRX_TQ4BIT_GPU_MEMORY_UTILIZATION", 0.05)
     enable_profile = os.getenv("XRX_TQ4BIT_ENABLE_PROFILE", "1") == "1"
     profile_warmup_generates = _int_env("XRX_TQ4BIT_PROFILE_WARMUP_GENERATES", 0)
 

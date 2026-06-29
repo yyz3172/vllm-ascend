@@ -5,18 +5,21 @@ class TurboquantPackKvForCache4bit : public OpDef {
 public:
     explicit TurboquantPackKvForCache4bit(const char* name) : OpDef(name)
     {
-        // Host binding checks contiguous(); omit AutoContiguous to avoid a
-        // second GM copy inside CANN when layout is already dense ND.
+        // Key/value can be large non-contiguous views. The kernel consumes
+        // explicit strides and storage offsets, so keep CANN from inserting
+        // another GM copy for them.
         this->Input("key")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("value")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("codebook")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
@@ -35,6 +38,12 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
+        this->Input("query_start_loc")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32, ge::DT_INT32})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("key_cache")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
@@ -45,14 +54,18 @@ public:
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        // 0 = general physical-group owner path, 1 = decode-only direct path,
-        // 2 = logical full-group fast path plus physical-owner fallback.
-        this->Attr("pack_mode").Int();
         this->Attr("n_vec").Int();
         this->Attr("vec_per_core").Int();
         this->Attr("num_heads").Int();
         this->Attr("block_size").Int();
         this->Attr("num_blocks").Int();
+        this->Attr("num_reqs").Int();
+        this->Attr("key_stride_token").Int();
+        this->Attr("key_stride_head").Int();
+        this->Attr("value_stride_token").Int();
+        this->Attr("value_stride_head").Int();
+        this->Attr("key_storage_offset").Int();
+        this->Attr("value_storage_offset").Int();
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

@@ -47,6 +47,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
 
@@ -55,6 +56,7 @@ import torch
 
 from vllm_ascend.ops.turboquant_kv_cache import (
     _c_ascend_turboquant_op_available,
+    _get_quantizer,
     _turboquant_pack_tables,
     _turboquant_slab_group4_to_row_format,
     ensure_turboquant_pack_tables_registered,
@@ -92,6 +94,7 @@ TURBOQUANT_KV_BITS = (4, 8)
 
 # Supported total KV cache capacities in token slots (num_blocks = slots // KV_BLOCK_SIZE).
 CACHE_TOKEN_SLOTS = (2048, 4096)
+REAL_SMOKE_DUMP_PATH = Path(__file__).with_name("data") / "tq4bit_real_smoke_dump.pt"
 
 
 @contextmanager
@@ -271,6 +274,7 @@ def test_turboquant_pack_kv_for_cache_to_cache_matches_old_path():
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     slot_mapping = torch.tensor([0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
     key_cache_old = torch.zeros(B, BS, H, P, dtype=torch.int8, device=device)
     value_cache_old = torch.zeros_like(key_cache_old)
     key_cache_new = torch.zeros_like(key_cache_old)
@@ -298,6 +302,8 @@ def test_turboquant_pack_kv_for_cache_to_cache_matches_old_path():
         key_cache=key_cache_new,
         value_cache=value_cache_new,
         slot_mapping=slot_mapping,
+        query_start_loc=query_start_loc,
+        num_reqs=1,
         bits_key=bits_key,
         bits_value=bits_value,
     )
@@ -314,6 +320,7 @@ def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     T = 7
     slot_mapping = torch.tensor([0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
 
@@ -343,6 +350,8 @@ def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
             key_cache=key_cache_slab,
             value_cache=value_cache_slab,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=1,
             bits_key=bits,
             bits_value=bits,
         )
@@ -403,6 +412,139 @@ def test_turboquant_4bit_slab_pack_decode_roundtrip_cpu() -> None:
     torch.testing.assert_close(bt_slab, bt_row, rtol=0, atol=0)
 
 
+def _assert_4bit_slab_cache_close(
+    name: str,
+    op_cache: torch.Tensor,
+    ref_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    head_size: int,
+    bits: int,
+    dtype: torch.dtype,
+) -> None:
+    row_w = turboquant_slab_row_bytes(head_size, bits=bits)
+    block_size = op_cache.shape[-1] // row_w
+    num_heads = op_cache.shape[1]
+    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
+    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
+    if slot_cpu.numel() == 0:
+        torch.testing.assert_close(op_cache, ref_cache, rtol=0, atol=0)
+        return
+
+    block_idx_cpu = torch.div(slot_cpu, block_size, rounding_mode="floor")
+    block_idx = block_idx_cpu.to(op_cache.device)
+    block_off = (slot_cpu - block_idx_cpu * block_size).to(op_cache.device)
+    head_idx = torch.arange(num_heads, device=op_cache.device, dtype=torch.int64)
+
+    op_rows = _turboquant_slab_group4_to_row_format(
+        op_cache, head_size=head_size, bits=bits
+    )
+    ref_rows = _turboquant_slab_group4_to_row_format(
+        ref_cache, head_size=head_size, bits=bits
+    )
+    op_logical = op_rows[
+        block_idx[:, None], block_off[:, None], head_idx[None, :], :
+    ]
+    ref_logical = ref_rows[
+        block_idx[:, None], block_off[:, None], head_idx[None, :], :
+    ]
+
+    op_indices = unpack_uint4(op_logical[..., : row_w - 2], head_size).to(torch.int16)
+    ref_indices = unpack_uint4(ref_logical[..., : row_w - 2], head_size).to(torch.int16)
+    index_diff = (op_indices - ref_indices).abs()
+    assert int((index_diff > 1).sum().item()) == 0
+    assert int((index_diff != 0).sum().item()) <= max(
+        32, int(ref_indices.numel() * 0.02)
+    )
+    torch.testing.assert_close(
+        op_logical[..., row_w - 2 : row_w],
+        ref_logical[..., row_w - 2 : row_w],
+        rtol=0,
+        atol=0,
+    )
+
+    with _patched_turboquant_env(
+        os.environ,
+        {
+            "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+            "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+        },
+        clear=False,
+    ):
+        op_decoded = turboquant_dequantize_from_packed_bytes(
+            op_logical.reshape(-1, row_w), head_size=head_size, dtype=dtype, bits=bits
+        )
+        ref_decoded = turboquant_dequantize_from_packed_bytes(
+            ref_logical.reshape(-1, row_w), head_size=head_size, dtype=dtype, bits=bits
+        )
+        torch.npu.synchronize()
+    max_err = float((op_decoded.float() - ref_decoded.float()).abs().max().cpu())
+    assert max_err <= 0.25, f"{name} decoded max error too large: {max_err}"
+
+
+def _gather_4bit_slab_rows_for_test(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    head_size: int,
+    bits: int,
+) -> torch.Tensor:
+    row_w = turboquant_slab_row_bytes(head_size, bits=bits)
+    block_size = cache.shape[-1] // row_w
+    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
+    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
+    block_idx_cpu = torch.div(slot_cpu, block_size, rounding_mode="floor")
+    block_idx = block_idx_cpu.to(cache.device)
+    block_off = (slot_cpu - block_idx_cpu * block_size).to(cache.device)
+    head_idx = torch.arange(cache.shape[1], device=cache.device, dtype=torch.int64)
+    rows = _turboquant_slab_group4_to_row_format(
+        cache, head_size=head_size, bits=bits
+    )
+    return rows[block_idx[:, None], block_off[:, None], head_idx[None, :], :]
+
+
+def _formula_dequantize_4bit_for_test(
+    packed_rows: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    head_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    row_w = turboquant_slab_row_bytes(head_size, bits=4)
+    packed_u8 = packed_rows.view(torch.uint8)[..., :row_w]
+    indices = unpack_uint4(packed_u8[..., : row_w - 2], head_size).to(torch.float32)
+    norm_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float16
+    norms = (
+        packed_u8[..., row_w - 2 : row_w]
+        .contiguous()
+        .view(norm_dtype)
+        .view(*packed_u8.shape[:-1])
+    )
+    delta = indices - 7.5
+    y_hat = 0.0001926 * (delta**3) + 0.020799 * delta
+    out = y_hat @ rotation.to(device=packed_rows.device, dtype=torch.float32)
+    return (out * norms.to(torch.float32).unsqueeze(-1)).to(dtype=dtype)
+
+
+def _reconstruction_stats(
+    original: torch.Tensor,
+    custom_dequant: torch.Tensor,
+    reference_dequant: torch.Tensor,
+) -> dict[str, float]:
+    custom_err = (custom_dequant.to(torch.float32) - original.to(torch.float32)).abs()
+    reference_err = (
+        reference_dequant.to(torch.float32) - original.to(torch.float32)
+    ).abs()
+    return {
+        "custom_mae": float(custom_err.mean().cpu()),
+        "custom_rmse": float(torch.sqrt(custom_err.square().mean()).cpu()),
+        "custom_max": float(custom_err.max().cpu()),
+        "reference_mae": float(reference_err.mean().cpu()),
+        "reference_rmse": float(torch.sqrt(reference_err.square().mean()).cpu()),
+        "reference_max": float(reference_err.max().cpu()),
+    }
+
+
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
@@ -418,9 +560,8 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
     bits = 4
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     T = 7
-    slot_mapping = torch.tensor(
-        [0, 7, 130, -1, 5, 129, 3], dtype=torch.int32, device=device
-    )
+    slot_mapping = torch.arange(T, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
     torch.manual_seed(1234)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
@@ -441,6 +582,8 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
             key_cache=key_cache_ref,
             value_cache=value_cache_ref,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=1,
             bits_key=bits,
             bits_value=bits,
         )
@@ -448,79 +591,287 @@ def test_turboquant_4bit_pack_to_cache_op_matches_reference_cache(
             key.contiguous(),
             value.contiguous(),
             slot_mapping,
+            query_start_loc,
             *_turboquant_pack_tables(device, D, bits, dtype),
             key_cache_op,
             value_cache_op,
+            1,
             BS,
         )
         torch.npu.synchronize()
 
-    valid = slot_mapping.to(device="cpu", dtype=torch.int64) >= 0
-    tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-    slot_cpu = slot_mapping.to(device="cpu", dtype=torch.int64)[valid]
-    block_idx = torch.div(slot_cpu, BS, rounding_mode="floor").to(device)
-    block_off = (slot_cpu - torch.div(slot_cpu, BS, rounding_mode="floor") * BS).to(
-        device
+    _assert_4bit_slab_cache_close(
+        "key_cache",
+        key_cache_op,
+        key_cache_ref,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
     )
-    head_idx = torch.arange(H, device=device, dtype=torch.int64)
+    _assert_4bit_slab_cache_close(
+        "value_cache",
+        value_cache_op,
+        value_cache_ref,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
 
-    def _assert_4bit_pack_close(
-        name: str,
-        op_cache: torch.Tensor,
-        ref_cache: torch.Tensor,
-    ) -> None:
-        op_rows = _turboquant_slab_group4_to_row_format(
-            op_cache, head_size=D, bits=bits
-        )
-        ref_rows = _turboquant_slab_group4_to_row_format(
-            ref_cache, head_size=D, bits=bits
-        )
-        op_logical = op_rows[
-            block_idx[:, None], block_off[:, None], head_idx[None, :], :
-        ]
-        ref_logical = ref_rows[
-            block_idx[:, None], block_off[:, None], head_idx[None, :], :
-        ]
 
-        op_indices = unpack_uint4(op_logical[..., : row_w - 2], D).to(torch.int16)
-        ref_indices = unpack_uint4(ref_logical[..., : row_w - 2], D).to(torch.int16)
-        index_diff = (op_indices - ref_indices).abs()
-        assert int((index_diff > 1).sum().item()) == 0
-        assert int((index_diff != 0).sum().item()) <= max(
-            32, int(ref_indices.numel() * 0.02)
-        )
-        torch.testing.assert_close(
-            op_logical[..., row_w - 2 : row_w],
-            ref_logical[..., row_w - 2 : row_w],
-            rtol=0,
-            atol=0,
-        )
+@requires_npu
+def test_turboquant_4bit_pack_real_smoke_dump_quality_guard() -> None:
+    if not _c_ascend_turboquant_op_available(
+        "turboquant_pack_kv_for_cache_4bit"
+    ):
+        pytest.skip("turboquant_pack_kv_for_cache_4bit op not available")
+    if not REAL_SMOKE_DUMP_PATH.exists():
+        pytest.fail(f"missing real smoke dump fixture: {REAL_SMOKE_DUMP_PATH}")
 
-        with _patched_turboquant_env(
-            os.environ,
-            {
-                "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
-                "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
-            },
-            clear=False,
-        ):
-            op_decoded = turboquant_dequantize_from_packed_bytes(
-                op_logical.reshape(-1, row_w), head_size=D, dtype=dtype, bits=bits
-            )
-            ref_decoded = turboquant_dequantize_from_packed_bytes(
-                ref_logical.reshape(-1, row_w), head_size=D, dtype=dtype, bits=bits
+    try:
+        fixture = torch.load(
+            REAL_SMOKE_DUMP_PATH, map_location="cpu", weights_only=False
+        )
+    except TypeError:
+        fixture = torch.load(REAL_SMOKE_DUMP_PATH, map_location="cpu")
+
+    device = torch.device("npu:0")
+    dtype = torch.bfloat16
+    bits = int(fixture["bits"])
+    D = int(fixture["head_size"])
+    BS = int(fixture["block_size"])
+    row_w = turboquant_slab_row_bytes(D, bits=bits)
+    cb_k, rot_t_k = _turboquant_pack_tables(device, D, bits, dtype)
+    rotation = _get_quantizer(D, bits, device).rotation.to(torch.float32)
+
+    totals = {
+        "key": {
+            "custom_l1": 0.0,
+            "custom_l2": 0.0,
+            "reference_l1": 0.0,
+            "reference_l2": 0.0,
+            "count": 0,
+        },
+        "value": {
+            "custom_l1": 0.0,
+            "custom_l2": 0.0,
+            "reference_l1": 0.0,
+            "reference_l2": 0.0,
+            "count": 0,
+        },
+    }
+
+    env = {
+        "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
+        "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
+        "VLLM_ASCEND_TURBOQUANT_DECODE_OP": "0",
+    }
+    with _patched_turboquant_env(os.environ, env, clear=False):
+        for sample in fixture["samples"]:
+            key = sample["key_original"].to(device=device, dtype=dtype).contiguous()
+            value = sample["value_original"].to(device=device, dtype=dtype).contiguous()
+            slot_mapping = sample["slot_mapping"].to(device=device, dtype=torch.int32)
+            T, H, _ = key.shape
+            query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
+            B = int(slot_mapping.to(torch.int64).max().item()) // BS + 1
+            key_cache = torch.zeros(B, H, BS * row_w, dtype=torch.uint8, device=device)
+            value_cache = torch.zeros_like(key_cache)
+
+            torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+                key,
+                value,
+                slot_mapping,
+                query_start_loc,
+                cb_k,
+                rot_t_k,
+                key_cache,
+                value_cache,
+                1,
+                BS,
             )
             torch.npu.synchronize()
-        max_err = float((op_decoded.float() - ref_decoded.float()).abs().max().cpu())
-        assert max_err <= 0.25, f"{name} decoded max error too large: {max_err}"
+            key_custom_packed = _gather_4bit_slab_rows_for_test(
+                key_cache, slot_mapping, head_size=D, bits=bits
+            )
+            value_custom_packed = _gather_4bit_slab_rows_for_test(
+                value_cache, slot_mapping, head_size=D, bits=bits
+            )
+            key_reference_packed = turboquant_quantize_to_packed_bytes(
+                key, bits=bits
+            ).view(torch.uint8)
+            value_reference_packed = turboquant_quantize_to_packed_bytes(
+                value, bits=bits
+            ).view(torch.uint8)
 
-    _assert_4bit_pack_close("key_cache", key_cache_op, key_cache_ref)
-    _assert_4bit_pack_close("value_cache", value_cache_op, value_cache_ref)
+            torch.testing.assert_close(
+                key_custom_packed.cpu(),
+                sample["key_custom_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                value_custom_packed.cpu(),
+                sample["value_custom_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                key_reference_packed.cpu(),
+                sample["key_reference_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                value_reference_packed.cpu(),
+                sample["value_reference_packed"].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+
+            key_custom_dequant = _formula_dequantize_4bit_for_test(
+                key_custom_packed, rotation, head_size=D, dtype=dtype
+            )
+            value_custom_dequant = _formula_dequantize_4bit_for_test(
+                value_custom_packed, rotation, head_size=D, dtype=dtype
+            )
+            key_reference_dequant = turboquant_dequantize_from_packed_bytes(
+                key_reference_packed, head_size=D, dtype=dtype, bits=bits
+            )
+            value_reference_dequant = turboquant_dequantize_from_packed_bytes(
+                value_reference_packed, head_size=D, dtype=dtype, bits=bits
+            )
+
+            for name, original, custom_dequant, reference_dequant in (
+                ("key", key, key_custom_dequant, key_reference_dequant),
+                ("value", value, value_custom_dequant, value_reference_dequant),
+            ):
+                stats = _reconstruction_stats(
+                    original, custom_dequant, reference_dequant
+                )
+                expected = sample["summary"][name]
+                assert stats["custom_mae"] == pytest.approx(
+                    expected["custom_mae"], rel=0.0, abs=2e-3
+                )
+                assert stats["reference_mae"] == pytest.approx(
+                    expected["reference_mae"], rel=0.0, abs=2e-3
+                )
+                custom_err = (
+                    custom_dequant.to(torch.float32) - original.to(torch.float32)
+                )
+                reference_err = (
+                    reference_dequant.to(torch.float32) - original.to(torch.float32)
+                )
+                totals[name]["custom_l1"] += float(custom_err.abs().sum().cpu())
+                totals[name]["custom_l2"] += float(custom_err.square().sum().cpu())
+                totals[name]["reference_l1"] += float(reference_err.abs().sum().cpu())
+                totals[name]["reference_l2"] += float(reference_err.square().sum().cpu())
+                totals[name]["count"] += int(original.numel())
+
+            key_idx_custom = unpack_uint4(
+                key_custom_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            key_idx_ref = unpack_uint4(
+                key_reference_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            value_idx_custom = unpack_uint4(
+                value_custom_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            value_idx_ref = unpack_uint4(
+                value_reference_packed[..., : row_w - 2], D
+            ).to(torch.int16)
+            assert int((key_idx_custom - key_idx_ref).abs().max().item()) <= 1
+            assert int((value_idx_custom - value_idx_ref).abs().max().item()) <= 1
+
+    key_custom_mae = totals["key"]["custom_l1"] / totals["key"]["count"]
+    key_reference_mae = totals["key"]["reference_l1"] / totals["key"]["count"]
+    value_custom_mae = totals["value"]["custom_l1"] / totals["value"]["count"]
+    value_reference_mae = totals["value"]["reference_l1"] / totals["value"]["count"]
+    value_custom_rmse = (
+        totals["value"]["custom_l2"] / totals["value"]["count"]
+    ) ** 0.5
+    value_reference_rmse = (
+        totals["value"]["reference_l2"] / totals["value"]["count"]
+    ) ** 0.5
+
+    # Real smoke K/V shows that custom pack and Python/codebook reference can choose
+    # adjacent indices. The guard keeps those differences bounded and verifies that
+    # value reconstruction is not regressed versus the reference path.
+    assert key_custom_mae <= key_reference_mae * 1.001
+    assert value_custom_mae <= value_reference_mae
+    assert value_custom_rmse <= value_reference_rmse
 
 
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
+def test_turboquant_4bit_pack_to_cache_accepts_fused_qkv_views(
+    dtype: torch.dtype,
+) -> None:
+    if not _c_ascend_turboquant_op_available(
+        "turboquant_pack_kv_for_cache_4bit"
+    ):
+        pytest.skip("turboquant_pack_kv_for_cache_4bit op not available")
+
+    device = torch.device("npu:0")
+    B, BS, H, D = 2, KV_BLOCK_SIZE, 2, KV_HEAD_DIM
+    q_heads = 4
+    q_size = q_heads * D
+    kv_size = H * D
+    qkv_size = q_size + 2 * kv_size
+    bits = 4
+    row_w = turboquant_slab_row_bytes(D, bits=bits)
+    T = 7
+    slot_mapping = torch.arange(T, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=device)
+    torch.manual_seed(2468)
+    qkv = torch.randn(T, qkv_size, dtype=dtype, device=device)
+    key = qkv[:, q_size : q_size + kv_size].view(T, H, D)
+    value = qkv[:, q_size + kv_size :].view(T, H, D)
+    assert key.stride() == (qkv_size, D, 1)
+    assert value.stride() == (qkv_size, D, 1)
+    assert key.storage_offset() == q_size
+    assert value.storage_offset() == q_size + kv_size
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    key_cache_contig = torch.zeros(B, H, BS * row_w, dtype=torch.uint8, device=device)
+    value_cache_contig = torch.zeros_like(key_cache_contig)
+    key_cache_view = torch.zeros_like(key_cache_contig)
+    value_cache_view = torch.zeros_like(value_cache_contig)
+    cb_k, rot_t_k = _turboquant_pack_tables(device, D, bits, dtype)
+    torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+        key.contiguous(),
+        value.contiguous(),
+        slot_mapping,
+        query_start_loc,
+        cb_k,
+        rot_t_k,
+        key_cache_contig,
+        value_cache_contig,
+        1,
+        BS,
+    )
+    torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
+        key,
+        value,
+        slot_mapping,
+        query_start_loc,
+        cb_k,
+        rot_t_k,
+        key_cache_view,
+        value_cache_view,
+        1,
+        BS,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(key_cache_view, key_cache_contig, rtol=0, atol=0)
+    torch.testing.assert_close(value_cache_view, value_cache_contig, rtol=0, atol=0)
+
+
+@requires_npu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_turboquant_4bit_pack_to_cache_seq_aware_decode_matches_reference(
     dtype: torch.dtype,
 ) -> None:
     if not _c_ascend_turboquant_op_available(
@@ -533,11 +884,12 @@ def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
     bits = 4
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     slot_mapping = torch.tensor(
-        [0, 4, 8, 128, 132, 136, -1],
+        [0, 4, 8, 128, 132, 136],
         dtype=torch.int32,
         device=device,
     )
     T = int(slot_mapping.numel())
+    query_start_loc = torch.arange(T + 1, dtype=torch.int32, device=device)
     torch.manual_seed(4321)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
@@ -546,41 +898,62 @@ def test_turboquant_4bit_pack_to_cache_decode_direct_matches_general(
     key_cache_direct = torch.zeros_like(key_cache_general)
     value_cache_direct = torch.zeros_like(value_cache_general)
 
-    env = {
+    ref_env = {
         "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
-        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0",
         "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
     }
-    with _patched_turboquant_env(os.environ, env, clear=False):
+    op_env = dict(ref_env)
+    op_env["VLLM_ASCEND_TURBOQUANT_ENCODE_OP"] = "1"
+    with _patched_turboquant_env(os.environ, ref_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_general,
             value_cache=value_cache_general,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=T,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=0,
         )
+    with _patched_turboquant_env(os.environ, op_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_direct,
             value_cache=value_cache_direct,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=T,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=1,
-        )
-        torch.npu.synchronize()
+    )
+    torch.npu.synchronize()
 
-    torch.testing.assert_close(key_cache_direct, key_cache_general, rtol=0, atol=0)
-    torch.testing.assert_close(value_cache_direct, value_cache_general, rtol=0, atol=0)
+    _assert_4bit_slab_cache_close(
+        "key_cache",
+        key_cache_direct,
+        key_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
+    _assert_4bit_slab_cache_close(
+        "value_cache",
+        value_cache_direct,
+        value_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
 
 
 @requires_npu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_turboquant_4bit_pack_to_cache_logical_fast_matches_general(
+def test_turboquant_4bit_pack_to_cache_seq_aware_prefill_matches_reference(
     dtype: torch.dtype,
 ) -> None:
     if not _c_ascend_turboquant_op_available(
@@ -593,11 +966,12 @@ def test_turboquant_4bit_pack_to_cache_logical_fast_matches_general(
     bits = 4
     row_w = turboquant_slab_row_bytes(D, bits=bits)
     slot_mapping = torch.tensor(
-        [0, 1, 2, 3, 8, 9, 10, 11, 64, 66, 68, 70, -1],
+        [1, 2, 3, 128, 129, 130, 131, 132, 133],
         dtype=torch.int32,
         device=device,
     )
     T = int(slot_mapping.numel())
+    query_start_loc = torch.tensor([0, 3, T], dtype=torch.int32, device=device)
     torch.manual_seed(5678)
     key = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
     value = torch.randn(T, H, D, dtype=dtype, device=device).contiguous()
@@ -606,36 +980,57 @@ def test_turboquant_4bit_pack_to_cache_logical_fast_matches_general(
     key_cache_fast = torch.zeros_like(key_cache_general)
     value_cache_fast = torch.zeros_like(value_cache_general)
 
-    env = {
+    ref_env = {
         "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE": "1",
-        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "1",
+        "VLLM_ASCEND_TURBOQUANT_ENCODE_OP": "0",
         "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
     }
-    with _patched_turboquant_env(os.environ, env, clear=False):
+    op_env = dict(ref_env)
+    op_env["VLLM_ASCEND_TURBOQUANT_ENCODE_OP"] = "1"
+    with _patched_turboquant_env(os.environ, ref_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_general,
             value_cache=value_cache_general,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=2,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=0,
         )
+    with _patched_turboquant_env(os.environ, op_env, clear=False):
         turboquant_pack_kv_for_cache_to_cache(
             key=key,
             value=value,
             key_cache=key_cache_fast,
             value_cache=value_cache_fast,
             slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            num_reqs=2,
             bits_key=bits,
             bits_value=bits,
-            pack_mode=2,
-        )
-        torch.npu.synchronize()
+    )
+    torch.npu.synchronize()
 
-    torch.testing.assert_close(key_cache_fast, key_cache_general, rtol=0, atol=0)
-    torch.testing.assert_close(value_cache_fast, value_cache_general, rtol=0, atol=0)
+    _assert_4bit_slab_cache_close(
+        "key_cache",
+        key_cache_fast,
+        key_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
+    _assert_4bit_slab_cache_close(
+        "value_cache",
+        value_cache_fast,
+        value_cache_general,
+        slot_mapping,
+        head_size=D,
+        bits=bits,
+        dtype=dtype,
+    )
 
 
 def _num_blocks_for_cache_tokens(total_token_slots: int, *, block_size: int = KV_BLOCK_SIZE) -> int:
