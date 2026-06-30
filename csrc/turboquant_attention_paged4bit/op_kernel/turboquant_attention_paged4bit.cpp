@@ -1113,9 +1113,21 @@ private:
                                                         attnTmp0, attnTmp1, expLocal,
                                                         gqaCount, computeRows);
             } else {
+#if TQ_ATTN_QK_NORM_VECTOR
+                if (gqaCount == 2U) {
+                    turboquant_attn::VectorQkFloatNormVectorGqa2(
+                        qGroup, tileFloat, scoreTile, kNorm, attnTmp0, attnTmp1, expLocal,
+                        computeRows);
+                } else {
+                    turboquant_attn::VectorQkFloatNormVector(
+                        qGroup, tileFloat, scoreTile, kNorm, attnTmp0, attnTmp1, expLocal,
+                        gqaCount, computeRows, 1.f);
+                }
+#else
                 turboquant_attn::VectorQkFloat(qGroup, tileFloat, scoreTile, kNorm,
                                                attnTmp0, attnTmp1, expLocal,
                                                gqaCount, computeRows, 1.f);
+#endif
             }
 
             LoadPackedTileRows(valueCacheGm_, packedLocal, loadRows, seqIdx, kvHead, pos);
