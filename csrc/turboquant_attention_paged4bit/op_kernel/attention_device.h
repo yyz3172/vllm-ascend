@@ -12,6 +12,10 @@
 
 #include "kernel_operator.h"
 
+#ifndef TQ_ATTN_QK_NORM_VECTOR
+#define TQ_ATTN_QK_NORM_VECTOR 1
+#endif
+
 namespace turboquant_attn {
 
 static constexpr uint32_t TQ_ATTN_HEAD = 128;
@@ -105,9 +109,8 @@ __aicore__ inline void VectorQkFloat(
     }
 }
 
-// Vector QK with K row norm applied once per score row. This saves scalar norm
-// reads in qTile long-query paths, but the extra vector op is not worthwhile for
-// single-token decode.
+// Vector QK with K row norm applied via vector Mul over scoreVec[M]. Avoids per-row
+// GetValue/SetValue and V↔S sync in VectorQkFloat.
 __aicore__ inline void VectorQkFloatNormVector(
     AscendC::LocalTensor<float> qGroup,
     AscendC::LocalTensor<float> kTileFloat,
