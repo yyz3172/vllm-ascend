@@ -134,7 +134,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
@@ -164,6 +164,9 @@ class InstanceInfo:
 
 
 TAINT_PRIORITY = 1e15
+
+# jiuwen affinity release API lives at the server root, not under /v1.
+RELEASE_KV_CACHE_PATH = "/release_kv_cache"
 
 global_args: argparse.Namespace | None = None
 shared_scheduler: "SharedProxyScheduler | None" = None
@@ -246,6 +249,7 @@ class SharedProxyScheduler:
         self._lock = threading.RLock()
         self.request_num = 0
         self.waiting_nodes: dict[str, tuple[str, tuple[str, int], int]] = {}
+        self.session_to_prefiller: dict[str, str] = {}
         self._pools: dict[ServerRole, RolePools] = {
             ServerRole.PREFILL: RolePools(),
             ServerRole.DECODE: RolePools(),
@@ -330,6 +334,26 @@ class SharedProxyScheduler:
                     for _, e in sorted(self.decoders.items(), key=lambda item: item[1].ordinal)
                 ],
             }
+
+    def bind_session_prefiller(self, cache_salt: Any, prefiller_key: str) -> None:
+        if cache_salt is None:
+            return
+        with self._lock:
+            self.session_to_prefiller[str(cache_salt)] = prefiller_key
+
+    def get_session_prefiller(self, cache_salt: Any) -> str | None:
+        if cache_salt is None:
+            return None
+        with self._lock:
+            return self.session_to_prefiller.get(str(cache_salt))
+
+    def get_server(self, role: ServerRole, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            pool = self._pool(role)
+            entry = pool.servers.get(key)
+            if entry is None:
+                return None
+            return {"host": entry.host, "port": entry.port, "key": key}
 
     def log_status(self, msg: str) -> None:
         snapshot = self.get_snapshot()
@@ -673,6 +697,12 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Log level for the proxy server.",
     )
+    parser.add_argument(
+        "--release-timeout",
+        type=float,
+        default=1000,
+        help="Timeout (seconds) for /release_kv_cache passthrough requests",
+    )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
@@ -908,6 +938,12 @@ async def assign_instances(
     pick_prefill = "begin_request" if is_initial_request else "reserve_prefill_kv"
     prefiller = await runtime.schedule(pick_prefill, prefiller_score)
     prefiller_key = prefiller["key"]
+    if is_initial_request:
+        await runtime.schedule(
+            "bind_session_prefiller",
+            req_data.get("cache_salt"),
+            prefiller_key,
+        )
 
     try:
         response = await send_request_to_service(
@@ -1141,6 +1177,99 @@ async def adjust_instances_impl(adjust_mode: str, request: Request):
 
 def parse_server_addresses(instances: list[str]) -> list[tuple[str, int]]:
     return [(host, int(port)) for host, port in (instance.split(":") for instance in instances)]
+
+
+async def _resolve_release_prefiller(cache_salt: Any) -> str:
+    runtime = get_runtime()
+    key = await runtime.schedule("get_session_prefiller", cache_salt)
+    if key is not None:
+        return key
+    snapshot = await runtime.schedule("get_snapshot")
+    prefills = snapshot.get("prefill_instances") or []
+    if len(prefills) == 1:
+        only = prefills[0]
+        return server_key(only["host"], only["port"])
+    if not prefills:
+        raise HTTPException(status_code=503, detail="No prefiller servers available")
+    logger.warning(
+        "No prefiller mapping for cache_salt=%s, forwarding release to first prefiller",
+        cache_salt,
+    )
+    first = prefills[0]
+    return server_key(first["host"], first["port"])
+
+
+async def _handle_release_kv_cache(request: Request):
+    runtime = get_runtime()
+    args = get_global_args()
+    req_data = await request.json()
+
+    prefiller_key = await _resolve_release_prefiller(req_data.get("cache_salt"))
+    server = await runtime.schedule("get_server", ServerRole.PREFILL, prefiller_key)
+    if server is None:
+        raise HTTPException(status_code=503, detail="Prefiller server not available")
+
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+    last_exc: Exception | None = None
+    base_url = build_server_url(server["host"], server["port"])
+
+    for attempt in range(1, args.max_retries + 1):
+        try:
+            target_url = f"{base_url}{RELEASE_KV_CACHE_PATH}"
+            logger.info(
+                "Forwarding release to %s (cache_salt=%s)",
+                target_url,
+                req_data.get("cache_salt"),
+            )
+            async with httpx.AsyncClient(
+                timeout=None,
+                base_url=base_url,
+                limits=httpx.Limits(
+                    max_connections=100000, max_keepalive_connections=100000
+                ),
+            ) as client:
+                response = await client.post(
+                    RELEASE_KV_CACHE_PATH,
+                    json=req_data,
+                    headers=headers,
+                    timeout=args.release_timeout,
+                )
+            if response.status_code >= 400:
+                logger.warning(
+                    "Release attempt %s failed for cache_salt=%s on %s: %s",
+                    attempt,
+                    req_data.get("cache_salt"),
+                    base_url,
+                    response.text,
+                )
+                if attempt < args.max_retries:
+                    await asyncio.sleep(args.retry_delay * (2 ** (attempt - 1)))
+                    continue
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as e:
+            logger.warning(
+                "Release attempt %s failed for cache_salt=%s on %s: %s",
+                attempt,
+                req_data.get("cache_salt"),
+                base_url,
+                str(e),
+            )
+            last_exc = e
+            if attempt < args.max_retries:
+                await asyncio.sleep(args.retry_delay * (2 ** (attempt - 1)))
+
+    logger.error(
+        "All %s release attempts failed for cache_salt=%s on %s",
+        args.max_retries,
+        req_data.get("cache_salt"),
+        base_url,
+    )
+    raise HTTPException(status_code=502, detail=str(last_exc))
+
+
+@app.post(RELEASE_KV_CACHE_PATH)
+async def handle_release_kv_cache(request: Request):
+    return await _handle_release_kv_cache(request)
 
 
 @app.post("/v1/completions")
