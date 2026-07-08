@@ -278,6 +278,31 @@ void turboquant_pack_kv_for_cache_to_cache_meta(
     (void)slot_w_v;
 }
 
+void turboquant_pack_kv_for_cache_k8v4_meta(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation_t,
+    const at::Tensor &codebook_value,
+    const at::Tensor &rotation_t_value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    (void)key;
+    (void)value;
+    (void)codebook;
+    (void)rotation_t;
+    (void)codebook_value;
+    (void)rotation_t_value;
+    (void)slot_mapping;
+    (void)key_cache;
+    (void)value_cache;
+    (void)slot_w_k;
+    (void)slot_w_v;
+}
+
 std::tuple<at::Tensor, at::Tensor> turboquant_decode_paged_8bit_meta(
     const at::Tensor &key_cache,
     const at::Tensor &value_cache,
@@ -303,6 +328,41 @@ std::tuple<at::Tensor, at::Tensor> turboquant_decode_paged_8bit_meta(
 }
 
 at::Tensor turboquant_fused_infer_attention_score_8bit_meta(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& block_table,
+    const at::Tensor& atten_mask,
+    const at::Tensor& actual_seq_len_q,
+    const at::Tensor& actual_seq_len_kv,
+    const at::Tensor& codebook,
+    const at::Tensor& rotation,
+    const at::Tensor& codebook_value,
+    const at::Tensor& rotation_value,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t block_size,
+    double scale_value) {
+    (void)key_cache;
+    (void)value_cache;
+    (void)block_table;
+    (void)atten_mask;
+    (void)actual_seq_len_q;
+    (void)actual_seq_len_kv;
+    (void)codebook;
+    (void)rotation;
+    (void)codebook_value;
+    (void)rotation_value;
+    (void)num_heads;
+    (void)num_kv_heads;
+    (void)head_size;
+    (void)block_size;
+    (void)scale_value;
+    return at::empty_symint(query.sym_sizes(), query.options().dtype(query.scalar_type()).device(at::kMeta));
+}
+
+at::Tensor turboquant_fused_infer_attention_score_k8v4_meta(
     const at::Tensor& query,
     const at::Tensor& key_cache,
     const at::Tensor& value_cache,
@@ -775,9 +835,11 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("turboquant_pack_kv_for_cache_v2_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
     ops.impl("turboquant_pack_kv_for_cache_v3_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
     ops.impl("turboquant_pack_kv_for_cache_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_k8v4", &vllm_ascend::meta::turboquant_pack_kv_for_cache_k8v4_meta);
 
     ops.impl("turboquant_pack_register_tables", &vllm_ascend::meta::turboquant_pack_register_tables_meta);
     ops.impl("turboquant_fused_infer_attention_score_8bit", &vllm_ascend::meta::turboquant_fused_infer_attention_score_8bit_meta);
+    ops.impl("turboquant_fused_infer_attention_score_k8v4", &vllm_ascend::meta::turboquant_fused_infer_attention_score_k8v4_meta);
     ops.impl("turboquant_decode_paged_8bit", &vllm_ascend::meta::turboquant_decode_paged_8bit_meta);
 }
 }

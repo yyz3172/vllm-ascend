@@ -21,6 +21,26 @@ namespace {
 static constexpr uint32_t TQ_CODEBOOK_SIZE = 256;
 static constexpr uint32_t TQ_HEAD_SIZE = 128;
 static constexpr uint32_t TQ_PACKED_BYTES = TQ_HEAD_SIZE + 2;
+static constexpr uint32_t TQ_COPY_STRIDE = 160U;  // align_up(130, 32)
+
+template <AscendC::HardEvent EVT>
+__aicore__ inline void SyncHardEvent()
+{
+    event_t event = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVT));
+    AscendC::SetFlag<EVT>(event);
+    AscendC::WaitFlag<EVT>(event);
+}
+
+__aicore__ inline void CopyPackedRowToLocal(AscendC::LocalTensor<uint8_t>& packedLocal,
+                                            const AscendC::GlobalTensor<uint8_t>& cacheGm,
+                                            uint64_t gmIdx,
+                                            uint32_t logicalBytes)
+{
+    AscendC::DataCopyExtParams copyParams{1, logicalBytes, 0, 0, 0};
+    AscendC::DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+    AscendC::DataCopyPad(packedLocal, cacheGm[gmIdx], copyParams, padParams);
+    SyncHardEvent<AscendC::HardEvent::MTE2_S>();
+}
 
 __aicore__ inline uint32_t FindSeqForToken(uint32_t tokenIdx,
                                           const AscendC::GlobalTensor<int32_t>& actualSeqLenQ,
@@ -88,8 +108,9 @@ public:
         outGm_.SetGlobalBuffer((__gm__ half*)out,
                                static_cast<uint64_t>(numTokens_) * numHeads_ * headSize_);
 
-        pipe_->InitBuffer(packedBuf_, TQ_PACKED_BYTES * sizeof(uint8_t));
+        pipe_->InitBuffer(packedBuf_, TQ_COPY_STRIDE * sizeof(uint8_t));
         pipe_->InitBuffer(queryBuf_, TQ_HEAD_SIZE * sizeof(half));
+        pipe_->InitBuffer(outBuf_, TQ_HEAD_SIZE * sizeof(half));
         pipe_->InitBuffer(expBuf_, 4 * sizeof(float));
         pipe_->InitBuffer(normU16Buf_, sizeof(uint16_t));
     }
@@ -112,8 +133,22 @@ private:
     {
         auto expLocal = expBuf_.Get<float>();
         expLocal.SetValue(0, x);
+        SyncHardEvent<AscendC::HardEvent::S_V>();
         AscendC::Exp(expLocal, expLocal, 1);
+        AscendC::PipeBarrier<PIPE_V>();
+        SyncHardEvent<AscendC::HardEvent::V_S>();
         return expLocal.GetValue(0);
+    }
+
+    __aicore__ inline void StoreOutput(uint64_t outOff, const float* values)
+    {
+        auto outLocal = outBuf_.Get<half>();
+        for (uint32_t d = 0; d < TQ_HEAD_SIZE; ++d) {
+            outLocal.SetValue(d, static_cast<half>(values[d]));
+        }
+        SyncHardEvent<AscendC::HardEvent::S_MTE3>();
+        AscendC::DataCopy(outGm_[outOff], outLocal, TQ_HEAD_SIZE);
+        SyncHardEvent<AscendC::HardEvent::MTE3_S>();
     }
 
     __aicore__ inline void LoadQuery(uint32_t tokenIdx, uint32_t headIdx, float qf[TQ_HEAD_SIZE])
@@ -121,6 +156,7 @@ private:
         auto qLocal = queryBuf_.Get<half>();
         const uint64_t qOff = (static_cast<uint64_t>(tokenIdx) * numHeads_ + headIdx) * headSize_;
         AscendC::DataCopy(qLocal, queryGm_[qOff], headSize_);
+        SyncHardEvent<AscendC::HardEvent::MTE2_S>();
         for (uint32_t d = 0; d < headSize_; ++d) {
             qf[d] = static_cast<float>(qLocal.GetValue(d));
         }
@@ -136,7 +172,7 @@ private:
         // packedBytes == headSize + 2.
         const uint64_t idx =
             (((static_cast<uint64_t>(blockId) * blockSize_ + posInBlock) * numKvHeads_ + kvHead) * TQ_PACKED_BYTES);
-        AscendC::DataCopy(packedLocal, cache[idx], TQ_PACKED_BYTES);
+        CopyPackedRowToLocal(packedLocal, cache, idx, TQ_PACKED_BYTES);
     }
 
     __aicore__ inline void DecodeRotateDot(const AscendC::LocalTensor<uint8_t>& packedLocal,
@@ -205,12 +241,12 @@ private:
 
         // DecodeOnly: one query token per seq; tokenIdx corresponds to seq order.
         const uint32_t kvLen = static_cast<uint32_t>(actualSeqLenKvGm_.GetValue(seqIdx));
+        const uint64_t outOff =
+            (static_cast<uint64_t>(tokenIdx) * numHeads_ + headIdx) * headSize_;
         if (kvLen == 0) {
-            // Write zeros.
-            const uint64_t outOff = (static_cast<uint64_t>(tokenIdx) * numHeads_ + headIdx) * headSize_;
-            for (uint32_t d = 0; d < headSize_; ++d) {
-                outGm_.SetValue(outOff + d, (half)0);
-            }
+            float zeros[TQ_HEAD_SIZE];
+            for (uint32_t d = 0; d < TQ_HEAD_SIZE; ++d) zeros[d] = 0.0f;
+            StoreOutput(outOff, zeros);
             return;
         }
 
@@ -222,7 +258,8 @@ private:
         float outAcc[TQ_HEAD_SIZE];
         for (uint32_t d = 0; d < TQ_HEAD_SIZE; ++d) outAcc[d] = 0.0f;
 
-        const uint32_t kvHead = headIdx % numKvHeads_;
+        const uint32_t gqaGroup = numHeads_ / numKvHeads_;
+        const uint32_t kvHead = headIdx / gqaGroup;
         const uint32_t lastPos = kvLen - 1;  // causal bound for decode token
 
         auto packedLocal = packedBuf_.Get<uint8_t>();
@@ -252,11 +289,16 @@ private:
             m = mNew;
         }
 
-        const float invS = 1.0f / s;
-        const uint64_t outOff = (static_cast<uint64_t>(tokenIdx) * numHeads_ + headIdx) * headSize_;
-        for (uint32_t d = 0; d < TQ_HEAD_SIZE; ++d) {
-            outGm_.SetValue(outOff + d, static_cast<half>(outAcc[d] * invS));
+        if (!(s > 0.0f)) {
+            for (uint32_t d = 0; d < TQ_HEAD_SIZE; ++d) outAcc[d] = 0.0f;
+            StoreOutput(outOff, outAcc);
+            return;
         }
+        const float invS = 1.0f / s;
+        for (uint32_t d = 0; d < TQ_HEAD_SIZE; ++d) {
+            outAcc[d] *= invS;
+        }
+        StoreOutput(outOff, outAcc);
     }
 
 private:
@@ -285,6 +327,7 @@ private:
 
     AscendC::TBuf<AscendC::TPosition::VECCALC> packedBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> queryBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> outBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> expBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> normU16Buf_;
 };

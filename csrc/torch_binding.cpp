@@ -59,6 +59,10 @@
 #include "turboquant_fused_infer_attention_score8bit/op_host/aclnn_turboquant_fused_infer_attention_score8bit.h"
 #include "turboquant_attention_paged8bit/op_host/aclnn_turboquant_attention_paged8bit.h"
 #include "turboquant_attention_paged4bit/turboquant_attention_paged4bit_torch_adpt.h"
+#include "turboquant_fused_infer_attention_score_k8v4/op_host/aclnn_turboquant_fused_infer_attention_score_k8v4.h"
+#include "turboquant_fused_infer_attention_score_k8v4/turboquant_fused_infer_attention_score_k8v4_torch_adpt.h"
+#include "turboquant_pack_kv_for_cache_k8v4/op_host/aclnn_turboquant_pack_kv_for_cache_k8v4.h"
+#include "turboquant_pack_kv_for_cache_k8v4/turboquant_pack_kv_for_cache_k8v4_torch_adpt.h"
 #include "turboquant_decode_paged8bit/op_host/aclnn_turboquant_decode_paged8bit.h"
 #include "aclnnop/aclnn_fused_infer_attention_score_v3.h"
 #include <c10/core/Device.h>
@@ -2048,6 +2052,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("turboquant_pack_kv_for_cache_to_cache", torch::kPrivateUse1,
              &vllm_ascend::turboquant_pack_kv_for_cache_to_cache);
 
+    // K8V4 fused pack: explicit K (8-bit) and V (4-bit) codebook/rotation tables.
+    ops.def(
+        "turboquant_pack_kv_for_cache_k8v4(Tensor key, Tensor value, Tensor codebook, "
+        "Tensor rotation_t, Tensor codebook_value, Tensor rotation_t_value, Tensor slot_mapping, "
+        "Tensor! key_cache, Tensor! value_cache, int slot_w_k, int slot_w_v) -> ()");
+    ops.impl("turboquant_pack_kv_for_cache_k8v4", torch::kPrivateUse1,
+             &vllm_ascend::turboquant_pack_kv_for_cache_k8v4);
+
     ops.def(
         "turboquant_pack_kv_for_cache_4bit(Tensor key, Tensor value, Tensor slot_mapping, "
         "Tensor query_start_loc, Tensor codebook, Tensor rotation_t, Tensor! key_cache, "
@@ -2076,6 +2088,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "turboquant_fused_infer_attention_score_8bit",
         torch::kPrivateUse1,
         &vllm_ascend::turboquant_fused_infer_attention_score_8bit);
+
+    // K8V4: key 8-bit, value 4-bit fused decode + paged attention.
+    ops.def(
+        "turboquant_fused_infer_attention_score_k8v4("
+        "Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, "
+        "Tensor atten_mask, Tensor actual_seq_len_q, Tensor actual_seq_len_kv, "
+        "Tensor codebook, Tensor rotation, Tensor codebook_value, Tensor rotation_value, "
+        "int num_heads, int num_kv_heads, int head_size, int block_size, float scale_value"
+        ") -> Tensor"
+    );
+    ops.impl(
+        "turboquant_fused_infer_attention_score_k8v4",
+        torch::kPrivateUse1,
+        &vllm_ascend::turboquant_fused_infer_attention_score_k8v4);
 
     ops.def(
         "turboquant_attention_paged8bit("

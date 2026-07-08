@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
@@ -65,6 +66,7 @@ from vllm_ascend.ops.turboquant_kv_cache import (
     ensure_turboquant_pack_tables_registered,
     turboquant_decode_kv_cache_compact,
     turboquant_fused_infer_attention_score_8bit,
+    turboquant_fused_infer_attention_score_k8v4,
     turboquant_pack_kv_for_cache,
     turboquant_pack_kv_for_cache_to_cache,
     turboquant_packed_bytes_per_vector,
@@ -1042,6 +1044,33 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and query.dtype == torch.float16
             ):
                 attn_output = turboquant_fused_infer_attention_score_8bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    atten_mask=attn_metadata.attn_mask,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                output[:num_tokens] = attn_output[:num_tokens]
+                return output
+            elif (
+                self.sinks is None
+                and self.turboquant_kv_bits_key == 8
+                and self.turboquant_kv_bits_value == 4
+                and self.head_size == 128
+                and query.dtype in (torch.float16, torch.bfloat16)
+                and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and envs_ascend.VLLM_ASCEND_TURBOQUANT_FUSED_FIA_K8V4
+            ):
+                attn_output = turboquant_fused_infer_attention_score_k8v4(
                     query=query,
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,

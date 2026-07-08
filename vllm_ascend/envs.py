@@ -73,6 +73,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 4-bit MSE path only; 8-bit falls back to PyTorch.
     "VLLM_ASCEND_TURBOQUANT_ENCODE_OP":
     lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_ENCODE_OP", "1"))),
+    # Use the fused K8V4 infer-attention-score custom op on the read path
+    # (key 8-bit, value 4-bit). Default ON; set to 0 to fall back to
+    # decode(reference)+FIA for A/B comparison.
+    "VLLM_ASCEND_TURBOQUANT_FUSED_FIA_K8V4":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_FUSED_FIA_K8V4", "1"))),
     # Use the 8-bit paged decode custom op (design doc §2.6 / Phase 1, scheme A):
     # folds block_table addressing into the kernel and decodes packed uint8 KV
     # cache to compact fp16 K/V, replacing the unique/searchsorted + PyTorch
