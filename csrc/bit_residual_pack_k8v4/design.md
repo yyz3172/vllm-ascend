@@ -1,34 +1,26 @@
-# BitResidual Pack KV For Cache
+# BitResidualPackK8v4 简要说明
 
-`bit_residual_pack_kv_for_cache` packs token-major K/V tensors into a
-field-major paged cache for the 1-bit sign + 7-bit residual quantizer.
+`bit_residual_pack_k8v4` 将 token-major 的 Key/Value 张量写入新的
+BitResidual KV cache 布局。
 
-Scope:
+当前实现范围：
 
-- `head_size=128`
-- K/V input dtype: fp16 or bf16
-- `rotation_t` dtype: fp16, shape `[128, 128]`
-- cache dtype: uint8, shape `[num_blocks, num_heads, block_size * 134]`
-- pack pipeline follows `turboquant_pack_kv_for_cache_v2_to_cache`: linear row
-  batching, normalize, KFC rotate matmul, encode, slot-mapped write-out
+- `head_size = 128`。
+- Key/Value/`rotation_t` 支持 `fp16` 和 `bf16`，三者 dtype 必须一致。
+- 输入布局为 `[num_tokens, num_heads, 128]`，支持 stride 传入。
+- `slot_mapping` 和 `query_start_loc` 为 `int32`。
+- `block_size` 必须是 4 的倍数。
+- Key cache 和 Value cache 均以 `uint8` 暴露，但内部按 `uint16[128]`
+  group 解释。
 
-Algorithm per vector:
+cache 布局：
 
-1. `norm = ||x||`
-2. `n = x / (norm + eps)`
-3. `y = n @ R^T`
-4. `sign = y >= 0`
-5. `err = y - (+/- 1/sqrt(128))`
-6. `base = min(err)`, `step = (max(err) - base) / 127`
-7. `q7 = round((err - base) / step)`
-8. code byte per dim: `(q7 << 1) | sign`, with sign in the lowest bit
+- Key: 每 2 行组成一个 group，每个 group stride 为 288 bytes。
+- Value: 每 4 行组成一个 group，每个 group stride 为 288 bytes。
+- Key group 保存 `uint16[128]` packed code、`uint16[2]` norm、
+  `float[2]` base 和 `float[2]` step。
+- Value group 保存 `uint16[128]` packed idx4、`float[4]` vmin 和
+  `float[4]` vstep。
 
-Cache layout inside each `(block, head)` pageblock:
-
-```text
-[ block_size * 128 code bytes ][ block_size fp16 norms ]
-[ block_size fp16 bases ][ block_size fp16 steps ]
-```
-
-The first implementation intentionally avoids the grouped 4-bit slab memory
-management used by `turboquant_pack_kv_for_cache4bit`.
+详细算法、每核任务划分、group merge 和接口变更见
+`IMPL_DESIGN.md`。

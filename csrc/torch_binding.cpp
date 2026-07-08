@@ -53,7 +53,7 @@
 #include "turboquant_pack_kv_for_cache_v2/op_host/aclnn_turboquant_pack_kv_for_cache_v2.h"
 #include "turboquant_pack_kv_for_cache_v2_to_cache/op_host/aclnn_turboquant_pack_kv_for_cache_v2_to_cache.h"
 #include "turboquant_pack_kv_for_cache_v3/op_host/aclnn_turboquant_pack_kv_for_cache_v3.h"
-#include "bit_residual_pack_kv_for_cache/op_host/aclnn_bit_residual_pack_kv_for_cache.h"
+#include "bit_residual_pack_k8v4/op_host/aclnn_bit_residual_pack_k8v4.h"
 #include "turboquant_pack_kv_for_cache4bit/op_host/aclnn_turboquant_pack_kv_for_cache4bit.h"
 #include <mutex>
 #include <unordered_map>
@@ -530,22 +530,28 @@ void turboquant_pack_kv_for_cache_v3_to_cache(
         key, value, slot_mapping, key_cache, value_cache, slot_w_k, slot_w_v);
 }
 
-void bit_residual_pack_kv_for_cache(
+void bit_residual_pack_k8v4(
     const at::Tensor &key,
     const at::Tensor &value,
     const at::Tensor &slot_mapping,
+    const at::Tensor &query_start_loc,
     const at::Tensor &rotation_t,
     at::Tensor &key_cache,
     at::Tensor &value_cache,
+    int64_t num_reqs,
     int64_t block_size) {
     constexpr int64_t kHeadSize = 128;
-    constexpr int64_t kRowBytes = kHeadSize + 6;
+    constexpr int64_t kGroupStride = 288;
+    constexpr int64_t kKeyGroupRows = 2;
+    constexpr int64_t kValueGroupRows = 4;
     TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
     TORCH_CHECK(slot_mapping.is_privateuseone(), "slot_mapping must be on NPU");
+    TORCH_CHECK(query_start_loc.is_privateuseone(), "query_start_loc must be on NPU");
     TORCH_CHECK(rotation_t.is_privateuseone(), "rotation_t must be on NPU");
     TORCH_CHECK(key_cache.is_privateuseone() && value_cache.is_privateuseone(),
                 "key_cache/value_cache must be on NPU");
     TORCH_CHECK(key.device() == value.device() && key.device() == slot_mapping.device() &&
+                    key.device() == query_start_loc.device() &&
                     key.device() == rotation_t.device() &&
                     key.device() == key_cache.device() && key.device() == value_cache.device(),
                 "all tensors must be on the same NPU device");
@@ -554,22 +560,26 @@ void bit_residual_pack_kv_for_cache(
     TORCH_CHECK(key.scalar_type() == at::kHalf || key.scalar_type() == at::kBFloat16,
                 "BitResidual pack accepts fp16/bf16 key/value");
     TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "slot_mapping must be int32");
-    TORCH_CHECK(rotation_t.scalar_type() == at::kHalf,
-                "BitResidual pack currently expects fp16 rotation_t");
-    TORCH_CHECK(rotation_t.dim() == 2 && rotation_t.size(0) == kHeadSize &&
+    TORCH_CHECK(query_start_loc.scalar_type() == at::kInt, "query_start_loc must be int32");
+    TORCH_CHECK(rotation_t.scalar_type() == key.scalar_type() &&
+                    rotation_t.dim() == 2 && rotation_t.size(0) == kHeadSize &&
                     rotation_t.size(1) == kHeadSize,
-                "rotation_t must be [128,128]");
+                "rotation_t must be [128,128] and match key/value dtype");
     TORCH_CHECK(key_cache.scalar_type() == at::kByte && value_cache.scalar_type() == at::kByte,
                 "key_cache/value_cache must be uint8");
     TORCH_CHECK(key_cache.dim() == 3 && value_cache.dim() == 3,
-                "BitResidual caches must be [num_blocks, num_heads, block_size * 134]");
+                "BitResidual k8v4 caches must be [num_blocks, num_heads, packed_bytes]");
     TORCH_CHECK(key_cache.size(0) == value_cache.size(0) &&
-                    key_cache.size(1) == value_cache.size(1) &&
-                    key_cache.size(2) == value_cache.size(2),
-                "key/value cache shapes must match");
+                    key_cache.size(1) == value_cache.size(1),
+                "key/value cache num_blocks and num_heads must match");
     TORCH_CHECK(block_size > 0, "block_size must be > 0");
-    TORCH_CHECK(key_cache.size(2) == block_size * kRowBytes,
-                "cache last dim must equal block_size * 134");
+    TORCH_CHECK(num_reqs > 0, "num_reqs must be > 0");
+    TORCH_CHECK(block_size % kValueGroupRows == 0,
+                "BitResidual k8v4 cache layout requires block_size to be a multiple of 4");
+    TORCH_CHECK(key_cache.size(2) == (block_size / kKeyGroupRows) * kGroupStride,
+                "key_cache last dim must equal (block_size / 2) * 288");
+    TORCH_CHECK(value_cache.size(2) == (block_size / kValueGroupRows) * kGroupStride,
+                "value_cache last dim must equal (block_size / 4) * 288");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous(),
                 "BitResidual caches must be contiguous");
 
@@ -590,19 +600,40 @@ void bit_residual_pack_kv_for_cache(
     TORCH_CHECK(n_vec == token_count * num_heads,
                 "key/value row count must equal num_tokens * num_heads");
     TORCH_CHECK(slot_mapping.numel() >= token_count, "slot_mapping length is smaller than token count");
+    TORCH_CHECK(query_start_loc.dim() == 1, "query_start_loc must be a 1-D tensor");
+    TORCH_CHECK(query_start_loc.numel() >= num_reqs + 1,
+                "query_start_loc length must be at least num_reqs + 1");
 
+    const bool key_strided_copy_supported =
+        key.stride(2) == 1 && key.stride(0) > 0 && key.stride(1) > 0;
+    const bool value_strided_copy_supported =
+        value.stride(2) == 1 && value.stride(0) > 0 && value.stride(1) > 0;
     at::Tensor key_work = key;
     at::Tensor value_work = value;
     at::Tensor slot_work = slot_mapping;
+    at::Tensor query_start_work = query_start_loc;
     at::Tensor rotation_work = rotation_t;
-    if (!key_work.is_contiguous()) {
-        key_work = key_work.contiguous();
+    if (!key_strided_copy_supported) {
+        if (!key_work.is_contiguous()) {
+            key_work = key_work.contiguous();
+        }
+        if (key_work.storage_offset() != 0) {
+            key_work = key_work.clone(at::MemoryFormat::Contiguous);
+        }
     }
-    if (!value_work.is_contiguous()) {
-        value_work = value_work.contiguous();
+    if (!value_strided_copy_supported) {
+        if (!value_work.is_contiguous()) {
+            value_work = value_work.contiguous();
+        }
+        if (value_work.storage_offset() != 0) {
+            value_work = value_work.clone(at::MemoryFormat::Contiguous);
+        }
     }
     if (!slot_work.is_contiguous()) {
         slot_work = slot_work.contiguous();
+    }
+    if (!query_start_work.is_contiguous()) {
+        query_start_work = query_start_work.contiguous();
     }
     if (!rotation_work.is_contiguous()) {
         rotation_work = rotation_work.contiguous();
@@ -615,18 +646,45 @@ void bit_residual_pack_kv_for_cache(
             vec_per_core = 16;
         }
     }
+    const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
+    const int64_t num_blocks = key_cache.size(0);
+    const int64_t key_stride_token = key_work.stride(0);
+    const int64_t key_stride_head = key_work.stride(1);
+    const int64_t value_stride_token = value_work.stride(0);
+    const int64_t value_stride_head = value_work.stride(1);
+    // ConvertType passes tensor storage_offset to ACL, and the GM_ADDR seen by
+    // the AscendC kernel is already at the logical tensor view. Keep the
+    // kernel-side offset at zero to avoid applying storage_offset twice.
+    const int64_t key_storage_offset = 0;
+    const int64_t value_storage_offset = 0;
+    constexpr int64_t kMaxKernelStride = std::numeric_limits<uint32_t>::max();
+    TORCH_CHECK(key_stride_token > 0 && key_stride_head > 0 &&
+                    value_stride_token > 0 && value_stride_head > 0 &&
+                    key_stride_token <= kMaxKernelStride &&
+                    key_stride_head <= kMaxKernelStride &&
+                    value_stride_token <= kMaxKernelStride &&
+                    value_stride_head <= kMaxKernelStride,
+                "key/value strides must be positive and fit uint32_t");
     const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
     EXEC_NPU_CMD(
-        aclnnBitResidualPackKvForCache,
+        aclnnBitResidualPackK8v4,
         key_work,
         value_work,
         rotation_work,
         slot_work,
+        query_start_work,
         n_vec,
-        static_cast<int64_t>(vec_per_core),
+        vec_per_core_i64,
         num_heads,
         block_size,
-        key_cache.size(0),
+        num_blocks,
+        num_reqs,
+        key_stride_token,
+        key_stride_head,
+        value_stride_token,
+        value_stride_head,
+        key_storage_offset,
+        value_storage_offset,
         key_cache,
         value_cache);
 }
@@ -2145,10 +2203,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::turboquant_pack_kv_for_cache_v3_to_cache);
 
     ops.def(
-        "bit_residual_pack_kv_for_cache(Tensor key, Tensor value, Tensor slot_mapping, "
-        "Tensor rotation_t, Tensor! key_cache, Tensor! value_cache, int block_size) -> ()");
-    ops.impl("bit_residual_pack_kv_for_cache", torch::kPrivateUse1,
-             &vllm_ascend::bit_residual_pack_kv_for_cache);
+        "bit_residual_pack_k8v4(Tensor key, Tensor value, Tensor slot_mapping, "
+        "Tensor query_start_loc, Tensor rotation_t, Tensor! key_cache, "
+        "Tensor! value_cache, int num_reqs, int block_size) -> ()");
+    ops.impl("bit_residual_pack_k8v4", torch::kPrivateUse1,
+             &vllm_ascend::bit_residual_pack_k8v4);
 
     ops.def(
         "turboquant_pack_kv_for_cache_to_cache(Tensor key, Tensor value, Tensor slot_mapping, "
