@@ -1,6 +1,7 @@
 set(_TQ_PACK_COMPILE_OPTIONS
         --cce-auto-sync=on
         -DASCENDC_DUMP=0
+        -I${CMAKE_SOURCE_DIR}/third_party/catlass/include
         -Wno-deprecated-declarations
         -Werror
 )

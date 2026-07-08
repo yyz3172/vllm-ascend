@@ -69,8 +69,9 @@ ge::graphStatus FillKfcCubeTiling(
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
 
-    // KFC mode: A from VECOUT (L1), B from GM, C to VECIN (L1).
-    // L1 holds both xBatch (A input) and yBatch (C output), so constrain baseM.
+    // Kept for tiling-data ABI compatibility. The kernel uses direct Mmad and
+    // does not register a Matmul object, but the generated tiling layout still
+    // contains TCubeTiling.
     constexpr uint32_t mmDataTypeSize = 2;  // fp16/bf16
     const uint32_t l1Usable = static_cast<uint32_t>(l1Size);
     // baseM*baseK + baseM*baseN <= l1Usable (A + C share L1)
@@ -95,7 +96,7 @@ ge::graphStatus FillKfcCubeTiling(
     }
 
     // Override with L1-aware baseM; keep auto baseN/baseK from GetTiling.
-    // Force usedCoreNum=1: each AIV worker calls IterateAll independently.
+    // Direct Mmad uses one resident rotation matrix per AIC group.
     cubeTiling.set_baseM(static_cast<uint32_t>(baseM));
     cubeTiling.set_usedCoreNum(1);
     return ge::GRAPH_SUCCESS;
@@ -267,7 +268,9 @@ static ge::graphStatus BitResidualPackK8v4TilingFunc(gert::TilingContext* contex
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    // KFC message queues and CANN internal workspace.
+    // 512 KiB is reserved before the manual A/C bridge workspace. The bridge
+    // needs 2 ping-pong buffers * (A + C) * 64*128 elements per data group,
+    // so 16 MiB is enough for current 910B/C MIX 1C2V group counts.
     workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
     context->SetTilingKey(tilingKey);
