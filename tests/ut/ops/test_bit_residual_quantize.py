@@ -31,6 +31,11 @@ import torch
 from vllm_ascend.ops.bit_residual_quantize import (
     bit_residual_quantize,
     bit_residual_dequantize,
+    bit_residual_block_bytes,
+    bit_residual_pack_to_block_bytes,
+    bit_residual_pack_to_bytes,
+    bit_residual_unpack_from_block_bytes,
+    bit_residual_unpack_from_bytes,
     compute_metrics,
     BITRESIDUAL_ROW_BYTES,
 )
@@ -156,7 +161,7 @@ def test_packed_keys() -> None:
     R = _make_rotation(torch.device("cpu"))
     x = torch.randn(5, D, dtype=torch.float16)
     packed = bit_residual_quantize(x, R, head_size=D)
-    expected = ["norms", "signs", "bases", "steps", "q3_indices"]
+    expected = ["norms", "signs", "bases", "steps", "q7_indices"]
     missing = [k for k in expected if k not in packed]
     if not missing:
         _pass(name)
@@ -177,18 +182,111 @@ def test_sign_bits_range() -> None:
         _fail(name, f"dtype={packed['signs'].dtype}, shape[-1]={packed['signs'].shape[-1]}")
 
 
-def test_q3_indices_range() -> None:
-    """3-bit indices should be in range 0..7."""
-    name = "q3_indices_range"
+def test_q7_indices_range() -> None:
+    """7-bit indices should be in range 0..127."""
+    name = "q7_indices_range"
     R = _make_rotation(torch.device("cpu"))
     x = torch.randn(5, D, dtype=torch.float16)
     packed = bit_residual_quantize(x, R, head_size=D)
-    q3 = packed["q3_indices"]
-    ok = q3.dtype == torch.uint8 and q3.min().item() >= 0 and q3.max().item() <= 7
+    q7 = packed["q7_indices"]
+    ok = q7.dtype == torch.uint8 and q7.min().item() >= 0 and q7.max().item() <= 127
     if ok:
         _pass(name)
     else:
-        _fail(name, f"dtype={q3.dtype}, min={q3.min()}, max={q3.max()}")
+        _fail(name, f"dtype={q7.dtype}, min={q7.min()}, max={q7.max()}")
+
+
+def test_byte_row_roundtrip_low_bit_sign() -> None:
+    """Byte rows store sign in bit0 and q7 in bits1..7."""
+    name = "byte_row_roundtrip_low_bit_sign"
+    R = _make_rotation(torch.device("cpu"))
+    x = torch.randn(9, D, dtype=torch.float16)
+    packed = bit_residual_quantize(x, R, head_size=D)
+    rows = bit_residual_pack_to_bytes(packed, dtype=torch.float16)
+    unpacked = bit_residual_unpack_from_bytes(
+        rows, dtype=torch.float16, original_shape=tuple(x.shape)
+    )
+    x_hat = bit_residual_dequantize(unpacked, R, head_size=D, dtype=torch.float16)
+    expected_code = ((packed["q7_indices"] & 0x7F) << 1) | (
+        packed["signs"].to(torch.uint8) & 0x01
+    )
+    code_ok = torch.equal(rows[:, :D], expected_code.reshape(-1, D))
+    roundtrip_ok = torch.equal(unpacked["signs"], packed["signs"]) and torch.equal(
+        unpacked["q7_indices"], packed["q7_indices"]
+    )
+    shape_ok = rows.shape == (x.shape[0], BITRESIDUAL_ROW_BYTES)
+    quality_ok = compute_metrics(x, x_hat)["cosine_similarity"] > 0.99
+    if code_ok and roundtrip_ok and shape_ok and quality_ok:
+        _pass(name)
+    else:
+        _fail(
+            name,
+            f"code_ok={code_ok}, roundtrip_ok={roundtrip_ok}, "
+            f"shape={tuple(rows.shape)}, quality_ok={quality_ok}",
+        )
+
+
+def test_pageblock_field_major_layout() -> None:
+    """Pageblock cache stores codes, norms, bases, and steps in separate regions."""
+    name = "pageblock_field_major_layout"
+    block_size = 4
+    num_blocks = 2
+    num_heads = 3
+    R = _make_rotation(torch.device("cpu"))
+    x = torch.randn(num_blocks, num_heads, block_size, D, dtype=torch.float16)
+    packed = bit_residual_quantize(x, R, head_size=D)
+    blocks = bit_residual_pack_to_block_bytes(
+        packed, dtype=torch.float16, block_size=block_size
+    )
+    unpacked = bit_residual_unpack_from_block_bytes(
+        blocks, dtype=torch.float16, block_size=block_size
+    )
+    code_bytes = block_size * D
+    scalar_bytes = block_size * 2
+    norm_off = code_bytes
+    base_off = norm_off + scalar_bytes
+    step_off = base_off + scalar_bytes
+    expected_code = ((packed["q7_indices"] & 0x7F) << 1) | (
+        packed["signs"].to(torch.uint8) & 0x01
+    )
+    code_ok = torch.equal(
+        blocks[..., :code_bytes],
+        expected_code.reshape(num_blocks, num_heads, code_bytes),
+    )
+    norm_ok = torch.equal(
+        blocks[..., norm_off:base_off],
+        packed["norms"].to(torch.float16).contiguous().view(torch.uint8).reshape(
+            num_blocks, num_heads, scalar_bytes
+        ),
+    )
+    base_ok = torch.equal(
+        blocks[..., base_off:step_off],
+        packed["bases"].to(torch.float16).contiguous().view(torch.uint8).reshape(
+            num_blocks, num_heads, scalar_bytes
+        ),
+    )
+    step_ok = torch.equal(
+        blocks[..., step_off:],
+        packed["steps"].to(torch.float16).contiguous().view(torch.uint8).reshape(
+            num_blocks, num_heads, scalar_bytes
+        ),
+    )
+    unpack_ok = torch.equal(unpacked["q7_indices"], packed["q7_indices"]) and torch.equal(
+        unpacked["signs"], packed["signs"]
+    )
+    shape_ok = blocks.shape == (
+        num_blocks,
+        num_heads,
+        bit_residual_block_bytes(block_size),
+    )
+    if code_ok and norm_ok and base_ok and step_ok and unpack_ok and shape_ok:
+        _pass(name)
+    else:
+        _fail(
+            name,
+            f"code={code_ok}, norm={norm_ok}, base={base_ok}, step={step_ok}, "
+            f"unpack={unpack_ok}, shape={tuple(blocks.shape)}",
+        )
 
 
 def test_per_vector_norms() -> None:
@@ -848,8 +946,9 @@ def test_fused_op_vs_bitresidual_real_data() -> None:
 ALL_TESTS = {
     "basic": [
         test_roundtrip_shape, test_zero_vector, test_packed_keys,
-        test_sign_bits_range, test_q3_indices_range, test_per_vector_norms,
-        test_rotation_balances_signs, test_multi_head_shapes,
+        test_sign_bits_range, test_q7_indices_range,
+        test_byte_row_roundtrip_low_bit_sign, test_pageblock_field_major_layout,
+        test_per_vector_norms, test_rotation_balances_signs, test_multi_head_shapes,
         test_rotation_balances_skewed_data,
     ],
     "comparison": [

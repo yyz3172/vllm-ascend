@@ -1,5 +1,5 @@
 """
-BitResidual 4-bit Quantization for KV Cache vectors (head_size=128).
+BitResidual 8-bit Quantization for KV Cache vectors (head_size=128).
 
 Algorithm per vector x of dimension D=128:
   1. Compute L2 norm: norm = ||x||
@@ -8,10 +8,10 @@ Algorithm per vector x of dimension D=128:
   4. Sign bit: sign = (y >= 0). Each dim gets 1 bit (1=positive, 0=negative).
      bit_vec = sign * (1/sqrt(D)) - (1-sign) * (1/sqrt(D)) = ±1/sqrt(D)
   5. Residual: err = y - bit_vec
-  6. 3-bit uniform quantization of err:
-     base = min(err), step = (max(err) - min(err)) / 7
-     q3 = round((err - base) / step)   # 0..7, stored as 3 bits
-  7. Reconstructed rotated vector: y_hat = bit_vec + base + q3 * step
+  6. 7-bit uniform quantization of err:
+     base = min(err), step = (max(err) - min(err)) / 127
+     q7 = round((err - base) / step)   # 0..127, stored as 7 bits
+  7. Reconstructed rotated vector: y_hat = bit_vec + base + q7 * step
   8. Reconstructed normalized vector: n_hat = y_hat @ R
   9. Reconstructed original vector: x_hat = n_hat * norm
 
@@ -23,8 +23,11 @@ Storage per vector (D=128):
   - sign:   128 bits = 16 bytes
   - base:   2 bytes (fp16)
   - step:   2 bytes (fp16)
-  - q3:     128 * 3 bits = 48 bytes (tight packing)
-  Total:    16 + 48 + 2 + 2 + 2 = 70 bytes (vs TurboQuant 4-bit = 66 bytes)
+  - sign/q7: 128 bytes, one byte per dim: bit0 is sign, bits1..7 are q7
+  Total per vector: 128 + 2 + 2 + 2 = 134 bytes
+
+Paged cache storage is field-major within each (page block, head):
+  [all sign/q7 bytes][all norm scalars][all base scalars][all step scalars].
 
 R is shared across all vectors (like TurboQuant's rotation), stored once.
 """
@@ -68,7 +71,7 @@ def bit_residual_quantize(
     *,
     head_size: int = 128,
 ) -> dict:
-    """Quantize a batch of vectors using BitResidual 4-bit scheme.
+    """Quantize a batch of vectors using BitResidual 8-bit scheme.
 
     Args:
         x: shape [N, head_size] or [N, H, head_size], float16/bf16/float32
@@ -81,7 +84,7 @@ def bit_residual_quantize(
         - signs:      [N, D] or [N, H, D], bool — sign bits in rotated space
         - bases:      [N, 1] or [N, H, 1], same dtype as x — residual min
         - steps:      [N, 1] or [N, H, 1], same dtype as x — residual step
-        - q3_indices: [N, D] or [N, H, D], uint8 — 3-bit quantized indices (0..7)
+        - q7_indices: [N, D] or [N, H, D], uint8 — 7-bit quantized indices (0..127)
     """
     original_shape = x.shape
     if x.shape[-1] != head_size:
@@ -115,15 +118,15 @@ def bit_residual_quantize(
     # 5. Residual
     err = y - bit_vec  # [N, D]
 
-    # 6. 3-bit uniform quantization of the residual
+    # 6. 7-bit uniform quantization of the residual
     err_min = err.min(dim=-1, keepdim=True).values  # [N, 1]
     err_max = err.max(dim=-1, keepdim=True).values  # [N, 1]
     range_val = err_max - err_min
-    step = range_val / 7.0
+    step = range_val / 127.0
     step = torch.where(range_val < eps, torch.full_like(step, eps), step)
 
-    q3_continuous = (err - err_min) / step
-    q3_indices = torch.clamp(torch.round(q3_continuous), 0, 7).to(torch.uint8)
+    q7_continuous = (err - err_min) / step
+    q7_indices = torch.clamp(torch.round(q7_continuous), 0, 127).to(torch.uint8)
 
     # Reshape to original shape
     if len(original_shape) == 3:
@@ -132,7 +135,7 @@ def bit_residual_quantize(
         signs = signs.reshape(_, H, D_)
         bases = err_min.reshape(_, H, 1)
         steps = step.reshape(_, H, 1)
-        q3_indices = q3_indices.reshape(_, H, D_)
+        q7_indices = q7_indices.reshape(_, H, D_)
     else:
         bases = err_min
         steps = step
@@ -142,7 +145,7 @@ def bit_residual_quantize(
         "signs": signs,
         "bases": bases.to(x.dtype),
         "steps": steps.to(x.dtype),
-        "q3_indices": q3_indices,
+        "q7_indices": q7_indices,
     }
 
 
@@ -157,7 +160,7 @@ def bit_residual_dequantize(
     head_size: int = 128,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Reconstruct vectors from BitResidual 4-bit packed data.
+    """Reconstruct vectors from BitResidual 8-bit packed data.
 
     Args:
         packed: dict from bit_residual_quantize
@@ -172,7 +175,7 @@ def bit_residual_dequantize(
     signs = packed["signs"]
     bases = packed["bases"].float()
     steps = packed["steps"].float()
-    q3_indices = packed["q3_indices"].float()
+    q7_indices = packed["q7_indices"].float()
     R = rotation.float().to(norms.device)
 
     D = head_size
@@ -182,7 +185,7 @@ def bit_residual_dequantize(
     bit_vec = signs.float() * (1.0 / sqrt_D) + (~signs).float() * (-1.0 / sqrt_D)
 
     # Reconstruct residual
-    err_hat = bases + q3_indices * steps
+    err_hat = bases + q7_indices * steps
 
     # Reconstruct rotated normalized vector
     y_hat = bit_vec + err_hat  # [N, D]
@@ -232,7 +235,186 @@ def compute_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Byte storage size (for comparison)
+# Byte row storage helpers
 # ---------------------------------------------------------------------------
 
-BITRESIDUAL_ROW_BYTES = 70  # signs(16) + q3_tight(48) + norm(2) + base(2) + step(2)
+BITRESIDUAL_CODE_BYTES = 128
+BITRESIDUAL_SCALAR_BYTES = 2
+BITRESIDUAL_ROW_BYTES = (
+    BITRESIDUAL_CODE_BYTES + 3 * BITRESIDUAL_SCALAR_BYTES
+)
+
+
+def bit_residual_block_bytes(block_size: int) -> int:
+    """Packed bytes for one ``(page block, head)`` BitResidual slab."""
+    if block_size <= 0:
+        raise ValueError("block_size must be positive.")
+    return block_size * BITRESIDUAL_ROW_BYTES
+
+
+def _bit_residual_code_bytes(packed: dict) -> torch.Tensor:
+    signs = packed["signs"].reshape(-1, packed["signs"].shape[-1]).to(torch.uint8)
+    q7 = packed["q7_indices"].reshape(-1, packed["q7_indices"].shape[-1]).to(torch.uint8)
+    if signs.shape[-1] != 128 or q7.shape[-1] != 128:
+        raise ValueError("BitResidual byte rows require head_size=128.")
+    return ((q7 & 0x7F) << 1) | (signs & 0x01)
+
+
+def bit_residual_pack_to_block_bytes(
+    packed: dict,
+    *,
+    dtype: torch.dtype,
+    block_size: int,
+) -> torch.Tensor:
+    """Pack quantized components into field-major page blocks.
+
+    Input components must have shape ``[num_blocks, num_heads, block_size, 128]``
+    for code-bearing tensors and ``[..., 1]`` for scalars. The returned cache has
+    shape ``[num_blocks, num_heads, block_size * 134]`` with layout:
+    ``codes | norms | bases | steps``.
+    """
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("BitResidual block cache stores scalars as fp16/bf16 only.")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive.")
+    signs_shape = packed["signs"].shape
+    if len(signs_shape) != 4 or signs_shape[-2:] != (block_size, 128):
+        raise ValueError(
+            "BitResidual block pack expects signs shape "
+            "[num_blocks, num_heads, block_size, 128]."
+        )
+    num_blocks, num_heads = signs_shape[:2]
+    code = _bit_residual_code_bytes(packed).reshape(
+        num_blocks, num_heads, block_size, BITRESIDUAL_CODE_BYTES
+    )
+    norms = packed["norms"].reshape(num_blocks, num_heads, block_size, 1).to(dtype)
+    bases = packed["bases"].reshape(num_blocks, num_heads, block_size, 1).to(dtype)
+    steps = packed["steps"].reshape(num_blocks, num_heads, block_size, 1).to(dtype)
+    block = torch.empty(
+        (num_blocks, num_heads, bit_residual_block_bytes(block_size)),
+        device=code.device,
+        dtype=torch.uint8,
+    )
+    code_bytes = block_size * BITRESIDUAL_CODE_BYTES
+    scalar_bytes = block_size * BITRESIDUAL_SCALAR_BYTES
+    norm_off = code_bytes
+    base_off = norm_off + scalar_bytes
+    step_off = base_off + scalar_bytes
+    block[..., :code_bytes] = code.reshape(num_blocks, num_heads, code_bytes)
+    block[..., norm_off:base_off] = norms.contiguous().view(torch.uint8).reshape(
+        num_blocks, num_heads, scalar_bytes
+    )
+    block[..., base_off:step_off] = bases.contiguous().view(torch.uint8).reshape(
+        num_blocks, num_heads, scalar_bytes
+    )
+    block[..., step_off:] = steps.contiguous().view(torch.uint8).reshape(
+        num_blocks, num_heads, scalar_bytes
+    )
+    return block
+
+
+def bit_residual_unpack_from_block_bytes(
+    blocks: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    block_size: int,
+) -> dict:
+    """Unpack field-major page blocks into quantized components."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("BitResidual block cache stores scalars as fp16/bf16 only.")
+    if blocks.shape[-1] != bit_residual_block_bytes(block_size):
+        raise ValueError(
+            f"Expected last dim {bit_residual_block_bytes(block_size)}, "
+            f"got {blocks.shape[-1]}."
+        )
+    if blocks.ndim != 3:
+        raise ValueError("BitResidual block cache must be [num_blocks, num_heads, bytes].")
+    num_blocks, num_heads = blocks.shape[:2]
+    code_bytes = block_size * BITRESIDUAL_CODE_BYTES
+    scalar_bytes = block_size * BITRESIDUAL_SCALAR_BYTES
+    norm_off = code_bytes
+    base_off = norm_off + scalar_bytes
+    step_off = base_off + scalar_bytes
+    code = blocks[..., :code_bytes].reshape(
+        num_blocks, num_heads, block_size, BITRESIDUAL_CODE_BYTES
+    )
+    signs = (code & 0x01) != 0
+    q7_indices = (code >> 1) & 0x7F
+    norms = blocks[..., norm_off:base_off].contiguous().view(dtype).reshape(
+        num_blocks, num_heads, block_size, 1
+    )
+    bases = blocks[..., base_off:step_off].contiguous().view(dtype).reshape(
+        num_blocks, num_heads, block_size, 1
+    )
+    steps = blocks[..., step_off:].contiguous().view(dtype).reshape(
+        num_blocks, num_heads, block_size, 1
+    )
+    return {
+        "norms": norms,
+        "signs": signs,
+        "bases": bases,
+        "steps": steps,
+        "q7_indices": q7_indices,
+    }
+
+
+def bit_residual_pack_to_bytes(packed: dict, *, dtype: torch.dtype) -> torch.Tensor:
+    """Pack independent rows as ``codes | norm | base | step`` for tests/tools."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("BitResidual byte rows store scalars as fp16/bf16 only.")
+    code = _bit_residual_code_bytes(packed)
+    scalars = torch.cat(
+        [
+            packed["norms"].reshape(-1, 1).to(dtype),
+            packed["bases"].reshape(-1, 1).to(dtype),
+            packed["steps"].reshape(-1, 1).to(dtype),
+        ],
+        dim=-1,
+    ).contiguous().view(torch.uint8)
+    rows = torch.empty(
+        (code.shape[0], BITRESIDUAL_ROW_BYTES),
+        device=code.device,
+        dtype=torch.uint8,
+    )
+    rows[:, :BITRESIDUAL_CODE_BYTES] = code
+    rows[:, BITRESIDUAL_CODE_BYTES:] = scalars.reshape(code.shape[0], 6)
+    return rows
+
+
+def bit_residual_unpack_from_bytes(
+    rows: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    original_shape: tuple[int, ...] | None = None,
+) -> dict:
+    """Unpack independent test/tool rows into quantized components."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("BitResidual byte rows store scalars as fp16/bf16 only.")
+    if rows.shape[-1] != BITRESIDUAL_ROW_BYTES:
+        raise ValueError(
+            f"Expected last dim {BITRESIDUAL_ROW_BYTES}, got {rows.shape[-1]}."
+        )
+    flat = rows.reshape(-1, BITRESIDUAL_ROW_BYTES).contiguous()
+    code = flat[:, :BITRESIDUAL_CODE_BYTES]
+    signs = (code & 0x01) != 0
+    q7_indices = (code >> 1) & 0x7F
+    scalars = flat[:, BITRESIDUAL_CODE_BYTES:].contiguous().view(dtype).reshape(-1, 3)
+    norms = scalars[:, 0:1]
+    bases = scalars[:, 1:2]
+    steps = scalars[:, 2:3]
+    if original_shape is not None:
+        if original_shape[-1] != 128:
+            raise ValueError("original_shape must end with head_size=128.")
+        prefix = original_shape[:-1]
+        signs = signs.reshape(*prefix, 128)
+        q7_indices = q7_indices.reshape(*prefix, 128)
+        norms = norms.reshape(*prefix, 1)
+        bases = bases.reshape(*prefix, 1)
+        steps = steps.reshape(*prefix, 1)
+    return {
+        "norms": norms,
+        "signs": signs,
+        "bases": bases,
+        "steps": steps,
+        "q7_indices": q7_indices,
+    }
