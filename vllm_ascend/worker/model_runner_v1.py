@@ -2842,6 +2842,8 @@ class NPUModelRunner(GPUModelRunner):
                                 )
                         # BitResidual k8v4: asymmetric slab layout with separate
                         # key/value packed widths (288-byte group stride).
+                        # Compute the actual needed sizes from num_blocks (derived
+                        # from sz_i / page_size_bytes) and k8v4 per-head packed widths.
                         if (
                             self.ascend_config.turboquant_kv_bits_key == 8
                             and self.ascend_config.turboquant_kv_bits_value == 4
@@ -2852,11 +2854,13 @@ class NPUModelRunner(GPUModelRunner):
                             block_size_k8v4 = current_kv_cache_spec.block_size
                             pk_k8v4 = bit_residual_k8v4_key_packed_width(block_size_k8v4)
                             pv_k8v4 = bit_residual_k8v4_value_packed_width(block_size_k8v4)
-                            sum_k8v4 = pk_k8v4 + pv_k8v4
-                            k_part = sz_i * pk_k8v4 // sum_k8v4
+                            num_kv_heads_k8v4 = current_kv_cache_spec.num_kv_heads
+                            # sz_i = num_blocks * current_kv_cache_spec.page_size_bytes
+                            # Derive num_blocks from the total allocation size.
+                            num_blocks_k8v4 = sz_i // current_kv_cache_spec.page_size_bytes
                             turboquant_var_width_sizes = (
-                                k_part,
-                                sz_i - k_part,
+                                num_blocks_k8v4 * num_kv_heads_k8v4 * pk_k8v4,
+                                num_blocks_k8v4 * num_kv_heads_k8v4 * pv_k8v4,
                             )
                     elif self.use_sparse:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
@@ -3016,8 +3020,28 @@ class NPUModelRunner(GPUModelRunner):
                         sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     assert raw_k_tensor is not None
                     assert raw_v_tensor is not None
-                    assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
-                    num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
+                    # BitResidual k8v4 uses its own slab cache layout with
+                    # different per-page sizes, so page_size_bytes is not
+                    # directly applicable. Derive num_blocks from the total
+                    # allocation divided by k8v4 per-block bytes.
+                    if (
+                        self.cache_config.cache_dtype == "turboquant"
+                        and isinstance(current_kv_cache_spec, AttentionSpec)
+                        and self.ascend_config.turboquant_kv_bits_key == 8
+                        and self.ascend_config.turboquant_kv_bits_value == 4
+                        and current_kv_cache_spec.head_size == 128
+                    ):
+                        k8v4_block_size = current_kv_cache_spec.block_size
+                        k8v4_pk = bit_residual_k8v4_key_packed_width(k8v4_block_size)
+                        k8v4_pv = bit_residual_k8v4_value_packed_width(k8v4_block_size)
+                        k8v4_page_size_bytes = (
+                            current_kv_cache_spec.num_kv_heads * (k8v4_pk + k8v4_pv)
+                        )
+                        assert sum_page_size_bytes % k8v4_page_size_bytes == 0
+                        num_blocks = sum_page_size_bytes // k8v4_page_size_bytes
+                    else:
+                        assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
+                        num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
 
                     # `num_blocks` is the number of blocks the model runner can use.
                     # `kv_cache_config.num_blocks` is the number of blocks that
