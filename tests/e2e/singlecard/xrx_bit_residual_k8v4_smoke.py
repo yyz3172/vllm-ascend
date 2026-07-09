@@ -84,7 +84,7 @@ def main() -> None:
             max_model_len=256,
             block_size=16,
             kv_cache_dtype="turboquant",
-            gpu_memory_utilization=0.05,
+            gpu_memory_utilization=0.03,
             # bits_key=8, bits_value=4 activates the BitResidual k8v4 path
             additional_config={"turboquant_kv_bits": [8, 4]},
             enforce_eager=True,

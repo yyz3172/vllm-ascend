@@ -3172,7 +3172,7 @@ class NPUModelRunner(GPUModelRunner):
                             )
                         kv_cache_shape = (*kv_cache_shape[:-1], packed_width)
                     if not isinstance(current_kv_cache_spec, MLAAttentionSpec):
-                        if not turboquant_asym:
+                        if not (turboquant_asym or turboquant_k8v4_layout):
                             k_shape = kv_cache_shape[1:]
                             v_shape = k_shape
                             # if hasattr(current_kv_cache_spec, "head_size_v"):
