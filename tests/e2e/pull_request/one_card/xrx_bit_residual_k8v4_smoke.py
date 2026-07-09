@@ -96,7 +96,7 @@ def main() -> None:
             llm.start_profile()
         try:
             outs = llm.generate(
-                ["Hello, my name is", "介绍bit_residual_k8v4技术"],
+                ["Hello, my name is", "介绍turboquant技术"],
                 sampling_params=SamplingParams(temperature=0.7, max_tokens=40),
             )
         finally:
