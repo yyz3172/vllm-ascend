@@ -1,0 +1,421 @@
+#
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""BitResidual K8V4 pack + paged attention smoke test.
+
+Run on an NPU machine after building custom ops:
+
+    python tests/e2e/singlecard/xrx_bit_residual_k8v4_smoke.py
+
+This test mirrors the direct smoke style of ``xrx_turboquant4bit_smoke.py`` but
+targets the BitResidual K8V4 custom-op chain. It validates:
+
+1. hand-built packed cache -> ``bit_residual_attention_paged_k8v4``;
+2. zero-length KV output;
+3. ``bit_residual_pack_k8v4`` -> packed cache -> paged attention.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT))
+
+# Set ASCEND_CUSTOM_OPP_PATH before importing torch/torch_npu. Otherwise CANN
+# may only search the system opapi library and miss this repo's custom ops.
+_CANN_OPP = REPO_ROOT / "vllm_ascend" / "_cann_ops_custom" / "vendors" / "vllm-ascend"
+if _CANN_OPP.is_dir():
+    existing_opp = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
+        str(_CANN_OPP) if not existing_opp else f"{_CANN_OPP}:{existing_opp}"
+    )
+
+import torch
+
+from vllm_ascend.utils import enable_custom_op
+
+HEAD_SIZE = 128
+BLOCK_SIZE = 16
+GROUP_STRIDE = 288
+KEY_GROUP_ROWS = 2
+VALUE_GROUP_ROWS = 4
+INV_SQRT_D = 1.0 / math.sqrt(HEAD_SIZE)
+SEED = 2026
+
+
+def _require_ops() -> None:
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        raise RuntimeError("torch.npu is not available")
+    if not enable_custom_op():
+        raise RuntimeError("vllm_ascend_C is not loaded; build/install custom ops first")
+    if not hasattr(torch.ops, "_C_ascend"):
+        raise RuntimeError("torch.ops._C_ascend is not registered")
+    for op_name in ("bit_residual_pack_k8v4", "bit_residual_attention_paged_k8v4"):
+        if not hasattr(torch.ops._C_ascend, op_name):
+            raise RuntimeError(f"torch.ops._C_ascend.{op_name} is not registered")
+
+
+def _identity(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    return torch.eye(HEAD_SIZE, dtype=dtype, device=device).contiguous()
+
+
+def _scalar_bytes(value: float, dtype: torch.dtype) -> torch.Tensor:
+    return torch.tensor([value], dtype=dtype).view(torch.uint8).reshape(-1)
+
+
+def _read_float32(x: torch.Tensor) -> float:
+    return x.contiguous().view(torch.float32)[0].item()
+
+
+def _read_dtype_scalar(x: torch.Tensor, dtype: torch.dtype) -> float:
+    return x.contiguous().view(dtype)[0].float().item()
+
+
+def _build_block_table(actual_seq_lens_kv: list[int]) -> tuple[torch.Tensor, int]:
+    blocks_per_seq = [
+        max(1, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        for seq_len in actual_seq_lens_kv
+    ]
+    max_blocks = max(blocks_per_seq)
+    block_table = torch.zeros((len(actual_seq_lens_kv), max_blocks), dtype=torch.int32)
+    next_block = 0
+    for seq_idx, block_count in enumerate(blocks_per_seq):
+        block_table[seq_idx, :block_count] = torch.arange(
+            next_block, next_block + block_count, dtype=torch.int32
+        )
+        next_block += block_count
+    return block_table, next_block
+
+
+def _write_manual_single_kv_cache(
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    block_table, num_blocks = _build_block_table([1])
+    key_cache = torch.zeros(
+        num_blocks,
+        1,
+        (BLOCK_SIZE // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        dtype=torch.uint8,
+    )
+    value_cache = torch.zeros(
+        num_blocks,
+        1,
+        (BLOCK_SIZE // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        dtype=torch.uint8,
+    )
+
+    key_group = key_cache[0, 0, :GROUP_STRIDE]
+    key_words = key_group[:256].contiguous().view(torch.uint16)
+    key_words.fill_(0x0001)
+    key_group[:256] = key_words.view(torch.uint8)
+    key_group[256:258] = _scalar_bytes(1.0, dtype)
+    key_group[260:264] = _scalar_bytes(0.0, torch.float32)
+    key_group[268:272] = _scalar_bytes(0.0, torch.float32)
+
+    value_group = value_cache[0, 0, :GROUP_STRIDE]
+    value_words = value_group[:256].contiguous().view(torch.uint16)
+    value_idx = (torch.arange(HEAD_SIZE, dtype=torch.int32) % 16).to(torch.uint16)
+    value_words.copy_(value_idx.contiguous())
+    value_group[:256] = value_words.view(torch.uint8)
+    value_group[256:260] = _scalar_bytes(-1.0, torch.float32)
+    value_group[272:276] = _scalar_bytes(0.25, torch.float32)
+
+    return key_cache, value_cache, block_table
+
+
+def _decode_key_row(
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_idx: int,
+    kv_head: int,
+    abs_pos: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
+    pos_in_block = abs_pos % BLOCK_SIZE
+    group_idx = pos_in_block // KEY_GROUP_ROWS
+    group_row = pos_in_block % KEY_GROUP_ROWS
+    group_base = group_idx * GROUP_STRIDE
+    group = key_cache[block_id, kv_head, group_base : group_base + GROUP_STRIDE]
+    words = group[:256].contiguous().view(torch.uint16).to(torch.int32)
+    if group_row == 0:
+        code = words & 0x00FF
+    else:
+        code = (words >> 8) & 0x00FF
+
+    q7 = (code >> 1).float()
+    sign = (code & 1).float()
+    sign_val = torch.where(sign == 1, INV_SQRT_D, -INV_SQRT_D)
+    norm = _read_dtype_scalar(group[256 + group_row * 2 : 258 + group_row * 2], dtype)
+    base = _read_float32(group[260 + group_row * 4 : 264 + group_row * 4])
+    step = _read_float32(group[268 + group_row * 4 : 272 + group_row * 4])
+    return (sign_val + base + q7 * step) * norm
+
+
+def _decode_value_row(
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_idx: int,
+    kv_head: int,
+    abs_pos: int,
+) -> torch.Tensor:
+    block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
+    pos_in_block = abs_pos % BLOCK_SIZE
+    group_idx = pos_in_block // VALUE_GROUP_ROWS
+    group_row = pos_in_block % VALUE_GROUP_ROWS
+    group_base = group_idx * GROUP_STRIDE
+    group = value_cache[block_id, kv_head, group_base : group_base + GROUP_STRIDE]
+    words = group[:256].contiguous().view(torch.uint16).to(torch.int32)
+    idx4 = ((words >> (group_row * 4)) & 0x000F).float()
+    vmin = _read_float32(group[256 + group_row * 4 : 260 + group_row * 4])
+    vstep = _read_float32(group[272 + group_row * 4 : 276 + group_row * 4])
+    return vmin + idx4 * vstep
+
+
+def _golden_attention(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lens_q: list[int],
+    actual_seq_lens_kv: list[int],
+    rotation_key: torch.Tensor,
+    rotation_value: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> torch.Tensor:
+    dtype = query.dtype
+    gqa_group = num_heads // num_kv_heads
+    out = torch.zeros_like(query, dtype=torch.float32)
+    for token_idx in range(query.shape[0]):
+        seq_idx = next(i for i, end in enumerate(actual_seq_lens_q) if token_idx < end)
+        q_start = 0 if seq_idx == 0 else actual_seq_lens_q[seq_idx - 1]
+        num_q_in_seq = actual_seq_lens_q[seq_idx] - q_start
+        q_pos = token_idx - q_start
+        causal_end = actual_seq_lens_kv[seq_idx] - num_q_in_seq + q_pos + 1
+        causal_end = max(0, min(causal_end, actual_seq_lens_kv[seq_idx]))
+        if causal_end == 0:
+            continue
+        for kv_head in range(num_kv_heads):
+            keys = torch.stack(
+                [
+                    _decode_key_row(
+                        key_cache, block_table, seq_idx, kv_head, pos, dtype
+                    )
+                    for pos in range(causal_end)
+                ],
+                dim=0,
+            )
+            values = torch.stack(
+                [
+                    _decode_value_row(value_cache, block_table, seq_idx, kv_head, pos)
+                    for pos in range(causal_end)
+                ],
+                dim=0,
+            )
+            for group_idx in range(gqa_group):
+                head_idx = kv_head * gqa_group + group_idx
+                query_rot = query[token_idx, head_idx].float() @ rotation_key.float()
+                scores = (keys * query_rot).sum(dim=-1) * scale
+                attn = torch.softmax(scores, dim=-1) @ values
+                out[token_idx, head_idx] = (
+                    attn.to(dtype).float() @ rotation_value.float()
+                ).to(dtype).float()
+    return out
+
+
+def _run_attention_op(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lens_q: list[int],
+    actual_seq_lens_kv: list[int],
+    rotation_key: torch.Tensor,
+    rotation_value: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> torch.Tensor:
+    return torch.ops._C_ascend.bit_residual_attention_paged_k8v4(
+        query.contiguous(),
+        key_cache.contiguous(),
+        value_cache.contiguous(),
+        block_table.contiguous(),
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        rotation_key.contiguous(),
+        rotation_value.contiguous(),
+        num_heads,
+        num_kv_heads,
+        HEAD_SIZE,
+        BLOCK_SIZE,
+        max(1, max(actual_seq_lens_kv)),
+        float(scale),
+    )
+
+
+def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+    actual_cpu = actual.float().cpu()
+    atol = 1e-3 if actual.dtype == torch.float16 else 4e-2
+    rtol = 1e-3 if actual.dtype == torch.float16 else 4e-2
+    torch.testing.assert_close(actual_cpu, expected.float(), atol=atol, rtol=rtol)
+    print(f"PASS {name}: dtype={actual.dtype}, maxdiff={(actual_cpu - expected).abs().max().item():.6f}")
+
+
+def _run_manual_single_kv(dtype: torch.dtype, device: torch.device) -> None:
+    key_cache_cpu, value_cache_cpu, block_table_cpu = _write_manual_single_kv_cache(dtype)
+    query = torch.randn((1, 1, HEAD_SIZE), dtype=dtype, device=device)
+    rotation_key = _identity(dtype, device)
+    rotation_value = _identity(dtype, device)
+    actual = _run_attention_op(
+        query=query,
+        key_cache=key_cache_cpu.to(device),
+        value_cache=value_cache_cpu.to(device),
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=[1],
+        actual_seq_lens_kv=[1],
+        rotation_key=rotation_key,
+        rotation_value=rotation_value,
+        num_heads=1,
+        num_kv_heads=1,
+        scale=HEAD_SIZE**-0.5,
+    )
+    expected = (-1.0 + (torch.arange(HEAD_SIZE) % 16).float() * 0.25).reshape(1, 1, -1)
+    expected = expected.to(dtype).float()
+    _assert_close("manual_single_kv", actual, expected)
+
+
+def _run_zero_kv(dtype: torch.dtype, device: torch.device) -> None:
+    key_cache_cpu, value_cache_cpu, block_table_cpu = _write_manual_single_kv_cache(dtype)
+    query = torch.randn((1, 1, HEAD_SIZE), dtype=dtype, device=device)
+    rotation = _identity(dtype, device)
+    actual = _run_attention_op(
+        query=query,
+        key_cache=key_cache_cpu.to(device),
+        value_cache=value_cache_cpu.to(device),
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=[1],
+        actual_seq_lens_kv=[0],
+        rotation_key=rotation,
+        rotation_value=rotation,
+        num_heads=1,
+        num_kv_heads=1,
+        scale=HEAD_SIZE**-0.5,
+    )
+    expected = torch.zeros((1, 1, HEAD_SIZE), dtype=torch.float32)
+    _assert_close("zero_kv", actual, expected)
+
+
+def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
+    torch.manual_seed(SEED)
+    num_kv_tokens = 6
+    num_query_tokens = 3
+    num_kv_heads = 8
+    num_heads = num_kv_heads
+    scale = HEAD_SIZE**-0.5
+    block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+    key = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    value = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    query = torch.randn(
+        (num_query_tokens, num_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    rotation = _identity(dtype, device)
+    slot_mapping = torch.arange(num_kv_tokens, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, num_kv_tokens], dtype=torch.int32, device=device)
+    key_cache = torch.zeros(
+        num_blocks,
+        num_kv_heads,
+        (BLOCK_SIZE // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        dtype=torch.uint8,
+        device=device,
+    )
+    value_cache = torch.zeros(
+        num_blocks,
+        num_kv_heads,
+        (BLOCK_SIZE // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    torch.ops._C_ascend.bit_residual_pack_k8v4(
+        key,
+        value,
+        slot_mapping,
+        query_start_loc,
+        rotation,
+        key_cache,
+        value_cache,
+        1,
+        BLOCK_SIZE,
+    )
+    torch.npu.synchronize()
+
+    actual_seq_lens_q = [num_query_tokens]
+    actual_seq_lens_kv = [num_kv_tokens]
+    actual = _run_attention_op(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+    torch.npu.synchronize()
+
+    expected = _golden_attention(
+        query=query.cpu(),
+        key_cache=key_cache.cpu(),
+        value_cache=value_cache.cpu(),
+        block_table=block_table_cpu,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation.cpu(),
+        rotation_value=rotation.cpu(),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+    _assert_close("pack_attention_chain", actual, expected)
+
+
+def main() -> None:
+    _require_ops()
+    device = torch.device("npu:0")
+    for dtype in (torch.float16, torch.bfloat16):
+        _run_manual_single_kv(dtype, device)
+        _run_zero_kv(dtype, device)
+        _run_pack_attention_chain(dtype, device)
+    print("bit residual k8v4 smoke output: all cases passed")
+
+
+if __name__ == "__main__":
+    main()
