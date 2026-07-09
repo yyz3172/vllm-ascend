@@ -87,7 +87,6 @@ static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_WORDS =
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
 static constexpr uint32_t TQ_MAX_BATCH_M = 64;
 static constexpr uint32_t TQ_BATCH_ELEMS = TQ_MAX_BATCH_M * TQ_PACK_D;
-static constexpr uint32_t TQ_QUEUE_DEPTH = 2;
 static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr uint32_t TQ_DTYPE_BYTES = sizeof(uint16_t);
@@ -132,6 +131,98 @@ static constexpr uint32_t TQ_SIGN_MASK_BYTES = 256;
 static constexpr uint32_t TQ_QUANT_INDEX_BYTES = TQ_PACK_D * sizeof(int32_t);
 static constexpr uint32_t TQ_QUANT_INDEX_U16_BYTES = TQ_PACK_D * sizeof(int16_t);
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
+
+// ── LocalTensor static buffer utilities (following turboquant_pack_kv_for_cache4bit) ──────
+static constexpr uint32_t TqAlignUp32(uint32_t x) {
+    return (x + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
+}
+
+template <typename T>
+__aicore__ inline AscendC::LocalTensor<T> TqMakeLocalTensor(
+    TPosition pos,
+    uint32_t address,
+    uint32_t elems) {
+    AscendC::TBuffAddr tensorAddr {};
+    tensorAddr.dataLen = elems * sizeof(T);
+    tensorAddr.bufferAddr = address;
+    tensorAddr.bufferHandle = nullptr;
+    tensorAddr.logicPos = static_cast<uint8_t>(pos);
+#if defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1
+    tensorAddr.absAddr = GetTPipePtr()->GetBaseAddr(static_cast<uint8_t>(pos)) + address;
+#endif
+    AscendC::LocalTensor<T> tensor;
+    tensor.SetAddr(tensorAddr);
+    return tensor;
+}
+
+template <TPosition Pos>
+struct TqStaticLocalBuffer {
+    template <typename T>
+    __aicore__ inline AscendC::LocalTensor<T> GetBufferByByte(
+        uint32_t address,
+        uint32_t bytes) const {
+        return TqMakeLocalTensor<T>(Pos, address, bytes / sizeof(T));
+    }
+};
+
+struct TqStaticLocalResource {
+    TqStaticLocalBuffer<TPosition::VECIN> vecIn;
+    TqStaticLocalBuffer<TPosition::VECOUT> vecOut;
+    TqStaticLocalBuffer<TPosition::VECCALC> vecCalc;
+};
+
+// ── VECCALC (UB) static layout ──────────────────────────────────────────────────────
+//
+// Hand-built LocalTensor buffer addresses live in one logical UB address space.
+// Do not reuse the same byte offsets across VECIN/VECOUT/VECCALC positions.
+// The pack pipeline only needs two large row buffers at the same time:
+//   normalize: XBatch + ABatch
+//   encode:    YBatch + EncodedBatch
+// Therefore X/Y share one slot, and A/encoded rows share another slot.
+static constexpr uint32_t TQ_UB_XY_BATCH_OFFSET = 0;
+static constexpr uint32_t TQ_UB_A_ENCODED_BATCH_OFFSET =
+    TqAlignUp32(TQ_UB_XY_BATCH_OFFSET + TQ_BATCH_ELEMS * TQ_DTYPE_BYTES);
+static constexpr uint32_t TQ_UB_ENCODED_BATCH_BYTES =
+    (TQ_MAX_BATCH_M * TQ_KEY_ENCODED_ROW_STRIDE_BYTES >
+     TQ_MAX_BATCH_M * TQ_VAL_ENCODED_ROW_STRIDE_BYTES)
+        ? TQ_MAX_BATCH_M * TQ_KEY_ENCODED_ROW_STRIDE_BYTES
+        : TQ_MAX_BATCH_M * TQ_VAL_ENCODED_ROW_STRIDE_BYTES;
+static constexpr uint32_t TQ_UB_A_ENCODED_BYTES =
+    (TQ_BATCH_ELEMS * TQ_DTYPE_BYTES > TQ_UB_ENCODED_BATCH_BYTES)
+        ? TQ_BATCH_ELEMS * TQ_DTYPE_BYTES
+        : TQ_UB_ENCODED_BATCH_BYTES;
+static constexpr uint32_t TQ_UB_NORM_SCALAR_OFFSET =
+    TqAlignUp32(TQ_UB_A_ENCODED_BATCH_OFFSET + TQ_UB_A_ENCODED_BYTES);
+static constexpr uint32_t TQ_UB_NORMS_OFFSET =
+    TqAlignUp32(TQ_UB_NORM_SCALAR_OFFSET + TQ_UB_ALIGN);
+static constexpr uint32_t TQ_UB_SIGN_MASK_OFFSET =
+    TqAlignUp32(TQ_UB_NORMS_OFFSET + TQ_MAX_BATCH_M * TQ_NORM_STRIDE * TQ_DTYPE_BYTES);
+static constexpr uint32_t TQ_UB_Y_FP32_OFFSET =
+    TqAlignUp32(TQ_UB_SIGN_MASK_OFFSET + TQ_SIGN_MASK_BYTES);
+static constexpr uint32_t TQ_UB_SIGN_VAL_OFFSET =
+    TqAlignUp32(TQ_UB_Y_FP32_OFFSET + TQ_PACK_D * sizeof(float));
+static constexpr uint32_t TQ_UB_ERR_OFFSET =
+    TqAlignUp32(TQ_UB_SIGN_VAL_OFFSET + TQ_PACK_D * sizeof(float));
+static constexpr uint32_t TQ_UB_QUANT_INDEX_OFFSET =
+    TqAlignUp32(TQ_UB_ERR_OFFSET + TQ_PACK_D * sizeof(float));
+static constexpr uint32_t TQ_UB_QUANT_INDEX_U16_OFFSET =
+    TqAlignUp32(TQ_UB_QUANT_INDEX_OFFSET + TQ_QUANT_INDEX_BYTES);
+static constexpr uint32_t TQ_UB_REDUCE_SCALAR_OFFSET =
+    TqAlignUp32(TQ_UB_QUANT_INDEX_U16_OFFSET + TQ_QUANT_INDEX_U16_BYTES);
+static constexpr uint32_t TQ_UB_REDUCE_OUT_OFFSET =
+    TqAlignUp32(TQ_UB_REDUCE_SCALAR_OFFSET + TQ_UB_ALIGN);
+static constexpr uint32_t TQ_UB_REDUCE_TMP_OFFSET =
+    TqAlignUp32(TQ_UB_REDUCE_OUT_OFFSET + TQ_PACK_D * 3 * sizeof(float));
+static constexpr uint32_t TQ_UB_PACKED_ROW_OFFSET =
+    TqAlignUp32(TQ_UB_REDUCE_TMP_OFFSET + TQ_PACK_D * sizeof(float));
+static constexpr uint32_t TQ_UB_PACK_MERGE_OFFSET =
+    TqAlignUp32(TQ_UB_PACKED_ROW_OFFSET + TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_GROUP_STRIDE);
+static constexpr uint32_t TQ_UB_PACK_MASK_OFFSET =
+    TqAlignUp32(TQ_UB_PACK_MERGE_OFFSET + TQ_GROUP_INDEX_BYTES);
+static constexpr uint32_t TQ_UB_TOTAL_BYTES =
+    TqAlignUp32(TQ_UB_PACK_MASK_OFFSET + TQ_GROUP_INDEX_BYTES);
+static_assert(TQ_UB_TOTAL_BYTES <= TOTAL_UB_SIZE,
+              "Bit-residual K8v4 static UB slices exceed UB size.");
 
 #if defined(ORIG_DTYPE_KEY)
 #if (ORIG_DTYPE_KEY == DT_BF16)
@@ -409,10 +500,105 @@ __aicore__ inline void copy_packed_gm_to_ub(
 }
 
 template <typename T>
+class BitResidualPackK8v4Resource {
+public:
+    __aicore__ inline void Init() {}
+
+    // ── Row buffers ───────────────────────────────────────────────────────────
+    __aicore__ inline AscendC::LocalTensor<T> XBatch() {
+        return local_.vecCalc.GetBufferByByte<T>(
+            TQ_UB_XY_BATCH_OFFSET,
+            TQ_BATCH_ELEMS * TQ_DTYPE_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<T> YBatch() {
+        return local_.vecCalc.GetBufferByByte<T>(
+            TQ_UB_XY_BATCH_OFFSET,
+            TQ_BATCH_ELEMS * TQ_DTYPE_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<T> ABatch() {
+        return local_.vecCalc.GetBufferByByte<T>(
+            TQ_UB_A_ENCODED_BATCH_OFFSET,
+            TQ_BATCH_ELEMS * TQ_DTYPE_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<uint16_t> KeyEncodedBatch() {
+        return local_.vecCalc.GetBufferByByte<uint16_t>(
+            TQ_UB_A_ENCODED_BATCH_OFFSET,
+            TQ_MAX_BATCH_M * TQ_KEY_ENCODED_ROW_STRIDE_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<uint16_t> ValEncodedBatch() {
+        return local_.vecCalc.GetBufferByByte<uint16_t>(
+            TQ_UB_A_ENCODED_BATCH_OFFSET,
+            TQ_MAX_BATCH_M * TQ_VAL_ENCODED_ROW_STRIDE_BYTES);
+    }
+
+    // ── VECCALC (UB compute scratch) ─────────────────────────────────────────
+    __aicore__ inline AscendC::LocalTensor<float> NormScalar() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_NORM_SCALAR_OFFSET, TQ_UB_ALIGN);
+    }
+    __aicore__ inline AscendC::LocalTensor<T> Norms() {
+        return local_.vecCalc.GetBufferByByte<T>(
+            TQ_UB_NORMS_OFFSET,
+            TQ_MAX_BATCH_M * TQ_NORM_STRIDE * TQ_DTYPE_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<uint8_t> SignMask() {
+        return local_.vecCalc.GetBufferByByte<uint8_t>(
+            TQ_UB_SIGN_MASK_OFFSET, TQ_SIGN_MASK_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<float> YFp32() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_Y_FP32_OFFSET, TQ_PACK_D * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<float> SignVal() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_SIGN_VAL_OFFSET, TQ_PACK_D * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<float> Err() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_ERR_OFFSET, TQ_PACK_D * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<int32_t> QuantIndex() {
+        return local_.vecCalc.GetBufferByByte<int32_t>(
+            TQ_UB_QUANT_INDEX_OFFSET, TQ_QUANT_INDEX_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<int16_t> QuantIndexU16() {
+        return local_.vecCalc.GetBufferByByte<int16_t>(
+            TQ_UB_QUANT_INDEX_U16_OFFSET, TQ_QUANT_INDEX_U16_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<float> ReduceScalar() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_REDUCE_SCALAR_OFFSET, TQ_UB_ALIGN);
+    }
+    __aicore__ inline AscendC::LocalTensor<float> ReduceOut() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_REDUCE_OUT_OFFSET, TQ_PACK_D * 3 * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<float> ReduceTmp() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_REDUCE_TMP_OFFSET, TQ_PACK_D * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<uint8_t> PackedRow() {
+        return local_.vecCalc.GetBufferByByte<uint8_t>(
+            TQ_UB_PACKED_ROW_OFFSET,
+            TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_GROUP_STRIDE);
+    }
+    __aicore__ inline AscendC::LocalTensor<uint16_t> PackMerge() {
+        return local_.vecCalc.GetBufferByByte<uint16_t>(
+            TQ_UB_PACK_MERGE_OFFSET, TQ_GROUP_INDEX_BYTES);
+    }
+    __aicore__ inline AscendC::LocalTensor<uint16_t> PackMask() {
+        return local_.vecCalc.GetBufferByByte<uint16_t>(
+            TQ_UB_PACK_MASK_OFFSET, TQ_GROUP_INDEX_BYTES);
+    }
+
+private:
+    TqStaticLocalResource local_;
+};
+
+template <typename T>
 class BitResidualPackK8v4 {
 public:
     __aicore__ inline explicit BitResidualPackK8v4(
-        AscendC::TPipe* pipe,
         __gm__ uint8_t* rawWorkspace,
         uint32_t nVec,
         uint32_t vecPerCore,
@@ -427,8 +613,7 @@ public:
         uint32_t valueStrideHead,
         uint64_t keyStorageOffset,
         uint64_t valueStorageOffset)
-        : pipe_(pipe),
-          nVec_(nVec),
+        : nVec_(nVec),
           numHeads_(numHeads == 0 ? 1 : numHeads),
           tokenCount_((nVec + (numHeads == 0 ? 1 : numHeads) - 1) / (numHeads == 0 ? 1 : numHeads)),
           blockSize_(blockSize == 0 ? 1 : blockSize),
@@ -474,30 +659,7 @@ public:
             (uint64_t)numBlocks_ * numHeads_ *
                 (blockSize_ / TQ_VAL_GROUP_ROWS) * TQ_VAL_GROUP_STRIDE);
 
-        const uint32_t batchElems = TQ_MAX_BATCH_M * TQ_PACK_D;
-        pipe_->InitBuffer(xBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
-        pipe_->InitBuffer(aBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
-        pipe_->InitBuffer(yBatchQue_, TQ_QUEUE_DEPTH, batchElems * sizeof(T));
-        pipe_->InitBuffer(normScalarBuf_, TQ_UB_ALIGN);
-        pipe_->InitBuffer(normsBuf_, TQ_MAX_BATCH_M * TQ_NORM_STRIDE * sizeof(T));
-        pipe_->InitBuffer(signMaskBuf_, TQ_SIGN_MASK_BYTES);
-        // yFp32Buf: fp32 y row [D=128]
-        pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
-        pipe_->InitBuffer(signValBuf_, TQ_PACK_D * sizeof(float));
-        pipe_->InitBuffer(errBuf_, TQ_PACK_D * sizeof(float));
-        pipe_->InitBuffer(quantIndexBuf_, TQ_QUANT_INDEX_BYTES);
-        pipe_->InitBuffer(quantIndexU16Buf_, TQ_QUANT_INDEX_U16_BYTES);
-        pipe_->InitBuffer(reduceScalarBuf_, TQ_UB_ALIGN);
-        // NormalizeBatch: fp32 row + fp32 squared row + fp32 ReduceSum tmp.
-        pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 3 * sizeof(float));
-        pipe_->InitBuffer(reduceTmpBuf_, TQ_PACK_D * sizeof(float));
-        pipe_->InitBuffer(packedRowBuf_, TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_GROUP_STRIDE * sizeof(uint8_t));
-        pipe_->InitBuffer(packMergeBuf_, TQ_GROUP_INDEX_BYTES);
-        pipe_->InitBuffer(packMaskBuf_, TQ_GROUP_INDEX_BYTES);
-        pipe_->InitBuffer(keyEncodedQue_, TQ_QUEUE_DEPTH,
-                          TQ_MAX_BATCH_M * TQ_KEY_ENCODED_ROW_STRIDE_BYTES);
-        pipe_->InitBuffer(valEncodedQue_, TQ_QUEUE_DEPTH,
-                          TQ_MAX_BATCH_M * TQ_VAL_ENCODED_ROW_STRIDE_BYTES);
+        resource_.Init();
     }
 
     __aicore__ inline void Process() {
@@ -527,12 +689,12 @@ private:
     __aicore__ inline void NormalizeBatchBrcbScaleToNorms(
         uint32_t m,
         AscendC::LocalTensor<T> norms) {
-        auto xBatch = xBatchQue_.DeQue<T>();
-        auto aBatch = aBatchQue_.AllocTensor<T>();
-        auto fp32Row = reduceOutBuf_.Get<float>();
-        auto scaleBlock = reduceOutBuf_.Get<float>()[TQ_PACK_D];
-        auto fp32Tmp = reduceOutBuf_.Get<float>()[TQ_PACK_D * 2];
-        auto normAcc = normScalarBuf_.Get<float>();
+        auto xBatch = resource_.XBatch();
+        auto aBatch = resource_.ABatch();
+        auto fp32Row = resource_.ReduceOut();
+        auto scaleBlock = resource_.ReduceOut()[TQ_PACK_D];
+        auto fp32Tmp = resource_.ReduceOut()[TQ_PACK_D * 2];
+        auto normAcc = resource_.NormScalar();
 
         TqSyncMte2ToV();
         for (uint32_t i = 0; i < m; ++i) {
@@ -566,28 +728,24 @@ private:
             AscendC::Cast(aBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
-
-        aBatchQue_.EnQue(aBatch);
-        xBatchQue_.FreeTensor(xBatch);
     }
 
     __aicore__ inline void EncodeKeyBatchWithNorms(
         uint32_t m,
         AscendC::LocalTensor<T> norms) {
-        auto yBatch = yBatchQue_.DeQue<T>();
-        auto encodedBatch = keyEncodedQue_.AllocTensor<uint16_t>();
-        auto yFp32 = yFp32Buf_.Get<float>();
-        auto signMask = signMaskBuf_.Get<uint8_t>();
-        auto signVal = signValBuf_.Get<float>();
-        auto err = errBuf_.Get<float>();
-        auto qI32 = quantIndexBuf_.Get<int32_t>();
-        auto qI16 = quantIndexU16Buf_.Get<int16_t>();
-        auto codeU16 = packMergeBuf_.Get<uint16_t>();
-        auto signI16 = packMaskBuf_.Get<int16_t>();
-        auto reduceScalar = reduceScalarBuf_.Get<float>();
+        auto yBatch = resource_.YBatch();
+        auto encodedBatch = resource_.KeyEncodedBatch();
+        auto yFp32 = resource_.YFp32();
+        auto signMask = resource_.SignMask();
+        auto signVal = resource_.SignVal();
+        auto err = resource_.Err();
+        auto qI32 = resource_.QuantIndex();
+        auto qI16 = resource_.QuantIndexU16();
+        auto codeU16 = resource_.PackMerge();
+        auto reduceScalar = resource_.ReduceScalar();
         auto baseAcc = reduceScalar;
         auto maxAcc = reduceScalar[1];
-        auto reduceTmp = reduceTmpBuf_.Get<float>();
+        auto reduceTmp = resource_.ReduceTmp();
         auto normWords = norms.template ReinterpretCast<uint16_t>();
 
         for (uint32_t i = 0; i < m; ++i) {
@@ -655,12 +813,12 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(qI32, signVal, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(signI16, qI32, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::Cast(qI16, qI32, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Or(
                 codeU16,
                 codeU16,
-                signI16.template ReinterpretCast<uint16_t>(),
+                qI16.template ReinterpretCast<uint16_t>(),
                 TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::DataCopy(encodedBatch[encodedOff], codeU16, TQ_PACK_D);
@@ -679,22 +837,19 @@ private:
             stepOut.SetValue(0, stepF);
         }
         TqSyncSToV();
-
-        keyEncodedQue_.EnQue(encodedBatch);
-        yBatchQue_.FreeTensor(yBatch);
     }
 
     __aicore__ inline void EncodeValueBatch(uint32_t m) {
-        auto yBatch = yBatchQue_.DeQue<T>();
-        auto encodedBatch = valEncodedQue_.AllocTensor<uint16_t>();
-        auto yFp32 = yFp32Buf_.Get<float>();
-        auto qFp32 = errBuf_.Get<float>();
-        auto qI32 = quantIndexBuf_.Get<int32_t>();
-        auto qI16 = quantIndexU16Buf_.Get<int16_t>();
-        auto reduceScalar = reduceScalarBuf_.Get<float>();
+        auto yBatch = resource_.YBatch();
+        auto encodedBatch = resource_.ValEncodedBatch();
+        auto yFp32 = resource_.YFp32();
+        auto qFp32 = resource_.Err();
+        auto qI32 = resource_.QuantIndex();
+        auto qI16 = resource_.QuantIndexU16();
+        auto reduceScalar = resource_.ReduceScalar();
         auto vminAcc = reduceScalar;
         auto vmaxAcc = reduceScalar[1];
-        auto reduceTmp = reduceTmpBuf_.Get<float>();
+        auto reduceTmp = resource_.ReduceTmp();
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
@@ -742,9 +897,6 @@ private:
             vstepOut.SetValue(0, vstepF);
         }
         TqSyncSToV();
-
-        valEncodedQue_.EnQue(encodedBatch);
-        yBatchQue_.FreeTensor(yBatch);
     }
 
     __aicore__ inline void CopyManualSliceToInput(
@@ -757,7 +909,7 @@ private:
         uint64_t storageOffset,
         uint32_t strideToken,
         uint32_t strideHead) {
-        auto xBatch = xBatchQue_.AllocTensor<T>();
+        auto xBatch = resource_.XBatch();
         const uint32_t firstHead = headTileStart + aivSlice * TQ_MANUAL_HEADS_PER_AIV;
         bool clearedInvalidRows = false;
         for (uint32_t localHead = 0; localHead < TQ_MANUAL_HEADS_PER_AIV; ++localHead) {
@@ -783,14 +935,13 @@ private:
         if (clearedInvalidRows) {
             AscendC::PipeBarrier<PIPE_V>();
         }
-        xBatchQue_.EnQue(xBatch);
     }
 
     __aicore__ inline void CopyManualCToYBatch(
         AscendC::GlobalTensor<T>& cWorkGm,
         uint32_t bufferOffset,
         uint32_t aivSlice) {
-        auto yBatch = yBatchQue_.AllocTensor<T>();
+        auto yBatch = resource_.YBatch();
         const uint32_t sliceElemOffset = aivSlice * TQ_MANUAL_AIV_SLICE_ELEMS;
         for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
             const uint32_t rowOffset = row * TQ_PACK_D;
@@ -800,7 +951,6 @@ private:
                 TQ_PACK_D);
         }
         TqSyncMte2ToV();
-        yBatchQue_.EnQue(yBatch);
     }
 
     __aicore__ inline void InitManualWorkspaceTensors(
@@ -831,7 +981,7 @@ private:
     }
 
     __aicore__ inline AscendC::LocalTensor<T> ManualNorms(uint32_t streamOrdinal) {
-        return normsBuf_.Get<T>()[ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_NORM_SLOT_ELEMS];
+        return resource_.Norms()[ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_NORM_SLOT_ELEMS];
     }
 
     struct ManualKey1StreamDesc {
@@ -859,8 +1009,8 @@ private:
         } else {
             EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M);
         }
-        auto encodedBatch = DeQueEncodedBatch<IS_KEY>();
-        auto packedGroups = packedRowBuf_.Get<uint8_t>();
+        auto encodedBatch = IS_KEY ? resource_.KeyEncodedBatch() : resource_.ValEncodedBatch();
+        auto packedGroups = resource_.PackedRow();
         const uint32_t groupRowsPerGroup = GroupRows<IS_KEY>();
         for (uint32_t localHead = 0; localHead < TQ_MANUAL_HEADS_PER_AIV; ++localHead) {
             const uint32_t headIdx = firstHead + localHead;
@@ -900,7 +1050,6 @@ private:
                 rowOff += rowsThisGroup;
             }
         }
-        FreeEncodedBatch<IS_KEY>(encodedBatch);
     }
 
     __aicore__ inline void SubmitManualKey1AivA(
@@ -926,12 +1075,11 @@ private:
         NormalizeBatchBrcbScaleToNorms(TQ_MANUAL_AIV_SLICE_M, norms);
 
         TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_A_FREE);
-        auto aBatch = aBatchQue_.DeQue<T>();
+        auto aBatch = resource_.ABatch();
         TqCopyManualAUbToGm(
             aWorkGm,
             bufferOffset + sliceElemOffset,
             aBatch);
-        aBatchQue_.FreeTensor(aBatch);
         TqCrossCoreSet<PIPE_MTE3>(flagBase + TQ_MANUAL_SYNC_A_READY);
         TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_A_FREE);
     }
@@ -1308,12 +1456,12 @@ private:
         uint32_t groupRow,
         bool clearOldBits) {
         auto packedU16 = packedGroup.template ReinterpretCast<uint16_t>();
-        auto shiftedIdx = packMergeBuf_.Get<uint16_t>();
+        auto shiftedIdx = resource_.PackMerge();
         const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
         const uint32_t shiftBits = groupRow * (IS_KEY ? 8 : 4);
 
         if (clearOldBits) {
-            auto clearMask = packMaskBuf_.Get<uint16_t>();
+            auto clearMask = resource_.PackMask();
             const uint16_t mask = static_cast<uint16_t>(
                 IS_KEY
                     ? ~static_cast<uint16_t>(0x00FFu << shiftBits)
@@ -1363,24 +1511,6 @@ private:
     }
 
     template <bool IS_KEY>
-    __aicore__ inline AscendC::LocalTensor<uint16_t> DeQueEncodedBatch() {
-        if constexpr (IS_KEY) {
-            return keyEncodedQue_.template DeQue<uint16_t>();
-        } else {
-            return valEncodedQue_.template DeQue<uint16_t>();
-        }
-    }
-
-    template <bool IS_KEY>
-    __aicore__ inline void FreeEncodedBatch(AscendC::LocalTensor<uint16_t>& encodedBatch) {
-        if constexpr (IS_KEY) {
-            keyEncodedQue_.FreeTensor(encodedBatch);
-        } else {
-            valEncodedQue_.FreeTensor(encodedBatch);
-        }
-    }
-
-    template <bool IS_KEY>
     __aicore__ inline uint64_t MakeCacheGroupBaseOffset(
         uint32_t blockIdx,
         uint32_t groupInBlock,
@@ -1405,7 +1535,7 @@ private:
     }
 
 private:
-    AscendC::TPipe* const pipe_;
+    BitResidualPackK8v4Resource<T> resource_;
     const uint32_t nVec_;
     const uint32_t numHeads_;
     const uint32_t tokenCount_;
@@ -1425,25 +1555,6 @@ private:
     const bool workspaceReady_;
     __gm__ T* const manualWorkspace_;
 
-    AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> xBatchQue_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> aBatchQue_;
-    AscendC::TQue<AscendC::TPosition::VECIN, TQ_QUEUE_DEPTH> yBatchQue_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> normScalarBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> normsBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> signMaskBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> yFp32Buf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> signValBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> errBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> quantIndexBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> quantIndexU16Buf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> reduceScalarBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> reduceOutBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> reduceTmpBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> packedRowBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> packMergeBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> packMaskBuf_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> keyEncodedQue_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, TQ_QUEUE_DEPTH> valEncodedQue_;
     AscendC::GlobalTensor<T> keyGm_;
     AscendC::GlobalTensor<T> valueGm_;
     AscendC::GlobalTensor<T> rotationTGm_;
@@ -1487,7 +1598,6 @@ extern "C" __global__ __aicore__ void bit_residual_pack_k8v4(
     }
     AscendC::TPipe pipe;
     BitResidualPackK8v4<TqDataT> op(
-        &pipe,
         wsPtr,
         tilingData.nVec,
         tilingData.vecPerCore,
@@ -1511,5 +1621,4 @@ extern "C" __global__ __aicore__ void bit_residual_pack_k8v4(
         keyCachePtr,
         valueCachePtr);
     op.Process();
-    pipe.Destroy();
 }

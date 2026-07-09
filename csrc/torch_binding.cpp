@@ -54,6 +54,7 @@
 #include "turboquant_pack_kv_for_cache_v2_to_cache/op_host/aclnn_turboquant_pack_kv_for_cache_v2_to_cache.h"
 #include "turboquant_pack_kv_for_cache_v3/op_host/aclnn_turboquant_pack_kv_for_cache_v3.h"
 #include "bit_residual_pack_k8v4/op_host/aclnn_bit_residual_pack_k8v4.h"
+#include "bit_residual_attention_paged_k8v4/op_host/aclnn_bit_residual_attention_paged_k8v4.h"
 #include "turboquant_pack_kv_for_cache4bit/op_host/aclnn_turboquant_pack_kv_for_cache4bit.h"
 #include <mutex>
 #include <unordered_map>
@@ -687,6 +688,94 @@ void bit_residual_pack_k8v4(
         value_storage_offset,
         key_cache,
         value_cache);
+}
+
+at::Tensor bit_residual_attention_paged_k8v4(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& block_table,
+    at::IntArrayRef actual_seq_len_q,
+    at::IntArrayRef actual_seq_len_kv,
+    const at::Tensor& rotation_key,
+    const at::Tensor& rotation_value,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t block_size,
+    int64_t max_actual_seq_len,
+    double scale_value)
+{
+    constexpr int64_t kHeadSize = 128;
+    constexpr int64_t kKeyGroupRows = 2;
+    constexpr int64_t kValueGroupRows = 4;
+    constexpr int64_t kGroupStride = 288;
+    TORCH_CHECK(query.is_privateuseone(), "query must be on NPU");
+    TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
+    TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
+    TORCH_CHECK(rotation_key.is_privateuseone(), "rotation_key must be on NPU");
+    TORCH_CHECK(rotation_value.is_privateuseone(), "rotation_value must be on NPU");
+    TORCH_CHECK(query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16,
+                "BitResidual attention accepts fp16/bf16 query");
+    TORCH_CHECK(head_size == kHeadSize, "BitResidual attention only supports head_size=128");
+    TORCH_CHECK(block_size > 0, "block_size must be > 0");
+    TORCH_CHECK(block_size % kValueGroupRows == 0,
+                "block_size must be a multiple of 4 (value group rows)");
+    TORCH_CHECK(max_actual_seq_len > 0, "max_actual_seq_len must be > 0");
+    TORCH_CHECK(num_heads > 0 && num_kv_heads > 0, "head counts must be > 0");
+    TORCH_CHECK(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(key_cache.scalar_type() == at::kByte, "key_cache must be uint8");
+    TORCH_CHECK(value_cache.scalar_type() == at::kByte, "value_cache must be uint8");
+    TORCH_CHECK(block_table.scalar_type() == at::kInt, "block_table must be int32");
+    TORCH_CHECK(rotation_key.scalar_type() == query.scalar_type() &&
+                rotation_key.dim() == 2 && rotation_key.size(0) == kHeadSize &&
+                rotation_key.size(1) == kHeadSize,
+                "rotation_key must be [128,128] and match query dtype");
+    TORCH_CHECK(rotation_value.scalar_type() == query.scalar_type() &&
+                rotation_value.dim() == 2 && rotation_value.size(0) == kHeadSize &&
+                rotation_value.size(1) == kHeadSize,
+                "rotation_value must be [128,128] and match query dtype");
+    TORCH_CHECK(key_cache.dim() == 3 && value_cache.dim() == 3,
+                "BitResidual caches must be [num_blocks, num_kv_heads, packed_bytes]");
+    TORCH_CHECK(key_cache.size(1) == num_kv_heads && value_cache.size(1) == num_kv_heads,
+                "cache num_kv_heads mismatch");
+    TORCH_CHECK(key_cache.size(2) == (block_size / kKeyGroupRows) * kGroupStride,
+                "key_cache last dim must equal (block_size / 2) * 288");
+    TORCH_CHECK(value_cache.size(2) == (block_size / kValueGroupRows) * kGroupStride,
+                "value_cache last dim must equal (block_size / 4) * 288");
+    TORCH_CHECK(actual_seq_len_q.size() > 0, "actual_seq_len_q must not be empty");
+    TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(),
+                "actual_seq_len_q and actual_seq_len_kv must have the same length");
+
+    const at::Tensor query_c = query.contiguous();
+    const at::Tensor key_cache_c = key_cache.contiguous();
+    const at::Tensor value_cache_c = value_cache.contiguous();
+    const at::Tensor block_table_c = block_table.contiguous();
+    const at::Tensor rotation_key_c = rotation_key.contiguous();
+    const at::Tensor rotation_value_c = rotation_value.contiguous();
+
+    at::Tensor out = at::empty(query_c.sizes(), query_c.options());
+
+    const c10_npu::OptionalNPUGuard npuGuard(query_c.device());
+    EXEC_NPU_CMD(
+        aclnnBitResidualAttentionPagedK8v4,
+        query_c,
+        key_cache_c,
+        value_cache_c,
+        block_table_c,
+        actual_seq_len_q,
+        actual_seq_len_kv,
+        rotation_key_c,
+        rotation_value_c,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        max_actual_seq_len,
+        scale_value,
+        out);
+
+    return out;
 }
 
 void turboquant_pack_kv_for_cache_to_cache(
@@ -2269,6 +2358,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "turboquant_attention_paged4bit",
         torch::kPrivateUse1,
         &vllm_ascend::turboquant_attention_paged4bit);
+
+    ops.def(
+        "bit_residual_attention_paged_k8v4("
+        "Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, "
+        "int[] actual_seq_len_q, int[] actual_seq_len_kv, "
+        "Tensor rotation_key, Tensor rotation_value, "
+        "int num_heads, int num_kv_heads, int head_size, int block_size, "
+        "int max_actual_seq_len, float scale_value"
+        ") -> Tensor");
+    ops.impl(
+        "bit_residual_attention_paged_k8v4",
+        torch::kPrivateUse1,
+        &vllm_ascend::bit_residual_attention_paged_k8v4);
 
     // TurboQuant 8-bit paged decode (设计文档 §2.6 方案 X / Phase 1).
     // 算子吞掉 block_table 寻址,host 侧只需 ceil + cumsum 算 gather_block_ids。
