@@ -736,12 +736,11 @@ private:
         auto yBatch = resource_.YBatch();
         auto encodedBatch = resource_.KeyEncodedBatch();
         auto yFp32 = resource_.YFp32();
-        auto signMask = resource_.SignMask();
         auto signVal = resource_.SignVal();
         auto err = resource_.Err();
-        auto qI32 = resource_.QuantIndex();
         auto qI16 = resource_.QuantIndexU16();
         auto codeU16 = resource_.PackMerge();
+        auto codeMask = resource_.PackMask();
         auto reduceScalar = resource_.ReduceScalar();
         auto baseAcc = reduceScalar;
         auto maxAcc = reduceScalar[1];
@@ -755,17 +754,36 @@ private:
 
             AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::CompareScalar(signMask, yFp32, -0.0f, AscendC::CMPMODE::GT, TQ_PACK_D);
+            auto signBits = qI16.template ReinterpretCast<uint16_t>();
+            AscendC::Duplicate(codeMask, static_cast<uint16_t>(1), TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(signVal, TQ_INV_SQRT_D_F, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Select(
-                signVal,
-                signMask,
-                signVal,
-                -TQ_INV_SQRT_D_F,
-                SELMODE::VSEL_TENSOR_SCALAR_MODE,
+            AscendC::ShiftRight(
+                qI16,
+                yBatch[yOff].template ReinterpretCast<int16_t>(),
+                static_cast<int16_t>(15),
                 TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(signBits, signBits, codeMask, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(signVal, qI16, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(signVal, signVal, -1.0f, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(signVal, signVal, 1.0f, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(qI16, signVal, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate(codeMask, static_cast<uint16_t>(0), TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Or(
+                codeU16,
+                qI16.template ReinterpretCast<uint16_t>(),
+                codeMask,
+                TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(signVal, signVal, 2.0f * TQ_INV_SQRT_D_F, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(signVal, signVal, -TQ_INV_SQRT_D_F, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Sub(err, yFp32, signVal, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -790,35 +808,18 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mins(err, err, TQ_KEY_QUANT_LEVELS_F, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI32, err, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI16, qI32, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::Cast(qI16, err, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::ShiftLeft(
-                codeU16,
+                codeMask,
                 qI16.template ReinterpretCast<uint16_t>(),
                 static_cast<uint16_t>(1),
                 TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-
-            AscendC::Duplicate(signVal, 1.0f, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Select(
-                signVal,
-                signMask,
-                signVal,
-                0.0f,
-                SELMODE::VSEL_TENSOR_SCALAR_MODE,
-                TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI32, signVal, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI16, qI32, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Or(
                 codeU16,
                 codeU16,
-                qI16.template ReinterpretCast<uint16_t>(),
+                codeMask,
                 TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::DataCopy(encodedBatch[encodedOff], codeU16, TQ_PACK_D);
