@@ -114,6 +114,8 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.kv_specs import turboquant_attention_spec_cls
 from vllm_ascend.ops.turboquant_kv_cache import (
+    bit_residual_k8v4_key_packed_width,
+    bit_residual_k8v4_value_packed_width,
     log_turboquant_kv_banner_once,
     turboquant_4bit_slab_cache_enabled,
     turboquant_packed_bytes_per_vector,
@@ -2838,6 +2840,24 @@ class NPUModelRunner(GPUModelRunner):
                                     k_part,
                                     sz_i - k_part,
                                 )
+                        # BitResidual k8v4: asymmetric slab layout with separate
+                        # key/value packed widths (288-byte group stride).
+                        if (
+                            self.ascend_config.turboquant_kv_bits_key == 8
+                            and self.ascend_config.turboquant_kv_bits_value == 4
+                            and isinstance(current_kv_cache_spec, AttentionSpec)
+                            and current_kv_cache_spec.head_size == 128
+                            and sz_i > 0
+                        ):
+                            block_size_k8v4 = current_kv_cache_spec.block_size
+                            pk_k8v4 = bit_residual_k8v4_key_packed_width(block_size_k8v4)
+                            pv_k8v4 = bit_residual_k8v4_value_packed_width(block_size_k8v4)
+                            sum_k8v4 = pk_k8v4 + pv_k8v4
+                            k_part = sz_i * pk_k8v4 // sum_k8v4
+                            turboquant_var_width_sizes = (
+                                k_part,
+                                sz_i - k_part,
+                            )
                     elif self.use_sparse:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
@@ -3037,6 +3057,7 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     turboquant_asym = False
                     turboquant_slab_layout = False
+                    turboquant_k8v4_layout = False
                     pk_tq: int | None = None
                     pv_tq: int | None = None
                     if (self.cache_config.cache_dtype == "turboquant"
@@ -3060,7 +3081,18 @@ class NPUModelRunner(GPUModelRunner):
                                 and tqs > 0 and tqs == pk_tq + pv_tq
                                 and not self.model_config.use_mla):
                             turboquant_asym = True
-                    if (turboquant_slab_layout and pk_tq is not None
+                        # BitResidual k8v4: 8-bit key + 4-bit value with its own
+                        # slab layout (288-byte group stride, asymmetric K/V widths).
+                        if (self.ascend_config.turboquant_kv_bits_key == 8
+                                and self.ascend_config.turboquant_kv_bits_value == 4
+                                and kv_cache_spec.head_size == 128):
+                            turboquant_k8v4_layout = True
+                    if turboquant_k8v4_layout:
+                        block_size = kv_cache_spec.block_size
+                        base = kv_cache_shape[1:-1]
+                        k_shape = (*base, bit_residual_k8v4_key_packed_width(block_size))
+                        v_shape = (*base, bit_residual_k8v4_value_packed_width(block_size))
+                    elif (turboquant_slab_layout and pk_tq is not None
                             and pv_tq is not None):
                         if pk_tq != pv_tq:
                             raise ValueError(

@@ -733,6 +733,99 @@ def turboquant_slab_block_size(
 
 _TURBOQUANT_SLAB_GROUP_ROWS = 4
 
+# ---------------------------------------------------------------------------
+# BitResidual k8v4 cache layout constants
+# ---------------------------------------------------------------------------
+BIT_RESIDUAL_K8V4_GROUP_STRIDE = 288  # bytes per group (key or value)
+BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS = 2  # key rows per group
+BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS = 4  # value rows per group
+
+
+def bit_residual_k8v4_key_packed_width(block_size: int) -> int:
+    """Packed byte width for key cache: (block_size / key_group_rows) * group_stride."""
+    return (block_size // BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS) * BIT_RESIDUAL_K8V4_GROUP_STRIDE
+
+
+def bit_residual_k8v4_value_packed_width(block_size: int) -> int:
+    """Packed byte width for value cache: (block_size / value_group_rows) * group_stride."""
+    return (block_size // BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS) * BIT_RESIDUAL_K8V4_GROUP_STRIDE
+
+
+def _bit_residual_k8v4_slab_block_size_or_none(
+    cache: torch.Tensor,
+) -> int | None:
+    """Infer block_size from a bit_residual k8v4 cache tensor shape.
+
+    Returns None if the shape doesn't match the k8v4 layout.
+    """
+    if cache.ndim != 3:
+        return None
+    last_dim = cache.shape[-1]
+    if last_dim % BIT_RESIDUAL_K8V4_GROUP_STRIDE != 0:
+        return None
+    groups_per_head = last_dim // BIT_RESIDUAL_K8V4_GROUP_STRIDE
+    # Try key group rows (2) first, then value group rows (4)
+    if groups_per_head * BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS > 0:
+        return groups_per_head * BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS
+    return None
+
+
+def bit_residual_k8v4_is_slab_cache(
+    cache: torch.Tensor,
+) -> bool:
+    """Return True if cache shape matches the bit_residual k8v4 slab layout."""
+    if cache.ndim != 3:
+        return False
+    last_dim = cache.shape[-1]
+    return last_dim % BIT_RESIDUAL_K8V4_GROUP_STRIDE == 0
+
+
+def _bit_residual_k8v4_rotation_t(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the [128, 128] R^T rotation matrix for bit_residual k8v4 ops.
+
+    Uses the same Haar orthogonal matrix (seed=42, dim=128) as TurboQuant MSE.
+    """
+    quantizer = _get_quantizer(dim=128, bits=8, device=device)
+    if dtype == torch.bfloat16:
+        if (
+            quantizer._rotation_t_bf16 is None
+            or quantizer._rotation_t_bf16.device != device
+        ):
+            quantizer._rotation_t_bf16 = quantizer.rotation_t.to(
+                device=device, dtype=torch.bfloat16
+            )
+        return quantizer._rotation_t_bf16
+    if dtype == torch.float16:
+        return quantizer._rotation_t_fp16.to(device=device)
+    # float32 fallback
+    return quantizer.rotation_t.to(device=device, dtype=dtype)
+
+
+def _bit_residual_k8v4_rotation(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the [128, 128] R (non-transposed) rotation matrix.
+
+    Uses the same Haar orthogonal matrix (seed=42, dim=128) as TurboQuant MSE.
+    """
+    quantizer = _get_quantizer(dim=128, bits=8, device=device)
+    if dtype == torch.bfloat16:
+        if (
+            quantizer._rotation_bf16 is None
+            or quantizer._rotation_bf16.device != device
+        ):
+            quantizer._rotation_bf16 = quantizer.rotation.to(
+                device=device, dtype=torch.bfloat16
+            )
+        return quantizer._rotation_bf16
+    if dtype == torch.float16:
+        return quantizer._rotation_fp16.to(device=device)
+    return quantizer.rotation.to(device=device, dtype=dtype)
+
 
 def _require_group4_slab_block_size(block_size: int) -> None:
     if block_size % _TURBOQUANT_SLAB_GROUP_ROWS != 0:
@@ -1268,6 +1361,40 @@ def turboquant_pack_kv_for_cache_to_cache(
         query_start_loc = query_start_loc.contiguous()
 
     head_size = key.shape[-1]
+
+    # ------------------------------------------------------------------
+    # BitResidual k8v4 path: bits_key=8, bits_value=4
+    # Uses its own cache layout (288-byte group stride) and custom op.
+    # ------------------------------------------------------------------
+    if (
+        bits_key == 8
+        and bits_value == 4
+        and head_size == 128
+        and key.dtype in (torch.float16, torch.bfloat16)
+        and key.device.type in ("npu", "privateuseone")
+        and _c_ascend_turboquant_op_available("bit_residual_pack_k8v4")
+    ):
+        # Infer block_size from key_cache shape.
+        # key_cache: [num_blocks, num_kv_heads, (block_size/2)*288]
+        key_cache_last_dim = key_cache.shape[-1]
+        if key_cache_last_dim % BIT_RESIDUAL_K8V4_GROUP_STRIDE == 0:
+            groups_per_head = key_cache_last_dim // BIT_RESIDUAL_K8V4_GROUP_STRIDE
+            block_size_k8v4 = groups_per_head * BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS
+            rotation_t = _bit_residual_k8v4_rotation_t(key.device, key.dtype)
+            torch.ops._C_ascend.bit_residual_pack_k8v4(
+                key,
+                value,
+                slot_mapping,
+                query_start_loc,
+                rotation_t,
+                _uint8_storage_view(key_cache),
+                _uint8_storage_view(value_cache),
+                int(num_reqs),
+                int(block_size_k8v4),
+            )
+            return
+        # If cache shape doesn't match k8v4 layout, fall through to other paths.
+
     key_slab_block_size = _turboquant_slab_block_size_or_none(
         key_cache, head_size=head_size, bits=bits_key
     )
@@ -2156,6 +2283,83 @@ def turboquant_attention_paged4bit(
         _contiguous_if_needed(rot_v),
         int(num_heads),
         int(num_key_value_heads),
+        int(head_size),
+        int(block_size),
+        int(max_actual_seq_len),
+        float(scale),
+    )
+    return out.view(query.shape[0], num_heads, head_size)
+
+
+def bit_residual_attention_paged_k8v4(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    actual_seq_lengths_q: list[int],
+    actual_seq_lengths_kv: list[int],
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    scale: float,
+) -> torch.Tensor | None:
+    """Call the bit_residual k8v4 paged attention op for decode/chunked-prefill.
+
+    Returns ``None`` when conditions are not met, so callers can fall through
+    to existing decode+FIA fallbacks.
+    """
+    if (
+        head_size != 128
+        or block_size % BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS != 0
+        or query.dtype not in (torch.float16, torch.bfloat16)
+        or block_tables.numel() == 0
+        or num_kv_heads <= 0
+        or num_heads % num_kv_heads != 0
+    ):
+        return None
+
+    # Verify cache shapes match k8v4 layout.
+    key_last_dim = key_cache.shape[-1]
+    value_last_dim = value_cache.shape[-1]
+    expected_key_width = bit_residual_k8v4_key_packed_width(block_size)
+    expected_value_width = bit_residual_k8v4_value_packed_width(block_size)
+    if key_last_dim != expected_key_width or value_last_dim != expected_value_width:
+        return None
+
+    if not _c_ascend_turboquant_op_available("bit_residual_attention_paged_k8v4"):
+        return None
+
+    actual_seq_lengths_q = [int(length) for length in actual_seq_lengths_q]
+    actual_seq_lengths_kv = [int(length) for length in actual_seq_lengths_kv]
+    if (
+        not actual_seq_lengths_q
+        or len(actual_seq_lengths_q) != len(actual_seq_lengths_kv)
+        or actual_seq_lengths_q[-1] != query.shape[0]
+    ):
+        return None
+    if any(length < 0 for length in actual_seq_lengths_kv):
+        return None
+
+    max_actual_seq_len = max(actual_seq_lengths_kv) if actual_seq_lengths_kv else 0
+    if max_actual_seq_len <= 0:
+        return None
+
+    rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
+    rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
+
+    out = torch.ops._C_ascend.bit_residual_attention_paged_k8v4(
+        _contiguous_if_needed(query),
+        _contiguous_if_needed(_uint8_storage_view(key_cache)),
+        _contiguous_if_needed(_uint8_storage_view(value_cache)),
+        _int32_contiguous_if_needed(block_tables),
+        actual_seq_lengths_q,
+        actual_seq_lengths_kv,
+        _contiguous_if_needed(rotation_key),
+        _contiguous_if_needed(rotation_value),
+        int(num_heads),
+        int(num_kv_heads),
         int(head_size),
         int(block_size),
         int(max_actual_seq_len),
