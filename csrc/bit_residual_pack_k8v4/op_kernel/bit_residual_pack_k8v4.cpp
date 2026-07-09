@@ -723,7 +723,7 @@ private:
                 scaleBlock,
                 static_cast<uint64_t>(TQ_PACK_D / 2),
                 2,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 0));
+                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(aBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -839,7 +839,8 @@ private:
         TqSyncSToV();
     }
 
-    __aicore__ inline void EncodeValueBatch(uint32_t m) {
+    __aicore__ inline void EncodeValueBatch(uint32_t m,
+                                               AscendC::LocalTensor<T> norms) {
         auto yBatch = resource_.YBatch();
         auto encodedBatch = resource_.ValEncodedBatch();
         auto yFp32 = resource_.YFp32();
@@ -854,6 +855,7 @@ private:
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
             const uint32_t encodedOff = i * TQ_VAL_ENCODED_ROW_STRIDE_WORDS;
+            const uint32_t normOff = i * TQ_NORM_STRIDE;
 
             AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -868,6 +870,21 @@ private:
             const float vstepF = rangeF > 0.0f ? rangeF / TQ_VAL_QUANT_LEVELS_F : 1.0f;
             const float invStepF = rangeF > 0.0f ? 1.0f / vstepF : 0.0f;
             TqSyncSToV();
+
+            // Fold norm into vmin/vstep so that decode reconstructs
+            // values with original magnitude without a separate norm:
+            //   y = vmin_scaled + idx4 * vstep_scaled
+            //     = norm * (vmin + idx4 * vstep)
+            //     ≈ norm * x_unit @ R^T = x @ R^T
+            auto normToFloat = resource_.ReduceOut();  // float32 scratch
+            AscendC::Cast(normToFloat, norms[normOff], AscendC::RoundMode::CAST_NONE, 1);
+            AscendC::PipeBarrier<PIPE_V>();
+            TqSyncVToS();
+            const float normF = normToFloat.GetValue(0);
+            TqSyncSToV();
+
+            const float vminScaledF = vminF * normF;
+            const float vstepScaledF = vstepF * normF;
 
             AscendC::Adds(qFp32, yFp32, -vminF, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -893,8 +910,8 @@ private:
             auto vstepOut = encodedBatch[
                 encodedOff + TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET / sizeof(uint16_t)]
                                 .template ReinterpretCast<float>();
-            vminOut.SetValue(0, vminF);
-            vstepOut.SetValue(0, vstepF);
+            vminOut.SetValue(0, vminScaledF);
+            vstepOut.SetValue(0, vstepScaledF);
         }
         TqSyncSToV();
     }
@@ -1007,7 +1024,7 @@ private:
         if constexpr (IS_KEY) {
             EncodeKeyBatchWithNorms(TQ_MANUAL_AIV_SLICE_M, norms);
         } else {
-            EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M);
+            EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M, norms);
         }
         auto encodedBatch = IS_KEY ? resource_.KeyEncodedBatch() : resource_.ValEncodedBatch();
         auto packedGroups = resource_.PackedRow();

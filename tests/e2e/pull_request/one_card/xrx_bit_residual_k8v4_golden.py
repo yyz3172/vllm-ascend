@@ -282,6 +282,94 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     print(f"PASS {name}: dtype={actual.dtype}, maxdiff={(actual_cpu - expected).abs().max().item():.6f}")
 
 
+def _assert_min_cosine(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    min_cosine: float,
+) -> None:
+    actual_cpu = actual.float().cpu().reshape(-1)
+    expected_cpu = expected.float().cpu().reshape(-1)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual_cpu, expected_cpu, dim=0
+    ).item()
+    if cosine < min_cosine:
+        raise AssertionError(
+            f"{name} cosine {cosine:.6f} is lower than {min_cosine:.6f}"
+        )
+    print(f"PASS {name}: dtype={actual.dtype}, cosine={cosine:.6f}")
+
+
+def _decode_cache_rows(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    num_tokens: int,
+    num_kv_heads: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    decoded_key = torch.stack(
+        [
+            torch.stack(
+                [
+                    _decode_key_row(key_cache, block_table, 0, head_idx, token_idx, dtype)
+                    for head_idx in range(num_kv_heads)
+                ],
+                dim=0,
+            )
+            for token_idx in range(num_tokens)
+        ],
+        dim=0,
+    )
+    decoded_value = torch.stack(
+        [
+            torch.stack(
+                [
+                    _decode_value_row(value_cache, block_table, 0, head_idx, token_idx)
+                    for head_idx in range(num_kv_heads)
+                ],
+                dim=0,
+            )
+            for token_idx in range(num_tokens)
+        ],
+        dim=0,
+    )
+    return decoded_key, decoded_value
+
+
+def _fp_attention(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    actual_seq_lens_q: list[int],
+    actual_seq_lens_kv: list[int],
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> torch.Tensor:
+    query = query.float()
+    key = key.float()
+    value = value.float()
+    gqa_group = num_heads // num_kv_heads
+    out = torch.zeros_like(query)
+    for token_idx in range(query.shape[0]):
+        seq_idx = next(i for i, end in enumerate(actual_seq_lens_q) if token_idx < end)
+        q_start = 0 if seq_idx == 0 else actual_seq_lens_q[seq_idx - 1]
+        num_q_in_seq = actual_seq_lens_q[seq_idx] - q_start
+        q_pos = token_idx - q_start
+        causal_end = actual_seq_lens_kv[seq_idx] - num_q_in_seq + q_pos + 1
+        causal_end = max(0, min(causal_end, actual_seq_lens_kv[seq_idx]))
+        for kv_head in range(num_kv_heads):
+            keys = key[:causal_end, kv_head]
+            values = value[:causal_end, kv_head]
+            for group_idx in range(gqa_group):
+                head_idx = kv_head * gqa_group + group_idx
+                scores = (keys * query[token_idx, head_idx]).sum(dim=-1) * scale
+                out[token_idx, head_idx] = torch.softmax(scores, dim=-1) @ values
+    return out
+
+
 def _run_manual_single_kv(dtype: torch.dtype, device: torch.device) -> None:
     key_cache_cpu, value_cache_cpu, block_table_cpu = _write_manual_single_kv_cache(dtype)
     query = torch.randn((1, 1, HEAD_SIZE), dtype=dtype, device=device)
@@ -374,6 +462,17 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
     )
     torch.npu.synchronize()
 
+    decoded_key, decoded_value = _decode_cache_rows(
+        key_cache.cpu(),
+        value_cache.cpu(),
+        block_table_cpu,
+        num_kv_tokens,
+        num_kv_heads,
+        dtype,
+    )
+    _assert_min_cosine("pack_key_decode", decoded_key, key.cpu(), 0.999)
+    _assert_min_cosine("pack_value_decode", decoded_value, value.cpu(), 0.990)
+
     actual_seq_lens_q = [num_query_tokens]
     actual_seq_lens_kv = [num_kv_tokens]
     actual = _run_attention_op(
@@ -405,6 +504,17 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
         scale=scale,
     )
     _assert_close("pack_attention_chain", actual, expected)
+    fp_expected = _fp_attention(
+        query=query.cpu(),
+        key=key.cpu(),
+        value=value.cpu(),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+    _assert_min_cosine("pack_attention_vs_fp", actual, fp_expected, 0.990)
 
 
 def main() -> None:
