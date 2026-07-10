@@ -30,8 +30,6 @@ constexpr uint32_t TQ_ROT_WS = TQ_HEAD * TQ_HEAD * sizeof(half);
 constexpr uint64_t TQ_CUBE_C_OFF = 256 * 1024;
 constexpr uint32_t TQ_UB_KV_TILE_CAP = 32;
 constexpr uint32_t TQ_UB_GQA_CAP = 8;
-// Decode-only tiles are often short; Cube mPad=16 overhead dominates below this.
-constexpr uint32_t TQ_SCALAR_DECODE_MAX_ROWS = 12;
 
 __aicore__ inline uint32_t AlignUp16(uint32_t x)
 {
@@ -288,16 +286,11 @@ private:
         LocalTensor<half> codebookLocal,
         GlobalTensor<half>& rotationGm,
         LocalTensor<half>& xHat,
-        uint32_t mRows,
-        bool rotationInUb)
+        uint32_t mRows)
     {
         turboquant::TqDecodeSync<AscendC::HardEvent::S_V>();
-        const bool useScalar =
-            !matmulReady_ || rotateMm_ == nullptr || mRows <= TQ_SCALAR_DECODE_MAX_ROWS;
-        if (useScalar) {
-            if (!rotationInUb) {
-                LoadRotation(rotationGm);
-            }
+        if (!matmulReady_ || rotateMm_ == nullptr) {
+            LoadRotation(rotationGm);
             turboquant::DecodeRowsScalar(packedLocal, codebookLocal, rotateWorkBuf_.Get<half>(),
                                          xHat, mRows);
             turboquant::TqDecodeSync<AscendC::HardEvent::S_V>();
@@ -316,16 +309,11 @@ private:
         LocalTensor<half> codebookLocal,
         GlobalTensor<half>& rotationGm,
         LocalTensor<half>& xHat,
-        uint32_t mRows,
-        bool rotationInUb)
+        uint32_t mRows)
     {
         turboquant::TqDecodeSync<AscendC::HardEvent::S_V>();
-        const bool useScalar =
-            !matmulReady_ || rotateMm_ == nullptr || mRows <= TQ_SCALAR_DECODE_MAX_ROWS;
-        if (useScalar) {
-            if (!rotationInUb) {
-                LoadRotation(rotationGm);
-            }
+        if (!matmulReady_ || rotateMm_ == nullptr) {
+            LoadRotation(rotationGm);
             turboquant::DecodeRowsScalar(packedLocal, codebookLocal, rotateWorkBuf_.Get<half>(),
                                          xHat, mRows);
             turboquant::TqDecodeSync<AscendC::HardEvent::S_V>();
@@ -410,31 +398,19 @@ private:
         auto codebookLocal = codebookBuf_.Get<half>();
         auto expLocal = expBuf_.Get<float>();
 
-        bool keyRotInUb = false;
-        bool valueRotInUb = false;
-        if (causalKvEnd <= TQ_SCALAR_DECODE_MAX_ROWS) {
-            LoadRotation(rotationGm_);
-            keyRotInUb = true;
-        }
-
         for (uint32_t pos = 0; pos < causalKvEnd;) {
             const uint32_t tileRows =
                 (pos + kvTileRows_ <= causalKvEnd) ? kvTileRows_ : (causalKvEnd - pos);
             LoadKeyTileRows(packedLocal, tileRows, seqIdx, kvHead, pos);
             LocalTensor<half> kTile = xHat;
-            DecodeKeyTile(packedLocal, codebookLocal, rotationGm_, kTile, tileRows, keyRotInUb);
+            DecodeKeyTile(packedLocal, codebookLocal, rotationGm_, kTile, tileRows);
 
             auto scoreTile = scoreBuf_.Get<float>();
             turboquant_attn::VectorQk(qGroup, kTile, scoreTile, gqaGroup_, tileRows, scaleValue_);
 
             LoadValueTileRows(packedLocal, tileRows, seqIdx, kvHead, pos);
             LocalTensor<half> vTile = xHat;
-            if (!valueRotInUb && tileRows <= TQ_SCALAR_DECODE_MAX_ROWS) {
-                LoadRotation(rotationVGm_);
-                valueRotInUb = true;
-            }
-            DecodeValueTile(packedLocal, codebookLocal[TQ_K_CODEBOOK], rotationVGm_, vTile, tileRows,
-                            valueRotInUb);
+            DecodeValueTile(packedLocal, codebookLocal[TQ_K_CODEBOOK], rotationVGm_, vTile, tileRows);
 
             turboquant_attn::OnlineSoftmaxUpdateTile(
                 scoreTile, vTile, mState, sState, outAcc, expLocal, gqaGroup_, tileRows);
