@@ -26,19 +26,6 @@ namespace bit_residual {
 
 using namespace AscendC;
 
-struct ManualKey1StreamDesc {
-    uint32_t tokenStart;
-    uint32_t slotStart;
-    uint32_t blockIdx;
-    uint32_t valueGroupInBlock;
-    uint32_t headTileStart;
-    uint32_t startGroupRow;
-    uint32_t validRows;
-    uint32_t streamOrdinal;
-    bool preserveValue;
-    bool isValue;
-};
-
 template <typename T>
 class BitResidualPackK8v4VectorService {
 public:
@@ -52,14 +39,18 @@ public:
         }
 
         auto& op = context_;
-        AscendC::GlobalTensor<T> aWorkGm;
+        AscendC::GlobalTensor<float> normWorkGm;
         AscendC::GlobalTensor<T> cWorkGm;
-        op.InitManualWorkspaceTensors(manualGroupId, aWorkGm, cWorkGm);
+        op.InitManualWorkspaceTensors(manualGroupId, normWorkGm, cWorkGm);
+
+        for (uint32_t buffer = 0; buffer < TQ_MANUAL_WORKSPACE_BUFFER_COUNT; ++buffer) {
+            TqCrossCoreSet<PIPE_MTE2>(
+                static_cast<uint16_t>(buffer * TQ_MANUAL_SYNC_PP_STRIDE +
+                                      TQ_MANUAL_SYNC_C_FREE));
+        }
 
         uint32_t tileOrdinal = 0;
         uint32_t manualTileOrdinal = 0;
-        bool hasPending = false;
-        ManualKey1StreamDesc pending {};
         for (uint32_t reqIdx = 0; reqIdx < op.numReqs_; ++reqIdx) {
             uint32_t seqStart = 0;
             uint32_t seqEnd = 0;
@@ -102,10 +93,8 @@ public:
                             tokenStart, slot, blockIdx, valueGroupInBlock,
                             headTileStart, startGroupRow, validRows, keyStream + 1,
                             preserveValue, true};
-                        ProcessPipelineStream(aWorkGm, cWorkGm, aivSlice,
-                                              keyDesc, hasPending, pending);
-                        ProcessPipelineStream(aWorkGm, cWorkGm, aivSlice,
-                                              valueDesc, hasPending, pending);
+                        FinishC(normWorkGm, cWorkGm, keyDesc, aivSlice);
+                        FinishC(normWorkGm, cWorkGm, valueDesc, aivSlice);
                         ++manualTileOrdinal;
                     }
                     ++tileOrdinal;
@@ -113,52 +102,62 @@ public:
                 rowOff += validRows;
             }
         }
-        DrainPipeline(cWorkGm, aivSlice, hasPending, pending);
     }
 
 private:
-    __aicore__ inline void NormalizeBatchBrcbScaleToNorms(
-        uint32_t m,
+    __aicore__ inline void LoadNormsAndNormalizeRotatedBatch(
+        AscendC::GlobalTensor<float>& normWorkGm,
+        uint32_t streamOrdinal,
+        uint32_t aivSlice,
         AscendC::LocalTensor<T> norms) {
-        auto xBatch = context_.resource_.XBatch();
-        auto aBatch = context_.resource_.ABatch();
-        auto fp32Row = context_.resource_.ReduceOut();
-        auto scaleBlock = context_.resource_.ReduceOut()[TQ_PACK_D];
-        auto fp32Tmp = context_.resource_.ReduceOut()[TQ_PACK_D * 2];
+        const uint32_t normOffset =
+            context_.ManualNormBufferOffset(streamOrdinal) +
+            aivSlice * TQ_MANUAL_NORM_MATRIX_ELEMS;
+        auto gram = context_.resource_.ReduceOut();
+        auto yBatch = context_.resource_.YBatch();
+        auto yFp32 = context_.resource_.YFp32();
+        auto scaleBlock = context_.resource_.ReduceTmp();
         auto normAcc = context_.resource_.NormScalar();
 
+        AscendC::DataCopy(gram, normWorkGm[normOffset], TQ_MANUAL_NORM_MATRIX_ELEMS);
         TqSyncMte2ToV();
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t rowOff = i * TQ_PACK_D;
-
-            AscendC::Cast(fp32Row, xBatch[rowOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(scaleBlock, fp32Row, fp32Row, TQ_PACK_D);
-            AscendC::ReduceSum<float>(normAcc, scaleBlock, fp32Tmp, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
+        TqSyncMte2ToS();
+        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
+            normAcc.SetValue(
+                0, gram.GetValue(row * (TQ_MANUAL_NORM_MATRIX_DIM + 1)));
+            AscendC::Maxs(normAcc, normAcc, 0.0f, 1);
             AscendC::Sqrt(normAcc, normAcc, 1);
             AscendC::PipeBarrier<PIPE_V>();
-
-            AscendC::Cast(norms[i * TQ_NORM_STRIDE], normAcc, AscendC::RoundMode::CAST_RINT, 1);
-            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                norms[row * TQ_NORM_STRIDE],
+                normAcc,
+                AscendC::RoundMode::CAST_RINT,
+                1);
             AscendC::Adds(normAcc, normAcc, TQ_NORM_EPS_F, 1);
-            AscendC::Duplicate(fp32Tmp, 1.0f, 1);
+            AscendC::Duplicate(scaleBlock, 1.0f, 1);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Div(normAcc, fp32Tmp, normAcc, 1);
+            AscendC::Div(normAcc, scaleBlock, normAcc, 1);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Brcb(scaleBlock, normAcc, 1, AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
+
+            const uint32_t rowOffset = row * TQ_PACK_D;
+            AscendC::Cast(
+                yFp32, yBatch[rowOffset], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul(
-                fp32Row,
-                fp32Row,
+                yFp32,
+                yFp32,
                 scaleBlock,
                 static_cast<uint64_t>(TQ_PACK_D / 2),
                 2,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(aBatch[rowOff], fp32Row, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
+            AscendC::Cast(
+                yBatch[rowOffset], yFp32, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
+        TqSyncSToV();
     }
 
     __aicore__ inline void EncodeKeyBatchWithNorms(
@@ -348,44 +347,6 @@ private:
         TqSyncSToV();
     }
 
-    __aicore__ inline void CopyManualSliceToInput(
-        const AscendC::GlobalTensor<T>& xGm,
-        uint32_t tokenStart,
-        uint32_t headTileStart,
-        uint32_t aivSlice,
-        uint32_t startGroupRow,
-        uint32_t validRows,
-        uint64_t storageOffset,
-        uint32_t strideToken,
-        uint32_t strideHead) {
-        auto xBatch = context_.resource_.XBatch();
-        const uint32_t firstHead = headTileStart + aivSlice * TQ_MANUAL_HEADS_PER_AIV;
-        bool clearedInvalidRows = false;
-        for (uint32_t localHead = 0; localHead < TQ_MANUAL_HEADS_PER_AIV; ++localHead) {
-            const uint32_t headIdx = firstHead + localHead;
-            for (uint32_t groupRow = 0; groupRow < TQ_MANUAL_GROUP_ROWS; ++groupRow) {
-                const uint32_t dstRow = localHead * TQ_MANUAL_GROUP_ROWS + groupRow;
-                if (groupRow < startGroupRow || groupRow >= startGroupRow + validRows) {
-                    AscendC::Duplicate(
-                        xBatch[dstRow * TQ_PACK_D].template ReinterpretCast<uint16_t>(),
-                        static_cast<uint16_t>(0),
-                        TQ_PACK_D);
-                    clearedInvalidRows = true;
-                    continue;
-                }
-                const uint32_t tokenRow = groupRow - startGroupRow;
-                const uint64_t srcOffset =
-                    storageOffset +
-                    static_cast<uint64_t>(tokenStart + tokenRow) * strideToken +
-                    static_cast<uint64_t>(headIdx) * strideHead;
-                AscendC::DataCopy(xBatch[dstRow * TQ_PACK_D], xGm[srcOffset], TQ_PACK_D);
-            }
-        }
-        if (clearedInvalidRows) {
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-    }
-
     __aicore__ inline void CopyManualCToYBatch(
         AscendC::GlobalTensor<T>& cWorkGm,
         uint32_t bufferOffset,
@@ -503,21 +464,6 @@ private:
                static_cast<uint64_t>(groupInBlock) * GroupStride<IS_KEY>();
     }
 
-    __aicore__ inline void CopyAUbToGm(
-        AscendC::GlobalTensor<T>& aWorkGm,
-        uint32_t elemOffset,
-        AscendC::LocalTensor<T> inputLocal) {
-        TqSyncVToMte3();
-        AscendC::DataCopyExtParams copyParams {
-            1,
-            static_cast<uint32_t>(TQ_MANUAL_AIV_SLICE_ELEMS * sizeof(T)),
-            0,
-            0,
-            0};
-        AscendC::DataCopyPad(aWorkGm[elemOffset], inputLocal, copyParams);
-        TqSyncMte3ToMte2();
-    }
-
     template <bool IS_KEY>
     __aicore__ inline void EncodeSliceToCache(
         AscendC::GlobalTensor<uint8_t>& packedGm,
@@ -577,89 +523,29 @@ private:
         }
     }
 
-    __aicore__ inline void SubmitA(
-        AscendC::GlobalTensor<T>& aWorkGm,
-        const ManualKey1StreamDesc& desc,
-        uint32_t aivSlice) {
-        auto& op = context_;
-        const uint16_t flagBase = op.ManualFlagBase(desc.streamOrdinal);
-        const uint32_t bufferOffset = op.ManualBufferOffset(desc.streamOrdinal);
-        const uint32_t sliceElemOffset = aivSlice * TQ_MANUAL_AIV_SLICE_ELEMS;
-        auto norms = op.ManualNorms(desc.streamOrdinal);
-
-        if (desc.isValue) {
-            CopyManualSliceToInput(
-                op.valueGm_, desc.tokenStart, desc.headTileStart, aivSlice,
-                desc.startGroupRow, desc.validRows, op.valueStorageOffset_,
-                op.valueStrideToken_, op.valueStrideHead_);
-        } else {
-            CopyManualSliceToInput(
-                op.keyGm_, desc.tokenStart, desc.headTileStart, aivSlice,
-                desc.startGroupRow, desc.validRows, op.keyStorageOffset_,
-                op.keyStrideToken_, op.keyStrideHead_);
-        }
-        NormalizeBatchBrcbScaleToNorms(TQ_MANUAL_AIV_SLICE_M, norms);
-
-        TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_A_FREE);
-        CopyAUbToGm(aWorkGm, bufferOffset + sliceElemOffset, op.resource_.ABatch());
-        TqCrossCoreSet<PIPE_MTE3>(flagBase + TQ_MANUAL_SYNC_A_READY);
-        TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_A_FREE);
-    }
-
-    __aicore__ inline void ReleaseCWrite(uint32_t streamOrdinal) {
-        TqCrossCoreSet<PIPE_MTE2>(
-            context_.ManualFlagBase(streamOrdinal) + TQ_MANUAL_SYNC_C_FREE);
-    }
-
     __aicore__ inline void FinishC(
+        AscendC::GlobalTensor<float>& normWorkGm,
         AscendC::GlobalTensor<T>& cWorkGm,
         const ManualKey1StreamDesc& desc,
         uint32_t aivSlice) {
-        auto& op = context_;
-        const uint16_t flagBase = op.ManualFlagBase(desc.streamOrdinal);
-        const uint32_t bufferOffset = op.ManualBufferOffset(desc.streamOrdinal);
-        auto norms = op.ManualNorms(desc.streamOrdinal);
+        const uint16_t flagBase = context_.ManualFlagBase(desc.streamOrdinal);
+        const uint32_t bufferOffset = context_.ManualBufferOffset(desc.streamOrdinal);
+        auto norms = context_.ManualNorms(desc.streamOrdinal);
 
         TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_READY);
         CopyManualCToYBatch(cWorkGm, bufferOffset, aivSlice);
+        LoadNormsAndNormalizeRotatedBatch(
+            normWorkGm, desc.streamOrdinal, aivSlice, norms);
         TqCrossCoreSet<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_FREE);
         if (desc.isValue) {
-            EncodeSliceToCache<false>(op.valueCacheGm_, desc, aivSlice, norms);
+            EncodeSliceToCache<false>(
+                context_.valueCacheGm_, desc, aivSlice, norms);
         } else {
-            EncodeSliceToCache<true>(op.keyCacheGm_, desc, aivSlice, norms);
+            EncodeSliceToCache<true>(
+                context_.keyCacheGm_, desc, aivSlice, norms);
         }
     }
 
-    __aicore__ inline void ProcessPipelineStream(
-        AscendC::GlobalTensor<T>& aWorkGm,
-        AscendC::GlobalTensor<T>& cWorkGm,
-        uint32_t aivSlice,
-        const ManualKey1StreamDesc& desc,
-        bool& hasPending,
-        ManualKey1StreamDesc& pending) {
-        if (hasPending) {
-            ReleaseCWrite(pending.streamOrdinal);
-            SubmitA(aWorkGm, desc, aivSlice);
-            FinishC(cWorkGm, pending, aivSlice);
-        } else {
-            SubmitA(aWorkGm, desc, aivSlice);
-            hasPending = true;
-        }
-        pending = desc;
-    }
-
-    __aicore__ inline void DrainPipeline(
-        AscendC::GlobalTensor<T>& cWorkGm,
-        uint32_t aivSlice,
-        bool& hasPending,
-        ManualKey1StreamDesc& pending) {
-        if (!hasPending) {
-            return;
-        }
-        ReleaseCWrite(pending.streamOrdinal);
-        FinishC(cWorkGm, pending, aivSlice);
-        hasPending = false;
-    }
     BitResidualPackK8v4Context<T>& context_;
 };
 
