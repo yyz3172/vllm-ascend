@@ -96,8 +96,15 @@ static constexpr uint32_t TQ_MANUAL_AIV_SLICE_ELEMS =
 static constexpr uint32_t TQ_MANUAL_ROT_A_L1_OFFSET = 0;
 static constexpr uint32_t TQ_MANUAL_ROT_B_L1_OFFSET =
     TQ_MANUAL_ROT_A_L1_OFFSET + TQ_MANUAL_ROT_TILE_ELEMS * TQ_DTYPE_BYTES;
+static constexpr uint32_t TQ_MANUAL_NORM_B_L0_BYTE_OFFSET =
+    TQ_ROT_K * TQ_ROT_N * TQ_DTYPE_BYTES;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT = 2;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_STRIDE_ELEMS = TQ_BATCH_ELEMS;
+static constexpr uint32_t TQ_MANUAL_NORM_MATRIX_DIM = TQ_MANUAL_AIV_SLICE_M;
+static constexpr uint32_t TQ_MANUAL_NORM_MATRIX_ELEMS =
+    TQ_MANUAL_NORM_MATRIX_DIM * TQ_MANUAL_NORM_MATRIX_DIM;
+static constexpr uint32_t TQ_MANUAL_NORM_WORKSPACE_STRIDE_FLOATS =
+    TQ_MANUAL_WORKSPACE_STRIDE_ELEMS * TQ_DTYPE_BYTES / sizeof(float);
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE =
     TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS * 2;
 static constexpr uint32_t TQ_MANUAL_C_WORKSPACE_ELEM_OFFSET =
@@ -122,6 +129,19 @@ static constexpr uint32_t TQ_SIGN_MASK_BYTES = 256;
 static constexpr uint32_t TQ_QUANT_INDEX_BYTES = TQ_PACK_D * sizeof(int32_t);
 static constexpr uint32_t TQ_QUANT_INDEX_U16_BYTES = TQ_PACK_D * sizeof(int16_t);
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
+
+struct ManualKey1StreamDesc {
+    uint32_t tokenStart;
+    uint32_t slotStart;
+    uint32_t blockIdx;
+    uint32_t valueGroupInBlock;
+    uint32_t headTileStart;
+    uint32_t startGroupRow;
+    uint32_t validRows;
+    uint32_t streamOrdinal;
+    bool preserveValue;
+    bool isValue;
+};
 
 // ── LocalTensor static buffer utilities (following turboquant_pack_kv_for_cache4bit) ──────
 static constexpr uint32_t TqAlignUp32(uint32_t x) {
@@ -520,18 +540,16 @@ public:
 
 public:
 
-    // norms[i] = ||x[i]||; xBatch rows unitized in-place (matches x / (norm + eps)).
-    // Inner dim: Cast + Mul + ReduceSum (vector), not scalar loop; fp32 acc avoids 16-bit overflow.
     __aicore__ inline void InitManualWorkspaceTensors(
         uint32_t manualGroupId,
-        AscendC::GlobalTensor<T>& aWorkGm,
+        AscendC::GlobalTensor<float>& normWorkGm,
         AscendC::GlobalTensor<T>& cWorkGm) const {
         __gm__ T* groupWork =
             manualWorkspace_ + static_cast<uint64_t>(manualGroupId) *
                                    TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE;
-        aWorkGm.SetGlobalBuffer(
-            groupWork,
-            TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS);
+        normWorkGm.SetGlobalBuffer(
+            reinterpret_cast<__gm__ float*>(groupWork),
+            TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_NORM_WORKSPACE_STRIDE_FLOATS);
         cWorkGm.SetGlobalBuffer(
             groupWork + TQ_MANUAL_C_WORKSPACE_ELEM_OFFSET,
             TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS);
@@ -547,6 +565,10 @@ public:
 
     __aicore__ inline uint32_t ManualBufferOffset(uint32_t streamOrdinal) const {
         return ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS;
+    }
+
+    __aicore__ inline uint32_t ManualNormBufferOffset(uint32_t streamOrdinal) const {
+        return ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_NORM_WORKSPACE_STRIDE_FLOATS;
     }
 
     __aicore__ inline AscendC::LocalTensor<T> ManualNorms(uint32_t streamOrdinal) {

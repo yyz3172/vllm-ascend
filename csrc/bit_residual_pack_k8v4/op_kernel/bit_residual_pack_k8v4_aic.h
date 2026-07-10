@@ -35,17 +35,15 @@ public:
 
     __aicore__ inline void Process(uint32_t manualGroupId) {
         auto& op = context_;
-        AscendC::GlobalTensor<T> aWorkGm;
+        AscendC::GlobalTensor<float> normWorkGm;
         AscendC::GlobalTensor<T> cWorkGm;
-        op.InitManualWorkspaceTensors(manualGroupId, aWorkGm, cWorkGm);
+        op.InitManualWorkspaceTensors(manualGroupId, normWorkGm, cWorkGm);
 
         TqManualMmadResource manualResource;
         LoadResidentRotation(manualResource, op.rotationTGm_);
 
         uint32_t tileOrdinal = 0;
         uint32_t manualTileOrdinal = 0;
-        bool hasPending = false;
-        uint32_t pendingStream = 0;
         for (uint32_t reqIdx = 0; reqIdx < op.numReqs_; ++reqIdx) {
             uint32_t seqStart = 0;
             uint32_t seqEnd = 0;
@@ -67,16 +65,31 @@ public:
                 const uint32_t validRows = (rowCount - rowOff > rowsInThisGroup)
                     ? rowsInThisGroup
                     : rowCount - rowOff;
+                const uint32_t tokenStart = seqStart + rowOff;
+                const uint32_t slot = firstSlot + rowOff;
+                const uint32_t blockIdx = slot / op.blockSize_;
+                const uint32_t blockOffset = slot - blockIdx * op.blockSize_;
+                const uint32_t valueGroupInBlock = blockOffset / TQ_VAL_GROUP_ROWS;
+                const bool preserveValue =
+                    startGroupRow != 0 || validRows < TQ_MANUAL_GROUP_ROWS;
                 for (uint32_t headTileStart = 0;
                      headTileStart < op.numHeads_;
                      headTileStart += TQ_MANUAL_HEADS_PER_TILE) {
                     if (tileOrdinal % op.dataCores_ == manualGroupId) {
                         const uint32_t keyStream =
                             manualTileOrdinal * TQ_MANUAL_STREAM_KIND_COUNT;
-                        ProcessPipelineStream(manualResource, aWorkGm, cWorkGm,
-                                              keyStream, hasPending, pendingStream);
-                        ProcessPipelineStream(manualResource, aWorkGm, cWorkGm,
-                                              keyStream + 1, hasPending, pendingStream);
+                        ManualKey1StreamDesc keyDesc {
+                            tokenStart, slot, blockIdx, valueGroupInBlock,
+                            headTileStart, startGroupRow, validRows, keyStream,
+                            preserveValue, false};
+                        ManualKey1StreamDesc valueDesc {
+                            tokenStart, slot, blockIdx, valueGroupInBlock,
+                            headTileStart, startGroupRow, validRows, keyStream + 1,
+                            preserveValue, true};
+                        ComputeStream(
+                            manualResource, normWorkGm, cWorkGm, keyDesc);
+                        ComputeStream(
+                            manualResource, normWorkGm, cWorkGm, valueDesc);
                         ++manualTileOrdinal;
                     }
                     ++tileOrdinal;
@@ -84,7 +97,6 @@ public:
                 rowOff += validRows;
             }
         }
-        DrainPipeline(manualResource, cWorkGm, hasPending, pendingStream);
     }
 
 private:
@@ -112,27 +124,146 @@ private:
         TqSyncFixed<AscendC::HardEvent::MTE2_MTE1>();
     }
 
-    __aicore__ inline void LoadATileToL1(
+    __aicore__ inline void LoadRawTensorToL1(
         TqManualMmadResource& resource,
-        AscendC::GlobalTensor<T>& aWorkGm,
-        uint32_t aOffset) {
-        auto aL1 = resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
-        for (uint32_t rowBase = 0; rowBase < TQ_MANUAL_ROT_TILE_M;
-             rowBase += TQ_CUBE_M_ALIGN) {
-            AscendC::Nd2NzParams params;
-            params.ndNum = 1;
-            params.nValue = TQ_CUBE_M_ALIGN;
-            params.dValue = TQ_ROT_K;
-            params.srcDValue = TQ_ROT_K;
-            params.dstNzC0Stride = TQ_CUBE_M_ALIGN;
-            params.dstNzNStride = 1;
-            params.srcNdMatrixStride = 0;
-            params.dstNzMatrixStride = 0;
-            AscendC::DataCopy(
-                aL1[(rowBase / TQ_CUBE_M_ALIGN) * TQ_MANUAL_AIV_SLICE_ELEMS],
-                aWorkGm[aOffset + rowBase * TQ_ROT_K], params);
+        AscendC::GlobalTensor<T>& xGm,
+        const ManualKey1StreamDesc& desc,
+        uint64_t storageOffset,
+        uint32_t strideToken,
+        uint32_t strideHead) {
+        auto aL1 =
+            resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
+        for (uint32_t aivSlice = 0; aivSlice < TQ_AIV_SUB_BLOCKS; ++aivSlice) {
+            const uint32_t firstHead =
+                desc.headTileStart + aivSlice * TQ_MANUAL_HEADS_PER_AIV;
+            const uint32_t l1SliceOffset =
+                aivSlice * TQ_MANUAL_AIV_SLICE_ELEMS;
+            for (uint32_t localHead = 0;
+                 localHead < TQ_MANUAL_HEADS_PER_AIV;
+                 ++localHead) {
+                const uint32_t headIdx = firstHead + localHead;
+                const uint64_t srcOffset =
+                    storageOffset +
+                    static_cast<uint64_t>(desc.tokenStart) * strideToken +
+                    static_cast<uint64_t>(headIdx) * strideHead;
+                const uint32_t dstRow =
+                    localHead * TQ_MANUAL_GROUP_ROWS + desc.startGroupRow;
+                AscendC::Nd2NzParams params;
+                params.ndNum = 1;
+                params.nValue = desc.validRows;
+                params.dValue = TQ_ROT_K;
+                params.srcDValue = strideToken;
+                params.dstNzC0Stride = TQ_MANUAL_AIV_SLICE_M;
+                params.dstNzNStride = 1;
+                params.srcNdMatrixStride = 0;
+                params.dstNzMatrixStride = 0;
+                AscendC::DataCopy(
+                    aL1[l1SliceOffset + dstRow * TQ_CUBE_M_ALIGN],
+                    xGm[srcOffset],
+                    params);
+            }
         }
         TqSyncFixed<AscendC::HardEvent::MTE2_MTE1>();
+    }
+
+    __aicore__ inline void LoadRawInputToL1(
+        TqManualMmadResource& resource,
+        const ManualKey1StreamDesc& desc) {
+        if (desc.isValue) {
+            LoadRawTensorToL1(
+                resource,
+                context_.valueGm_,
+                desc,
+                context_.valueStorageOffset_,
+                context_.valueStrideToken_,
+                context_.valueStrideHead_);
+        } else {
+            LoadRawTensorToL1(
+                resource,
+                context_.keyGm_,
+                desc,
+                context_.keyStorageOffset_,
+                context_.keyStrideToken_,
+                context_.keyStrideHead_);
+        }
+    }
+
+    __aicore__ inline void ComputeNormMatrices(
+        TqManualMmadResource& resource,
+        AscendC::GlobalTensor<float>& normWorkGm,
+        uint32_t streamOrdinal) {
+        auto aL1 =
+            resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
+        auto aL0 = resource.l0ABuf.template GetBufferByByte<T>(0);
+        auto bL0 = resource.l0BBuf.template GetBufferByByte<T>(
+            TQ_MANUAL_NORM_B_L0_BYTE_OFFSET);
+        auto cL0 = resource.l0CBuf.template GetBufferByByte<float>(0);
+        const uint32_t normBase = context_.ManualNormBufferOffset(streamOrdinal);
+
+        for (uint32_t slice = 0; slice < TQ_AIV_SUB_BLOCKS; ++slice) {
+            const uint32_t l1SliceOffset =
+                slice * TQ_MANUAL_AIV_SLICE_ELEMS;
+            TqSyncFixed<AscendC::HardEvent::M_MTE1>();
+
+            AscendC::LoadData2DParams aLoad;
+            aLoad.startIndex = 0;
+            aLoad.repeatTimes = TQ_ROT_K / TQ_CUBE_M_ALIGN;
+            aLoad.srcStride = 1;
+            aLoad.sid = 0;
+            aLoad.dstGap = 0;
+            aLoad.ifTranspose = false;
+            aLoad.addrMode = 0;
+            AscendC::LoadData(aL0, aL1[l1SliceOffset], aLoad);
+
+            AscendC::LoadData2DParams bLoad;
+            bLoad.startIndex = 0;
+            bLoad.repeatTimes = 1;
+            bLoad.srcStride = 1;
+            bLoad.sid = 0;
+            bLoad.dstGap = 0;
+            bLoad.ifTranspose = true;
+            bLoad.addrMode = 0;
+            for (uint32_t kBlock = 0;
+                 kBlock < TQ_ROT_K / TQ_CUBE_M_ALIGN;
+                 ++kBlock) {
+                const uint32_t blockOffset =
+                    kBlock * TQ_MANUAL_AIV_SLICE_M * TQ_CUBE_M_ALIGN;
+                AscendC::LoadData(
+                    bL0[blockOffset],
+                    aL1[l1SliceOffset + blockOffset],
+                    bLoad);
+            }
+            TqSyncFixed<AscendC::HardEvent::MTE1_M>();
+
+            AscendC::MmadParams mmParams;
+            mmParams.m = TQ_MANUAL_AIV_SLICE_M;
+            mmParams.n = TQ_MANUAL_AIV_SLICE_M;
+            mmParams.k = TQ_ROT_K;
+            mmParams.cmatrixInitVal = true;
+            mmParams.cmatrixSource = false;
+            mmParams.unitFlag = 0b11;
+            TqSyncFixed<AscendC::HardEvent::FIX_M>();
+            AscendC::Mmad(cL0, aL0, bL0, mmParams);
+            AscendC::PipeBarrier<PIPE_M>();
+            TqSyncFixed<AscendC::HardEvent::M_FIX>();
+
+            AscendC::DataCopyCO12DstParams fixParams;
+            fixParams.mSize = TQ_MANUAL_AIV_SLICE_M;
+            fixParams.nSize = TQ_MANUAL_AIV_SLICE_M;
+            fixParams.dstStride = TQ_MANUAL_AIV_SLICE_M;
+            fixParams.srcStride = TQ_MANUAL_AIV_SLICE_M;
+            fixParams.quantPre = QuantMode_t::NoQuant;
+            fixParams.nz2ndEn = true;
+            fixParams.unitFlag = 0b11;
+            fixParams.reluPre = 0;
+            AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
+            AscendC::DataCopy(
+                normWorkGm[
+                    normBase + slice * TQ_MANUAL_NORM_MATRIX_ELEMS],
+                cL0,
+                fixParams);
+            TqSyncFixed<AscendC::HardEvent::FIX_M>();
+        }
     }
 
     __aicore__ inline void ComputeLoadedTile(
@@ -145,6 +276,9 @@ private:
         auto bL0 = resource.l0BBuf.template GetBufferByByte<T>(0);
         auto cL0Base = resource.l0CBuf.template GetBufferByByte<float>(0);
 
+        // The preceding Gram MMAD also consumes L0B.  Wait for PIPE_M before
+        // replacing that buffer with the resident rotation matrix.
+        TqSyncFixed<AscendC::HardEvent::M_MTE1>();
         AscendC::LoadData2DParams bLoad;
         bLoad.startIndex = 0;
         bLoad.repeatTimes = TQ_ROT_N / TQ_CUBE_M_ALIGN;
@@ -205,82 +339,24 @@ private:
         }
     }
 
-    __aicore__ inline void StartA(uint32_t streamOrdinal) {
-        auto& op = context_;
-        TqCrossCoreSetForBothAiv<PIPE_FIX>(
-            op.ManualFlagBase(streamOrdinal) + TQ_MANUAL_SYNC_A_FREE);
-    }
-
-    __aicore__ inline void WaitAndLoadA(
+    __aicore__ inline void ComputeStream(
         TqManualMmadResource& resource,
-        AscendC::GlobalTensor<T>& aWorkGm,
-        uint32_t streamOrdinal) {
-        auto& op = context_;
-        const uint16_t flagBase = op.ManualFlagBase(streamOrdinal);
-        const uint32_t bufferOffset = op.ManualBufferOffset(streamOrdinal);
-        TqCrossCoreWaitForBothAiv<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_A_READY);
-        LoadATileToL1(resource, aWorkGm, bufferOffset);
-        TqCrossCoreSetForBothAiv<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_A_FREE);
-    }
-
-    __aicore__ inline void LoadA(
-        TqManualMmadResource& resource,
-        AscendC::GlobalTensor<T>& aWorkGm,
-        uint32_t streamOrdinal) {
-        StartA(streamOrdinal);
-        WaitAndLoadA(resource, aWorkGm, streamOrdinal);
-    }
-
-    __aicore__ inline void ComputeC(
-        TqManualMmadResource& resource,
+        AscendC::GlobalTensor<float>& normWorkGm,
         AscendC::GlobalTensor<T>& cWorkGm,
-        uint32_t streamOrdinal) {
-        auto& op = context_;
-        const uint16_t flagBase = op.ManualFlagBase(streamOrdinal);
-        const uint32_t bufferOffset = op.ManualBufferOffset(streamOrdinal);
-        TqCrossCoreWaitForBothAiv<PIPE_FIX>(flagBase + TQ_MANUAL_SYNC_C_FREE);
+        const ManualKey1StreamDesc& desc) {
+        const uint16_t flagBase = context_.ManualFlagBase(desc.streamOrdinal);
+        const uint32_t bufferOffset =
+            context_.ManualBufferOffset(desc.streamOrdinal);
+        TqCrossCoreWaitForBothAiv<PIPE_FIX>(
+            flagBase + TQ_MANUAL_SYNC_C_FREE);
+        LoadRawInputToL1(resource, desc);
+        ComputeNormMatrices(resource, normWorkGm, desc.streamOrdinal);
         ComputeLoadedTile(resource, cWorkGm, bufferOffset);
         TqSyncFixed<AscendC::HardEvent::FIX_MTE3>();
-        TqCrossCoreSetForBothAiv<PIPE_FIX>(flagBase + TQ_MANUAL_SYNC_C_READY);
+        TqCrossCoreSetForBothAiv<PIPE_FIX>(
+            flagBase + TQ_MANUAL_SYNC_C_READY);
     }
 
-    __aicore__ inline void FinishC(uint32_t streamOrdinal) {
-        TqCrossCoreWaitForBothAiv<PIPE_FIX>(
-            context_.ManualFlagBase(streamOrdinal) + TQ_MANUAL_SYNC_C_FREE);
-    }
-
-    __aicore__ inline void ProcessPipelineStream(
-        TqManualMmadResource& resource,
-        AscendC::GlobalTensor<T>& aWorkGm,
-        AscendC::GlobalTensor<T>& cWorkGm,
-        uint32_t streamOrdinal,
-        bool& hasPending,
-        uint32_t& pendingStream) {
-        if (!hasPending) {
-            LoadA(resource, aWorkGm, streamOrdinal);
-            pendingStream = streamOrdinal;
-            hasPending = true;
-            return;
-        }
-        StartA(streamOrdinal);
-        ComputeC(resource, cWorkGm, pendingStream);
-        WaitAndLoadA(resource, aWorkGm, streamOrdinal);
-        FinishC(pendingStream);
-        pendingStream = streamOrdinal;
-    }
-
-    __aicore__ inline void DrainPipeline(
-        TqManualMmadResource& resource,
-        AscendC::GlobalTensor<T>& cWorkGm,
-        bool& hasPending,
-        uint32_t pendingStream) {
-        if (!hasPending) {
-            return;
-        }
-        ComputeC(resource, cWorkGm, pendingStream);
-        FinishC(pendingStream);
-        hasPending = false;
-    }
     BitResidualPackK8v4Context<T>& context_;
 };
 
