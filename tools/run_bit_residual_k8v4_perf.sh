@@ -2,11 +2,24 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+Z_TMP="${ROOT_DIR}/ztmp"
 cd "${ROOT_DIR}"
 
-source xrx_infoenvs
+ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}
+if [[ ! -d "${ASCEND_HOME_PATH}" && -d /usr/local/Ascend/cann-8.5.1 ]]; then
+    ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+fi
 
-RUNNER=${RUNNER:-"${ROOT_DIR}/ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf"}
+if [[ -f "${ASCEND_HOME_PATH}/set_env.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "${ASCEND_HOME_PATH}/set_env.sh"
+fi
+if [[ -f "${ROOT_DIR}/xrx_infoenvs" ]]; then
+    # shellcheck disable=SC1090
+    source "${ROOT_DIR}/xrx_infoenvs"
+fi
+
+RUNNER=${RUNNER:-"${Z_TMP}/bit_residual_k8v4_perf/bit_residual_k8v4_perf"}
 DEVICE=${DEVICE:-0}
 SEQ_LEN=${SEQ_LEN:-512}
 DECODE_SEQ_LEN=${DECODE_SEQ_LEN:-2048}
@@ -16,7 +29,7 @@ BLOCK_SIZE=${BLOCK_SIZE:-128}
 WARMUP=${WARMUP:-1}
 REPEAT=${REPEAT:-5}
 SLOT_PATTERN=${SLOT_PATTERN:-contiguous}
-SKIP_CACHE_FILL=${SKIP_CACHE_FILL:-1}
+SKIP_CACHE_FILL=${SKIP_CACHE_FILL:-0}
 
 scenario=${1:-${SCENARIO:-prefill_pack}}
 if [[ "${scenario}" == "-h" || "${scenario}" == "--help" || "${scenario}" == "help" ]]; then
@@ -44,14 +57,37 @@ Common env overrides:
   WARMUP=${WARMUP}
   REPEAT=${REPEAT}
   SKIP_CACHE_FILL=${SKIP_CACHE_FILL}
-  Q_LENS, KV_LENS, BATCH_SIZE, PREFILL_TOKENS, DECODE_BATCH, PACK_MODE, SLOT_PATTERN
+  Q_LENS, KV_LENS, BATCH_SIZE, PREFILL_TOKENS, DECODE_BATCH, SLOT_PATTERN
+
+Instructions:
+  1. Build the runner first:
+     bash tools/build_bit_residual_k8v4_perf.sh
+
+  2. Run inside docker container:
+     docker exec -it vllm.x00827378 bash
+     cd /root/x00827378/vllm-ascend
+     bash tools/run_bit_residual_k8v4_perf.sh [scenario]
+
+  3. Example runs:
+     # Prefill pack (512 tokens)
+     bash tools/run_bit_residual_k8v4_perf.sh prefill_pack
+
+     # Batch decode attention (32 requests, 1 token each, 2048 KV)
+     BATCH_SIZE=32 bash tools/run_bit_residual_k8v4_perf.sh batch_decode_attention
+
+     # Mixed workload (1 prefill 128 + 7 decode 1, KV=512/2048)
+     bash tools/run_bit_residual_k8v4_perf.sh mixed_both
+
+     # Custom configuration
+     HEADS=32 KV_HEADS=8 SEQ_LEN=1024 bash tools/run_bit_residual_k8v4_perf.sh prefill_attention
+
 EOF
     exit 0
 fi
 
 if [[ ! -x "${RUNNER}" ]]; then
-    echo "[run_attention_512] missing runner: ${RUNNER}" >&2
-    echo "[run_attention_512] build it with: bash tools/build_flex_tq_4bit_perf.sh" >&2
+    echo "[run_k8v4_perf] missing runner: ${RUNNER}" >&2
+    echo "[run_k8v4_perf] build it with: bash tools/build_bit_residual_k8v4_perf.sh" >&2
     exit 1
 fi
 
@@ -110,25 +146,24 @@ common_args() {
     printf '%s\n' "${args[@]}"
 }
 
-run_flex() {
+run_k8v4() {
     exec "${RUNNER}" "$@"
 }
 
 prefill_pack() {
     local q_lens=${Q_LENS:-${SEQ_LEN}}
     local kv_lens=${KV_LENS:-${SEQ_LEN}}
-    run_flex \
+    run_k8v4 \
         --pack-only \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
-        --pack-mode "${PACK_MODE:-contiguous-group-fast}" \
         $(common_args)
 }
 
 prefill_attention() {
     local q_lens=${Q_LENS:-${SEQ_LEN}}
     local kv_lens=${KV_LENS:-${SEQ_LEN}}
-    run_flex \
+    run_k8v4 \
         --attention-only \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
@@ -136,16 +171,15 @@ prefill_attention() {
 }
 
 single_decode_pack() {
-    run_flex \
+    run_k8v4 \
         --pack-only \
         --q-lens "${Q_LENS:-1}" \
         --kv-lens "${KV_LENS:-${DECODE_SEQ_LEN}}" \
-        --pack-mode "${PACK_MODE:-decode-vec-tasks}" \
         $(common_args)
 }
 
 single_decode_attention() {
-    run_flex \
+    run_k8v4 \
         --attention-only \
         --q-lens "${Q_LENS:-1}" \
         --kv-lens "${KV_LENS:-${DECODE_SEQ_LEN}}" \
@@ -156,11 +190,10 @@ batch_decode_pack() {
     local batch_size=${BATCH_SIZE:-32}
     local q_lens=${Q_LENS:-$(repeat_lens 1 "${batch_size}")}
     local kv_lens=${KV_LENS:-$(repeat_lens "${DECODE_SEQ_LEN}" "${batch_size}")}
-    run_flex \
+    run_k8v4 \
         --pack-only \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
-        --pack-mode "${PACK_MODE:-decode-vec-tasks}" \
         $(common_args)
 }
 
@@ -168,7 +201,7 @@ batch_decode_attention() {
     local batch_size=${BATCH_SIZE:-32}
     local q_lens=${Q_LENS:-$(repeat_lens 1 "${batch_size}")}
     local kv_lens=${KV_LENS:-$(repeat_lens "${DECODE_SEQ_LEN}" "${batch_size}")}
-    run_flex \
+    run_k8v4 \
         --attention-only \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
@@ -178,18 +211,17 @@ batch_decode_attention() {
 mixed_pack() {
     local q_lens=${Q_LENS:-$(mixed_q_lens)}
     local kv_lens=${KV_LENS:-$(mixed_kv_lens)}
-    run_flex \
+    run_k8v4 \
         --pack-only \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
-        --pack-mode "${PACK_MODE:-slot-mapping-group-owner}" \
         $(common_args)
 }
 
 mixed_attention() {
     local q_lens=${Q_LENS:-$(mixed_q_lens)}
     local kv_lens=${KV_LENS:-$(mixed_kv_lens)}
-    run_flex \
+    run_k8v4 \
         --attention-only \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
@@ -199,10 +231,9 @@ mixed_attention() {
 mixed_both() {
     local q_lens=${Q_LENS:-$(mixed_q_lens)}
     local kv_lens=${KV_LENS:-$(mixed_kv_lens)}
-    run_flex \
+    run_k8v4 \
         --q-lens "${q_lens}" \
         --kv-lens "${kv_lens}" \
-        --pack-mode "${PACK_MODE:-slot-mapping-group-owner}" \
         $(common_args)
 }
 
@@ -235,7 +266,7 @@ case "${scenario}" in
         mixed_both
         ;;
     *)
-        echo "[run_attention_512] unknown scenario: ${scenario}" >&2
+        echo "[run_k8v4_perf] unknown scenario: ${scenario}" >&2
         "$0" --help >&2
         exit 1
         ;;

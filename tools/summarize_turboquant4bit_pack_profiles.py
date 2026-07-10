@@ -148,7 +148,7 @@ def main() -> int:
     parser.add_argument(
         "profile_dir",
         nargs="?",
-        default="mytmp/pack4bit_branch_profiles",
+        default="ztmp/pack4bit_branch_profiles",
         help="Directory produced by profile_turboquant4bit_pack_branches.sh",
     )
     parser.add_argument("--top-lines", type=int, default=8)

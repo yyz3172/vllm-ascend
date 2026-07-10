@@ -4,13 +4,13 @@ ROOT_DIR=${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-8.5.1}
 SIM_SOC=${SIM_SOC:-Ascend910B3}
 SOC_DIR=${SOC_DIR:-ascend910b}
-PERF_OUT=${PERF_OUT:-${ROOT_DIR}/mytmp/perf_out_tq4bit_aclnn}
+PERF_OUT=${PERF_OUT:-${ROOT_DIR}/ztmp/perf_out_tq4bit_aclnn}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d%H%M%S)}
 MSPROF_LOG=${MSPROF_LOG:-${PERF_OUT}/msprof_op_simulator_tq4bit_aclnn_${RUN_ID}.log}
 LAUNCH_COUNT=${LAUNCH_COUNT:-1}
 REQUIRE_DEBUG_LINE=${REQUIRE_DEBUG_LINE:-1}
 AUTO_BUILD_DEBUG_LINE=${AUTO_BUILD_DEBUG_LINE:-1}
-RUNNER=${RUNNER:-${ROOT_DIR}/mytmp/flex_tq_4bit_perf/flex_tq_4bit_perf}
+RUNNER=${RUNNER:-${ROOT_DIR}/ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf}
 AUTO_BUILD_RUNNER=${AUTO_BUILD_RUNNER:-1}
 
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
@@ -97,9 +97,9 @@ sync_4bit_runtime_artifacts() {
     local src_bin dst_bin src_impl dst_impl op
 
     for op in turboquant_pack_kv_for_cache4bit turboquant_attention_paged4bit; do
-        src_bin="${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/bin/${op}"
+        src_bin="${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/bin/${op}"
         dst_bin="${opp_root}/op_impl/ai_core/tbe/kernel/${SOC_DIR}/${op}"
-        src_impl="${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/${op}"
+        src_impl="${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/${op}"
         dst_impl="${opp_root}/op_impl/ai_core/tbe/vllm-ascend_impl/ascendc/${op}"
         rm -rf "${dst_bin}" "${dst_impl}"
         mkdir -p "${dst_bin}" "${dst_impl}"
@@ -108,23 +108,23 @@ sync_4bit_runtime_artifacts() {
     done
 
     local ops_info_src
-    ops_info_src="${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/custom/op_impl/ai_core/tbe/config/${SOC_DIR}/aic-${SOC_DIR}-ops-info.json"
+    ops_info_src="${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/custom/op_impl/ai_core/tbe/config/${SOC_DIR}/aic-${SOC_DIR}-ops-info.json"
     if [[ ! -f "${ops_info_src}" ]]; then
-        ops_info_src="${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/autogen/aic-${SOC_DIR}-ops-info.json"
+        ops_info_src="${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/autogen/aic-${SOC_DIR}-ops-info.json"
     fi
     cp -a "${ops_info_src}" \
         "${opp_root}/op_impl/ai_core/tbe/config/${SOC_DIR}/aic-${SOC_DIR}-ops-info.json"
-    cp -a "${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/libcust_opapi.so" \
+    cp -a "${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/libcust_opapi.so" \
         "${opp_root}/op_api/lib/libcust_opapi.so"
-    cp -a "${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/libcust_opsproto_rt2.0.so" \
+    cp -a "${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/libcust_opsproto_rt2.0.so" \
         "${opp_root}/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so"
-    cp -a "${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_pack_kv_for_cache4bit.h" \
+    cp -a "${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_pack_kv_for_cache4bit.h" \
         "${opp_root}/op_api/include/aclnn_turboquant_pack_kv_for_cache4bit.h"
-    cp -a "${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/autogen/turboquant_pack_kv_for_cache4bit_proto.h" \
+    cp -a "${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/autogen/turboquant_pack_kv_for_cache4bit_proto.h" \
         "${opp_root}/op_proto/inc/turboquant_pack_kv_for_cache4bit_proto.h"
-    cp -a "${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_attention_paged4bit.h" \
+    cp -a "${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_attention_paged4bit.h" \
         "${opp_root}/op_api/include/aclnn_turboquant_attention_paged4bit.h"
-    cp -a "${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug/autogen/turboquant_attention_paged4bit_proto.h" \
+    cp -a "${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug/autogen/turboquant_attention_paged4bit_proto.h" \
         "${opp_root}/op_proto/inc/turboquant_attention_paged4bit_proto.h"
 
     rm -rf /tmp/xrx_tq4bit_runtime_config_root
@@ -150,22 +150,22 @@ build_4bit_debug_line_kernels() {
         export TURBOQUANT_PACK_KV_FOR_CACHE4BIT_DEBUG_LINE=ON
         export TURBOQUANT_ATTENTION_PAGED4BIT_DEBUG_LINE=ON
         rm -f \
-            "mytmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_pack_kv_for_cache4bit.cpp" \
-            "mytmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_pack_kv_for_cache4bit.h" \
-            "mytmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_attention_paged4bit.cpp" \
-            "mytmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_attention_paged4bit.h" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/TurboquantPackKvForCache4bit.py" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/TurboquantAttentionPaged4bit.py" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantPackKvForCache4bit-turboquant_pack_kv_for_cache4bit-0.sh" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantPackKvForCache4bit-turboquant_pack_kv_for_cache4bit-1.sh" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantAttentionPaged4bit-turboquant_attention_paged4bit-0.sh" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantAttentionPaged4bit-turboquant_attention_paged4bit-1.sh"
+            "ztmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_pack_kv_for_cache4bit.cpp" \
+            "ztmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_pack_kv_for_cache4bit.h" \
+            "ztmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_attention_paged4bit.cpp" \
+            "ztmp/build_libcust_opapi_nodebug/autogen/aclnn_turboquant_attention_paged4bit.h" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/TurboquantPackKvForCache4bit.py" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/TurboquantAttentionPaged4bit.py" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantPackKvForCache4bit-turboquant_pack_kv_for_cache4bit-0.sh" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantPackKvForCache4bit-turboquant_pack_kv_for_cache4bit-1.sh" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantAttentionPaged4bit-turboquant_attention_paged4bit-0.sh" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/TurboquantAttentionPaged4bit-turboquant_attention_paged4bit-1.sh"
         rm -rf \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/__pycache__" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/__pycache__"
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/__pycache__" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/__pycache__"
         cmake \
             -S csrc \
-            -B mytmp/build_libcust_opapi_nodebug \
+            -B ztmp/build_libcust_opapi_nodebug \
             -DBUILD_OPEN_PROJECT=ON \
             -DASCEND_COMPUTE_UNIT="${SOC_DIR}" \
             -DASCEND_OP_NAME=ALL \
@@ -176,38 +176,38 @@ build_4bit_debug_line_kernels() {
             -DTURBOQUANT_ATTENTION_PAGED4BIT_DEBUG_LINE=ON \
             -DCMAKE_BUILD_TYPE=Release
         if ! grep -Eq '^Turboquant(PackKvForCache4bit|AttentionPaged4bit),,.*(^|;)-g(;|$)' \
-            mytmp/build_libcust_opapi_nodebug/autogen/custom_compile_options.ini; then
+            ztmp/build_libcust_opapi_nodebug/autogen/custom_compile_options.ini; then
             echo "[profile_tq4bit] CMake configure did not add -g to 4bit custom compile options" >&2
             grep -E '^Turboquant(PackKvForCache4bit|AttentionPaged4bit),' \
-                mytmp/build_libcust_opapi_nodebug/autogen/custom_compile_options.ini >&2 || true
+                ztmp/build_libcust_opapi_nodebug/autogen/custom_compile_options.ini >&2 || true
             exit 1
         fi
-        cmake --build mytmp/build_libcust_opapi_nodebug \
+        cmake --build ztmp/build_libcust_opapi_nodebug \
             --target opbuild_gen_default \
             --target turboquant_pack_kv_for_cache4bit_${SOC_DIR}_py_copy \
             --target turboquant_attention_paged4bit_${SOC_DIR}_py_copy \
             -j "${BUILD_JOBS:-64}"
         if ! grep -Eq -- "'-g'" \
-            mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/TurboquantPackKvForCache4bit.py; then
+            ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/TurboquantPackKvForCache4bit.py; then
             echo "[profile_tq4bit] regenerated pack4bit impl Python does not contain -g" >&2
             exit 1
         fi
         if ! grep -Eq -- "'-g'" \
-            mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/TurboquantAttentionPaged4bit.py; then
+            ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/TurboquantAttentionPaged4bit.py; then
             echo "[profile_tq4bit] regenerated attention4bit impl Python does not contain -g" >&2
             exit 1
         fi
         rm -f \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/turboquant_pack_kv_for_cache4bit_${SOC_DIR}_src_copy.done" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_pack_kv_for_cache4bit_${SOC_DIR}_0.done" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_pack_kv_for_cache4bit_${SOC_DIR}_1.done" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/turboquant_attention_paged4bit_${SOC_DIR}_src_copy.done" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_attention_paged4bit_${SOC_DIR}_0.done" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_attention_paged4bit_${SOC_DIR}_1.done"
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_pack_kv_for_cache4bit/turboquant_pack_kv_for_cache4bit_${SOC_DIR}_src_copy.done" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_pack_kv_for_cache4bit_${SOC_DIR}_0.done" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_pack_kv_for_cache4bit_${SOC_DIR}_1.done" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/src/turboquant_attention_paged4bit/turboquant_attention_paged4bit_${SOC_DIR}_src_copy.done" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_attention_paged4bit_${SOC_DIR}_0.done" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/gen/turboquant_attention_paged4bit_${SOC_DIR}_1.done"
         rm -rf \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/bin/turboquant_pack_kv_for_cache4bit" \
-            "mytmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/bin/turboquant_attention_paged4bit"
-        cmake --build mytmp/build_libcust_opapi_nodebug \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/bin/turboquant_pack_kv_for_cache4bit" \
+            "ztmp/build_libcust_opapi_nodebug/binary/${SOC_DIR}/bin/turboquant_attention_paged4bit"
+        cmake --build ztmp/build_libcust_opapi_nodebug \
             --target turboquant_pack_kv_for_cache4bit_${SOC_DIR} \
             --target turboquant_attention_paged4bit_${SOC_DIR} \
             -j "${BUILD_JOBS:-64}"

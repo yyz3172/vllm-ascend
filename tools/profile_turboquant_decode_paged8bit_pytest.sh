@@ -5,7 +5,7 @@ ROOT_DIR=${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-8.5.1}
 SIM_SOC=${SIM_SOC:-Ascend910B3}
 SOC_DIR=${SOC_DIR:-ascend910b}
-PERF_OUT=${PERF_OUT:-${ROOT_DIR}/mytmp/perf_out_pytest_tq_decode}
+PERF_OUT=${PERF_OUT:-${ROOT_DIR}/ztmp/perf_out_pytest_tq_decode}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d%H%M%S)}
 MSPROF_LOG=${MSPROF_LOG:-${PERF_OUT}/msprof_op_simulator_pytest_${RUN_ID}.log}
 PYTHON_BIN=${PYTHON_BIN:-python3}
@@ -13,7 +13,7 @@ PYTEST_NODEID=${PYTEST_NODEID:-tests/ut/ops/test_turboquant_decode_paged_8bit_op
 LAUNCH_COUNT=${LAUNCH_COUNT:-1}
 REQUIRE_DEBUG_LINE=${REQUIRE_DEBUG_LINE:-1}
 PYTEST_SIMULATOR_BACKEND=${PYTEST_SIMULATOR_BACKEND:-acl_runner}
-CPP_RUNNER=${CPP_RUNNER:-${ROOT_DIR}/mytmp/test_turboquant_decode_paged8bit}
+CPP_RUNNER=${CPP_RUNNER:-${ROOT_DIR}/ztmp/test_turboquant_decode_paged8bit}
 AUTO_BUILD_CPP_RUNNER=${AUTO_BUILD_CPP_RUNNER:-1}
 
 mkdir -p "${PERF_OUT}"

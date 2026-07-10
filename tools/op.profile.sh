@@ -5,16 +5,16 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../" && pwd)
 echo "root dir is " $ROOT_DIR
 cd "${ROOT_DIR}"
 
-mkdir -p "${ROOT_DIR}/mytmp"
-export TMPDIR="${ROOT_DIR}/mytmp/tmp"
+mkdir -p "${ROOT_DIR}/ztmp"
+export TMPDIR="${ROOT_DIR}/ztmp/tmp"
 export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
 mkdir -p "${TMPDIR}"
 
-APP=${TQ4BIT_OP_PROFILE_APP:-tools/run_attention_512.sh}
+APP=${TQ4BIT_OP_PROFILE_APP:-"bash tools/run_attention_512.sh"}
 METRICS=${TQ4BIT_OP_PROFILE_METRICS:-Source,PipeUtilization}
 #METRICS=${TQ4BIT_OP_PROFILE_METRICS:-Source,PipeUtilization,TimelineDetail}
-LOG_FILE=${TQ4BIT_OP_PROFILE_LOG:-"${ROOT_DIR}/mytmp/log.op.timeline"}
+LOG_FILE=${TQ4BIT_OP_PROFILE_LOG:-"${ROOT_DIR}/ztmp/log.op.timeline"}
 CHECK_SOURCE=${TQ4BIT_OP_PROFILE_CHECK_SOURCE:-1}
 MARKER="${TMPDIR}/op_profile_start.$$.marker"
 touch "${MARKER}"
@@ -26,7 +26,7 @@ if [[ "${CHECK_SOURCE}" == "1" && ",${METRICS}," != *",Source,"* ]]; then
 fi
 
 msprof op \
-    --output="${ROOT_DIR}/mytmp" \
+    --output="${ROOT_DIR}/ztmp" \
     --application="${APP}" \
     --aic-metrics="${METRICS}" \
     --dump=on \
@@ -41,7 +41,7 @@ if [[ "${CHECK_SOURCE}" == "1" ]]; then
         if [[ -z "${opprof}" || "${dir}" -nt "${opprof}" ]]; then
             opprof="${dir}"
         fi
-    done < <(find "${ROOT_DIR}/mytmp" -maxdepth 1 -type d -name 'OPPROF_*' -newer "${MARKER}")
+    done < <(find "${ROOT_DIR}/ztmp" -maxdepth 1 -type d -name 'OPPROF_*' -newer "${MARKER}")
 
     if [[ -z "${opprof}" ]]; then
         echo "[op.profile] ERROR: no new OPPROF output found for debug-source validation" >&2

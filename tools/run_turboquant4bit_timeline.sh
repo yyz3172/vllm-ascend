@@ -25,7 +25,7 @@ if [[ -f "${ROOT_DIR}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_e
     source "${ROOT_DIR}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash"
 fi
 
-TMP_ROOT="${ROOT_DIR}/mytmp/turboquant4bit_timeline"
+TMP_ROOT="${ROOT_DIR}/ztmp/turboquant4bit_timeline"
 mkdir -p "${TMP_ROOT}/tmp"
 export TMPDIR="${TMP_ROOT}/tmp"
 export TMP="${TMPDIR}"

@@ -6,7 +6,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-8.5.1}
 SIM_SOC=${SIM_SOC:-Ascend910B3}
 SIM_MODE=${SIM_MODE:-pv}
-PERF_OUT=${PERF_OUT:-${ROOT_DIR}/mytmp/perf_out}
+PERF_OUT=${PERF_OUT:-${ROOT_DIR}/ztmp/perf_out}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d%H%M%S)}
 MSPROF_LOG=${MSPROF_LOG:-${PERF_OUT}/msprof_op_simulator_${RUN_ID}.log}
 
@@ -32,7 +32,7 @@ msprof op simulator \
     --soc-version="${SIM_SOC}" \
     --output="${PERF_OUT}" \
     --launch-count=1 \
-    --application=${ROOT_DIR}/mytmp/test_turboquant_decode_paged8bit \
+    --application=${ROOT_DIR}/ztmp/test_turboquant_decode_paged8bit \
     2>&1 | tee "${MSPROF_LOG}"
 msprof_status=${PIPESTATUS[0]}
 set -e

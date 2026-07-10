@@ -2,7 +2,7 @@
 set -euo pipefail
 cd /root/x00827378/vllm-ascend
 source xrx_infoenvs
-exec ../../mytmp/flex_tq_4bit_perf/flex_tq_4bit_perf \
+exec ../../ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf \
     --pack-only \
     --q-lens 1 \
     --kv-lens 512 \
