@@ -98,6 +98,14 @@ static constexpr uint32_t TQ_MANUAL_ROT_B_L1_OFFSET =
     TQ_MANUAL_ROT_A_L1_OFFSET + TQ_MANUAL_ROT_TILE_ELEMS * TQ_DTYPE_BYTES;
 static constexpr uint32_t TQ_MANUAL_NORM_B_L0_BYTE_OFFSET =
     TQ_ROT_K * TQ_ROT_N * TQ_DTYPE_BYTES;
+static constexpr uint32_t TQ_MANUAL_NORM_A_L0_BYTE_OFFSET =
+    TQ_MANUAL_ROT_TILE_M * TQ_ROT_K * TQ_DTYPE_BYTES;
+static constexpr uint32_t TQ_MANUAL_NORM_C_L0_BYTE_OFFSET =
+    TQ_MANUAL_ROT_TILE_M * TQ_ROT_N * sizeof(float);
+static constexpr uint32_t TQ_MANUAL_NORM_A_L0_EVENT = EVENT_ID1;
+static constexpr uint32_t TQ_MANUAL_NORM_B_L0_EVENT = EVENT_ID2;
+static constexpr uint32_t TQ_MANUAL_ROT_B_L0_EVENT = EVENT_ID3;
+static constexpr uint32_t TQ_MANUAL_NORM_C_L0_EVENT = EVENT_ID1;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT = 2;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_STRIDE_ELEMS = TQ_BATCH_ELEMS;
 static constexpr uint32_t TQ_MANUAL_NORM_MATRIX_DIM = TQ_MANUAL_AIV_SLICE_M;
