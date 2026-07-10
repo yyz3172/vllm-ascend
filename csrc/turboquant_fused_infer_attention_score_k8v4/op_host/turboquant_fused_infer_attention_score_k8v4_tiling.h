@@ -12,9 +12,21 @@ constexpr uint32_t TQ_K8V4_KV_TILE_ROWS = 16;
 constexpr uint32_t TQ_K8V4_UB_KV_TILE_CAP = 32;
 constexpr uint32_t TQ_K8V4_UB_GQA_CAP = 8;
 constexpr uint32_t TQ_K8V4_MAX_PARALLEL_CORES = 8;
+constexpr uint32_t TQ_K8V4_CUBE_MIN_G = 8;
+constexpr uint32_t TQ_K8V4_CUBE_MIN_TILE = 16;
+constexpr uint32_t TQ_K8V4_QKPV_VECTOR = 0;
+constexpr uint32_t TQ_K8V4_QKPV_CUBE = 1;
+
+// Tiling keys:
+//   0 = Vector QK/PV + KFC decode rotate
+//   1 = Cube QK/PV   + KFC decode rotate
+constexpr uint64_t TQ_K8V4_KEY_VECTOR = 0;
+constexpr uint64_t TQ_K8V4_KEY_CUBE = 1;
 
 BEGIN_TILING_DATA_DEF(TurboquantFusedInferAttentionScoreK8v4TilingData)
 TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, decodeRotateTiling);
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, qkTiling);
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, pvTiling);
 TILING_DATA_FIELD_DEF(uint32_t, numTokens);
 TILING_DATA_FIELD_DEF(uint32_t, batchSize);
 TILING_DATA_FIELD_DEF(uint32_t, numHeads);
@@ -31,6 +43,7 @@ TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum);
 TILING_DATA_FIELD_DEF(uint32_t, formerCoreNum);
 TILING_DATA_FIELD_DEF(uint32_t, blockSplitRange);
 TILING_DATA_FIELD_DEF(uint32_t, tailSplitRange);
+TILING_DATA_FIELD_DEF(uint32_t, qkPvMode);
 TILING_DATA_FIELD_DEF(float, scaleValue);
 TILING_DATA_FIELD_DEF(uint32_t, cacheNormBf16);
 END_TILING_DATA_DEF;

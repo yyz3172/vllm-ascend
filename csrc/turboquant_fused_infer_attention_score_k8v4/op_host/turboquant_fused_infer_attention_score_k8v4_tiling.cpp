@@ -76,6 +76,129 @@ ge::graphStatus FillDecodeRotateTiling(
     return ge::GRAPH_SUCCESS;
 }
 
+ge::graphStatus FillQkTiling(
+    const char* nodeName,
+    const platform_ascendc::PlatformAscendC& platform,
+    uint32_t gqaGroup,
+    uint32_t kvTileRows,
+    optiling::TCubeTiling& cubeTiling)
+{
+    uint64_t l1Size = 0, l0aSize = 0, l0bSize = 0, l0cSize = 0, ubSize = 0;
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1Size);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, l0aSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, l0bSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+
+    matmul_tiling::PlatformInfo platformInfo;
+    platformInfo.socVersion = platform.GetSocVersion();
+    platformInfo.l1Size = l1Size;
+    platformInfo.l0CSize = l0cSize;
+    platformInfo.ubSize = ubSize;
+    platformInfo.l0ASize = l0aSize;
+    platformInfo.l0BSize = l0bSize;
+
+    matmul_tiling::MatmulApiTiling bmm1(platformInfo);
+    const uint32_t m = AlignUp(gqaGroup, TQ_M_ALIGN);
+    bmm1.SetShape(m, kvTileRows, optiling::TQ_K8V4_HEAD_SIZE);
+    bmm1.SetOrgShape(m, kvTileRows, optiling::TQ_K8V4_HEAD_SIZE, optiling::TQ_K8V4_HEAD_SIZE);
+    bmm1.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT16, false);
+    bmm1.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT16, true);
+    bmm1.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT);
+    bmm1.SetBias(false);
+    const uint32_t baseN = std::min(AlignUp(kvTileRows, TQ_M_ALIGN), 256U);
+    if (bmm1.SetFixSplit(m, baseN) == -1) {
+        OPS_LOG_E(nodeName, "qk SetFixSplit failed");
+        return ge::GRAPH_FAILED;
+    }
+    if (bmm1.GetTiling(cubeTiling) == -1) {
+        OPS_LOG_E(nodeName, "qk GetTiling failed");
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus FillPvTiling(
+    const char* nodeName,
+    const platform_ascendc::PlatformAscendC& platform,
+    uint32_t gqaGroup,
+    uint32_t kvTileRows,
+    optiling::TCubeTiling& cubeTiling)
+{
+    uint64_t l1Size = 0, l0aSize = 0, l0bSize = 0, l0cSize = 0, ubSize = 0;
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1Size);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_A, l0aSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_B, l0bSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
+    platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+
+    matmul_tiling::PlatformInfo platformInfo;
+    platformInfo.socVersion = platform.GetSocVersion();
+    platformInfo.l1Size = l1Size;
+    platformInfo.l0CSize = l0cSize;
+    platformInfo.ubSize = ubSize;
+    platformInfo.l0ASize = l0aSize;
+    platformInfo.l0BSize = l0bSize;
+
+    matmul_tiling::MatmulApiTiling bmm2(platformInfo);
+    const uint32_t m = AlignUp(gqaGroup, TQ_M_ALIGN);
+    bmm2.SetShape(m, optiling::TQ_K8V4_HEAD_SIZE, kvTileRows);
+    bmm2.SetOrgShape(m, optiling::TQ_K8V4_HEAD_SIZE, kvTileRows, kvTileRows);
+    bmm2.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT16, false);
+    bmm2.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                  matmul_tiling::DataType::DT_FLOAT16, false);
+    bmm2.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND_ALIGN,
+                  matmul_tiling::DataType::DT_FLOAT);
+    bmm2.SetBias(false);
+    if (bmm2.SetFixSplit(m) == -1) {
+        OPS_LOG_E(nodeName, "pv SetFixSplit failed");
+        return ge::GRAPH_FAILED;
+    }
+    if (bmm2.GetTiling(cubeTiling) == -1) {
+        OPS_LOG_E(nodeName, "pv GetTiling failed");
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+uint32_t PickQkPvMode(uint32_t gqaGroup, uint32_t kvTileRows)
+{
+    if (gqaGroup >= optiling::TQ_K8V4_CUBE_MIN_G &&
+        kvTileRows >= optiling::TQ_K8V4_CUBE_MIN_TILE) {
+        return optiling::TQ_K8V4_QKPV_CUBE;
+    }
+    return optiling::TQ_K8V4_QKPV_VECTOR;
+}
+
+size_t CalcWorkspaceSize(const platform_ascendc::PlatformAscendC& platform)
+{
+    size_t ws = static_cast<size_t>(platform.GetLibApiWorkSpaceSize());
+    if (ws < 16U * 1024U * 1024U) {
+        ws = 16U * 1024U * 1024U;
+    }
+    // Per-core GM scratch: decode fp32 C + QK/PV cube operands (see kernel offsets).
+    constexpr size_t kDecodeStride =
+        static_cast<size_t>(optiling::TQ_K8V4_UB_KV_TILE_CAP) * optiling::TQ_K8V4_HEAD_SIZE *
+        sizeof(float);
+    constexpr size_t kQkPvStride =
+        static_cast<size_t>(optiling::TQ_K8V4_UB_GQA_CAP) * optiling::TQ_K8V4_UB_KV_TILE_CAP *
+            sizeof(float) +
+        static_cast<size_t>(optiling::TQ_K8V4_UB_GQA_CAP) * optiling::TQ_K8V4_HEAD_SIZE *
+            sizeof(uint16_t) * 2 +
+        static_cast<size_t>(optiling::TQ_K8V4_UB_KV_TILE_CAP) * optiling::TQ_K8V4_HEAD_SIZE *
+            sizeof(uint16_t) +
+        static_cast<size_t>(optiling::TQ_K8V4_UB_GQA_CAP) * optiling::TQ_K8V4_HEAD_SIZE *
+            sizeof(float);
+    constexpr size_t kPerCore = kDecodeStride + kQkPvStride;
+    ws += static_cast<size_t>(256) * 1024U;
+    ws += static_cast<size_t>(optiling::TQ_K8V4_MAX_PARALLEL_CORES) * kPerCore;
+    return ws;
+}
+
 void SplitBn(uint32_t bn, uint32_t coreNum, uint32_t& usedCoreNum,
              uint32_t& formerCoreNum, uint32_t& blockSplitRange, uint32_t& tailSplitRange)
 {
@@ -224,10 +347,22 @@ static ge::graphStatus TurboquantFusedInferAttentionScoreK8v4TilingFunc(gert::Ti
     const uint32_t bn = numTokens * numKvHeads;
     const uint32_t kvTileRows = PickKvTileRows(blockSize);
 
+    const uint32_t qkPvMode = PickQkPvMode(gqaGroup, kvTileRows);
+
     TurboquantFusedInferAttentionScoreK8v4TilingData tiling{};
     if (FillDecodeRotateTiling(nodeName, ascendcPlatform, kvTileRows, tiling.decodeRotateTiling) !=
         ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
+    }
+    if (qkPvMode == optiling::TQ_K8V4_QKPV_CUBE) {
+        if (FillQkTiling(nodeName, ascendcPlatform, gqaGroup, kvTileRows, tiling.qkTiling) !=
+            ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
+        if (FillPvTiling(nodeName, ascendcPlatform, gqaGroup, kvTileRows, tiling.pvTiling) !=
+            ge::GRAPH_SUCCESS) {
+            return ge::GRAPH_FAILED;
+        }
     }
 
     uint32_t usedCoreNum = 0;
@@ -252,6 +387,7 @@ static ge::graphStatus TurboquantFusedInferAttentionScoreK8v4TilingFunc(gert::Ti
     tiling.set_formerCoreNum(formerCoreNum);
     tiling.set_blockSplitRange(blockSplitRange);
     tiling.set_tailSplitRange(tailSplitRange);
+    tiling.set_qkPvMode(qkPvMode);
     tiling.set_scaleValue(*scaleValuePtr);
     const uint32_t cacheNormBf16 =
         (cacheNormBf16Ptr != nullptr && *cacheNormBf16Ptr != 0) ? 1U : 0U;
@@ -270,10 +406,7 @@ static ge::graphStatus TurboquantFusedInferAttentionScoreK8v4TilingFunc(gert::Ti
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    workspaces[0] = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
-    if (workspaces[0] < 16U * 1024U * 1024U) {
-        workspaces[0] = 16U * 1024U * 1024U;
-    }
+    workspaces[0] = CalcWorkspaceSize(ascendcPlatform);
     if (workspaces[0] > MAX_USER_WORKSPACE) {
         OPS_LOG_E(nodeName, "workspace size %zu exceeds cap", workspaces[0]);
         return ge::GRAPH_FAILED;
@@ -283,12 +416,16 @@ static ge::graphStatus TurboquantFusedInferAttentionScoreK8v4TilingFunc(gert::Ti
         ascendcPlatform.CalcTschBlockDim(TQ_KFC_AIV_NUM, TQ_KFC_AIC_NUM, TQ_KFC_AIV_NUM);
     const uint32_t blockDim = std::max(1U, usedCoreNum) * mixBlockDim;
     context->SetBlockDim(blockDim);
-    context->SetTilingKey(0);
+    // Cube QK/PV kernel path uses a separate tiling key; keep key=0 until multi-matmul
+    // registration is split into its own TU (CANN Mc2 workspace constraint).
+    context->SetTilingKey(optiling::TQ_K8V4_KEY_VECTOR);
 
     OPS_LOG_I(nodeName,
               "TurboquantFusedInferAttentionScoreK8v4 tiling: tokens=%u bn=%u kvTile=%u "
-              "usedCore=%u keyRow=%u valueRow=%u ws=%zu",
-              numTokens, bn, kvTileRows, usedCoreNum, keyRowBytes, valueRowBytes, workspaces[0]);
+              "usedCore=%u qkpv=%u key=%lu keyRow=%u valueRow=%u ws=%zu",
+              numTokens, bn, kvTileRows, usedCoreNum, qkPvMode,
+              static_cast<unsigned long>(optiling::TQ_K8V4_KEY_VECTOR), keyRowBytes,
+              valueRowBytes, workspaces[0]);
     return ge::GRAPH_SUCCESS;
 }
 

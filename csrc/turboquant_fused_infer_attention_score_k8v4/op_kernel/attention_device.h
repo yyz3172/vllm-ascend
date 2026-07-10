@@ -15,121 +15,97 @@
 namespace turboquant_attn {
 
 static constexpr uint32_t TQ_ATTN_HEAD = 128;
+static constexpr uint32_t TQ_ATTN_TILE_STRIDE = 32;
+
+template <AscendC::HardEvent EVT>
+__aicore__ inline void AttnSync()
+{
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVT));
+    AscendC::SetFlag<EVT>(e);
+    AscendC::WaitFlag<EVT>(e);
+}
 
 __aicore__ inline float ExpScalar(AscendC::LocalTensor<float>& expBuf, float x)
 {
     expBuf.SetValue(0, x);
+    AttnSync<AscendC::HardEvent::S_V>();
     AscendC::Exp(expBuf, expBuf, 1);
+    AttnSync<AscendC::HardEvent::V_S>();
     return expBuf.GetValue(0);
 }
 
-// Vector QK: Q_group[G,128] dot K_tile[M,128] -> score[G,M]
-__aicore__ inline void VectorQk(
+// Vector QK: Q[G,128] dot K[M,128] -> score[G,M] with Mul+ReduceSum.
+__aicore__ inline void VectorQkFloatPreScaled(
     AscendC::LocalTensor<float> qGroup,
-    const AscendC::LocalTensor<half>& kTile,
+    AscendC::LocalTensor<float> kTileFloat,
     AscendC::LocalTensor<float> scoreOut,
+    AscendC::LocalTensor<float> reduceTmp,
+    AscendC::LocalTensor<float> mulTmp,
     uint32_t gqaGroup,
     uint32_t mRows,
     float scale)
 {
     for (uint32_t g = 0; g < gqaGroup; ++g) {
+        auto scoreVec = scoreOut[g * TQ_ATTN_TILE_STRIDE];
         for (uint32_t m = 0; m < mRows; ++m) {
-            float dot = 0.f;
-            for (uint32_t d = 0; d < TQ_ATTN_HEAD; ++d) {
-                dot += qGroup.GetValue(g * TQ_ATTN_HEAD + d) *
-                       static_cast<float>(kTile.GetValue(m * TQ_ATTN_HEAD + d));
-            }
-            scoreOut.SetValue(g * mRows + m, dot * scale);
+            AscendC::Mul(mulTmp, qGroup[g * TQ_ATTN_HEAD], kTileFloat[m * TQ_ATTN_HEAD],
+                         TQ_ATTN_HEAD);
+            AscendC::ReduceSum<float>(scoreVec[m], mulTmp, reduceTmp, TQ_ATTN_HEAD);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        if (scale != 1.f) {
+            AscendC::Muls(scoreVec, scoreVec, scale, mRows);
+            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 }
 
-// Vector PV: prob[G,M] dot V_tile[M,128] -> out[G,128]
-__aicore__ inline void VectorPv(
-    AscendC::LocalTensor<float> prob,
-    const AscendC::LocalTensor<half>& vTile,
-    AscendC::LocalTensor<float> outGroup,
-    uint32_t gqaGroup,
-    uint32_t mRows)
-{
-    for (uint32_t g = 0; g < gqaGroup; ++g) {
-        for (uint32_t d = 0; d < TQ_ATTN_HEAD; ++d) {
-            float acc = 0.f;
-            for (uint32_t m = 0; m < mRows; ++m) {
-                acc += prob.GetValue(g * mRows + m) *
-                       static_cast<float>(vTile.GetValue(m * TQ_ATTN_HEAD + d));
-            }
-            outGroup.SetValue(g * TQ_ATTN_HEAD + d, acc);
-        }
-    }
-}
-
-// Online softmax update for one KV tile (per G head).
-__aicore__ inline void OnlineSoftmaxUpdateTile(
+// Tile-level online softmax + vector PV with fp32 V tile.
+__aicore__ inline void OnlineSoftmaxUpdateTileFloatPreScaled(
     AscendC::LocalTensor<float> scoreTile,
-    const AscendC::LocalTensor<half>& vTile,
+    AscendC::LocalTensor<float> vTileFloat,
     AscendC::LocalTensor<float> mState,
     AscendC::LocalTensor<float> sState,
     AscendC::LocalTensor<float> outAcc,
     AscendC::LocalTensor<float>& expBuf,
+    AscendC::LocalTensor<float> reduceTmp,
     uint32_t gqaGroup,
     uint32_t mRows)
 {
     for (uint32_t g = 0; g < gqaGroup; ++g) {
+        auto scoreVec = scoreTile[g * TQ_ATTN_TILE_STRIDE];
+        AscendC::ReduceMax<float>(expBuf, scoreVec, reduceTmp, mRows, false);
+        AscendC::PipeBarrier<PIPE_V>();
+        AttnSync<AscendC::HardEvent::V_S>();
+
+        const float oldM = mState.GetValue(g);
+        const float oldS = sState.GetValue(g);
+        const float tileM = expBuf.GetValue(0);
+        const float mNew = (tileM > oldM) ? tileM : oldM;
+        const float alpha =
+            (oldS <= 0.f) ? 0.f : ((mNew > oldM) ? ExpScalar(expBuf, oldM - mNew) : 1.f);
+
+        AscendC::Adds(scoreVec, scoreVec, -mNew, mRows);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Exp(scoreVec, scoreVec, mRows);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ReduceSum<float>(expBuf, scoreVec, reduceTmp, mRows);
+        AscendC::PipeBarrier<PIPE_V>();
+        AttnSync<AscendC::HardEvent::V_S>();
+
+        const uint32_t outBase = g * TQ_ATTN_HEAD;
+        if (oldS > 0.f) {
+            AscendC::Muls(outAcc[outBase], outAcc[outBase], alpha, TQ_ATTN_HEAD);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         for (uint32_t m = 0; m < mRows; ++m) {
-            const float score = scoreTile.GetValue(g * mRows + m);
-            const float oldM = mState.GetValue(g);
-            const float oldS = sState.GetValue(g);
-            const float mNew = (score > oldM) ? score : oldM;
-            const float alpha = (mNew > oldM) ? ExpScalar(expBuf, oldM - mNew) : 1.f;
-            const float beta = ExpScalar(expBuf, score - mNew);
-
-            for (uint32_t d = 0; d < TQ_ATTN_HEAD; ++d) {
-                const float vVal =
-                    static_cast<float>(vTile.GetValue(m * TQ_ATTN_HEAD + d));
-                const uint32_t outIdx = g * TQ_ATTN_HEAD + d;
-                outAcc.SetValue(outIdx, outAcc.GetValue(outIdx) * alpha + vVal * beta);
-            }
-            sState.SetValue(g, oldS * alpha + beta);
-            mState.SetValue(g, mNew);
+            const float beta = scoreVec.GetValue(m);
+            AscendC::Axpy(outAcc[outBase], vTileFloat[m * TQ_ATTN_HEAD], beta, TQ_ATTN_HEAD);
+            AscendC::PipeBarrier<PIPE_V>();
         }
-    }
-}
-
-// FlashDecode combine: merge partial (max, sum, accum) across kv segments.
-__aicore__ inline void FlashDecodeCombineHead(
-    float* globalM,
-    float* globalS,
-    float* globalOut,
-    const float* partialM,
-    const float* partialS,
-    const float* partialOut,
-    uint32_t numParts,
-    AscendC::LocalTensor<float>& expBuf)
-{
-    float bestM = partialM[0];
-    for (uint32_t p = 1; p < numParts; ++p) {
-        if (partialM[p] > bestM) {
-            bestM = partialM[p];
-        }
-    }
-    float sumS = 0.f;
-    float outAcc[TQ_ATTN_HEAD];
-    for (uint32_t d = 0; d < TQ_ATTN_HEAD; ++d) {
-        outAcc[d] = 0.f;
-    }
-    for (uint32_t p = 0; p < numParts; ++p) {
-        const float w = ExpScalar(expBuf, partialM[p] - bestM) * partialS[p];
-        sumS += w;
-        for (uint32_t d = 0; d < TQ_ATTN_HEAD; ++d) {
-            outAcc[d] += w * partialOut[p * TQ_ATTN_HEAD + d];
-        }
-    }
-    const float invS = (sumS > 0.f) ? (1.f / sumS) : 0.f;
-    globalM[0] = bestM;
-    globalS[0] = sumS;
-    for (uint32_t d = 0; d < TQ_ATTN_HEAD; ++d) {
-        globalOut[d] = outAcc[d] * invS;
+        const float tileS = expBuf.GetValue(0);
+        sState.SetValue(g, oldS * alpha + tileS);
+        mState.SetValue(g, mNew);
     }
 }
 

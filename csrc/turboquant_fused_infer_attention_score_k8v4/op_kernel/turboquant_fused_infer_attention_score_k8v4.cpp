@@ -1,18 +1,18 @@
 /*
  * TurboQuant fused attention (K8V4): key 8-bit + value 4-bit packed KV.
  *
- * Performance path aligned with turboquant_attention_paged8bit:
- * - KV tiled GM->UB loads
+ * Performance path:
+ * - KV tiled GM->UB loads with vectorized 4-bit unpack
  * - Vectorized Gather + Cube rotate decode (decode_device.h)
- * - GQA-grouped online softmax (attention_device.h)
+ * - Vector QK/PV + tile-level online softmax (attention_device.h)
  */
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 
-#include "decode_device.h"
 #include "attention_device.h"
+#include "decode_device.h"
 
 namespace {
 
@@ -24,10 +24,10 @@ constexpr uint32_t TQ_V_CODEBOOK = 16;
 constexpr uint32_t TQ_K_PACKED = turboquant::TQ_DECODE_PACKED_BYTES;
 constexpr uint32_t TQ_V_INDEX_BYTES = 64;
 constexpr uint32_t TQ_V_PACKED = TQ_V_INDEX_BYTES + 2;
-constexpr uint32_t TQ_V_PACKED_STRIDE = (TQ_V_PACKED + 31U) / 32U * 32U;  // 66 -> 96 for MTE
+constexpr uint32_t TQ_V_PACKED_STRIDE = (TQ_V_PACKED + 31U) / 32U * 32U;
 constexpr uint32_t TQ_AIV_SUB = 2;
 constexpr uint32_t TQ_ROT_WS = TQ_HEAD * TQ_HEAD * sizeof(half);
-constexpr uint64_t TQ_CUBE_C_OFF = 256 * 1024;
+constexpr uint64_t TQ_WS_DECODE_REGION = 256ULL * 1024ULL;
 constexpr uint32_t TQ_UB_KV_TILE_CAP = 32;
 constexpr uint32_t TQ_UB_GQA_CAP = 8;
 
@@ -88,6 +88,7 @@ public:
         usedCoreNum_ = tiling_->usedCoreNum;
         scaleValue_ = tiling_->scaleValue;
         (void)tiling_->cacheNormBf16;
+        (void)tiling_->qkPvMode;
 
         queryGm_.SetGlobalBuffer(query, static_cast<uint64_t>(numTokens_) * numHeads_ * headSize_);
         keyCacheGm_.SetGlobalBuffer(keyCache, 0);
@@ -112,7 +113,8 @@ public:
         pipe_->InitBuffer(expBuf_, 4 * sizeof(float));
         pipe_->InitBuffer(qGroupBuf_, TQ_UB_GQA_CAP * TQ_HEAD * sizeof(half));
         pipe_->InitBuffer(qGroupFloatBuf_, TQ_UB_GQA_CAP * TQ_HEAD * sizeof(float));
-        pipe_->InitBuffer(scoreBuf_, TQ_UB_GQA_CAP * TQ_UB_KV_TILE_CAP * sizeof(float));
+        pipe_->InitBuffer(scoreBuf_,
+                          TQ_UB_GQA_CAP * turboquant_attn::TQ_ATTN_TILE_STRIDE * sizeof(float));
         pipe_->InitBuffer(mStateBuf_, TQ_UB_GQA_CAP * sizeof(float));
         pipe_->InitBuffer(sStateBuf_, TQ_UB_GQA_CAP * sizeof(float));
         pipe_->InitBuffer(outAccBuf_, TQ_UB_GQA_CAP * TQ_HEAD * sizeof(float));
@@ -120,6 +122,16 @@ public:
         pipe_->InitBuffer(idxFloatBuf_, TQ_UB_KV_TILE_CAP * TQ_HEAD * sizeof(float));
         pipe_->InitBuffer(idxS32Buf_, TQ_UB_KV_TILE_CAP * TQ_HEAD * sizeof(int32_t));
         pipe_->InitBuffer(yHatBuf_, TQ_UB_KV_TILE_CAP * TQ_HEAD * sizeof(half));
+        pipe_->InitBuffer(kvFloatBuf_, TQ_UB_KV_TILE_CAP * TQ_HEAD * sizeof(float));
+        pipe_->InitBuffer(vFloatBuf_, TQ_UB_KV_TILE_CAP * TQ_HEAD * sizeof(float));
+        pipe_->InitBuffer(mulTmpBuf_, TQ_HEAD * sizeof(float));
+        pipe_->InitBuffer(reduceTmpBuf_, TQ_HEAD * sizeof(float));
+        pipe_->InitBuffer(nibbleMaskBuf_, TQ_V_INDEX_BYTES * sizeof(uint8_t));
+
+        auto mask = nibbleMaskBuf_.Get<uint8_t>();
+        for (uint32_t i = 0; i < TQ_V_INDEX_BYTES; ++i) {
+            mask.SetValue(i, static_cast<uint8_t>(0x0Fu));
+        }
 
         auto* wsBase = reinterpret_cast<__gm__ uint8_t*>(GetSysWorkSpacePtr());
         matmulReady_ = (wsBase != nullptr);
@@ -127,7 +139,7 @@ public:
             const uint32_t coreIdx = GetBlockIdx() / TQ_AIV_SUB;
             constexpr uint64_t kCubeCStride =
                 static_cast<uint64_t>(TQ_UB_KV_TILE_CAP) * TQ_HEAD * sizeof(float);
-            const uint64_t cubeCOff = TQ_CUBE_C_OFF + static_cast<uint64_t>(coreIdx) * kCubeCStride;
+            const uint64_t cubeCOff = TQ_WS_DECODE_REGION + static_cast<uint64_t>(coreIdx) * kCubeCStride;
             cubeCGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(wsBase + cubeCOff),
                                      static_cast<uint64_t>(TQ_UB_KV_TILE_CAP) * TQ_HEAD);
         }
@@ -241,6 +253,7 @@ private:
         uint32_t kvStart)
     {
         auto valueRaw = valueRawBuf_.Get<uint8_t>();
+        auto nibbleMask = nibbleMaskBuf_.Get<uint8_t>();
         AscendC::DataCopyExtParams copyParams{1, TQ_V_PACKED, 0, 0, 0};
         AscendC::DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         for (uint32_t t = 0; t < mRows; ++t) {
@@ -255,17 +268,19 @@ private:
             AscendC::DataCopyPad(valueRaw[t * TQ_V_PACKED_STRIDE], valueCacheGm_[srcOff],
                                  copyParams, padParams);
         }
-        turboquant::TqDecodeSync<AscendC::HardEvent::MTE2_S>();
+        turboquant::TqDecodeSync<AscendC::HardEvent::MTE2_V>();
 
         const uint32_t normBase = mRows * TQ_HEAD;
         for (uint32_t t = 0; t < mRows; ++t) {
             const uint32_t rowBase = t * TQ_V_PACKED_STRIDE;
             const uint32_t dstBase = t * TQ_HEAD;
+            auto rowRaw = valueRaw[rowBase];
+            auto lo = packed[dstBase];
+            AscendC::And(lo, rowRaw, nibbleMask, TQ_V_INDEX_BYTES);
+            AscendC::PipeBarrier<PIPE_V>();
             for (uint32_t b = 0; b < TQ_V_INDEX_BYTES; ++b) {
-                const uint8_t byteVal = valueRaw.GetValue(rowBase + b);
-                packed.SetValue(dstBase + b, static_cast<uint8_t>(byteVal & 0x0Fu));
                 packed.SetValue(dstBase + b + TQ_V_INDEX_BYTES,
-                                static_cast<uint8_t>((byteVal >> 4) & 0x0Fu));
+                                static_cast<uint8_t>((rowRaw.GetValue(b) >> 4) & 0x0Fu));
             }
             const uint32_t dstNorm = normBase + t * sizeof(half);
             packed.SetValue(dstNorm, valueRaw.GetValue(rowBase + TQ_V_INDEX_BYTES));
@@ -357,16 +372,21 @@ private:
         uint32_t tokenIdx, uint32_t kvHead, LocalTensor<float> sState, LocalTensor<float> outAcc)
     {
         const uint32_t qBaseHead = kvHead * gqaGroup_;
+        auto outLocal = qGroupBuf_.Get<half>();
         for (uint32_t g = 0; g < gqaGroup_; ++g) {
             const float sum = sState.GetValue(g);
             const float invS = (sum > 0.f) ? (1.f / sum) : 0.f;
+            AscendC::Muls(outAcc[g * TQ_HEAD], outAcc[g * TQ_HEAD], invS, TQ_HEAD);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(outLocal, outAcc, AscendC::RoundMode::CAST_NONE, gqaGroup_ * TQ_HEAD);
+        turboquant::TqDecodeSync<AscendC::HardEvent::V_MTE3>();
+        for (uint32_t g = 0; g < gqaGroup_; ++g) {
             const uint64_t off =
                 (static_cast<uint64_t>(tokenIdx) * numHeads_ + qBaseHead + g) * TQ_HEAD;
-            for (uint32_t d = 0; d < TQ_HEAD; ++d) {
-                outGm_.SetValue(off + d,
-                                static_cast<half>(outAcc.GetValue(g * TQ_HEAD + d) * invS));
-            }
+            DataCopy(outGm_[off], outLocal[g * TQ_HEAD], TQ_HEAD);
         }
+        turboquant::TqDecodeSync<AscendC::HardEvent::MTE3_V>();
     }
 
     __aicore__ inline void ComputeAttention(uint32_t tokenIdx, uint32_t kvHead)
@@ -397,6 +417,9 @@ private:
         auto xHat = xHatBuf_.Get<half>();
         auto codebookLocal = codebookBuf_.Get<half>();
         auto expLocal = expBuf_.Get<float>();
+        auto scoreTile = scoreBuf_.Get<float>();
+        auto kTileFloat = kvFloatBuf_.Get<float>();
+        auto vTileFloat = vFloatBuf_.Get<float>();
 
         for (uint32_t pos = 0; pos < causalKvEnd;) {
             const uint32_t tileRows =
@@ -405,15 +428,21 @@ private:
             LocalTensor<half> kTile = xHat;
             DecodeKeyTile(packedLocal, codebookLocal, rotationGm_, kTile, tileRows);
 
-            auto scoreTile = scoreBuf_.Get<float>();
-            turboquant_attn::VectorQk(qGroup, kTile, scoreTile, gqaGroup_, tileRows, scaleValue_);
+            AscendC::Cast(kTileFloat, kTile, AscendC::RoundMode::CAST_NONE, tileRows * TQ_HEAD);
+            AscendC::PipeBarrier<PIPE_V>();
+            turboquant_attn::VectorQkFloatPreScaled(
+                qGroup, kTileFloat, scoreTile, reduceTmpBuf_.Get<float>(), mulTmpBuf_.Get<float>(),
+                gqaGroup_, tileRows, scaleValue_);
 
             LoadValueTileRows(packedLocal, tileRows, seqIdx, kvHead, pos);
             LocalTensor<half> vTile = xHat;
             DecodeValueTile(packedLocal, codebookLocal[TQ_K_CODEBOOK], rotationVGm_, vTile, tileRows);
 
-            turboquant_attn::OnlineSoftmaxUpdateTile(
-                scoreTile, vTile, mState, sState, outAcc, expLocal, gqaGroup_, tileRows);
+            AscendC::Cast(vTileFloat, vTile, AscendC::RoundMode::CAST_NONE, tileRows * TQ_HEAD);
+            AscendC::PipeBarrier<PIPE_V>();
+            turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaled(
+                scoreTile, vTileFloat, mState, sState, outAcc, expLocal, reduceTmpBuf_.Get<float>(),
+                gqaGroup_, tileRows);
             pos += tileRows;
         }
 
@@ -468,6 +497,11 @@ private:
     TBuf<TPosition::VECCALC> idxFloatBuf_;
     TBuf<TPosition::VECCALC> idxS32Buf_;
     TBuf<TPosition::VECOUT> yHatBuf_;
+    TBuf<TPosition::VECCALC> kvFloatBuf_;
+    TBuf<TPosition::VECCALC> vFloatBuf_;
+    TBuf<TPosition::VECCALC> mulTmpBuf_;
+    TBuf<TPosition::VECCALC> reduceTmpBuf_;
+    TBuf<TPosition::VECCALC> nibbleMaskBuf_;
 };
 
 #define INVOKE_TQ_K8V4_FIA_KERNEL()                                                               \
@@ -482,7 +516,7 @@ private:
         op.Init(reinterpret_cast<__gm__ half*>(query),                                          \
                 reinterpret_cast<__gm__ uint8_t*>(key_cache),                                 \
                 reinterpret_cast<__gm__ uint8_t*>(value_cache),                               \
-                reinterpret_cast<__gm__ int32_t*>(block_table),                               \
+                reinterpret_cast<__gm__ int32_t*>(block_table),                                 \
                 reinterpret_cast<__gm__ int32_t*>(actual_seq_len_q),                          \
                 reinterpret_cast<__gm__ int32_t*>(actual_seq_len_kv),                         \
                 reinterpret_cast<__gm__ half*>(codebook),                                     \
