@@ -352,15 +352,44 @@ private:
         uint32_t bufferOffset,
         uint32_t aivSlice) {
         auto yBatch = context_.resource_.YBatch();
-        const uint32_t sliceElemOffset = aivSlice * TQ_MANUAL_AIV_SLICE_ELEMS;
-        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
-            const uint32_t rowOffset = row * TQ_PACK_D;
-            AscendC::DataCopy(
-                yBatch[rowOffset],
-                cWorkGm[bufferOffset + sliceElemOffset + rowOffset],
-                TQ_PACK_D);
-        }
+        // Rotation C is now written in NZ fractal format (CFG_NZ fixpipe).
+        // Read the entire NZ-format slice into a scratch area, then
+        // rearrange rows from NZ fractal layout to contiguous ND format.
+        //
+        // NZ layout of 16×128 matrix (8 fractal blocks of 16×16):
+        //   Element (row m, col n) → NZ offset = (n/16)*256 + (n%16)*16 + m
+        // A row of 128 elements is scattered across 8 fractal blocks.
+        //
+        // Strategy: read NZ tile into yBatch[2048] (scratch), rearrange
+        // into yBatch[0] (destination for row-major normalization).
+        static constexpr uint32_t NZ_TILE_ELEMS =
+            TQ_MANUAL_AIV_SLICE_M * TQ_ROT_N;  // 16×128 = 2048
+        static constexpr uint32_t SCRATCH_OFFSET = NZ_TILE_ELEMS;
+        static constexpr uint32_t NZ_FRACAL_BLOCK_ELEMS = 256;
+
+        const uint32_t sliceElemOffset = aivSlice * NZ_TILE_ELEMS;
+        // Read entire NZ-format tile from GM into scratch area
+        AscendC::DataCopy(
+            yBatch[SCRATCH_OFFSET],
+            cWorkGm[bufferOffset + sliceElemOffset],
+            NZ_TILE_ELEMS);
         TqSyncMte2ToV();
+        TqSyncMte2ToS();
+
+        // Rearrange NZ → ND: for each row m, extract 128 elements
+        // from scattered NZ positions into contiguous row at yBatch[m*128].
+        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
+            for (uint32_t n = 0; n < TQ_ROT_N; ++n) {
+                const uint32_t blockIdx = n / TQ_CUBE_M_ALIGN;
+                const uint32_t nLocal = n % TQ_CUBE_M_ALIGN;
+                const uint32_t nzOffset =
+                    blockIdx * NZ_FRACAL_BLOCK_ELEMS + nLocal * TQ_CUBE_M_ALIGN + row;
+                yBatch.SetValue(
+                    row * TQ_ROT_N + n,
+                    yBatch.GetValue(SCRATCH_OFFSET + nzOffset));
+            }
+        }
+        TqSyncSToV();
     }
 
     template <bool IS_KEY>
