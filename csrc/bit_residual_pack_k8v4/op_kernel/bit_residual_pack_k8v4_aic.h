@@ -41,6 +41,12 @@ public:
 
         TqManualMmadResource manualResource;
         LoadResidentRotation(manualResource, op.rotationTGm_);
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(
+            TQ_MANUAL_NORM_A_L0_EVENT);
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(
+            TQ_MANUAL_NORM_B_L0_EVENT);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(
+            TQ_MANUAL_NORM_C_L0_EVENT);
 
         uint32_t tileOrdinal = 0;
         uint32_t manualTileOrdinal = 0;
@@ -122,6 +128,26 @@ private:
         params.dstNzMatrixStride = TQ_CUBE_M_ALIGN * TQ_ROT_N;
         AscendC::DataCopy(bL1, rotationTGm, params);
         TqSyncFixed<AscendC::HardEvent::MTE2_MTE1>();
+
+        auto rotationBL0 = resource.l0BBuf.template GetBufferByByte<T>(0);
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(
+            TQ_MANUAL_ROT_B_L0_EVENT);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(
+            TQ_MANUAL_ROT_B_L0_EVENT);
+        AscendC::LoadData2DParams bLoad;
+        bLoad.startIndex = 0;
+        bLoad.repeatTimes = TQ_ROT_N / TQ_CUBE_M_ALIGN;
+        bLoad.srcStride = 1;
+        bLoad.sid = 0;
+        bLoad.dstGap = 0;
+        bLoad.ifTranspose = true;
+        bLoad.addrMode = 0;
+        for (uint32_t i = 0; i < TQ_ROT_K / TQ_CUBE_M_ALIGN; ++i) {
+            AscendC::LoadData(
+                rotationBL0[i * TQ_ROT_N * TQ_CUBE_M_ALIGN],
+                bL1[i * TQ_ROT_N * TQ_CUBE_M_ALIGN], bLoad);
+        }
+        TqSyncFixed<AscendC::HardEvent::MTE1_M>();
     }
 
     __aicore__ inline void LoadRawTensorToL1(
@@ -194,16 +220,22 @@ private:
         uint32_t streamOrdinal) {
         auto aL1 =
             resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
-        auto aL0 = resource.l0ABuf.template GetBufferByByte<T>(0);
+        auto aL0 = resource.l0ABuf.template GetBufferByByte<T>(
+            TQ_MANUAL_NORM_A_L0_BYTE_OFFSET);
         auto bL0 = resource.l0BBuf.template GetBufferByByte<T>(
             TQ_MANUAL_NORM_B_L0_BYTE_OFFSET);
-        auto cL0 = resource.l0CBuf.template GetBufferByByte<float>(0);
+        auto cL0 = resource.l0CBuf.template GetBufferByByte<float>(
+            TQ_MANUAL_NORM_C_L0_BYTE_OFFSET);
         const uint32_t normBase = context_.ManualNormBufferOffset(streamOrdinal);
 
+        TqSyncFixed<AscendC::HardEvent::FIX_M>();
         for (uint32_t slice = 0; slice < TQ_AIV_SUB_BLOCKS; ++slice) {
             const uint32_t l1SliceOffset =
                 slice * TQ_MANUAL_AIV_SLICE_ELEMS;
-            TqSyncFixed<AscendC::HardEvent::M_MTE1>();
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(
+                TQ_MANUAL_NORM_A_L0_EVENT);
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(
+                TQ_MANUAL_NORM_B_L0_EVENT);
 
             AscendC::LoadData2DParams aLoad;
             aLoad.startIndex = 0;
@@ -221,7 +253,10 @@ private:
             bLoad.srcStride = 1;
             bLoad.sid = 0;
             bLoad.dstGap = 0;
-            bLoad.ifTranspose = true;
+            // aL1 is already NZ.  L0B consumes the NZ block as the logical
+            // transpose for A * A^T; an extra LoadData transpose permutes the
+            // Gram columns and turns diagonal entries into cross-row dots.
+            bLoad.ifTranspose = false;
             bLoad.addrMode = 0;
             for (uint32_t kBlock = 0;
                  kBlock < TQ_ROT_K / TQ_CUBE_M_ALIGN;
@@ -242,9 +277,14 @@ private:
             mmParams.cmatrixInitVal = true;
             mmParams.cmatrixSource = false;
             mmParams.unitFlag = 0b11;
-            TqSyncFixed<AscendC::HardEvent::FIX_M>();
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(
+                TQ_MANUAL_NORM_C_L0_EVENT);
             AscendC::Mmad(cL0, aL0, bL0, mmParams);
             AscendC::PipeBarrier<PIPE_M>();
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(
+                TQ_MANUAL_NORM_A_L0_EVENT);
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(
+                TQ_MANUAL_NORM_B_L0_EVENT);
             TqSyncFixed<AscendC::HardEvent::M_FIX>();
 
             AscendC::DataCopyCO12DstParams fixParams;
@@ -262,7 +302,8 @@ private:
                     normBase + slice * TQ_MANUAL_NORM_MATRIX_ELEMS],
                 cL0,
                 fixParams);
-            TqSyncFixed<AscendC::HardEvent::FIX_M>();
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(
+                TQ_MANUAL_NORM_C_L0_EVENT);
         }
     }
 
@@ -271,26 +312,12 @@ private:
         AscendC::GlobalTensor<T>& cWorkGm,
         uint32_t cOffset) {
         auto aL1 = resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
-        auto bL1 = resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_B_L1_OFFSET);
         auto aL0 = resource.l0ABuf.template GetBufferByByte<T>(0);
         auto bL0 = resource.l0BBuf.template GetBufferByByte<T>(0);
         auto cL0Base = resource.l0CBuf.template GetBufferByByte<float>(0);
 
-        // The preceding Gram MMAD also consumes L0B.  Wait for PIPE_M before
-        // replacing that buffer with the resident rotation matrix.
-        TqSyncFixed<AscendC::HardEvent::M_MTE1>();
-        AscendC::LoadData2DParams bLoad;
-        bLoad.startIndex = 0;
-        bLoad.repeatTimes = TQ_ROT_N / TQ_CUBE_M_ALIGN;
-        bLoad.srcStride = 1;
-        bLoad.sid = 0;
-        bLoad.dstGap = 0;
-        bLoad.ifTranspose = true;
-        bLoad.addrMode = 0;
-        for (uint32_t i = 0; i < TQ_ROT_K / TQ_CUBE_M_ALIGN; ++i) {
-            AscendC::LoadData(bL0[i * TQ_ROT_N * TQ_CUBE_M_ALIGN],
-                              bL1[i * TQ_ROT_N * TQ_CUBE_M_ALIGN], bLoad);
-        }
+        // The rotation matrix stays resident in its own L0B tensor.
+        TqSyncFixed<AscendC::HardEvent::FIX_M>();
         for (uint32_t rowBase = 0; rowBase < TQ_MANUAL_ROT_TILE_M;
              rowBase += TQ_CUBE_M_ALIGN) {
             auto aL0Tile =
