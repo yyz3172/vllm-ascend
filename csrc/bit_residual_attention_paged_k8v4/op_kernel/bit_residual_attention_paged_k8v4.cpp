@@ -769,14 +769,15 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
     Muls(qGroupFloat, qGroupFloat, scaleValue_, gqaCount * D);
     PipeBarrier<PIPE_V>();
 
-    // Init mState and sState.
-    auto mState = MStateBuf();
-    auto sState = SStateBuf();
-    auto outAcc = OutAccBuf();
+    // m/s states as Scalar arrays to avoid LocalTensor GetValue/SetValue
+    // V<->S sync in the KV tile loop.
+    float mStateScalar[TQ_BR_UB_GQA_CAP];
+    float sStateScalar[TQ_BR_UB_GQA_CAP];
     for (uint32_t g = 0; g < gqaCount; ++g) {
-        mState.SetValue(g, -1e30f);  // -inf
-        sState.SetValue(g, 0.f);
+        mStateScalar[g] = -3.402823466e+38f;
+        sStateScalar[g] = 0.f;
     }
+    auto outAcc = OutAccBuf();
     Duplicate(outAcc, 0.f, gqaCount * D);
     PipeBarrier<PIPE_V>();
 
@@ -809,15 +810,15 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         auto expBuf = FloatScratchBuf();
         auto softmaxReduceTmp = expBuf[TQ_BR_HEAD_SIZE];
         auto weightedValue = expBuf[TQ_BR_HEAD_SIZE];
-        turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaled(
-            scoreBuf, decodedV, mState, sState, outAcc, expBuf,
+        turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledScalar(
+            scoreBuf, decodedV, mStateScalar, sStateScalar, outAcc, expBuf,
             softmaxReduceTmp, weightedValue,
             gqaCount, mRows);
     }
 
     // Normalize: outAcc /= sState
     for (uint32_t g = 0; g < gqaCount; ++g) {
-        const float s = sState.GetValue(g);
+        const float s = sStateScalar[g];
         auto outAccRow = outAcc[g * D];
         Muls(outAccRow, outAccRow, 1.0f / s, D);
         PipeBarrier<PIPE_V>();

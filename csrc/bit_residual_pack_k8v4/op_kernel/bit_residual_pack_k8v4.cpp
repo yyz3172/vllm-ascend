@@ -29,6 +29,8 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "catlass/arch/resource.hpp"
+#include "bit_residual_pack_k8v4_aiv.h"
+#include "bit_residual_pack_k8v4_aic.h"
 
 using namespace AscendC;
 

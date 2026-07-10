@@ -101,7 +101,7 @@ def candidate_runtime_debug_elf(root: Path, op: str, soc_dir: str) -> Path | Non
         / subdir
         / f"{hash_name}.o",
         root
-        / "mytmp/build_libcust_opapi_nodebug_debug_line/binary"
+        / "ztmp/build_libcust_opapi_nodebug_debug_line/binary"
         / soc_dir
         / "bin"
         / subdir
