@@ -356,10 +356,23 @@ def _read_turboquant_env_cache() -> dict[str, bool | int | str]:
 
 _TURBOQUANT_ENV_CACHE: dict[str, bool | int | str] = _read_turboquant_env_cache()
 
+# CPU hot-path caches (cleared by refresh_turboquant_env_cache).
+_SEQ_LEN_TENSOR_CACHE: dict[tuple, torch.Tensor] = {}
+_SEQ_LEN_TENSOR_CACHE_MAX = 256
+_FP16_MASK_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_FP16_MASK_CACHE_MAX = 64
+_FUSED_FIA_K8V4_OP: object | bool | None = None
+_PACK_K8V4_OP: object | bool | None = None
+
 
 def refresh_turboquant_env_cache() -> None:
     """Refresh TurboQuant env snapshot after tests or tools patch ``os.environ``."""
+    global _FUSED_FIA_K8V4_OP, _PACK_K8V4_OP
     _TURBOQUANT_ENV_CACHE.update(_read_turboquant_env_cache())
+    _FUSED_FIA_K8V4_OP = None
+    _PACK_K8V4_OP = None
+    _SEQ_LEN_TENSOR_CACHE.clear()
+    _FP16_MASK_CACHE.clear()
 
 
 def _turboquant_encode_op_enabled() -> bool:
@@ -850,33 +863,83 @@ def _contiguous_if_needed(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _turboquant_rewrite_cache_norm_bf16_to_fp16(
-    cache: torch.Tensor,
-    *,
-    head_size: int,
-    bits: int,
-) -> torch.Tensor:
-    """Rewrite bf16 norm slots to fp16 bytes for fused K8V4 read (cache_norm_bf16=0).
+# ---------------------------------------------------------------------------
+# CPU hot-path helpers (decode): seq-len reuse, fp16-norm cache contract, gates
+# ---------------------------------------------------------------------------
 
-    Pack stores norms in the activation dtype (bf16 for bf16 models). The fused-read
-    kernel's stable path interprets the 2-byte norm slot as fp16; convert in-place on
-    a cache copy before invoking the custom op.
-    """
-    norm_offset = turboquant_indices_byte_len(head_size, bits)
-    byte_view = _uint8_storage_view(cache).contiguous()
-    out = byte_view.clone()
-    norm_bytes = out[..., norm_offset : norm_offset + 2]
-    flat = norm_bytes.reshape(-1, 2)
-    bf16_norms = flat.view(torch.bfloat16)
-    fp16_bytes = bf16_norms.to(torch.float16).view(torch.uint8)
-    out[..., norm_offset : norm_offset + 2] = fp16_bytes.reshape(flat.shape).reshape(
-        norm_bytes.shape
+
+def _int32_seq_lens_on_device(
+    seq_lens: list[int] | torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return int32 seq-len tensor on ``device``, reusing across layers when possible."""
+    if isinstance(seq_lens, torch.Tensor):
+        if seq_lens.dtype == torch.int32 and seq_lens.device == device:
+            return _contiguous_if_needed(seq_lens)
+        return seq_lens.to(device=device, dtype=torch.int32).contiguous()
+
+    device = _normalize_turboquant_device(device)
+    key = (device.type, device.index, tuple(int(x) for x in seq_lens))
+    cached = _SEQ_LEN_TENSOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tensor = torch.tensor(seq_lens, device=device, dtype=torch.int32)
+    if len(_SEQ_LEN_TENSOR_CACHE) >= _SEQ_LEN_TENSOR_CACHE_MAX:
+        _SEQ_LEN_TENSOR_CACHE.clear()
+    _SEQ_LEN_TENSOR_CACHE[key] = tensor
+    return tensor
+
+
+def _fp16_mask_on_device(atten_mask: torch.Tensor) -> torch.Tensor:
+    """Return contiguous fp16 atten_mask, caching the view when mask is reused."""
+    if atten_mask.dtype == torch.float16 and atten_mask.is_contiguous():
+        return atten_mask
+    key = (atten_mask.data_ptr(), atten_mask.numel())
+    cached = _FP16_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = (
+        atten_mask
+        if atten_mask.dtype == torch.float16
+        else atten_mask.to(torch.float16)
     )
-    if cache.dtype == torch.int8:
-        return out.view(torch.int8)
-    if cache.dtype != torch.uint8:
-        return out.view(cache.dtype)
+    out = out.contiguous()
+    if len(_FP16_MASK_CACHE) >= _FP16_MASK_CACHE_MAX:
+        _FP16_MASK_CACHE.clear()
+    _FP16_MASK_CACHE[key] = out
     return out
+
+
+def _get_fused_fia_k8v4_op():
+    """Cached ``torch.ops._C_ascend.turboquant_fused_infer_attention_score_k8v4``."""
+    global _FUSED_FIA_K8V4_OP
+    if _FUSED_FIA_K8V4_OP is False:
+        return None
+    if _FUSED_FIA_K8V4_OP is not None:
+        return _FUSED_FIA_K8V4_OP
+    op = getattr(
+        getattr(torch.ops, "_C_ascend", None),
+        "turboquant_fused_infer_attention_score_k8v4",
+        None,
+    )
+    _FUSED_FIA_K8V4_OP = op if op is not None else False
+    return op
+
+
+def _get_pack_k8v4_op():
+    """Cached ``torch.ops._C_ascend.turboquant_pack_kv_for_cache_k8v4``."""
+    global _PACK_K8V4_OP
+    if _PACK_K8V4_OP is False:
+        return None
+    if _PACK_K8V4_OP is not None:
+        return _PACK_K8V4_OP
+    op = getattr(
+        getattr(torch.ops, "_C_ascend", None),
+        "turboquant_pack_kv_for_cache_k8v4",
+        None,
+    )
+    _PACK_K8V4_OP = op if op is not None else False
+    return op
 
 
 def _prepare_k8v4_fused_read_caches(
@@ -888,17 +951,13 @@ def _prepare_k8v4_fused_read_caches(
     bits_value: int,
     activation_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return K/V caches ready for ``turboquant_fused_infer_attention_score_k8v4``."""
-    key_in = key_cache
-    value_in = value_cache
-    if activation_dtype == torch.bfloat16:
-        key_in = _turboquant_rewrite_cache_norm_bf16_to_fp16(
-            key_cache, head_size=head_size, bits=bits_key
-        )
-        value_in = _turboquant_rewrite_cache_norm_bf16_to_fp16(
-            value_cache, head_size=head_size, bits=bits_value
-        )
-    return key_in, value_in
+    """Return K/V caches for fused K8V4 read.
+
+    Norm slots are IEEE fp16 LE bytes (pack writes fp16 even for bf16 activations),
+    matching ``TqDecodeReadNorm``. No per-call cache clone/rewrite.
+    """
+    del head_size, bits_key, bits_value, activation_dtype  # contract: unused
+    return key_cache, value_cache
 
 
 def _int32_contiguous_if_needed(tensor: torch.Tensor) -> torch.Tensor:
@@ -923,8 +982,8 @@ def turboquant_quantize_to_packed_bytes(x: torch.Tensor, *, bits: int = 4) -> to
     idx_storage = _pack_turboquant_indices(indices, bits)
     idx_w = idx_storage.shape[-1]
 
-    norm_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float16
-    norm_bytes = norms.to(dtype=norm_dtype).view(torch.uint8).view(-1, 2)
+    # Norm slot contract: always IEEE fp16 LE bytes (matches fused decode kernels).
+    norm_bytes = norms.to(dtype=torch.float16).view(torch.uint8).view(-1, 2)
 
     packed = torch.empty((x_flat.shape[0], packed_bytes), dtype=torch.uint8, device=x.device)
     packed[:, :idx_w] = idx_storage.reshape(x_flat.shape[0], idx_w)
@@ -1031,8 +1090,13 @@ def turboquant_dequantize_from_packed_bytes(
     norm_bytes = packed_flat[:, idx_len : idx_len + 2]
 
     indices = _unpack_turboquant_indices(idx_packed, head_size, bits)
-    norm_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float16
-    norms = norm_bytes.contiguous().view(norm_dtype).view(-1, 1)
+    # Norm slots are always fp16 LE bytes; cast to the caller's activation dtype.
+    norms = (
+        norm_bytes.contiguous()
+        .view(torch.float16)
+        .view(-1, 1)
+        .to(dtype=dtype if dtype in (torch.float16, torch.bfloat16) else torch.float16)
+    )
     if not torch.isfinite(norms).all():
         norms = torch.nan_to_num(norms, nan=0.0, posinf=65504.0, neginf=0.0)
 
@@ -1497,8 +1561,10 @@ def turboquant_pack_kv_for_cache_to_cache(
     # K8V4 fused pack: key 8-bit, value 4-bit, writing directly into the paged
     # cache. Requires head_size=128, fp16/bf16 K/V, and the compiled op. Falls
     # through to the reference pack below when unavailable.
+    pack_op = _get_pack_k8v4_op()
     can_use_k8v4 = (
-        bits_key == 8
+        pack_op is not None
+        and bits_key == 8
         and bits_value == 4
         and head_size == 128
         and key.dtype in (torch.float16, torch.bfloat16)
@@ -1506,22 +1572,16 @@ def turboquant_pack_kv_for_cache_to_cache(
         and _turboquant_encode_op_enabled()
         and _current_mse_impl() != "v3"
         and _turboquant_4bit_default_codebook_enabled()
-        and _turboquant_pack_k8v4_op_ready()
     )
     if can_use_k8v4:
+        # Op expects fp16 tables even when K/V activations are bf16.
         cb_k, rot_t_k = _turboquant_pack_tables(
-            key.device, head_size, 8, key.dtype
+            key.device, head_size, 8, torch.float16
         )
         cb_v, rot_t_v = _turboquant_pack_tables(
-            key.device, head_size, 4, key.dtype
+            key.device, head_size, 4, torch.float16
         )
-        # The K8V4 pack op keeps K/V in fp16/bf16 but always expects fp16 tables
-        # (see op_def: codebook/rotation_t are DT_FLOAT16 for both dtype combos).
-        cb_k = _fp16_contiguous_if_needed(cb_k)
-        rot_t_k = _fp16_contiguous_if_needed(rot_t_k)
-        cb_v = _fp16_contiguous_if_needed(cb_v)
-        rot_t_v = _fp16_contiguous_if_needed(rot_t_v)
-        torch.ops._C_ascend.turboquant_pack_kv_for_cache_k8v4(
+        pack_op(
             key,
             value,
             cb_k,
@@ -2222,11 +2282,7 @@ def turboquant_fused_infer_attention_score_k8v4(
             scale,
         )
 
-    fused = getattr(
-        getattr(torch.ops, "_C_ascend", None),
-        "turboquant_fused_infer_attention_score_k8v4",
-        None,
-    )
+    fused = _get_fused_fia_k8v4_op()
     if fused is None:
         return _turboquant_fused_infer_attention_score_k8v4_impl(
             query,
@@ -2243,13 +2299,10 @@ def turboquant_fused_infer_attention_score_k8v4(
             scale,
         )
 
+    # Tables are already fp16 contiguous (lru_cache); no per-call cast.
     cb_k, rot_k, cb_v, rot_v = _turboquant_fused_8bit_decode_tables(
-        query.device, head_size, bits_key, bits_value
+        query.device, head_size, bits_key, bits_value, torch.float16
     )
-    cb_k = _fp16_contiguous_if_needed(cb_k)
-    rot_k = _fp16_contiguous_if_needed(rot_k)
-    cb_v = _fp16_contiguous_if_needed(cb_v)
-    rot_v = _fp16_contiguous_if_needed(rot_v)
     key_cache_in, value_cache_in = _prepare_k8v4_fused_read_caches(
         key_cache,
         value_cache,
@@ -2258,20 +2311,17 @@ def turboquant_fused_infer_attention_score_k8v4(
         bits_value=bits_value,
         activation_dtype=query.dtype,
     )
-    # Fused-read kernel entry is fp16-only; cast bf16 query/mask for the custom op.
+    # Adapter also accepts bf16 and casts; prefer one cast here for query only.
     query_in = _fp16_contiguous_if_needed(query)
-    atten_mask_in = (
-        _fp16_contiguous_if_needed(atten_mask)
-        if atten_mask.dtype == torch.bfloat16
-        else atten_mask
-    )
-    seq_q = torch.tensor(actual_seq_lengths_q, device=query.device, dtype=torch.int32)
-    seq_kv = torch.tensor(actual_seq_lengths_kv, device=query.device, dtype=torch.int32)
+    atten_mask_in = _fp16_mask_on_device(atten_mask)
+    seq_q = _int32_seq_lens_on_device(actual_seq_lengths_q, query.device)
+    seq_kv = _int32_seq_lens_on_device(actual_seq_lengths_kv, query.device)
+    block_tables_i32 = _int32_contiguous_if_needed(block_tables)
     out = fused(
         query_in,
         _contiguous_if_needed(_int8_storage_view(key_cache_in)),
         _contiguous_if_needed(_int8_storage_view(value_cache_in)),
-        block_tables.to(torch.int32),
+        block_tables_i32,
         atten_mask_in,
         seq_q,
         seq_kv,

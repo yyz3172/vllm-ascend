@@ -179,26 +179,12 @@ __aicore__ inline void write_norm_fp16_le_local(
     packedLocal.SetValue(norm_off + 1, (uint8_t)((normBits.u >> 8) & 0xFFu));
 }
 
-#if TQ_INPUT_IS_BF16
 __aicore__ inline void write_norm_le_local(
     AscendC::LocalTensor<uint8_t>& packedLocal, uint32_t norm_off, float norm_f) {
-    // AscendC does not support scalar float->bfloat16 casts on AIV; truncate the
-    // upper 16 bits of IEEE754 fp32, matching PyTorch's bf16 rounding mode.
-    union {
-        float f;
-        uint32_t u;
-    } bits {};
-    bits.f = norm_f;
-    const uint16_t bf16Bits = static_cast<uint16_t>(bits.u >> 16);
-    packedLocal.SetValue(norm_off, (uint8_t)(bf16Bits & 0xFFu));
-    packedLocal.SetValue(norm_off + 1, (uint8_t)((bf16Bits >> 8) & 0xFFu));
-}
-#else
-__aicore__ inline void write_norm_le_local(
-    AscendC::LocalTensor<uint8_t>& packedLocal, uint32_t norm_off, float norm_f) {
+    // Norm slots are always IEEE fp16 LE bytes (matches TqDecodeReadNorm / fused K8V4 read),
+    // even when K/V activations are bf16.
     write_norm_fp16_le_local(packedLocal, norm_off, static_cast<half>(norm_f));
 }
-#endif
 
 __aicore__ inline void copy_packed_ub_to_gm(
     AscendC::GlobalTensor<uint8_t>& packedGm,
