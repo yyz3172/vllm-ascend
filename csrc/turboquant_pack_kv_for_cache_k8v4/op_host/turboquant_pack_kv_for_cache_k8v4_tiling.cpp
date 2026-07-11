@@ -187,7 +187,11 @@ static ge::graphStatus TurboquantPackKvForCacheK8v4TilingFunc(gert::TilingContex
         OPS_LOG_E(nodeName, "invalid pack attrs");
         return ge::GRAPH_FAILED;
     }
-    if (vecPerCore > 128) {
+    // Decode-sized nVec: force small batches so multiple MIX groups parallelize
+    // the 8-bit Key encode (dominant cost). Host attr may still pass align16(nVec).
+    if (nVec <= 32U && vecPerCore > 4U) {
+        vecPerCore = 4;
+    } else if (vecPerCore > 128) {
         vecPerCore = 128;
     }
 

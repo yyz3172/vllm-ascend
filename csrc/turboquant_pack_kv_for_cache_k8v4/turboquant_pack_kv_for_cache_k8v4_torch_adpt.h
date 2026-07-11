@@ -60,12 +60,13 @@ inline void turboquant_pack_kv_for_cache_k8v4(
 
     const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
 
+    // Small decode packs: prefer more MIX groups over fat batches so Key encode
+    // (8-bit argmin) parallelizes across AICs. Cube mPad still AlignUp16(m).
     uint32_t vec_per_core = 128;
-    if (n_vec < 128) {
-        vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
-        if (vec_per_core == 0) {
-            vec_per_core = 16;
-        }
+    if (n_vec <= 32) {
+        vec_per_core = 4;
+    } else if (n_vec < 128) {
+        vec_per_core = 16;
     }
     const int64_t pack_mode = no_kfc ? 1 : 0;
     const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
