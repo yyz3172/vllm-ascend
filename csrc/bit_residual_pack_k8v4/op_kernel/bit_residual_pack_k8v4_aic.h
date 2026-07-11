@@ -41,34 +41,14 @@ public:
 
         TqManualMmadResource manualResource;
 
-        // Pre-set all event flags BEFORE LoadResidentRotation so that
-        // WaitFlag calls inside LoadResidentRotation can consume them.
-        // If these pre-sets were placed AFTER LoadResidentRotation,
-        // Wait<M_MTE1>(ROT_B) inside LoadResidentRotation would block
-        // forever because the flag hasn't been set yet → deadlock.
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_A_L0_EVENT);
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_B_L0_EVENT);
-        // FIX_M pre-set for unitFlag=0b11 pattern: hardware-internal
-        // MMAD wait consumes this flag on the first iteration.
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(TQ_MANUAL_NORM_C_L0_EVENT);
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_ROT_A_L0_EVENT);
-        // ROT_B M_MTE1: pre-set so LoadResidentRotation's
-        //   WaitFlag<M_MTE1>(ROT_B) passes (L0B initially "free").
-        // ROT_B MTE1_M: set inside LoadResidentRotation after B LoadData.
-        //   No further M_MTE1(ROT_B) — resident B never re-loaded.
-        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_ROT_B_L0_EVENT);
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(TQ_MANUAL_ROT_C_L0_EVENT);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(TQ_MANUAL_NORM_C_L0_EVENT);
 
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_ROT_B_L0_EVENT);
         LoadResidentRotation(manualResource, op.rotationTGm_);
-
-        // Resident rotation B was loaded into L0B[0..32KB] by
-        // LoadResidentRotation, which set MTE1_M(ROT_B).  Consume that
-        // flag once here — B stays resident in L0B for all subsequent
-        // MMAD iterations and never needs per-call MTE1_M sync.
-        // Placing this Wait inside ComputeLoadedTile would cause a
-        // depth-1 hang: the flag is consumed on the first call, and
-        // subsequent calls block forever because no new Set is produced
-        // (MTE1 never re-loads resident B).
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(TQ_MANUAL_ROT_B_L0_EVENT);
 
         uint32_t tileOrdinal = 0;
