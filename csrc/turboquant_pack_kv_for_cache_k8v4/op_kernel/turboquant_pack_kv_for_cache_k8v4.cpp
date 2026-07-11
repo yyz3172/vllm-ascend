@@ -45,7 +45,7 @@ static constexpr uint32_t TQ_VALUE_INDEX_BYTES = TQ_PACK_D / 2;  // 64
 static constexpr uint32_t TQ_REDUCE_MASK = 64;
 static constexpr uint32_t TQ_REDUCE_BATCHES = (TQ_PACK_K_KEY + TQ_REDUCE_MASK - 1) / TQ_REDUCE_MASK;
 static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;
-static constexpr uint32_t TQ_D_TILE = 16;
+static constexpr uint32_t TQ_D_TILE = 32;
 static constexpr uint32_t TQ_V_D_TILE = 128;  // 4-bit: all dims in one sync (K=16 fits UB)
 static constexpr uint32_t TQ_V_REDUCE_MASK = TQ_PACK_K_VALUE;
 static constexpr uint32_t TQ_V_REDUCE_BATCHES = 1;
@@ -287,7 +287,9 @@ public:
 
         matmulReady_ = (rawWorkspace != nullptr);
         if (matmulReady_) {
-            const uint32_t core = GetBlockIdx();
+            // Match Process(): logical MIX core is blockIdx/2 (primary AIV only).
+            constexpr uint32_t kAivSub = 2;
+            const uint32_t core = GetBlockIdx() / kAivSub;
             auto* coreScratch = rawWorkspace + TQ_PER_CORE_SCRATCH_BASE
                                 + static_cast<uint64_t>(core) * TQ_PER_CORE_SCRATCH;
             cubeCGm_.SetGlobalBuffer(
@@ -332,12 +334,18 @@ public:
         if (!matmulReady_ || !TqIsAiv()) {
             return;
         }
-        // Batch rows per core using vecPerCore_ so decode-sized shapes (e.g. one
-        // token x num_heads) amortize Cube rotate instead of mPad=16 per row.
+        // MIX_AIC_1_2: blockIdx enumerates AIVs; logical data-core is blockIdx/2.
+        // Only the primary AIV (subBlock 0) runs Cube KFC + encode — same pattern as
+        // fused-infer. Secondary AIV previously either duplicated work or issued a
+        // concurrent IterateAll (KFC conflict), inflating wall time vs aiv_time.
+        constexpr uint32_t kAivSub = 2;
+        if ((AscendC::GetSubBlockIdx() % kAivSub) != 0) {
+            return;
+        }
         const uint32_t batchGroups =
             (nVec_ + vecPerCore_ - 1) / vecPerCore_;
         const uint32_t dataCores = batchGroups > 16U ? 16U : batchGroups;
-        const uint32_t core = AscendC::GetBlockIdx();
+        const uint32_t core = AscendC::GetBlockIdx() / kAivSub;
         const uint32_t rowsPerCore = (nVec_ + dataCores - 1) / dataCores;
         const uint32_t coreStart = core * rowsPerCore;
         if (coreStart >= nVec_) {
@@ -547,6 +555,7 @@ private:
                         b, static_cast<uint8_t>((idxs[b] & 0x0Fu) | ((idxs[b + TQ_VALUE_INDEX_BYTES] & 0x0Fu) << 4)));
                 }
             } else {
+                // 8-bit key: build + reduce per tile, one V<->S sync per tile (not per dim).
                 for (uint32_t tileStart = 0; tileStart < TQ_PACK_D; tileStart += TQ_D_TILE) {
                     const uint32_t tileCnt = (tileStart + TQ_D_TILE <= TQ_PACK_D)
                                                  ? TQ_D_TILE
