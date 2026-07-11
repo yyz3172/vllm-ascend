@@ -253,6 +253,9 @@ static ge::graphStatus TurboquantPackKvForCacheK8v4TilingFunc(gert::TilingContex
         constexpr uint32_t kMaxMixGroups = 16;
         dataCores = std::min(dataCores, kMaxMixGroups);
         blockDim = dataCores * mixBlockDim;
+    } else {
+        dataCores = std::min(dataCores, 16U);
+        blockDim = dataCores;
     }
 
     auto rawTiling = context->GetRawTilingData();

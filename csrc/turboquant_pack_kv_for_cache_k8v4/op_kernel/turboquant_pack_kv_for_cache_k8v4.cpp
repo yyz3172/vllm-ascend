@@ -46,6 +46,7 @@ static constexpr uint32_t TQ_REDUCE_MASK = 64;
 static constexpr uint32_t TQ_REDUCE_BATCHES = (TQ_PACK_K_KEY + TQ_REDUCE_MASK - 1) / TQ_REDUCE_MASK;
 static constexpr int32_t TQ_REDUCE_SRC_REP_STRIDE = TQ_REDUCE_MASK / 8;
 static constexpr uint32_t TQ_D_TILE = 16;
+static constexpr uint32_t TQ_V_D_TILE = 128;  // 4-bit: all dims in one sync (K=16 fits UB)
 static constexpr uint32_t TQ_V_REDUCE_MASK = TQ_PACK_K_VALUE;
 static constexpr uint32_t TQ_V_REDUCE_BATCHES = 1;
 static constexpr int32_t TQ_V_REDUCE_SRC_REP_STRIDE = TQ_V_REDUCE_MASK / 8;
@@ -272,7 +273,12 @@ public:
         pipe_->InitBuffer(yFp32Buf_, TQ_PACK_D * sizeof(float));
         pipe_->InitBuffer(cbTileBuf_, TQ_PACK_K_KEY * sizeof(float));
         pipe_->InitBuffer(distBuf_, TQ_D_TILE * TQ_PACK_K_KEY * sizeof(float) + 256);
-        pipe_->InitBuffer(argminResultBuf_, TQ_REDUCE_BATCHES * 2 * sizeof(float));
+        // 4-bit encode may batch TQ_V_D_TILE results; 8-bit uses TQ_D_TILE * batches.
+        const uint32_t argminElems =
+            (TQ_V_D_TILE > TQ_D_TILE * TQ_REDUCE_BATCHES)
+                ? (TQ_V_D_TILE * 2)
+                : (TQ_D_TILE * TQ_REDUCE_BATCHES * 2);
+        pipe_->InitBuffer(argminResultBuf_, argminElems * sizeof(float));
         pipe_->InitBuffer(reduceOutBuf_, TQ_PACK_D * 2 * sizeof(float));
         const uint32_t maxSlotW = slot_w_k_ > slot_w_v_ ? slot_w_k_ : slot_w_v_;
         pipe_->InitBuffer(packedRowBuf_, (maxSlotW + TQ_UB_ALIGN) * sizeof(uint8_t));
@@ -297,17 +303,29 @@ public:
         if (!TqIsAiv()) {
             return;
         }
+        // Match Process() core split so packMode=1 uses all AIV workers evenly.
+        const uint32_t batchGroups =
+            (nVec_ + vecPerCore_ - 1) / vecPerCore_;
+        const uint32_t dataCores = batchGroups > 16U ? 16U : batchGroups;
         const uint32_t core = AscendC::GetBlockIdx();
-        const uint32_t start = core * vecPerCore_;
-        uint32_t end = start + vecPerCore_;
-        if (end > nVec_) {
-            end = nVec_;
-        }
-        if (start >= end) {
+        const uint32_t rowsPerCore = (nVec_ + dataCores - 1) / dataCores;
+        const uint32_t coreStart = core * rowsPerCore;
+        if (coreStart >= nVec_) {
             return;
         }
-        PackBatch(keyGm_, keyCacheGm_, start, end, slot_w_k_, /*fourBit=*/false, true);
-        PackBatch(valueGm_, valueCacheGm_, start, end, slot_w_v_, /*fourBit=*/true, true);
+        const uint32_t coreEnd = coreStart + rowsPerCore > nVec_
+            ? nVec_ : coreStart + rowsPerCore;
+
+        for (uint32_t batchStart = coreStart; batchStart < coreEnd;
+             batchStart += vecPerCore_) {
+            const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
+                ? coreEnd : batchStart + vecPerCore_;
+
+            PackBatch(keyGm_, keyCacheGm_, batchStart, batchEnd,
+                      slot_w_k_, /*fourBit=*/false, true);
+            PackBatch(valueGm_, valueCacheGm_, batchStart, batchEnd,
+                      slot_w_v_, /*fourBit=*/true, true);
+        }
     }
 
     __aicore__ inline void Process() {
@@ -363,7 +381,6 @@ private:
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t rowOff = i * TQ_PACK_D;
             AscendC::Cast(fp32Row, xBatch[rowOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            TqSyncMte2ToV();
             AscendC::Mul(fp32Row, fp32Row, fp32Row, TQ_PACK_D);
             AscendC::ReduceSum<float>(normAcc, fp32Row, fp32Tmp, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -377,6 +394,38 @@ private:
             AscendC::Muls(xBatch[rowOff], xBatch[rowOff], invH, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
+    }
+
+    // Vector rotate: x[m,D] @ R^T[D,D] on AIV (packMode=1). Matches v3 pack path.
+    __aicore__ inline void LoadRotationToUb(AscendC::GlobalTensor<half>& rotationTGm) {
+        auto rotationTLocal = rotateWorkBuf_.Get<half>();
+        AscendC::DataCopy(rotationTLocal, rotationTGm, (uint64_t)TQ_PACK_D * TQ_PACK_D);
+        TqSyncMte2ToV();
+    }
+
+    __aicore__ inline void RotateBatchMatmulVector(
+        AscendC::LocalTensor<half>& xUnitBatch,
+        AscendC::LocalTensor<half>& yBatch,
+        uint32_t m) {
+        auto rotationTLocal = rotateWorkBuf_.Get<half>();
+        auto acc = yFp32Buf_.Get<float>();
+        auto rotFp32 = reduceOutBuf_.Get<float>();
+
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t xOff = i * TQ_PACK_D;
+            auto xBlock = xUnitBatch[xOff];
+
+            AscendC::Duplicate(acc, 0.0f, TQ_PACK_D);
+            for (uint32_t k = 0; k < TQ_PACK_D; ++k) {
+                const uint32_t rotOff = k * TQ_PACK_D;
+                const float xVal = static_cast<float>(xBlock.GetValue(k));
+                AscendC::Cast(rotFp32, rotationTLocal[rotOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+                AscendC::Muls(rotFp32, rotFp32, xVal, TQ_PACK_D);
+                AscendC::Add(acc, acc, rotFp32, TQ_PACK_D);
+            }
+            AscendC::Cast(yBatch[i * TQ_ROT_N], acc, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void RotateBatchMatmul(
@@ -406,19 +455,8 @@ private:
         AscendC::LocalTensor<half>& yBatch,
         AscendC::GlobalTensor<half>& rotationTGm,
         uint32_t m) {
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t xRow = i * TQ_PACK_D;
-            const uint32_t yRow = i * TQ_ROT_N;
-            for (uint32_t n = 0; n < TQ_ROT_N; ++n) {
-                float acc = 0.f;
-                for (uint32_t k = 0; k < TQ_ROT_K; ++k) {
-                    acc += static_cast<float>(xUnitBatch.GetValue(xRow + k)) *
-                           static_cast<float>(rotationTGm.GetValue((uint64_t)k * TQ_ROT_N + n));
-                }
-                yBatch.SetValue(yRow + n, static_cast<half>(acc));
-            }
-        }
-        AscendC::PipeBarrier<PIPE_V>();
+        LoadRotationToUb(rotationTGm);
+        RotateBatchMatmulVector(xUnitBatch, yBatch, m);
     }
 
     // Encode one batch of rotated rows to packed cache rows.
@@ -452,7 +490,7 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
         }
 
-        auto yFp32 = yCubeFp32Buf_.Get<float>();
+        auto yFp32 = yFp32Buf_.Get<float>();
         auto distTile = distBuf_.Get<float>();
         auto argminRes = argminResultBuf_.Get<float>();
         auto packedRow = packedRowBuf_.Get<uint8_t>();
@@ -475,11 +513,38 @@ private:
             TqSyncSToV();
 
             if (fourBit) {
+                // Batch TQ_V_D_TILE dims per sync. distBuf holds TQ_D_TILE*256 floats;
+                // with K=16 that fits TQ_V_D_TILE rows (32*16 < 16*256).
+                uint8_t idxs[TQ_PACK_D];
+                for (uint32_t tileStart = 0; tileStart < TQ_PACK_D; tileStart += TQ_V_D_TILE) {
+                    const uint32_t tileCnt = (tileStart + TQ_V_D_TILE <= TQ_PACK_D)
+                                                 ? TQ_V_D_TILE
+                                                 : (TQ_PACK_D - tileStart);
+                    for (uint32_t dl = 0; dl < tileCnt; ++dl) {
+                        auto distRow = distTile[dl * TQ_PACK_K_VALUE];
+                        AscendC::Duplicate(distRow, yVals[tileStart + dl], TQ_PACK_K_VALUE);
+                        AscendC::Sub(distRow, distRow, cbFp32, TQ_PACK_K_VALUE);
+                        AscendC::Abs(distRow, distRow, TQ_PACK_K_VALUE);
+                    }
+                    for (uint32_t dl = 0; dl < tileCnt; ++dl) {
+                        auto distRow = distTile[dl * TQ_PACK_K_VALUE];
+                        auto resRow = argminRes[dl * 2];
+                        AscendC::WholeReduceMin<float>(
+                            resRow, distRow, TQ_V_REDUCE_MASK, TQ_V_REDUCE_BATCHES, 1, 1,
+                            TQ_V_REDUCE_SRC_REP_STRIDE, AscendC::ReduceOrder::ORDER_INDEX_VALUE);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    TqSyncVToS();
+                    for (uint32_t dl = 0; dl < tileCnt; ++dl) {
+                        auto resRow = argminRes[dl * 2];
+                        idxs[tileStart + dl] =
+                            MergeWholeReduceMinIdx(resRow, TQ_V_REDUCE_BATCHES, TQ_V_REDUCE_MASK);
+                    }
+                    TqSyncSToV();
+                }
                 for (uint32_t b = 0; b < TQ_VALUE_INDEX_BYTES; ++b) {
-                    const uint8_t lo = ArgminAbsL1Vector16(yVals[b], cbFp32, distTile, argminRes);
-                    const uint8_t hi = ArgminAbsL1Vector16(
-                        yVals[b + TQ_VALUE_INDEX_BYTES], cbFp32, distTile, argminRes);
-                    packedRow.SetValue(b, static_cast<uint8_t>((lo & 0x0Fu) | ((hi & 0x0Fu) << 4)));
+                    packedRow.SetValue(
+                        b, static_cast<uint8_t>((idxs[b] & 0x0Fu) | ((idxs[b + TQ_VALUE_INDEX_BYTES] & 0x0Fu) << 4)));
                 }
             } else {
                 for (uint32_t tileStart = 0; tileStart < TQ_PACK_D; tileStart += TQ_D_TILE) {
@@ -494,16 +559,20 @@ private:
                     }
                     for (uint32_t dl = 0; dl < tileCnt; ++dl) {
                         auto distRow = distTile[dl * TQ_PACK_K_KEY];
+                        auto resRow = argminRes[dl * TQ_REDUCE_BATCHES * 2];
                         AscendC::WholeReduceMin<float>(
-                            argminRes, distRow, TQ_REDUCE_MASK, TQ_REDUCE_BATCHES, 1, 1,
+                            resRow, distRow, TQ_REDUCE_MASK, TQ_REDUCE_BATCHES, 1, 1,
                             TQ_REDUCE_SRC_REP_STRIDE, AscendC::ReduceOrder::ORDER_INDEX_VALUE);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        TqSyncVToS();
-                        const uint8_t idx =
-                            MergeWholeReduceMinIdx(argminRes, TQ_REDUCE_BATCHES, TQ_REDUCE_MASK);
-                        packedRow.SetValue(tileStart + dl, idx);
-                        TqSyncSToV();
                     }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    TqSyncVToS();
+                    for (uint32_t dl = 0; dl < tileCnt; ++dl) {
+                        auto resRow = argminRes[dl * TQ_REDUCE_BATCHES * 2];
+                        packedRow.SetValue(
+                            tileStart + dl,
+                            MergeWholeReduceMinIdx(resRow, TQ_REDUCE_BATCHES, TQ_REDUCE_MASK));
+                    }
+                    TqSyncSToV();
                 }
             }
 

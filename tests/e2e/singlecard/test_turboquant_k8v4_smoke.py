@@ -40,7 +40,7 @@ from vllm_ascend.ascend_config import clear_ascend_config
 from vllm_ascend.ops.turboquant_kv_cache import refresh_turboquant_env_cache
 
 MODEL_PATH = "/root/yyz/models/Qwen3-0.6B"
-PROFILE_DIR = "/root/yyz/pytorch_profiler/TurboQuant/260710/k8v4_0.6B"
+PROFILE_DIR = "/root/yyz/pytorch_profiler/TurboQuant/260711/k8v4_0.6B"
 PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_WARMUP_ITERATIONS", "2"))
 PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_ACTIVE_ITERATIONS", "2"))
 

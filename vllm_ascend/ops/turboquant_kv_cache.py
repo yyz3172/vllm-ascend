@@ -2189,6 +2189,22 @@ def turboquant_fused_infer_attention_score_k8v4(
             "turboquant_fused_infer_attention_score_k8v4 requires bits_key=8, "
             f"bits_value=4, got key={bits_key}, value={bits_value}."
         )
+    # Fused K8V4 read path is decode-only; prefill-sized Q batches use fallback.
+    if query.shape[0] > 8:
+        return _turboquant_fused_infer_attention_score_k8v4_impl(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            atten_mask,
+            actual_seq_lengths_q,
+            actual_seq_lengths_kv,
+            head_size,
+            num_heads,
+            num_key_value_heads,
+            block_size,
+            scale,
+        )
     gqa_group = num_heads // num_key_value_heads
     if gqa_group > 8:
         return _turboquant_fused_infer_attention_score_k8v4_impl(
