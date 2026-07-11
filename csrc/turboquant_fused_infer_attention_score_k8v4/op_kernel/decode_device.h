@@ -70,13 +70,51 @@ __aicore__ inline half TqDecodeReadNorm(const AscendC::LocalTensor<uint8_t>& pac
     return bits.h;
 }
 
+// Load rotation [D,D] fp16 from GM into rotateWork (D*D*sizeof(half) bytes).
+__aicore__ inline void TqDecodeLoadRotationUb(
+    AscendC::GlobalTensor<half>& rotationGm,
+    const AscendC::LocalTensor<uint8_t>& rotateWork) {
+    auto rotationLocal = rotateWork.template ReinterpretCast<half>();
+    AscendC::DataCopy(rotationLocal, rotationGm, TQ_DECODE_HEAD_SIZE * TQ_DECODE_HEAD_SIZE);
+    TqDecodeSync<AscendC::HardEvent::MTE2_V>();
+}
+
+// AIV vector rotate: xHat[i] = yHat[i] @ R (R row-major in rotateWork).
+// scratchFp32 must hold >= 2*D floats (acc + row scratch).
+__aicore__ inline void TqDecodeRotateVector(
+    const AscendC::LocalTensor<half>& yHat,
+    const AscendC::LocalTensor<half>& xHat,
+    const AscendC::LocalTensor<uint8_t>& rotateWork,
+    const AscendC::LocalTensor<float>& scratchFp32,
+    uint32_t M) {
+    const uint32_t D = TQ_DECODE_HEAD_SIZE;
+    auto rotationLocal = rotateWork.template ReinterpretCast<half>();
+    auto acc = scratchFp32;
+    auto rotFp32 = scratchFp32[D];
+
+    for (uint32_t i = 0; i < M; ++i) {
+        const uint32_t yOff = i * D;
+        AscendC::Duplicate(acc, 0.0f, D);
+        for (uint32_t k = 0; k < D; ++k) {
+            const uint32_t rotOff = k * D;
+            const float yVal = static_cast<float>(yHat.GetValue(yOff + k));
+            AscendC::Cast(rotFp32, rotationLocal[rotOff], AscendC::RoundMode::CAST_NONE, D);
+            AscendC::Muls(rotFp32, rotFp32, yVal, D);
+            AscendC::Add(acc, acc, rotFp32, D);
+        }
+        AscendC::Cast(xHat[yOff], acc, AscendC::RoundMode::CAST_NONE, D);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
 // Vectorized 8-bit decode for M packed rows. Caller must have:
 //   - Compacted ``packed`` into UB as [M*128 index bytes][M*2 norm bytes],
 //     with the index region DataCopied and ready for MTE2->V sync,
 //   - ``codebook`` (256 fp16) resident in UB,
-//   - ``rotationGm`` (128x128 fp16) in GM with ``rotateMm`` REGIST_MATMUL_OBJ'd,
-//   - ``cubeCGm`` a fp32 GM scratch of >= M*128 floats.
-// Scratch tensors (idxHalf/idxFloat/idxS32/yHat[VECOUT]/cubeFp32/xHat) sized M*128.
+//   - ``rotationGm`` (128x128 fp16) in GM,
+//   - ``rotateWork`` UB scratch (>= D*D*sizeof(half)) for rotation + vector matmul,
+//   - ``cubeFp32`` scratch with >= 2*D floats for rotate accumulation.
+// Scratch tensors (idxHalf/idxFloat/idxS32/yHat/xHat) sized M*128.
 // On return ``xHat`` (UB fp16, M*128) holds the decoded rows row-major.
 __aicore__ inline void DecodeRows8bit(
     const AscendC::LocalTensor<uint8_t>& packed,
@@ -93,6 +131,8 @@ __aicore__ inline void DecodeRows8bit(
     const AscendC::LocalTensor<half>& xHat,
     uint32_t M,
     uint32_t mPad) {
+    (void)cubeCGm;
+    (void)rotateMm;
     const uint32_t D = TQ_DECODE_HEAD_SIZE;
     const uint32_t n = M * D;
 
@@ -136,28 +176,10 @@ __aicore__ inline void DecodeRows8bit(
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    // (6) Cube: x_hat = y_hat @ R, fp32 accumulate to GM, then back to UB + fp16.
-    // SetSingleShape(singleM, singleN, singleK): A[M,K] @ B[K,N], doc requires
-    // tensorA >= singleM*singleK, tensorB >= singleK*singleN (in elements).
-    rotateMm.SetOrgShape(mPad, D, D);
-    rotateMm.SetSingleShape(M, D, D);
-    rotateMm.SetTensorA(yHat, false);
-    rotateMm.SetTensorB(rotationGm, false);
-    rotateMm.SetLocalWorkspace(rotateWork);
-    // Match pack op: non-sequential GetTensorC per baseN tile assembles full [mPad,N]
-    // in cubeCGm; linear DataCopy(m*D) is valid. IterateAll does not reproduce this
-    // layout on MIX KFC (CANN: IterateAll expects continuous GM).
-    // while (rotateMm.Iterate()) {
-    //     rotateMm.GetTensorC(cubeCGm);
-    //     iterCount++;
-    // }
-    rotateMm.IterateAll(cubeCGm);
-    rotateMm.End();
-
-    AscendC::DataCopy(cubeFp32, cubeCGm, n);
-    TqDecodeSync<AscendC::HardEvent::MTE2_V>();
-    AscendC::Cast(xHat, cubeFp32, AscendC::RoundMode::CAST_NONE, n);
-    AscendC::PipeBarrier<PIPE_V>();
+    // (6) AIV rotate: x_hat = y_hat @ R. Avoid IterateAll on MIX KFC — it leaves
+    // AIC scalar-spinning with aic_mac≈0 while AIV waits on cubeCGm layout.
+    TqDecodeLoadRotationUb(rotationGm, rotateWork);
+    TqDecodeRotateVector(yHat, xHat, rotateWork, cubeFp32, M);
 }
 
 // Fully scalar reference decode (AIV-only). No Gather, no Cube — used as the
