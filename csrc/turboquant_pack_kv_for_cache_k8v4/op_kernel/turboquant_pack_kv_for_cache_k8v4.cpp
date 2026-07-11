@@ -334,14 +334,11 @@ public:
         if (!matmulReady_ || !TqIsAiv()) {
             return;
         }
-        // MIX_AIC_1_2: blockIdx enumerates AIVs; logical data-core is blockIdx/2.
-        // Only the primary AIV (subBlock 0) runs Cube KFC + encode — same pattern as
-        // fused-infer. Secondary AIV previously either duplicated work or issued a
-        // concurrent IterateAll (KFC conflict), inflating wall time vs aiv_time.
+        // MIX_AIC_1_2: each AIV has its own UB — no buffer doubling needed.
+        // sub0 = Key with Cube KFC rotate; sub1 = Value with AIV vector rotate
+        // (avoids concurrent IterateAll on the same Matmul/KFC client).
         constexpr uint32_t kAivSub = 2;
-        if ((AscendC::GetSubBlockIdx() % kAivSub) != 0) {
-            return;
-        }
+        const uint32_t sub = AscendC::GetSubBlockIdx() % kAivSub;
         const uint32_t batchGroups =
             (nVec_ + vecPerCore_ - 1) / vecPerCore_;
         const uint32_t dataCores = batchGroups > 16U ? 16U : batchGroups;
@@ -359,10 +356,13 @@ public:
             const uint32_t batchEnd = batchStart + vecPerCore_ > coreEnd
                 ? coreEnd : batchStart + vecPerCore_;
 
-            PackBatch(keyGm_, keyCacheGm_, batchStart, batchEnd,
-                      slot_w_k_, /*fourBit=*/false, false);
-            PackBatch(valueGm_, valueCacheGm_, batchStart, batchEnd,
-                      slot_w_v_, /*fourBit=*/true, false);
+            if (sub == 0) {
+                PackBatch(keyGm_, keyCacheGm_, batchStart, batchEnd,
+                          slot_w_k_, /*fourBit=*/false, /*manualRotate=*/false);
+            } else {
+                PackBatch(valueGm_, valueCacheGm_, batchStart, batchEnd,
+                          slot_w_v_, /*fourBit=*/true, /*manualRotate=*/true);
+            }
         }
     }
 
