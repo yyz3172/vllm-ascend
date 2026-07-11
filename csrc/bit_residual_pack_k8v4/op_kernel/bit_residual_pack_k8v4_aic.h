@@ -260,6 +260,7 @@ private:
         TqManualMmadResource& resource,
         AscendC::GlobalTensor<float>& normWorkGm,
         uint32_t streamOrdinal) {
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
         auto aL1 =
             resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
         auto aL0 = resource.l0ABuf.template GetBufferByByte<T>(
@@ -270,6 +271,7 @@ private:
             TQ_MANUAL_NORM_C_L0_BYTE_OFFSET);
         const uint32_t normBase = context_.ManualNormBufferOffset(streamOrdinal);
 
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
         for (uint32_t slice = 0; slice < TQ_AIV_SUB_BLOCKS; ++slice) {
             const uint32_t l1SliceOffset =
                 slice * TQ_MANUAL_AIV_SLICE_ELEMS;
@@ -277,19 +279,6 @@ private:
             // ── MTE1: load A and B from L1 to L0 ────────────────────────
             // Wait until M engine has finished consuming the previous
             // L0A/L0B data (M_MTE1 direction).
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_A_L0_EVENT);
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_B_L0_EVENT);
-
-            AscendC::LoadData2DParams aLoad;
-            aLoad.startIndex = 0;
-            aLoad.repeatTimes = TQ_ROT_K / TQ_CUBE_M_ALIGN;
-            aLoad.srcStride = 1;
-            aLoad.sid = 0;
-            aLoad.dstGap = 0;
-            aLoad.ifTranspose = false;
-            aLoad.addrMode = 0;
-            AscendC::LoadData(aL0, aL1[l1SliceOffset], aLoad);
-
             AscendC::LoadData2DParams bLoad;
             bLoad.startIndex = 0;
             bLoad.repeatTimes = 1;
@@ -298,6 +287,7 @@ private:
             bLoad.dstGap = 0;
             bLoad.ifTranspose = false;
             bLoad.addrMode = 0;
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_B_L0_EVENT);
             for (uint32_t kBlock = 0;
                  kBlock < TQ_ROT_K / TQ_CUBE_M_ALIGN;
                  ++kBlock) {
@@ -308,6 +298,18 @@ private:
                     aL1[l1SliceOffset + blockOffset],
                     bLoad);
             }
+            
+            AscendC::LoadData2DParams aLoad;
+            aLoad.startIndex = 0;
+            aLoad.repeatTimes = TQ_ROT_K / TQ_CUBE_M_ALIGN;
+            aLoad.srcStride = 1;
+            aLoad.sid = 0;
+            aLoad.dstGap = 0;
+            aLoad.ifTranspose = false;
+            aLoad.addrMode = 0;
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_A_L0_EVENT);
+            AscendC::LoadData(aL0, aL1[l1SliceOffset], aLoad);
+
             // MTE1→L0A/L0B load done.  Signal M that buffers are ready
             // (MTE1_M direction).
             AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(TQ_MANUAL_NORM_A_L0_EVENT);
@@ -318,6 +320,8 @@ private:
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(TQ_MANUAL_NORM_A_L0_EVENT);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(TQ_MANUAL_NORM_B_L0_EVENT);
 
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
             AscendC::MmadParams mmParams;
             mmParams.m = TQ_MANUAL_AIV_SLICE_M;
             mmParams.n = TQ_MANUAL_AIV_SLICE_M;
@@ -326,12 +330,7 @@ private:
             mmParams.cmatrixSource = false;
             mmParams.unitFlag = 0b11;
             AscendC::Mmad(cL0, aL0, bL0, mmParams);
-            AscendC::PipeBarrier<PIPE_M>();
 
-            // M finished consuming L0A and L0B.  Release them so the next
-            // slice's MTE1 LoadData can overwrite them (M_MTE1 direction).
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_A_L0_EVENT);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_B_L0_EVENT);
 
             // ── FIX: Fixpipe L0C → GM (CFG_NZ, NoQuant) ─────────────────
             // With unitFlag=0b11, hardware handles M→FIX→M sync internally:
@@ -354,6 +353,11 @@ private:
                     normBase + slice * TQ_MANUAL_NORM_MATRIX_ELEMS],
                 cL0,
                 fixParams);
+                
+            // M finished consuming L0A and L0B.  Release them so the next
+            // slice's MTE1 LoadData can overwrite them (M_MTE1 direction).
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_A_L0_EVENT);
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(TQ_MANUAL_NORM_B_L0_EVENT);
         }
     }
 
@@ -470,7 +474,7 @@ private:
             flagBase + TQ_MANUAL_SYNC_C_FREE);
         LoadRawInputToL1(resource, desc);
         ComputeNormMatrices(resource, normWorkGm, desc.streamOrdinal);
-        ComputeLoadedTile(resource, cWorkGm, bufferOffset);
+        //ComputeLoadedTile(resource, cWorkGm, bufferOffset);
         TqSyncFixed<AscendC::HardEvent::FIX_MTE3>();
         TqCrossCoreSetForBothAiv<PIPE_FIX>(
             flagBase + TQ_MANUAL_SYNC_C_READY);
