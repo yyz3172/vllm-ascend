@@ -38,15 +38,9 @@ public:
             return;
         }
 
-        // Initialize constant-1 diagonal (once per Process call, reused for Div)
-        auto onesDiag = context_.resource_.NormOneDiag();
-        AscendC::Duplicate(onesDiag, 1.0f, TQ_MANUAL_AIV_SLICE_M);
-        AscendC::PipeBarrier<PIPE_V>();
-
         auto& op = context_;
-        AscendC::GlobalTensor<float> normWorkGm;
         AscendC::GlobalTensor<T> cWorkGm;
-        op.InitManualWorkspaceTensors(manualGroupId, normWorkGm, cWorkGm);
+        op.InitManualWorkspaceTensors(manualGroupId, cWorkGm);
 
         for (uint32_t buffer = 0; buffer < TQ_MANUAL_WORKSPACE_BUFFER_COUNT; ++buffer) {
             TqCrossCoreSet<PIPE_MTE2>(
@@ -98,8 +92,8 @@ public:
                             tokenStart, slot, blockIdx, valueGroupInBlock,
                             headTileStart, startGroupRow, validRows, keyStream + 1,
                             preserveValue, true};
-                        FinishC(normWorkGm, cWorkGm, keyDesc, aivSlice);
-                        FinishC(normWorkGm, cWorkGm, valueDesc, aivSlice);
+                        FinishC(cWorkGm, keyDesc, aivSlice);
+                        FinishC(cWorkGm, valueDesc, aivSlice);
                         ++manualTileOrdinal;
                     }
                     ++tileOrdinal;
@@ -110,103 +104,34 @@ public:
     }
 
 private:
-    __aicore__ inline void LoadNormsAndNormalizeRotatedBatch(
-        AscendC::GlobalTensor<float>& normWorkGm,
-        uint32_t streamOrdinal,
-        uint32_t aivSlice,
-        AscendC::LocalTensor<T> norms) {
-        const uint32_t normOffset =
-            context_.ManualNormBufferOffset(streamOrdinal) +
-            aivSlice * TQ_MANUAL_NORM_MATRIX_ELEMS;
-        auto gram = context_.resource_.ReduceOut();
-        auto normDiag = context_.resource_.NormDiagFp32();
-        auto normEpsDiag = context_.resource_.NormEpsDiagFp32();
-        auto invNormDiag = context_.resource_.InvNormDiagFp32();
-        auto onesDiag = context_.resource_.NormOneDiag();
-        auto yBatch = context_.resource_.YBatch();
-        auto yFp32 = context_.resource_.YFp32();
-        auto scaleBlock = context_.resource_.ReduceTmp();
-        auto normAcc = context_.resource_.NormScalar();
-        auto normsT = context_.resource_.NormScalar().template ReinterpretCast<T>();
-
-        // Phase 1: Load gram matrix from GM → UB
-        AscendC::DataCopy(gram, normWorkGm[normOffset], TQ_MANUAL_NORM_MATRIX_ELEMS);
-        TqSyncMte2ToV();
-        TqSyncMte2ToS();
-
-        // Phase 2: Extract diagonal → contiguous float32[16]
-        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
-            normDiag.SetValue(row, gram.GetValue(row * (TQ_MANUAL_NORM_MATRIX_DIM + 1)));
-        }
-        TqSyncSToV();
-
-        // Phase 3: Batch vector norm computation — Sqrt / Adds / Div
-        AscendC::Maxs(normDiag, normDiag, 0.0f, TQ_MANUAL_AIV_SLICE_M);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Sqrt(normDiag, normDiag, TQ_MANUAL_AIV_SLICE_M);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(normEpsDiag, normDiag, TQ_NORM_EPS_F, TQ_MANUAL_AIV_SLICE_M);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Div(invNormDiag, onesDiag, normEpsDiag, TQ_MANUAL_AIV_SLICE_M);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        // Phase 4: Cast norms fp32 → T, scatter to stride slots
-        AscendC::Cast(normsT, normDiag, AscendC::RoundMode::CAST_RINT,
-                       TQ_MANUAL_AIV_SLICE_M);
-        AscendC::PipeBarrier<PIPE_V>();
-        TqSyncVToS();
-        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
-            norms.SetValue(row * TQ_NORM_STRIDE, normsT.GetValue(row));
-        }
-
-        // Phase 5: Per-row invNorm scale (Brcb from normAcc)
-        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
-            normAcc.SetValue(0, invNormDiag.GetValue(row));
-
-            TqSyncSToV();
-            AscendC::Brcb(scaleBlock, normAcc, 1, AscendC::BrcbRepeatParams(1, 8));
-            AscendC::PipeBarrier<PIPE_V>();
-
-            const uint32_t rowOffset = row * TQ_PACK_D;
-            AscendC::Cast(
-                yFp32, yBatch[rowOffset], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(
-                yFp32, yFp32, scaleBlock,
-                static_cast<uint64_t>(TQ_PACK_D / 2), 2,
-                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(
-                yBatch[rowOffset], yFp32, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        TqSyncSToV();
-    }
-
-    __aicore__ inline void EncodeKeyBatchWithNorms(
-        uint32_t m,
-        AscendC::LocalTensor<T> norms) {
+    // ── Sign-reversal quantization for key rows ───────────────────────────
+    // After rotation y = x @ R^T:
+    //   sig_vec[d] = sign(y[d]) ? +1 : -1  (positive→+1, negative→-1)
+    //   rev_vec = y * sig_vec  (all dims become positive)
+    //   base/step from min/max of rev_vec
+    //   q7 = (rev_vec - base) * invStep, clamped [0, 127]
+    //   code = (q7 << 1) | sign_bit
+    //
+    __aicore__ inline void EncodeKeyBatch(uint32_t m) {
         auto yBatch = context_.resource_.YBatch();
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto yFp32 = context_.resource_.YFp32();
         auto signVal = context_.resource_.SignVal();
-        auto err = context_.resource_.Err();
+        auto revVec = context_.resource_.RevVec();
         auto qI16 = context_.resource_.QuantIndexU16();
         auto codeU16 = context_.resource_.PackMerge();
         auto codeMask = context_.resource_.PackMask();
+        auto signSave = context_.resource_.PackMask();  // reuse PackMask for sign bits
         auto reduceScalar = context_.resource_.ReduceScalar();
         auto baseAcc = reduceScalar;
         auto maxAcc = reduceScalar[1];
         auto reduceTmp = context_.resource_.ReduceTmp();
-        auto normWords = norms.template ReinterpretCast<uint16_t>();
 
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
             const uint32_t encodedOff = i * TQ_KEY_ENCODED_ROW_STRIDE_WORDS;
-            const uint32_t normOff = i * TQ_NORM_STRIDE;
 
-            AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
+            // Step 1: Extract sign bits from rotated y
             auto signBits = qI16.template ReinterpretCast<uint16_t>();
             AscendC::Duplicate(codeMask, static_cast<uint16_t>(1), TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -218,32 +143,32 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::And(signBits, signBits, codeMask, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(signVal, qI16, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(signVal, signVal, -1.0f, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Adds(signVal, signVal, 1.0f, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI16, signVal, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(codeMask, static_cast<uint16_t>(0), TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Or(
-                codeU16,
-                qI16.template ReinterpretCast<uint16_t>(),
-                codeMask,
-                TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(signVal, signVal, 2.0f * TQ_INV_SQRT_D_F, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Adds(signVal, signVal, -TQ_INV_SQRT_D_F, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(err, yFp32, signVal, TQ_PACK_D);
+
+            // Save sign bits for later code packing (before we reuse qI16)
+            AscendC::DataCopy(signSave, signBits, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
 
-            AscendC::ReduceMin<float>(baseAcc, err, reduceTmp, TQ_PACK_D);
+            // Step 2: Generate sig_vec: 0→+1.0, 1→-1.0
+            // sign_bit=0 (positive) → +1.0, sign_bit=1 (negative) → -1.0
+            AscendC::Cast(signVal, qI16, AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ReduceMax<float>(maxAcc, err, reduceTmp, TQ_PACK_D);
+            AscendC::Muls(signVal, signVal, -2.0f, TQ_PACK_D);  // 0→0, 1→-2
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(signVal, signVal, 1.0f, TQ_PACK_D);   // 0→+1, 1→-1 = sig_vec
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // Step 3: Cast y to fp32 (no normalization)
+            AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // Step 4: rev_vec = yFp32 * sig_vec (all dims become positive)
+            AscendC::Mul(revVec, yFp32, signVal, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // Step 5: base/step from rev_vec (all positive → min ≥ 0)
+            AscendC::ReduceMin<float>(baseAcc, revVec, reduceTmp, TQ_PACK_D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::ReduceMax<float>(maxAcc, revVec, reduceTmp, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             TqSyncVToS();
             const float baseF = baseAcc.GetValue(0);
@@ -253,34 +178,33 @@ private:
             const float invStepF = rangeF > 0.0f ? 1.0f / stepF : 0.0f;
             TqSyncSToV();
 
-            AscendC::Adds(err, err, -baseF, TQ_PACK_D);
+            // Step 6: Quantize rev_vec: q7 = (rev_vec - baseF) * invStepF, clamped [0,127]
+            AscendC::Adds(revVec, revVec, -baseF, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(err, err, invStepF, TQ_PACK_D);
+            AscendC::Muls(revVec, revVec, invStepF, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Maxs(err, err, 0.0f, TQ_PACK_D);
+            AscendC::Maxs(revVec, revVec, 0.0f, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mins(err, err, TQ_KEY_QUANT_LEVELS_F, TQ_PACK_D);
+            AscendC::Mins(revVec, revVec, TQ_KEY_QUANT_LEVELS_F, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI16, err, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
+            AscendC::Cast(qI16, revVec, AscendC::RoundMode::CAST_RINT, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
+
+            // Step 7: Pack code = (q7 << 1) | sign_bit
+            // qI16 has quantized index (0..127)
+            // signSave has sign bits (0 or 1)
             AscendC::ShiftLeft(
                 codeMask,
                 qI16.template ReinterpretCast<uint16_t>(),
                 static_cast<uint16_t>(1),
                 TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Or(
-                codeU16,
-                codeU16,
-                codeMask,
-                TQ_PACK_D);
+            AscendC::Or(codeU16, signSave, codeMask, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::DataCopy(encodedBatch[encodedOff], codeU16, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
 
-            encodedBatch.SetValue(
-                encodedOff + TQ_KEY_ENCODED_NORM_WORD_OFFSET,
-                normWords.GetValue(normOff));
+            // Step 8: Store base and step at new offsets (no norm word)
             auto baseOut = encodedBatch[
                 encodedOff + TQ_KEY_ENCODED_BASE_BYTE_OFFSET / sizeof(uint16_t)]
                                .template ReinterpretCast<float>();
@@ -293,12 +217,15 @@ private:
         TqSyncSToV();
     }
 
-    __aicore__ inline void EncodeValueBatch(uint32_t m,
-                                               AscendC::LocalTensor<T> norms) {
+    // ── Value quantization (no norm folding) ──────────────────────────────
+    // vmin/vstep stored as raw values (not multiplied by norm).
+    // Decode: y = vmin + idx4 * vstep
+    //
+    __aicore__ inline void EncodeValueBatch(uint32_t m) {
         auto yBatch = context_.resource_.YBatch();
         auto encodedBatch = context_.resource_.ValEncodedBatch();
         auto yFp32 = context_.resource_.YFp32();
-        auto qFp32 = context_.resource_.Err();
+        auto qFp32 = context_.resource_.RevVec();  // reuse RevVec buffer for value quant
         auto qI32 = context_.resource_.QuantIndex();
         auto qI16 = context_.resource_.QuantIndexU16();
         auto reduceScalar = context_.resource_.ReduceScalar();
@@ -309,7 +236,6 @@ private:
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t yOff = i * TQ_ROT_N;
             const uint32_t encodedOff = i * TQ_VAL_ENCODED_ROW_STRIDE_WORDS;
-            const uint32_t normOff = i * TQ_NORM_STRIDE;
 
             AscendC::Cast(yFp32, yBatch[yOff], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
@@ -325,21 +251,8 @@ private:
             const float invStepF = rangeF > 0.0f ? 1.0f / vstepF : 0.0f;
             TqSyncSToV();
 
-            // Fold norm into vmin/vstep so that decode reconstructs
-            // values with original magnitude without a separate norm:
-            //   y = vmin_scaled + idx4 * vstep_scaled
-            //     = norm * (vmin + idx4 * vstep)
-            //     ≈ norm * x_unit @ R^T = x @ R^T
-            auto normToFloat = context_.resource_.ReduceOut();  // float32 scratch
-            AscendC::Cast(normToFloat, norms[normOff], AscendC::RoundMode::CAST_NONE, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            TqSyncVToS();
-            const float normF = normToFloat.GetValue(0);
-            TqSyncSToV();
-
-            const float vminScaledF = vminF * normF;
-            const float vstepScaledF = vstepF * normF;
-
+            // Quantize: idx4 = (yFp32 - vminF) * invStepF, clamped [0, 15]
+            // Store raw vmin/vstep (no norm folding)
             AscendC::Adds(qFp32, yFp32, -vminF, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Muls(qFp32, qFp32, invStepF, TQ_PACK_D);
@@ -364,8 +277,8 @@ private:
             auto vstepOut = encodedBatch[
                 encodedOff + TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET / sizeof(uint16_t)]
                                 .template ReinterpretCast<float>();
-            vminOut.SetValue(0, vminScaledF);
-            vstepOut.SetValue(0, vstepScaledF);
+            vminOut.SetValue(0, vminF);
+            vstepOut.SetValue(0, vstepF);
         }
         TqSyncSToV();
     }
@@ -392,40 +305,80 @@ private:
     }
 
     template <bool IS_KEY>
-    __aicore__ inline constexpr uint32_t GroupBytes() const {
-        return IS_KEY ? TQ_KEY_GROUP_BYTES : TQ_VAL_GROUP_BYTES;
-    }
-
-    template <bool IS_KEY>
-    __aicore__ inline constexpr uint32_t GroupStride() const {
-        return IS_KEY ? TQ_KEY_GROUP_STRIDE : TQ_VAL_GROUP_STRIDE;
-    }
-
-    template <bool IS_KEY>
     __aicore__ inline constexpr uint32_t EncodedRowStrideWords() const {
         return IS_KEY ? TQ_KEY_ENCODED_ROW_STRIDE_WORDS : TQ_VAL_ENCODED_ROW_STRIDE_WORDS;
     }
 
-    __aicore__ inline void ClearPackedGroup(AscendC::LocalTensor<uint8_t>& packedGroup) const {
-        auto packedU16 = packedGroup.template ReinterpretCast<uint16_t>();
-        AscendC::Duplicate(
-            packedU16,
-            static_cast<uint16_t>(0),
-            TQ_PACKED_GROUP_STRIDE / sizeof(uint16_t));
-        AscendC::PipeBarrier<PIPE_V>();
+    // ── 16-row sub-block layout helpers ───────────────────────────────────
+    // Key block: [code zone (8×256)] [base zone (16×float)] [step zone (16×float)]
+    // Val block: [code zone (4×256)] [vmin zone (16×float)] [vstep zone (16×float)]
+
+    template <bool IS_KEY>
+    __aicore__ inline constexpr uint32_t BlockStride() const {
+        return IS_KEY ? TQ_KEY_BLOCK_STRIDE : TQ_VAL_BLOCK_STRIDE;
     }
 
     template <bool IS_KEY>
-    __aicore__ inline void MergeEncodedRowToGroup(
-        AscendC::LocalTensor<uint8_t>& packedGroup,
+    __aicore__ inline constexpr uint32_t GroupsPerBlock() const {
+        return IS_KEY ? TQ_KEY_GROUPS_PER_BLOCK : TQ_VAL_GROUPS_PER_BLOCK;
+    }
+
+    template <bool IS_KEY>
+    __aicore__ inline constexpr uint32_t BlockTotalBytes() const {
+        return IS_KEY
+            ? TQ_KEY_BLOCK_CODE_BYTES + TQ_KEY_BLOCK_BASE_BYTES + TQ_KEY_BLOCK_STEP_BYTES
+            : TQ_VAL_BLOCK_CODE_BYTES + TQ_VAL_BLOCK_VMIN_BYTES + TQ_VAL_BLOCK_VSTEP_BYTES;
+    }
+
+    // Byte offset of a specific group's code zone within a 16-row block
+    template <bool IS_KEY>
+    __aicore__ inline constexpr uint32_t GroupCodeOffset(uint32_t groupInBlock) const {
+        return groupInBlock * TQ_GROUP_INDEX_BYTES;
+    }
+
+    // Byte offset of base/step for a specific row within a 16-row block
+    __aicore__ inline constexpr uint32_t KeyBaseOffset(uint32_t rowInBlock) const {
+        return TQ_KEY_BLOCK_BASE_OFFSET + rowInBlock * sizeof(float);
+    }
+    __aicore__ inline constexpr uint32_t KeyStepOffset(uint32_t rowInBlock) const {
+        return TQ_KEY_BLOCK_STEP_OFFSET + rowInBlock * sizeof(float);
+    }
+    __aicore__ inline constexpr uint32_t ValVminOffset(uint32_t rowInBlock) const {
+        return TQ_VAL_BLOCK_VMIN_OFFSET + rowInBlock * sizeof(float);
+    }
+    __aicore__ inline constexpr uint32_t ValVstepOffset(uint32_t rowInBlock) const {
+        return TQ_VAL_BLOCK_VSTEP_OFFSET + rowInBlock * sizeof(float);
+    }
+
+    __aicore__ inline void ClearPackedBlock(AscendC::LocalTensor<uint8_t>& packedBlock) const {
+        auto packedU16 = packedBlock.template ReinterpretCast<uint16_t>();
+        AscendC::Duplicate(
+            packedU16,
+            static_cast<uint16_t>(0),
+            TQ_PACKED_BLOCK_STRIDE / sizeof(uint16_t));
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // ── Merge one encoded row into a 16-row sub-block ─────────────────────
+    // Code zone: group-level bit packing (ShiftLeft + OR by groupRow shift bits)
+    // Base/Step/Vmin/Vstep: per-row float written at rowInBlock position
+    //
+    template <bool IS_KEY>
+    __aicore__ inline void MergeEncodedRowToBlock(
+        AscendC::LocalTensor<uint8_t>& packedBlock,
         const AscendC::LocalTensor<uint16_t>& encodedBatch,
         uint32_t encodedRow,
+        uint32_t groupInBlock,
         uint32_t groupRow,
+        uint32_t rowInBlock,
         bool clearOldBits) {
-        auto packedU16 = packedGroup.template ReinterpretCast<uint16_t>();
+        auto packedU16 = packedBlock.template ReinterpretCast<uint16_t>();
         auto shiftedIdx = context_.resource_.PackMerge();
         const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
         const uint32_t shiftBits = groupRow * (IS_KEY ? 8 : 4);
+
+        // ── Code zone: merge code words into the group ────────────────────
+        const uint32_t codeWordOff = GroupCodeOffset<IS_KEY>(groupInBlock) / sizeof(uint16_t);
 
         if (clearOldBits) {
             auto clearMask = context_.resource_.PackMask();
@@ -435,7 +388,8 @@ private:
                     : ~static_cast<uint16_t>(0x000Fu << shiftBits));
             AscendC::Duplicate(clearMask, mask, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::And(packedU16, packedU16, clearMask, TQ_PACK_D);
+            // Clear the group's code words (not the entire block!)
+            AscendC::And(packedU16[codeWordOff], packedU16[codeWordOff], clearMask, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
         }
 
@@ -445,66 +399,66 @@ private:
             static_cast<uint16_t>(shiftBits),
             TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Or(packedU16, packedU16, shiftedIdx, TQ_PACK_D);
+        AscendC::Or(packedU16[codeWordOff], packedU16[codeWordOff], shiftedIdx, TQ_PACK_D);
         AscendC::PipeBarrier<PIPE_V>();
 
+        // ── Scalar zone: write base/step/vmin/vstep per row ───────────────
         if constexpr (IS_KEY) {
-            const uint32_t normWord = TQ_KEY_GROUP_NORM_OFFSET / sizeof(uint16_t) + groupRow;
-            packedU16.SetValue(
-                normWord,
-                encodedBatch.GetValue(encodedOff + TQ_KEY_ENCODED_NORM_WORD_OFFSET));
-            auto packedBase = packedGroup[TQ_KEY_GROUP_BASE_OFFSET].template ReinterpretCast<float>();
-            auto packedStep = packedGroup[TQ_KEY_GROUP_STEP_OFFSET].template ReinterpretCast<float>();
+            auto packedBase = packedBlock[KeyBaseOffset(rowInBlock)].template ReinterpretCast<float>();
+            auto packedStep = packedBlock[KeyStepOffset(rowInBlock)].template ReinterpretCast<float>();
             auto encodedBase = encodedBatch[
                 encodedOff + TQ_KEY_ENCODED_BASE_BYTE_OFFSET / sizeof(uint16_t)]
                                    .template ReinterpretCast<float>();
             auto encodedStep = encodedBatch[
                 encodedOff + TQ_KEY_ENCODED_STEP_BYTE_OFFSET / sizeof(uint16_t)]
                                    .template ReinterpretCast<float>();
-            packedBase.SetValue(groupRow, encodedBase.GetValue(0));
-            packedStep.SetValue(groupRow, encodedStep.GetValue(0));
+            packedBase.SetValue(0, encodedBase.GetValue(0));
+            packedStep.SetValue(0, encodedStep.GetValue(0));
         } else {
-            auto packedVmin = packedGroup[TQ_VAL_GROUP_VMIN_OFFSET].template ReinterpretCast<float>();
-            auto packedVstep = packedGroup[TQ_VAL_GROUP_VSTEP_OFFSET].template ReinterpretCast<float>();
+            auto packedVmin = packedBlock[ValVminOffset(rowInBlock)].template ReinterpretCast<float>();
+            auto packedVstep = packedBlock[ValVstepOffset(rowInBlock)].template ReinterpretCast<float>();
             auto encodedVmin = encodedBatch[
                 encodedOff + TQ_VAL_ENCODED_VMIN_BYTE_OFFSET / sizeof(uint16_t)]
                                    .template ReinterpretCast<float>();
             auto encodedVstep = encodedBatch[
                 encodedOff + TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET / sizeof(uint16_t)]
                                     .template ReinterpretCast<float>();
-            packedVmin.SetValue(groupRow, encodedVmin.GetValue(0));
-            packedVstep.SetValue(groupRow, encodedVstep.GetValue(0));
+            packedVmin.SetValue(0, encodedVmin.GetValue(0));
+            packedVstep.SetValue(0, encodedVstep.GetValue(0));
         }
     }
 
+    // ── Cache block offset: blockIdx × numHeads × subBlocks × stride ──────
     template <bool IS_KEY>
-    __aicore__ inline uint64_t MakeCacheGroupBaseOffset(
+    __aicore__ inline uint64_t MakeCacheBlockBaseOffset(
         uint32_t blockIdx,
-        uint32_t groupInBlock,
+        uint32_t subBlockInBlock,
         uint32_t headIdx) const {
+        const uint32_t subBlocksPerBlock = context_.blockSize_ / TQ_BLOCK_ROWS;
         return ((uint64_t)blockIdx * context_.numHeads_ + headIdx) *
-                   (context_.blockSize_ / GroupRows<IS_KEY>()) * GroupStride<IS_KEY>() +
-               static_cast<uint64_t>(groupInBlock) * GroupStride<IS_KEY>();
+                   subBlocksPerBlock * BlockStride<IS_KEY>() +
+               static_cast<uint64_t>(subBlockInBlock) * BlockStride<IS_KEY>();
     }
 
     template <bool IS_KEY>
     __aicore__ inline void EncodeSliceToCache(
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const ManualKey1StreamDesc& desc,
-        uint32_t aivSlice,
-        AscendC::LocalTensor<T> norms) {
+        uint32_t aivSlice) {
         auto& op = context_;
         const uint32_t firstHead =
             desc.headTileStart + aivSlice * TQ_MANUAL_HEADS_PER_AIV;
         if constexpr (IS_KEY) {
-            EncodeKeyBatchWithNorms(TQ_MANUAL_AIV_SLICE_M, norms);
+            EncodeKeyBatch(TQ_MANUAL_AIV_SLICE_M);
         } else {
-            EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M, norms);
+            EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M);
         }
         auto encodedBatch =
             IS_KEY ? op.resource_.KeyEncodedBatch() : op.resource_.ValEncodedBatch();
-        auto packedGroups = op.resource_.PackedRow();
+        auto packedBlocks = op.resource_.PackedRow();
         const uint32_t groupRowsPerGroup = GroupRows<IS_KEY>();
+        const uint32_t subBlocksPerBlock = op.blockSize_ / TQ_BLOCK_ROWS;
+
         for (uint32_t localHead = 0; localHead < TQ_MANUAL_HEADS_PER_AIV;
              ++localHead) {
             const uint32_t headIdx = firstHead + localHead;
@@ -513,59 +467,62 @@ private:
                 const uint32_t slot = desc.slotStart + rowOff;
                 const uint32_t blockIdx = slot / op.blockSize_;
                 const uint32_t blockOffset = slot - blockIdx * op.blockSize_;
-                const uint32_t groupInBlock = blockOffset / groupRowsPerGroup;
-                const uint32_t firstGroupRow = blockOffset % groupRowsPerGroup;
-                uint32_t rowsThisGroup = groupRowsPerGroup - firstGroupRow;
-                if (rowsThisGroup > desc.validRows - rowOff) {
-                    rowsThisGroup = desc.validRows - rowOff;
+                const uint32_t subBlockInBlock = blockOffset / TQ_BLOCK_ROWS;
+                const uint32_t rowInSubBlock = blockOffset % TQ_BLOCK_ROWS;
+                const uint32_t groupInBlock = rowInSubBlock / groupRowsPerGroup;
+                const uint32_t groupRow = rowInSubBlock % groupRowsPerGroup;
+                uint32_t rowsThisSubBlock = TQ_BLOCK_ROWS - rowInSubBlock;
+                if (rowsThisSubBlock > desc.validRows - rowOff) {
+                    rowsThisSubBlock = desc.validRows - rowOff;
                 }
-                const uint64_t groupBase = MakeCacheGroupBaseOffset<IS_KEY>(
-                    blockIdx, groupInBlock, headIdx);
-                const bool preserveExisting =
-                    firstGroupRow != 0 || rowsThisGroup < groupRowsPerGroup;
+                // Maximum rows we can process in this sub-block
+                uint32_t rowsThisRound = rowsThisSubBlock;
 
-                auto packedGroup = packedGroups[localHead * TQ_PACKED_GROUP_STRIDE];
+                const uint64_t subBlockBase = MakeCacheBlockBaseOffset<IS_KEY>(
+                    blockIdx, subBlockInBlock, headIdx);
+                const bool preserveExisting =
+                    rowInSubBlock != 0 || rowsThisRound < TQ_BLOCK_ROWS;
+
+                auto packedBlock = packedBlocks[localHead * TQ_PACKED_BLOCK_STRIDE];
                 if (preserveExisting) {
                     copy_packed_gm_to_ub(
-                        packedGroup, packedGm, groupBase, GroupBytes<IS_KEY>());
+                        packedBlock, packedGm, subBlockBase, BlockTotalBytes<IS_KEY>());
                 } else {
-                    ClearPackedGroup(packedGroup);
+                    ClearPackedBlock(packedBlock);
                 }
-                for (uint32_t r = 0; r < rowsThisGroup; ++r) {
+                for (uint32_t r = 0; r < rowsThisRound; ++r) {
                     const uint32_t manualGroupRow = desc.startGroupRow + rowOff + r;
                     const uint32_t encodedRow =
                         localHead * TQ_MANUAL_GROUP_ROWS + manualGroupRow;
-                    MergeEncodedRowToGroup<IS_KEY>(
-                        packedGroup, encodedBatch, encodedRow, firstGroupRow + r,
+                    const uint32_t currentRowInSubBlock = rowInSubBlock + r;
+                    const uint32_t currentGroupInBlock = currentRowInSubBlock / groupRowsPerGroup;
+                    const uint32_t currentGroupRow = currentRowInSubBlock % groupRowsPerGroup;
+                    MergeEncodedRowToBlock<IS_KEY>(
+                        packedBlock, encodedBatch, encodedRow,
+                        currentGroupInBlock, currentGroupRow, currentRowInSubBlock,
                         preserveExisting);
                 }
                 copy_packed_ub_to_gm(
-                    packedGm, groupBase, packedGroup, GroupBytes<IS_KEY>());
-                rowOff += rowsThisGroup;
+                    packedGm, subBlockBase, packedBlock, BlockTotalBytes<IS_KEY>());
+                rowOff += rowsThisRound;
             }
         }
     }
 
     __aicore__ inline void FinishC(
-        AscendC::GlobalTensor<float>& normWorkGm,
         AscendC::GlobalTensor<T>& cWorkGm,
         const ManualKey1StreamDesc& desc,
         uint32_t aivSlice) {
         const uint16_t flagBase = context_.ManualFlagBase(desc.streamOrdinal);
         const uint32_t bufferOffset = context_.ManualBufferOffset(desc.streamOrdinal);
-        auto norms = context_.ManualNorms(desc.streamOrdinal);
 
         TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_READY);
         CopyManualCToYBatch(cWorkGm, bufferOffset, aivSlice);
-        LoadNormsAndNormalizeRotatedBatch(
-            normWorkGm, desc.streamOrdinal, aivSlice, norms);
         TqCrossCoreSet<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_FREE);
         if (desc.isValue) {
-            EncodeSliceToCache<false>(
-                context_.valueCacheGm_, desc, aivSlice, norms);
+            EncodeSliceToCache<false>(context_.valueCacheGm_, desc, aivSlice);
         } else {
-            EncodeSliceToCache<true>(
-                context_.keyCacheGm_, desc, aivSlice, norms);
+            EncodeSliceToCache<true>(context_.keyCacheGm_, desc, aivSlice);
         }
     }
 

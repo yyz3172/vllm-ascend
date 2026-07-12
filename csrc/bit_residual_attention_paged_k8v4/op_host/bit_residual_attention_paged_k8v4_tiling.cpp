@@ -231,15 +231,16 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
     const uint32_t maxBlocksPerSeq = static_cast<uint32_t>(btShape.GetDim(1));
     const uint32_t totalCacheBlocks = static_cast<uint32_t>(keyCacheShape.GetDim(0));
 
-    // BitResidual K8V4 cache shape validation.
-    const uint32_t keyPackedBytes = (blockSize / TQ_BR_KEY_GROUP_ROWS) * TQ_BR_GROUP_STRIDE;
-    const uint32_t valuePackedBytes = (blockSize / TQ_BR_VALUE_GROUP_ROWS) * TQ_BR_GROUP_STRIDE;
+    // BitResidual K8V4 cache shape validation (16-row sub-block layout).
+    const uint32_t subBlocksPerBlock = blockSize / TQ_BR_BLOCK_ROWS;
+    const uint32_t keyPackedBytes = subBlocksPerBlock * TQ_BR_KEY_BLOCK_STRIDE;
+    const uint32_t valuePackedBytes = subBlocksPerBlock * TQ_BR_VAL_BLOCK_STRIDE;
     if (keyCacheShape.GetDim(1) != static_cast<int64_t>(numKvHeads) ||
         keyCacheShape.GetDim(2) != static_cast<int64_t>(keyPackedBytes)) {
         OPS_LOG_E(nodeName,
                   "key_cache shape must be [num_blocks, num_kv_heads, (block_size/%u)*%u], "
                   "got [%ld, %ld, %ld]",
-                  TQ_BR_KEY_GROUP_ROWS, TQ_BR_GROUP_STRIDE,
+                  TQ_BR_BLOCK_ROWS, TQ_BR_KEY_BLOCK_STRIDE,
                   keyCacheShape.GetDim(0), keyCacheShape.GetDim(1), keyCacheShape.GetDim(2));
         return ge::GRAPH_FAILED;
     }
@@ -248,7 +249,7 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
         OPS_LOG_E(nodeName,
                   "value_cache shape must be [num_blocks, num_kv_heads, (block_size/%u)*%u], "
                   "got [%ld, %ld, %ld]",
-                  TQ_BR_VALUE_GROUP_ROWS, TQ_BR_GROUP_STRIDE,
+                  TQ_BR_BLOCK_ROWS, TQ_BR_VAL_BLOCK_STRIDE,
                   valCacheShape.GetDim(0), valCacheShape.GetDim(1), valCacheShape.GetDim(2));
         return ge::GRAPH_FAILED;
     }
@@ -261,9 +262,9 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
         OPS_LOG_E(nodeName, "only head_size=128 supported, got %u", headSize);
         return ge::GRAPH_FAILED;
     }
-    if (blockSize % TQ_BR_VALUE_GROUP_ROWS != 0) {
-        OPS_LOG_E(nodeName, "block_size must be a multiple of %u (value group rows), got %u",
-                  TQ_BR_VALUE_GROUP_ROWS, blockSize);
+    if (blockSize % TQ_BR_BLOCK_ROWS != 0) {
+        OPS_LOG_E(nodeName, "block_size must be a multiple of %u (sub-block rows), got %u",
+                  TQ_BR_BLOCK_ROWS, blockSize);
         return ge::GRAPH_FAILED;
     }
     if (numHeads == 0 || numKvHeads == 0 || numHeads % numKvHeads != 0) {
