@@ -62,8 +62,11 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(eventListMte1Mte2);
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1);
 
-        uint32_t tileOrdinal = 0;
         uint32_t manualTileOrdinal = 0;
+        const uint32_t subBlocksPerBlock = op.blockSize_ / TQ_BLOCK_ROWS;
+        const uint32_t headTileCount =
+            (op.numHeads_ + TQ_MANUAL_HEADS_PER_TILE - 1) /
+            TQ_MANUAL_HEADS_PER_TILE;
         for (uint32_t reqIdx = 0; reqIdx < op.numReqs_; ++reqIdx) {
             uint32_t seqStart = 0;
             uint32_t seqEnd = 0;
@@ -89,13 +92,18 @@ public:
                 const uint32_t slot = firstSlot + rowOff;
                 const uint32_t blockIdx = slot / op.blockSize_;
                 const uint32_t blockOffset = slot - blockIdx * op.blockSize_;
-                const uint32_t valueGroupInBlock = blockOffset / TQ_VAL_GROUP_ROWS;
+                const uint32_t subBlockInBlock = blockOffset / TQ_BLOCK_ROWS;
+                const uint32_t valueGroupInBlock = blockOffset / TQ_MANUAL_GROUP_ROWS;
                 const bool preserveValue =
                     startGroupRow != 0 || validRows < TQ_MANUAL_GROUP_ROWS;
                 for (uint32_t headTileStart = 0;
                      headTileStart < op.numHeads_;
                      headTileStart += TQ_MANUAL_HEADS_PER_TILE) {
-                    if (tileOrdinal % op.dataCores_ == manualGroupId) {
+                    const uint64_t workOrdinal =
+                        (static_cast<uint64_t>(blockIdx) * subBlocksPerBlock +
+                         subBlockInBlock) * headTileCount +
+                        headTileStart / TQ_MANUAL_HEADS_PER_TILE;
+                    if (workOrdinal % op.dataCores_ == manualGroupId) {
                         const uint32_t keyStream =
                             manualTileOrdinal * TQ_MANUAL_STREAM_KIND_COUNT;
                         ManualKey1StreamDesc keyDesc {
@@ -110,7 +118,6 @@ public:
                         ComputeStream(manualResource, cWorkGm, valueDesc);
                         ++manualTileOrdinal;
                     }
-                    ++tileOrdinal;
                 }
                 rowOff += validRows;
             }

@@ -737,8 +737,6 @@ _TURBOQUANT_SLAB_GROUP_ROWS = 4
 # BitResidual k8v4 cache layout constants (sign-reversal, 16-row sub-blocks)
 # ---------------------------------------------------------------------------
 BIT_RESIDUAL_K8V4_BLOCK_ROWS = 16     # rows per sub-block
-BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS = 2  # key rows per group (within sub-block)
-BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS = 4  # value rows per group (within sub-block)
 BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE = 2176   # 8*256 code + 16*4 base + 16*4 step
 BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE = 1152   # 4*256 code + 16*4 vmin + 16*4 vstep
 

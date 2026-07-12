@@ -9,14 +9,8 @@ namespace optiling {
 // Must match decode_device.h and pack kernel common.h.
 constexpr uint32_t TQ_BR_HEAD_SIZE = 128;
 constexpr uint32_t TQ_BR_BLOCK_ROWS = 16;  // rows per sub-block
-constexpr uint32_t TQ_BR_KEY_GROUP_ROWS = 2;
-constexpr uint32_t TQ_BR_VALUE_GROUP_ROWS = 4;
-constexpr uint32_t TQ_BR_KEY_GROUPS_PER_BLOCK = TQ_BR_BLOCK_ROWS / TQ_BR_KEY_GROUP_ROWS;  // 8
-constexpr uint32_t TQ_BR_VAL_GROUPS_PER_BLOCK = TQ_BR_BLOCK_ROWS / TQ_BR_VALUE_GROUP_ROWS;  // 4
 constexpr uint32_t TQ_BR_KEY_BLOCK_STRIDE = 2176;  // 8*256 code + 16*4 base + 16*4 step
 constexpr uint32_t TQ_BR_VAL_BLOCK_STRIDE = 1152;  // 4*256 code + 16*4 vmin + 16*4 vstep
-constexpr uint32_t TQ_BR_GROUP_INDEX_WORDS = TQ_BR_HEAD_SIZE;  // uint16[128]
-constexpr uint32_t TQ_BR_GROUP_INDEX_BYTES = TQ_BR_HEAD_SIZE * sizeof(uint16_t);  // 256
 
 // Attention UB caps.
 constexpr uint32_t TQ_BR_ATTN_KV_TILE_CAP = 64;

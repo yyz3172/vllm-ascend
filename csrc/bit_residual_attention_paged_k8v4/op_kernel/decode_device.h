@@ -31,25 +31,24 @@ using namespace AscendC;
 
 // BitResidual K8V4 cache layout constants (must match pack kernel).
 static constexpr uint32_t TQ_BR_HEAD_SIZE = 128;
-static constexpr uint32_t TQ_BR_KEY_GROUP_ROWS = 2;
-static constexpr uint32_t TQ_BR_VALUE_GROUP_ROWS = 4;
 static constexpr uint32_t TQ_BR_BLOCK_ROWS = 16;
-static constexpr uint32_t TQ_BR_KEY_GROUPS_PER_BLOCK = TQ_BR_BLOCK_ROWS / TQ_BR_KEY_GROUP_ROWS;
-static constexpr uint32_t TQ_BR_VAL_GROUPS_PER_BLOCK = TQ_BR_BLOCK_ROWS / TQ_BR_VALUE_GROUP_ROWS;
-static constexpr uint32_t TQ_BR_GROUP_INDEX_BYTES = TQ_BR_HEAD_SIZE * sizeof(uint16_t);  // 256
-static constexpr uint32_t TQ_BR_GROUP_INDEX_WORDS = TQ_BR_HEAD_SIZE;  // uint16[128] = 128 words
+static constexpr uint32_t TQ_BR_KEY_GROUP_ROWS = 2;
+static constexpr uint32_t TQ_BR_VAL_GROUP_ROWS = 4;
+static constexpr uint32_t TQ_BR_GROUP_INDEX_WORDS = TQ_BR_HEAD_SIZE;
+static constexpr uint32_t TQ_BR_GROUP_INDEX_BYTES =
+    TQ_BR_GROUP_INDEX_WORDS * sizeof(uint16_t);
 
 // 16-row sub-block layout:
-// Key: [code zone 8×256] [base zone 16×float] [step zone 16×float] = 2176 bytes
-// Val: [code zone 4×256] [vmin zone 16×float] [vstep zone 16×float] = 1152 bytes
-static constexpr uint32_t TQ_BR_KEY_BLOCK_CODE_BYTES = TQ_BR_KEY_GROUPS_PER_BLOCK * TQ_BR_GROUP_INDEX_BYTES;
+static constexpr uint32_t TQ_BR_KEY_BLOCK_CODE_BYTES =
+    (TQ_BR_BLOCK_ROWS / TQ_BR_KEY_GROUP_ROWS) * TQ_BR_GROUP_INDEX_BYTES;
 static constexpr uint32_t TQ_BR_KEY_BLOCK_BASE_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_BR_KEY_BLOCK_STEP_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_BR_KEY_BLOCK_BASE_OFFSET = TQ_BR_KEY_BLOCK_CODE_BYTES;
 static constexpr uint32_t TQ_BR_KEY_BLOCK_STEP_OFFSET = TQ_BR_KEY_BLOCK_BASE_OFFSET + TQ_BR_KEY_BLOCK_BASE_BYTES;
 static constexpr uint32_t TQ_BR_KEY_BLOCK_STRIDE = TQ_BR_KEY_BLOCK_CODE_BYTES + TQ_BR_KEY_BLOCK_BASE_BYTES + TQ_BR_KEY_BLOCK_STEP_BYTES;  // 2176
 
-static constexpr uint32_t TQ_BR_VAL_BLOCK_CODE_BYTES = TQ_BR_VAL_GROUPS_PER_BLOCK * TQ_BR_GROUP_INDEX_BYTES;
+static constexpr uint32_t TQ_BR_VAL_BLOCK_CODE_BYTES =
+    (TQ_BR_BLOCK_ROWS / TQ_BR_VAL_GROUP_ROWS) * TQ_BR_GROUP_INDEX_BYTES;
 static constexpr uint32_t TQ_BR_VAL_BLOCK_VMIN_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_BR_VAL_BLOCK_VSTEP_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_BR_VAL_BLOCK_VMIN_OFFSET = TQ_BR_VAL_BLOCK_CODE_BYTES;
