@@ -240,8 +240,10 @@ static constexpr uint32_t TQ_UB_PACK_MERGE_OFFSET =
     TqAlignUp32(TQ_UB_PACKED_ROW_OFFSET + TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_GROUP_STRIDE);
 static constexpr uint32_t TQ_UB_PACK_MASK_OFFSET =
     TqAlignUp32(TQ_UB_PACK_MERGE_OFFSET + TQ_GROUP_INDEX_BYTES);
-static constexpr uint32_t TQ_UB_TOTAL_BYTES =
+static constexpr uint32_t TQ_UB_NORM_ONE_DIAG_OFFSET =
     TqAlignUp32(TQ_UB_PACK_MASK_OFFSET + TQ_GROUP_INDEX_BYTES);
+static constexpr uint32_t TQ_UB_TOTAL_BYTES =
+    TqAlignUp32(TQ_UB_NORM_ONE_DIAG_OFFSET + TQ_MANUAL_AIV_SLICE_M * sizeof(float));
 static_assert(TQ_UB_TOTAL_BYTES <= TOTAL_UB_SIZE,
               "Bit-residual K8v4 static UB slices exceed UB size.");
 
@@ -454,9 +456,32 @@ public:
         return local_.vecCalc.GetBufferByByte<float>(
             TQ_UB_REDUCE_OUT_OFFSET, TQ_PACK_D * 3 * sizeof(float));
     }
+    // ── ReduceOut sub-slices for batch norm computation ──────────────────────
+    // Gram matrix occupies ReduceOut[0..255] (256 floats). After diagonal
+    // extraction, we use ReduceOut[256..303] for norm/invNorm float32 vectors.
+    __aicore__ inline AscendC::LocalTensor<float> NormDiagFp32() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_REDUCE_OUT_OFFSET + TQ_MANUAL_NORM_MATRIX_ELEMS * sizeof(float),
+            TQ_MANUAL_AIV_SLICE_M * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<float> NormEpsDiagFp32() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_REDUCE_OUT_OFFSET + (TQ_MANUAL_NORM_MATRIX_ELEMS + TQ_MANUAL_AIV_SLICE_M) * sizeof(float),
+            TQ_MANUAL_AIV_SLICE_M * sizeof(float));
+    }
+    __aicore__ inline AscendC::LocalTensor<float> InvNormDiagFp32() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_REDUCE_OUT_OFFSET + (TQ_MANUAL_NORM_MATRIX_ELEMS + 2 * TQ_MANUAL_AIV_SLICE_M) * sizeof(float),
+            TQ_MANUAL_AIV_SLICE_M * sizeof(float));
+    }
     __aicore__ inline AscendC::LocalTensor<float> ReduceTmp() {
         return local_.vecCalc.GetBufferByByte<float>(
             TQ_UB_REDUCE_TMP_OFFSET, TQ_PACK_D * sizeof(float));
+    }
+    // ── Constant-1 diagonal for norm Div ──────────────────────────────
+    __aicore__ inline AscendC::LocalTensor<float> NormOneDiag() {
+        return local_.vecCalc.GetBufferByByte<float>(
+            TQ_UB_NORM_ONE_DIAG_OFFSET, TQ_MANUAL_AIV_SLICE_M * sizeof(float));
     }
     __aicore__ inline AscendC::LocalTensor<uint8_t> PackedRow() {
         return local_.vecCalc.GetBufferByByte<uint8_t>(
