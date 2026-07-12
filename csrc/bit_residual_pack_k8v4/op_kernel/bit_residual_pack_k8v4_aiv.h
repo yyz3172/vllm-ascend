@@ -38,6 +38,11 @@ public:
             return;
         }
 
+        // Initialize constant-1 diagonal (once per Process call, reused for Div)
+        auto onesDiag = context_.resource_.NormOneDiag();
+        AscendC::Duplicate(onesDiag, 1.0f, TQ_MANUAL_AIV_SLICE_M);
+        AscendC::PipeBarrier<PIPE_V>();
+
         auto& op = context_;
         AscendC::GlobalTensor<float> normWorkGm;
         AscendC::GlobalTensor<T> cWorkGm;
@@ -114,30 +119,51 @@ private:
             context_.ManualNormBufferOffset(streamOrdinal) +
             aivSlice * TQ_MANUAL_NORM_MATRIX_ELEMS;
         auto gram = context_.resource_.ReduceOut();
+        auto normDiag = context_.resource_.NormDiagFp32();
+        auto normEpsDiag = context_.resource_.NormEpsDiagFp32();
+        auto invNormDiag = context_.resource_.InvNormDiagFp32();
+        auto onesDiag = context_.resource_.NormOneDiag();
         auto yBatch = context_.resource_.YBatch();
         auto yFp32 = context_.resource_.YFp32();
         auto scaleBlock = context_.resource_.ReduceTmp();
         auto normAcc = context_.resource_.NormScalar();
+        auto normsT = context_.resource_.NormScalar().template ReinterpretCast<T>();
 
+        // Phase 1: Load gram matrix from GM → UB
         AscendC::DataCopy(gram, normWorkGm[normOffset], TQ_MANUAL_NORM_MATRIX_ELEMS);
         TqSyncMte2ToV();
         TqSyncMte2ToS();
+
+        // Phase 2: Extract diagonal → contiguous float32[16]
         for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
-            normAcc.SetValue(
-                0, gram.GetValue(row * (TQ_MANUAL_NORM_MATRIX_DIM + 1)));
-            AscendC::Maxs(normAcc, normAcc, 0.0f, 1);
-            AscendC::Sqrt(normAcc, normAcc, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(
-                norms[row * TQ_NORM_STRIDE],
-                normAcc,
-                AscendC::RoundMode::CAST_RINT,
-                1);
-            AscendC::Adds(normAcc, normAcc, TQ_NORM_EPS_F, 1);
-            AscendC::Duplicate(scaleBlock, 1.0f, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Div(normAcc, scaleBlock, normAcc, 1);
-            AscendC::PipeBarrier<PIPE_V>();
+            normDiag.SetValue(row, gram.GetValue(row * (TQ_MANUAL_NORM_MATRIX_DIM + 1)));
+        }
+        TqSyncSToV();
+
+        // Phase 3: Batch vector norm computation — Sqrt / Adds / Div
+        AscendC::Maxs(normDiag, normDiag, 0.0f, TQ_MANUAL_AIV_SLICE_M);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sqrt(normDiag, normDiag, TQ_MANUAL_AIV_SLICE_M);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(normEpsDiag, normDiag, TQ_NORM_EPS_F, TQ_MANUAL_AIV_SLICE_M);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Div(invNormDiag, onesDiag, normEpsDiag, TQ_MANUAL_AIV_SLICE_M);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Phase 4: Cast norms fp32 → T, scatter to stride slots
+        AscendC::Cast(normsT, normDiag, AscendC::RoundMode::CAST_RINT,
+                       TQ_MANUAL_AIV_SLICE_M);
+        AscendC::PipeBarrier<PIPE_V>();
+        TqSyncVToS();
+        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
+            norms.SetValue(row * TQ_NORM_STRIDE, normsT.GetValue(row));
+        }
+
+        // Phase 5: Per-row invNorm scale (Brcb from normAcc)
+        for (uint32_t row = 0; row < TQ_MANUAL_AIV_SLICE_M; ++row) {
+            normAcc.SetValue(0, invNormDiag.GetValue(row));
+
+            TqSyncSToV();
             AscendC::Brcb(scaleBlock, normAcc, 1, AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
 
@@ -146,11 +172,8 @@ private:
                 yFp32, yBatch[rowOffset], AscendC::RoundMode::CAST_NONE, TQ_PACK_D);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul(
-                yFp32,
-                yFp32,
-                scaleBlock,
-                static_cast<uint64_t>(TQ_PACK_D / 2),
-                2,
+                yFp32, yFp32, scaleBlock,
+                static_cast<uint64_t>(TQ_PACK_D / 2), 2,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(
