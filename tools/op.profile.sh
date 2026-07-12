@@ -11,10 +11,25 @@ export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
 mkdir -p "${TMPDIR}"
 
-APP=${TQ4BIT_OP_PROFILE_APP:-"bash tools/run_attention_512.sh"}
+TARGET=${TQ4BIT_OP_PROFILE_TARGET:-br}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tq|--turboquant)   TARGET=tq; shift ;;
+        --br|--bitresidual)  TARGET=br; shift ;;
+        *)                   echo "Usage: $0 [--tq|--turboquant|--br|--bitresidual]" >&2; exit 1 ;;
+    esac
+done
+
+if [[ "${TARGET}" == "br" ]]; then
+    APP=${TQ4BIT_OP_PROFILE_APP:-"bash tools/run_bit_residual_512.sh"}
+    LOG_FILE=${TQ4BIT_OP_PROFILE_LOG:-"${ROOT_DIR}/ztmp/log.op.timeline.br"}
+else
+    APP=${TQ4BIT_OP_PROFILE_APP:-"bash tools/run_attention_512.sh"}
+    LOG_FILE=${TQ4BIT_OP_PROFILE_LOG:-"${ROOT_DIR}/ztmp/log.op.timeline"}
+fi
+
 METRICS=${TQ4BIT_OP_PROFILE_METRICS:-Source,PipeUtilization}
 #METRICS=${TQ4BIT_OP_PROFILE_METRICS:-Source,PipeUtilization,TimelineDetail}
-LOG_FILE=${TQ4BIT_OP_PROFILE_LOG:-"${ROOT_DIR}/ztmp/log.op.timeline"}
 CHECK_SOURCE=${TQ4BIT_OP_PROFILE_CHECK_SOURCE:-1}
 MARKER="${TMPDIR}/op_profile_start.$$.marker"
 touch "${MARKER}"
@@ -50,7 +65,11 @@ if [[ "${CHECK_SOURCE}" == "1" ]]; then
 
     if ! python "${ROOT_DIR}/tools/check_opprof_debug_source.py" "${opprof}" --require-insight-source; then
         echo "[op.profile] ERROR: ${opprof} does not carry MindStudio-visible kernel source data" >&2
-        echo "[op.profile] Rebuild and sync debug-line kernels with: bash tools/build_debug_perf.sh" >&2
+        if [[ "${TARGET}" == "br" ]]; then
+            echo "[op.profile] Rebuild and sync debug-line kernels with: bash tools/build_debug_perf.sh --br" >&2
+        else
+            echo "[op.profile] Rebuild and sync debug-line kernels with: bash tools/build_debug_perf.sh --tq" >&2
+        fi
         echo "[op.profile] Host runner/libcust_opapi.so debug info is not enough; the runtime OPP kernel .o must have .debug_line." >&2
         exit 1
     fi
