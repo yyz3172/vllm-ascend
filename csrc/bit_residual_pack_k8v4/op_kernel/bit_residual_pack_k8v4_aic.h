@@ -140,7 +140,7 @@ public:
         
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(eventListMte1Mte2);
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1[0]);
-        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1[0]);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1[1]);
         Finite();
     }
 
@@ -286,12 +286,13 @@ private:
             TQ_MANUAL_NORM_A_L0_BYTE_OFFSET);
         auto bL0 = resource.l0BBuf.template GetBufferByByte<T>(
             TQ_MANUAL_NORM_B_L0_BYTE_OFFSET);
-        auto cL0 = resource.l0CBuf.template GetBufferByByte<float>(
+        auto cL0Base = resource.l0CBuf.template GetBufferByByte<float>(
             TQ_MANUAL_NORM_C_L0_BYTE_OFFSET);
         const uint32_t normBase = context_.ManualNormBufferOffset(streamOrdinal);
         for (uint32_t slice = 0; slice < TQ_AIV_SUB_BLOCKS; ++slice) {
             const uint32_t l1SliceOffset =
                 slice * TQ_MANUAL_AIV_SLICE_ELEMS;
+            const uint8_t unitFlag = 0b11;
 
             // ── MTE1: load A and B from L1 to L0 ────────────────────────
             // Wait until M engine has finished consuming the previous
@@ -302,7 +303,7 @@ private:
             bLoad.srcStride = 1;
             bLoad.sid = 0;
             bLoad.dstGap = 0;
-            bLoad.ifTranspose = true;
+            bLoad.ifTranspose = false;
             bLoad.addrMode = 0;
 
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1[0]);
@@ -331,26 +332,20 @@ private:
             mmParams.k = TQ_ROT_K;
             mmParams.cmatrixInitVal = true;
             mmParams.cmatrixSource = false;
-            mmParams.unitFlag = 0b11;
+            mmParams.unitFlag = unitFlag;
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M[0]);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M[1]);
+            auto cL0 = cL0Base[
+                slice * TQ_MANUAL_NORM_MATRIX_ELEMS];
             AscendC::Mmad(cL0, aL0, bL0, mmParams);
 
-
-            // ── FIX: Fixpipe L0C → GM (CFG_NZ, NoQuant) ─────────────────
-            // With unitFlag=0b11, hardware handles M→FIX→M sync internally:
-            //   - MMAD hw-internal: wait FIX_M, signal M_FIX
-            //   - Fixpipe hw-internal: wait M_FIX, signal FIX_M
-            // NO software Set<M_FIX>/Wait<M_FIX>/Set<FIX_M>/Wait<FIX_M>
-            // — explicit software signals on the same channels conflict
-            // with hardware signals (depth-1 flag conflict → deadlock).
             AscendC::FixpipeParamsV220 fixParams;
             fixParams.nSize = TQ_MANUAL_AIV_SLICE_M;
             fixParams.mSize = TQ_MANUAL_AIV_SLICE_M;
             fixParams.srcStride = TQ_MANUAL_AIV_SLICE_M;
             fixParams.dstStride = TQ_MANUAL_AIV_SLICE_M;
             fixParams.ndNum = 1;
-            fixParams.unitFlag = 0b11;
+            fixParams.unitFlag = unitFlag;
             fixParams.quantPre = QuantMode_t::NoQuant;
             fixParams.reluEn = false;
             AscendC::Fixpipe<float, float, AscendC::CFG_NZ>(
@@ -358,7 +353,7 @@ private:
                     normBase + slice * TQ_MANUAL_NORM_MATRIX_ELEMS],
                 cL0,
                 fixParams);
-                
+
             // M finished consuming L0A and L0B.  Release them so the next
             // slice's MTE1 LoadData can overwrite them (M_MTE1 direction).
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1[0]);
@@ -404,6 +399,7 @@ private:
 
         for (uint32_t rowBase = 0; rowBase < TQ_MANUAL_ROT_TILE_M;
              rowBase += TQ_CUBE_M_ALIGN) {
+            const uint8_t unitFlag = 0b11;
             auto aL0Tile =
                 aL0[(rowBase / TQ_CUBE_M_ALIGN) * TQ_CUBE_M_ALIGN * TQ_ROT_K];
             auto cL0 =
@@ -441,28 +437,20 @@ private:
             mmParams.k = TQ_ROT_K;
             mmParams.cmatrixInitVal = true;
             mmParams.cmatrixSource = false;
-            mmParams.unitFlag = 0b11;
+            mmParams.unitFlag = unitFlag;
 
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M[0]);
             AscendC::Mmad(cL0, aL0Tile, bL0, mmParams);
-            // M finished L0A; release for next MTE1 load (M_MTE1 direction).
-
-            // ── FIX: Fixpipe L0C → GM (CFG_NZ) ──────────────────────────
-            // With unitFlag=0b11, hardware handles M_FIX/FIX_M internally:
-            //   - Fixpipe hw-internal: wait M_FIX before Fixpipe, signal
-            //     FIX_M after Fixpipe
-            //   - No software Wait<M_FIX> or Set<FIX_M> needed (conflicts
-            //     with hardware internal signals — depth-1 flag conflict).
             AscendC::FixpipeParamsV220 fixParams;
             fixParams.nSize = TQ_ROT_N;
             fixParams.mSize = TQ_CUBE_M_ALIGN;
             fixParams.srcStride = TQ_CUBE_M_ALIGN;
             fixParams.dstStride = TQ_ROT_N;
             fixParams.ndNum = 1;
-            fixParams.unitFlag = 0b11;
+            fixParams.unitFlag = unitFlag;
             fixParams.quantPre = FixpipeQuantMode();
             fixParams.reluEn = false;
-            AscendC::Fixpipe<T, float, AscendC::CFG_NZ>(
+            AscendC::Fixpipe<T, float, AscendC::CFG_ROW_MAJOR>(
                 cWorkGm[cOffset + rowBase * TQ_ROT_N], cL0, fixParams);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1[0]);
         }
