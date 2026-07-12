@@ -262,14 +262,10 @@ using TqDataT = half;
 #endif
 
 __aicore__ inline uint32_t TqManualRawBlockIdx() {
-#if defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1
     if ASCEND_IS_AIV {
         return static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
     }
     return static_cast<uint32_t>(AscendC::GetBlockIdx());
-#else
-    return static_cast<uint32_t>(get_block_idx());
-#endif
 }
 
 using TqManualMmadResource = Catlass::Arch::Resource<Catlass::Arch::AtlasA2>;
