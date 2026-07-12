@@ -33,17 +33,14 @@ static constexpr uint32_t TqAlignUp32(uint32_t x) {
 }
 
 static constexpr int TQ_PACK_D = 128;
+static constexpr uint32_t TQ_BLOCK_ROWS = 16;
 static constexpr uint32_t TQ_KEY_GROUP_ROWS = 2;
 static constexpr uint32_t TQ_VAL_GROUP_ROWS = 4;
-static constexpr uint32_t TQ_BLOCK_ROWS = 16;  // rows per sub-block (lcm of key/val group rows)
-static constexpr uint32_t TQ_KEY_GROUPS_PER_BLOCK = TQ_BLOCK_ROWS / TQ_KEY_GROUP_ROWS;
-static constexpr uint32_t TQ_VAL_GROUPS_PER_BLOCK = TQ_BLOCK_ROWS / TQ_VAL_GROUP_ROWS;
 static constexpr uint32_t TQ_GROUP_INDEX_BYTES = TQ_PACK_D * sizeof(uint16_t);
 // ── 16-row sub-block layout: code zone | base zone | step zone ──────────────
-// Key sub-block: 8 groups × 256B code + 16 × 4B base + 16 × 4B step = 2176B
-// Value sub-block: 4 groups × 256B code + 16 × 4B vmin + 16 × 4B vstep = 1152B
+// Code rows are packed in groups, followed by 16 row scalars for each field.
 static constexpr uint32_t TQ_KEY_BLOCK_CODE_BYTES =
-    TQ_KEY_GROUPS_PER_BLOCK * TQ_GROUP_INDEX_BYTES;
+    (TQ_BLOCK_ROWS / TQ_KEY_GROUP_ROWS) * TQ_GROUP_INDEX_BYTES;
 static constexpr uint32_t TQ_KEY_BLOCK_BASE_BYTES = TQ_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_KEY_BLOCK_STEP_BYTES = TQ_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_KEY_BLOCK_BASE_OFFSET = TQ_KEY_BLOCK_CODE_BYTES;
@@ -52,7 +49,7 @@ static constexpr uint32_t TQ_KEY_BLOCK_STEP_OFFSET =
 static constexpr uint32_t TQ_KEY_BLOCK_STRIDE =
     TqAlignUp32(TQ_KEY_BLOCK_CODE_BYTES + TQ_KEY_BLOCK_BASE_BYTES + TQ_KEY_BLOCK_STEP_BYTES);
 static constexpr uint32_t TQ_VAL_BLOCK_CODE_BYTES =
-    TQ_VAL_GROUPS_PER_BLOCK * TQ_GROUP_INDEX_BYTES;
+    (TQ_BLOCK_ROWS / TQ_VAL_GROUP_ROWS) * TQ_GROUP_INDEX_BYTES;
 static constexpr uint32_t TQ_VAL_BLOCK_VMIN_BYTES = TQ_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_VAL_BLOCK_VSTEP_BYTES = TQ_BLOCK_ROWS * sizeof(float);
 static constexpr uint32_t TQ_VAL_BLOCK_VMIN_OFFSET = TQ_VAL_BLOCK_CODE_BYTES;
@@ -91,7 +88,7 @@ static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr uint32_t TQ_DTYPE_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BYTE_OFFSET = 512 * 1024;
-static constexpr uint32_t TQ_MANUAL_GROUP_ROWS = TQ_VAL_GROUP_ROWS;
+static constexpr uint32_t TQ_MANUAL_GROUP_ROWS = 4;
 static constexpr uint32_t TQ_MANUAL_STREAM_KIND_COUNT = 2;  // key stream + value stream per tile
 static constexpr uint32_t TQ_MANUAL_ROT_TILE_M = 32;
 static constexpr uint32_t TQ_MANUAL_ROT_TILE_ELEMS = TQ_MANUAL_ROT_TILE_M * TQ_ROT_K;
@@ -217,9 +214,9 @@ static constexpr uint32_t TQ_UB_PACKED_ROW_OFFSET =
 static constexpr uint32_t TQ_UB_PACK_MERGE_OFFSET =
     TqAlignUp32(TQ_UB_PACKED_ROW_OFFSET + TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_BLOCK_STRIDE);
 static constexpr uint32_t TQ_UB_PACK_MASK_OFFSET =
-    TqAlignUp32(TQ_UB_PACK_MERGE_OFFSET + TQ_GROUP_INDEX_BYTES);
+    TqAlignUp32(TQ_UB_PACK_MERGE_OFFSET + TQ_PACK_D * sizeof(uint16_t));
 static constexpr uint32_t TQ_UB_TOTAL_BYTES =
-    TqAlignUp32(TQ_UB_PACK_MASK_OFFSET + TQ_GROUP_INDEX_BYTES);
+    TqAlignUp32(TQ_UB_PACK_MASK_OFFSET + TQ_PACK_D * sizeof(uint16_t));
 static_assert(TQ_UB_TOTAL_BYTES <= TOTAL_UB_SIZE,
               "Bit-residual K8v4 static UB slices exceed UB size.");
 
@@ -434,11 +431,11 @@ public:
     }
     __aicore__ inline AscendC::LocalTensor<uint16_t> PackMerge() {
         return local_.vecCalc.GetBufferByByte<uint16_t>(
-            TQ_UB_PACK_MERGE_OFFSET, TQ_GROUP_INDEX_BYTES);
+            TQ_UB_PACK_MERGE_OFFSET, TQ_PACK_D * sizeof(uint16_t));
     }
     __aicore__ inline AscendC::LocalTensor<uint16_t> PackMask() {
         return local_.vecCalc.GetBufferByByte<uint16_t>(
-            TQ_UB_PACK_MASK_OFFSET, TQ_GROUP_INDEX_BYTES);
+            TQ_UB_PACK_MASK_OFFSET, TQ_PACK_D * sizeof(uint16_t));
     }
 
 private:
@@ -576,8 +573,7 @@ public:
             dataCores_ == 0 || numHeads_ < TQ_MANUAL_HEADS_PER_TILE ||
             numHeads_ % TQ_MANUAL_HEADS_PER_TILE != 0 ||
             tokenCount_ == 0 || tokenCount_ * numHeads_ != nVec_ ||
-            blockSize_ % TQ_VAL_GROUP_ROWS != 0 ||
-            blockSize_ % TQ_KEY_GROUP_ROWS != 0 ||
+            blockSize_ % TQ_BLOCK_ROWS != 0 ||
             keyStrideHead_ != TQ_PACK_D ||
             valueStrideHead_ != TQ_PACK_D ||
             keyStrideToken_ == 0 ||

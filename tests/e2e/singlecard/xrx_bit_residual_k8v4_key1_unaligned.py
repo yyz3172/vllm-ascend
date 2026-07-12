@@ -54,16 +54,17 @@ D = 128
 H = 8
 BS = 128
 BLOCK_ROWS = 16
+# 16-row sub-block layout constants (matching kernel)
+KEY_BLOCK_STRIDE = 2176   # 16*128 code + 16*4 base + 16*4 step
+VAL_BLOCK_STRIDE = 1152   # 16*64 code + 16*4 vmin + 16*4 vstep
+KEY_ROW_CODE_BYTES = 128
+VAL_ROW_CODE_BYTES = 64
 KEY_GROUP_ROWS = 2
 VALUE_GROUP_ROWS = 4
-
-# 16-row sub-block layout constants (matching kernel)
-KEY_BLOCK_STRIDE = 2176   # 8*256 code + 16*4 base + 16*4 step
-VAL_BLOCK_STRIDE = 1152   # 4*256 code + 16*4 vmin + 16*4 vstep
-KEY_BLOCK_CODE_BYTES = 8 * 256    # 2048
+KEY_BLOCK_CODE_BYTES = BLOCK_ROWS * KEY_ROW_CODE_BYTES
 KEY_BLOCK_BASE_OFFSET = KEY_BLOCK_CODE_BYTES          # 2048
 KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_CODE_BYTES + 16 * 4  # 2112
-VAL_BLOCK_CODE_BYTES = 4 * 256    # 1024
+VAL_BLOCK_CODE_BYTES = BLOCK_ROWS * VAL_ROW_CODE_BYTES
 VAL_BLOCK_VMIN_OFFSET = VAL_BLOCK_CODE_BYTES           # 1024
 VAL_BLOCK_VSTEP_OFFSET = VAL_BLOCK_CODE_BYTES + 16 * 4  # 1088
 
@@ -121,8 +122,6 @@ def _decode_key_cache(
         pos_in_block = slot % BS
         sub_block_in_block = pos_in_block // BLOCK_ROWS
         row_in_sub_block = pos_in_block % BLOCK_ROWS
-        group_in_block = row_in_sub_block // KEY_GROUP_ROWS
-        group_row = row_in_sub_block % KEY_GROUP_ROWS
 
         # Sub-block base offset in the per-head slice
         sub_block_base = sub_block_in_block * KEY_BLOCK_STRIDE
@@ -130,15 +129,17 @@ def _decode_key_cache(
         for head in range(h):
             sub = cache_cpu[block_idx, head, sub_block_base : sub_block_base + KEY_BLOCK_STRIDE]
 
-            # Code zone: 8 groups × 256 bytes = 2048 bytes
-            # Each group stores 128 uint16 words. group_row selects bits within each word.
-            code_bytes = sub[:KEY_BLOCK_CODE_BYTES]
-            words = code_bytes.contiguous().view(torch.uint16)
-            group_words = words[group_in_block * 128 : group_in_block * 128 + 128]
+            group_idx = row_in_sub_block // KEY_GROUP_ROWS
+            group_row = row_in_sub_block % KEY_GROUP_ROWS
+            words = sub[:KEY_BLOCK_CODE_BYTES].contiguous().view(torch.uint16)
+            group_words = words[group_idx * D : (group_idx + 1) * D].to(torch.int32)
             if group_row == 0:
-                code[token_idx, head] = (group_words & 0x00FF).to(torch.uint8)
+                first = group_words & 0xFF
+                code[token_idx, head] = (
+                    ((first & 0x7F) << 1) | (first >> 7)
+                ).to(torch.uint8)
             else:
-                code[token_idx, head] = ((group_words.to(torch.int32) >> 8) & 0x00FF).to(torch.uint8)
+                code[token_idx, head] = (group_words >> 8).to(torch.uint8)
 
             # Base zone: 16 floats at KEY_BLOCK_BASE_OFFSET + row*4
             base[token_idx, head] = _u8_to_float32(
@@ -174,8 +175,6 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, t
         pos_in_block = slot % BS
         sub_block_in_block = pos_in_block // BLOCK_ROWS
         row_in_sub_block = pos_in_block % BLOCK_ROWS
-        group_in_block = row_in_sub_block // VALUE_GROUP_ROWS
-        group_row = row_in_sub_block % VALUE_GROUP_ROWS
 
         # Sub-block base offset in the per-head slice
         sub_block_base = sub_block_in_block * VAL_BLOCK_STRIDE
@@ -183,13 +182,13 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, t
         for head in range(h):
             sub = cache_cpu[block_idx, head, sub_block_base : sub_block_base + VAL_BLOCK_STRIDE]
 
-            # Code zone: 4 groups × 256 bytes = 1024 bytes
-            # Each group stores 128 uint16 words packed with 4-bit idx4 values.
-            code_bytes = sub[:VAL_BLOCK_CODE_BYTES]
-            words = code_bytes.contiguous().view(torch.uint16)
-            group_words = words[group_in_block * 128 : group_in_block * 128 + 128]
-            shift = group_row * 4
-            idx4[token_idx, head] = ((group_words.to(torch.int32) >> shift) & 0x000F).to(torch.uint8)
+            group_idx = row_in_sub_block // VALUE_GROUP_ROWS
+            group_row = row_in_sub_block % VALUE_GROUP_ROWS
+            words = sub[:VAL_BLOCK_CODE_BYTES].contiguous().view(torch.uint16)
+            group_words = words[group_idx * D : (group_idx + 1) * D].to(torch.int32)
+            idx4[token_idx, head] = (
+                (group_words >> (group_row * 4)) & 0x0F
+            ).to(torch.uint8)
 
             # vmin zone: 16 floats at VAL_BLOCK_VMIN_OFFSET + row*4
             vmin[token_idx, head] = _u8_to_float32(

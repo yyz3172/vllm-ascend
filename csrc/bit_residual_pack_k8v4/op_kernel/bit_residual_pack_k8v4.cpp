@@ -17,12 +17,11 @@
 // Fused bit-residual pack for KV cache (fp16/bf16).
 //
 // Reference (Python):
-//   norms = vector_norm(x, dim=-1, keepdim=True)
-//   y = (x / (norms + eps)) @ R^T        # batched [M, D] @ [D, D]
-//   key:   sign + 7-bit residual, 2 rows packed per uint16
-//   value: 4-bit uniform quantization, 4 rows packed per uint16
+//   y = x @ R^T                           # batched [M, D] @ [D, D]
+//   key:   sign reversal + 7-bit uniform quantization
+//   value: 4-bit uniform quantization, processed four rows at a time
 //
-// Per AICore: normalize all assigned rows, then ONE matmul [M,128]@[128,128],
+// Per AICore: rotate all assigned rows with one matmul [M,128]@[128,128],
 // not M separate M=1 matmuls (avoids Cube padding waste).
 
 #include "kernel_operator.h"

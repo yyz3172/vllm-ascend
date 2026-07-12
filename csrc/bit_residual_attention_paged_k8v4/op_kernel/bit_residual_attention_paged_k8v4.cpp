@@ -116,7 +116,7 @@ constexpr uint32_t TQ_BR_UB_FLOAT_SCRATCH_BYTES = TQ_BR_HEAD_SIZE * 2 * sizeof(f
 
 // packedMaskBuf (uint16 mask constant, filled once)
 constexpr uint32_t TQ_BR_UB_MASK_OFFSET = TQ_BR_UB_FLOAT_SCRATCH_OFFSET + TQ_BR_UB_FLOAT_SCRATCH_BYTES;
-constexpr uint32_t TQ_BR_UB_MASK_BYTES = TQ_BR_GROUP_INDEX_BYTES;  // 256
+constexpr uint32_t TQ_BR_UB_MASK_BYTES = TQ_BR_HEAD_SIZE * sizeof(uint16_t);
 
 // rotateWorkBuf (for Cube matmul workspace)
 constexpr uint32_t TQ_BR_UB_ROTATE_WORK_OFFSET = TQ_BR_UB_MASK_OFFSET + TQ_BR_UB_MASK_BYTES;
@@ -338,7 +338,7 @@ template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::InitPackedMask() {
     // Fill mask buffer with 0x00FF for key code byte extraction (8-bit code in uint16)
     auto mask = MaskBuf();
-    Duplicate(mask, static_cast<uint16_t>(0x00FF), TQ_BR_GROUP_INDEX_WORDS);
+    Duplicate(mask, static_cast<uint16_t>(0x00FF), TQ_BR_HEAD_SIZE);
     PipeBarrier<PIPE_V>();
 }
 
@@ -388,7 +388,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows)
 {
     // Key cache: 16-row sub-block layout
-    // [code zone (8×256)] [base zone (16×float)] [step zone (16×float)] = 2176 bytes per sub-block
+    // [8 packed 2-row code groups] [16 bases] [16 steps] = 2176 bytes.
     // blockSize/16 sub-blocks per block.
     //
     // For each row, find its 16-row sub-block in the block, load it, extract code + base + step.
@@ -400,7 +400,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
     auto floatScratch = FloatScratchBuf();
     auto kBase = KBaseBuf();
     auto kStep = KStepBuf();
-    auto mask = MaskBuf();
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
 
@@ -410,8 +409,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const uint32_t posInBlock = absPos % blockSize_;
         const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
         const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
-        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_KEY_GROUP_ROWS;
-        const uint32_t groupRow = rowInSubBlock % TQ_BR_KEY_GROUP_ROWS;
 
         // Look up physical block from block_table.
         TqBrSync<HardEvent::S_MTE2>();
@@ -428,26 +425,27 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         DataCopyPad(packedRaw, keyCacheGm_[subBlockBase], copyParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
+        TqBrSync<HardEvent::MTE2_S>();
 
-        // Reinterpret as uint16 for code extraction.
-        // Code zone starts at groupInBlock * 256 bytes = groupInBlock * 128 uint16 words
+        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_KEY_GROUP_ROWS;
+        const uint32_t groupRow = rowInSubBlock % TQ_BR_KEY_GROUP_ROWS;
         auto packedU16 = packedRaw.template ReinterpretCast<uint16_t>();
-        const uint32_t codeWordOff = groupInBlock * TQ_BR_GROUP_INDEX_WORDS;
-        auto groupU16 = packedU16[codeWordOff];
-
-        // Extract code byte for this group_row.
         auto extractI16 = codeI16[row * D];
-        auto extractU16 = extractI16.template ReinterpretCast<uint16_t>();
-
-        if (groupRow == 0) {
-            And(extractU16, groupU16, mask, D);
-        } else {
-            ShiftRight(extractI16, groupU16.template ReinterpretCast<int16_t>(),
-                       static_cast<int16_t>(groupRow * 8), D);
-            PipeBarrier<PIPE_V>();
-            And(extractU16, extractI16.template ReinterpretCast<uint16_t>(), mask, D);
+        const uint32_t codeWordOff =
+            groupInBlock * TQ_BR_GROUP_INDEX_WORDS;
+        for (uint32_t d = 0; d < D; ++d) {
+            const uint16_t word = packedU16.GetValue(codeWordOff + d);
+            uint16_t genericCode;
+            if (groupRow == 0) {
+                const uint16_t firstCode = word & 0x00ffu;
+                const uint16_t q7 = firstCode & 0x007fu;
+                const uint16_t sign = firstCode >> 7;
+                genericCode = (q7 << 1) | sign;
+            } else {
+                genericCode = word >> 8;
+            }
+            extractI16.SetValue(d, static_cast<int16_t>(genericCode));
         }
-        PipeBarrier<PIPE_V>();
 
         // Read base and step at new offsets (base at rowInSubBlock*4 within base zone,
         // step at rowInSubBlock*4 within step zone).
@@ -470,7 +468,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows)
 {
     // Value cache: 16-row sub-block layout
-    // [code zone (4×256)] [vmin zone (16×float)] [vstep zone (16×float)] = 1152 bytes per sub-block
+    // [4 packed 4-row code groups] [16 vmins] [16 vsteps] = 1152 bytes.
 
     const uint32_t valSubBlocksPerBlock = blockSize_ / TQ_BR_BLOCK_ROWS;
     const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
@@ -483,18 +481,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
 
-    auto valMask = MaskBuf();
-    Duplicate(valMask, static_cast<uint16_t>(0x000F), D);
-    PipeBarrier<PIPE_V>();
-
     for (uint32_t row = 0; row < mRows; ++row) {
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
         const uint32_t posInBlock = absPos % blockSize_;
         const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
         const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
-        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_VALUE_GROUP_ROWS;
-        const uint32_t groupRow = rowInSubBlock % TQ_BR_VALUE_GROUP_ROWS;
 
         TqBrSync<HardEvent::S_MTE2>();
         const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
@@ -510,18 +502,20 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         DataCopyPad(packedRaw, valueCacheGm_[subBlockBase], copyParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
+        TqBrSync<HardEvent::MTE2_S>();
 
-        // Code zone: groupInBlock * 256 bytes = groupInBlock * 128 uint16 words
+        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_VAL_GROUP_ROWS;
+        const uint32_t groupRow = rowInSubBlock % TQ_BR_VAL_GROUP_ROWS;
         auto packedI16 = packedRaw.template ReinterpretCast<int16_t>();
-        const uint32_t codeWordOff = groupInBlock * TQ_BR_GROUP_INDEX_WORDS;
-        auto groupI16 = packedI16[codeWordOff];
-
-        // Extract 4-bit index for this group_row.
+        auto groupI16 = packedI16[groupInBlock * TQ_BR_GROUP_INDEX_WORDS];
         auto extractI16 = codeI16[row * D];
         auto extractU16 = extractI16.template ReinterpretCast<uint16_t>();
-        ShiftRight(extractI16, groupI16, static_cast<int16_t>(groupRow * 4), D);
+        auto valMask = MaskBuf();
+        Duplicate(valMask, static_cast<uint16_t>(0x000f), D);
         PipeBarrier<PIPE_V>();
-
+        ShiftRight(
+            extractI16, groupI16, static_cast<int16_t>(groupRow * 4), D);
+        PipeBarrier<PIPE_V>();
         And(extractU16, extractU16, valMask, D);
         PipeBarrier<PIPE_V>();
 
@@ -541,7 +535,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
 
     // Restore key mask for next K tile load.
     auto mask = MaskBuf();
-    Duplicate(mask, static_cast<uint16_t>(0x00FF), TQ_BR_GROUP_INDEX_WORDS);
+    Duplicate(mask, static_cast<uint16_t>(0x00FF), TQ_BR_HEAD_SIZE);
     PipeBarrier<PIPE_V>();
 
     TqBrSync<HardEvent::V_S>();

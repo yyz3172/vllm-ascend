@@ -52,9 +52,16 @@ from vllm_ascend.utils import enable_custom_op
 
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
-GROUP_STRIDE = 288
+KEY_BLOCK_STRIDE = 2176
+VALUE_BLOCK_STRIDE = 1152
+KEY_ROW_CODE_BYTES = HEAD_SIZE
+VALUE_ROW_CODE_BYTES = HEAD_SIZE // 2
 KEY_GROUP_ROWS = 2
 VALUE_GROUP_ROWS = 4
+KEY_BLOCK_BASE_OFFSET = BLOCK_SIZE * KEY_ROW_CODE_BYTES
+KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_BASE_OFFSET + BLOCK_SIZE * 4
+VALUE_BLOCK_VMIN_OFFSET = BLOCK_SIZE * VALUE_ROW_CODE_BYTES
+VALUE_BLOCK_VSTEP_OFFSET = VALUE_BLOCK_VMIN_OFFSET + BLOCK_SIZE * 4
 INV_SQRT_D = 1.0 / math.sqrt(HEAD_SIZE)
 SEED = 2026
 
@@ -110,31 +117,34 @@ def _write_manual_single_kv_cache(
     key_cache = torch.zeros(
         num_blocks,
         1,
-        (BLOCK_SIZE // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        KEY_BLOCK_STRIDE,
         dtype=torch.uint8,
     )
     value_cache = torch.zeros(
         num_blocks,
         1,
-        (BLOCK_SIZE // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        VALUE_BLOCK_STRIDE,
         dtype=torch.uint8,
     )
 
-    key_group = key_cache[0, 0, :GROUP_STRIDE]
-    key_words = key_group[:256].contiguous().view(torch.uint16)
-    key_words.fill_(0x0001)
-    key_group[:256] = key_words.view(torch.uint8)
-    key_group[256:258] = _scalar_bytes(1.0, dtype)
-    key_group[260:264] = _scalar_bytes(0.0, torch.float32)
-    key_group[268:272] = _scalar_bytes(0.0, torch.float32)
+    key_block = key_cache[0, 0]
+    key_block[:KEY_ROW_CODE_BYTES].zero_()
+    key_block[KEY_BLOCK_BASE_OFFSET : KEY_BLOCK_BASE_OFFSET + 4] = _scalar_bytes(
+        INV_SQRT_D, torch.float32
+    )
+    key_block[KEY_BLOCK_STEP_OFFSET : KEY_BLOCK_STEP_OFFSET + 4] = _scalar_bytes(
+        0.0, torch.float32
+    )
 
-    value_group = value_cache[0, 0, :GROUP_STRIDE]
-    value_words = value_group[:256].contiguous().view(torch.uint16)
+    value_block = value_cache[0, 0]
     value_idx = (torch.arange(HEAD_SIZE, dtype=torch.int32) % 16).to(torch.uint16)
-    value_words.copy_(value_idx.contiguous())
-    value_group[:256] = value_words.view(torch.uint8)
-    value_group[256:260] = _scalar_bytes(-1.0, torch.float32)
-    value_group[272:276] = _scalar_bytes(0.25, torch.float32)
+    value_block[:256] = value_idx.contiguous().view(torch.uint8)
+    value_block[VALUE_BLOCK_VMIN_OFFSET : VALUE_BLOCK_VMIN_OFFSET + 4] = (
+        _scalar_bytes(-1.0, torch.float32)
+    )
+    value_block[VALUE_BLOCK_VSTEP_OFFSET : VALUE_BLOCK_VSTEP_OFFSET + 4] = (
+        _scalar_bytes(0.25, torch.float32)
+    )
 
     return key_cache, value_cache, block_table
 
@@ -149,23 +159,28 @@ def _decode_key_row(
 ) -> torch.Tensor:
     block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
     pos_in_block = abs_pos % BLOCK_SIZE
+    block = key_cache[block_id, kv_head]
     group_idx = pos_in_block // KEY_GROUP_ROWS
     group_row = pos_in_block % KEY_GROUP_ROWS
-    group_base = group_idx * GROUP_STRIDE
-    group = key_cache[block_id, kv_head, group_base : group_base + GROUP_STRIDE]
-    words = group[:256].contiguous().view(torch.uint16).to(torch.int32)
+    words = block[
+        group_idx * 256 : (group_idx + 1) * 256
+    ].contiguous().view(torch.uint16).to(torch.int32)
     if group_row == 0:
-        code = words & 0x00FF
+        first = words & 0xFF
+        code = ((first & 0x7F) << 1) | (first >> 7)
     else:
-        code = (words >> 8) & 0x00FF
+        code = words >> 8
 
     q7 = (code >> 1).float()
     sign = (code & 1).float()
-    sign_val = torch.where(sign == 1, INV_SQRT_D, -INV_SQRT_D)
-    norm = _read_dtype_scalar(group[256 + group_row * 2 : 258 + group_row * 2], dtype)
-    base = _read_float32(group[260 + group_row * 4 : 264 + group_row * 4])
-    step = _read_float32(group[268 + group_row * 4 : 272 + group_row * 4])
-    return (sign_val + base + q7 * step) * norm
+    sign_val = torch.where(sign == 0, 1.0, -1.0)
+    base = _read_float32(block[
+        KEY_BLOCK_BASE_OFFSET + pos_in_block * 4 : KEY_BLOCK_BASE_OFFSET + pos_in_block * 4 + 4
+    ])
+    step = _read_float32(block[
+        KEY_BLOCK_STEP_OFFSET + pos_in_block * 4 : KEY_BLOCK_STEP_OFFSET + pos_in_block * 4 + 4
+    ])
+    return (base + q7 * step) * sign_val
 
 
 def _decode_value_row(
@@ -177,14 +192,19 @@ def _decode_value_row(
 ) -> torch.Tensor:
     block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
     pos_in_block = abs_pos % BLOCK_SIZE
+    block = value_cache[block_id, kv_head]
     group_idx = pos_in_block // VALUE_GROUP_ROWS
     group_row = pos_in_block % VALUE_GROUP_ROWS
-    group_base = group_idx * GROUP_STRIDE
-    group = value_cache[block_id, kv_head, group_base : group_base + GROUP_STRIDE]
-    words = group[:256].contiguous().view(torch.uint16).to(torch.int32)
-    idx4 = ((words >> (group_row * 4)) & 0x000F).float()
-    vmin = _read_float32(group[256 + group_row * 4 : 260 + group_row * 4])
-    vstep = _read_float32(group[272 + group_row * 4 : 276 + group_row * 4])
+    words = block[
+        group_idx * 256 : (group_idx + 1) * 256
+    ].contiguous().view(torch.uint16).to(torch.int32)
+    idx4 = ((words >> (group_row * 4)) & 0x0F).float()
+    vmin = _read_float32(block[
+        VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 4 : VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 4 + 4
+    ])
+    vstep = _read_float32(block[
+        VALUE_BLOCK_VSTEP_OFFSET + pos_in_block * 4 : VALUE_BLOCK_VSTEP_OFFSET + pos_in_block * 4 + 4
+    ])
     return vmin + idx4 * vstep
 
 
@@ -437,14 +457,14 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
     key_cache = torch.zeros(
         num_blocks,
         num_kv_heads,
-        (BLOCK_SIZE // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        KEY_BLOCK_STRIDE,
         dtype=torch.uint8,
         device=device,
     )
     value_cache = torch.zeros(
         num_blocks,
         num_kv_heads,
-        (BLOCK_SIZE // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        VALUE_BLOCK_STRIDE,
         dtype=torch.uint8,
         device=device,
     )
