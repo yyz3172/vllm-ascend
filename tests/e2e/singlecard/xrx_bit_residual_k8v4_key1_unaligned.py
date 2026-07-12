@@ -1,4 +1,4 @@
-"""BitResidual k8v4 manual-Mmad unaligned-slot test.
+"""BitResidual k8v4 sign-reversal unaligned-slot test.
 
 Run on an NPU machine after building ``bit_residual_pack_k8v4``:
 
@@ -6,20 +6,22 @@ Run on an NPU machine after building ``bit_residual_pack_k8v4``:
 
 The test verifies a chain of properties that collectively catch encoding bugs:
 
-  1. norm accuracy: decoded norms match input L2 norms within dtype tolerance;
-  2. QDQ round-trip: decoded q7/idx4 precisely reconstruct stored base/step/
+  1. QDQ round-trip: decoded q7/idx4 precisely reconstruct stored base/step/
      vmin/vstep, proving encoding format and decode logic are correct;
-  3. sign-bit consistency: code = (q7 << 1) | sign holds for every byte;
-  4. encoding range validity: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0;
-  5. non-degenerate check: random input produces step > 0 in most groups;
-  6. sign bit balance: sign=1 fraction is roughly balanced for random input;
-  7. RMW correctness: overlapping writes preserve data in untouched slots;
-  8. multi-request correctness: distinct requests with different lengths
+  2. sign-bit consistency: code = (q7 << 1) | sign holds for every byte;
+  3. encoding range validity: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0;
+  4. non-degenerate check: random input produces step > 0 in most groups;
+  5. sign bit balance: sign=1 fraction is roughly balanced for random input;
+  6. RMW correctness: overlapping writes preserve data in untouched slots;
+  7. multi-request correctness: distinct requests with different lengths
      encode and decode correctly.
 
-Note: a known KFC stale-workspace bug causes idempotency violations for
-unaligned offsets — see [[unaligned-idempotency-bug]]. Idempotency is
-reported but not asserted.
+Sign-reversal quantization (no normalization):
+  After rotation, generate sig_vec = sign(y) → ±1.0
+  rev_vec = y * sig_vec (all dimensions become positive)
+  Quantize rev_vec: base + q7*step, with code = (q7<<1)|sign_bit
+  Decode: err = base + q7*step, decoded = err * sig_vec (NO norm)
+  Value: vmin/vstep stored raw (no norm folding)
 """
 
 from __future__ import annotations
@@ -51,10 +53,20 @@ from vllm_ascend.utils import enable_custom_op
 D = 128
 H = 8
 BS = 128
-GROUP_STRIDE = 288
+BLOCK_ROWS = 16
 KEY_GROUP_ROWS = 2
 VALUE_GROUP_ROWS = 4
-INV_SQRT_D = 1.0 / (D ** 0.5)
+
+# 16-row sub-block layout constants (matching kernel)
+KEY_BLOCK_STRIDE = 2176   # 8*256 code + 16*4 base + 16*4 step
+VAL_BLOCK_STRIDE = 1152   # 4*256 code + 16*4 vmin + 16*4 vstep
+KEY_BLOCK_CODE_BYTES = 8 * 256    # 2048
+KEY_BLOCK_BASE_OFFSET = KEY_BLOCK_CODE_BYTES          # 2048
+KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_CODE_BYTES + 16 * 4  # 2112
+VAL_BLOCK_CODE_BYTES = 4 * 256    # 1024
+VAL_BLOCK_VMIN_OFFSET = VAL_BLOCK_CODE_BYTES           # 1024
+VAL_BLOCK_VSTEP_OFFSET = VAL_BLOCK_CODE_BYTES + 16 * 4  # 1088
+
 SEED = 42
 # offset=0 aligned; offsets 1,2,3 cover unaligned key/value group rows;
 # offset=4 crosses value group boundary (group_row=0); offset=5 crosses key
@@ -89,47 +101,64 @@ def _decode_key_cache(
     slots: torch.Tensor,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
+    """Decode key cache using 16-row sub-block layout.
+
+    Sub-block layout: [code zone (2048)] [base zone (64)] [step zone (64)] = 2176 bytes
+    Each sub-block covers 16 rows (8 key groups of 2 rows each).
+    """
     cache_cpu = cache.cpu()
     slots_cpu = slots.cpu().to(torch.int64)
     t = slots_cpu.numel()
     h = cache_cpu.shape[1]
     code = torch.empty(t, h, D, dtype=torch.uint8)
-    norm = torch.empty(t, h, dtype=torch.float32)
     base = torch.empty(t, h, dtype=torch.float32)
     step = torch.empty(t, h, dtype=torch.float32)
-    norm_dtype = torch.float16 if dtype == torch.float16 else torch.bfloat16
+
+    sub_blocks_per_block = BS // BLOCK_ROWS
 
     for token_idx, slot in enumerate(slots_cpu.tolist()):
         block_idx = slot // BS
-        block_off = slot % BS
-        group_idx = block_off // KEY_GROUP_ROWS
-        group_row = block_off % KEY_GROUP_ROWS
-        group_base = group_idx * GROUP_STRIDE
+        pos_in_block = slot % BS
+        sub_block_in_block = pos_in_block // BLOCK_ROWS
+        row_in_sub_block = pos_in_block % BLOCK_ROWS
+        group_in_block = row_in_sub_block // KEY_GROUP_ROWS
+        group_row = row_in_sub_block % KEY_GROUP_ROWS
+
+        # Sub-block base offset in the per-head slice
+        sub_block_base = sub_block_in_block * KEY_BLOCK_STRIDE
+
         for head in range(h):
-            group = cache_cpu[block_idx, head, group_base : group_base + GROUP_STRIDE]
-            words = group[:256].contiguous().view(torch.uint16)
+            sub = cache_cpu[block_idx, head, sub_block_base : sub_block_base + KEY_BLOCK_STRIDE]
+
+            # Code zone: 8 groups × 256 bytes = 2048 bytes
+            # Each group stores 128 uint16 words. group_row selects bits within each word.
+            code_bytes = sub[:KEY_BLOCK_CODE_BYTES]
+            words = code_bytes.contiguous().view(torch.uint16)
+            group_words = words[group_in_block * 128 : group_in_block * 128 + 128]
             if group_row == 0:
-                code[token_idx, head] = (words & 0x00FF).to(torch.uint8)
+                code[token_idx, head] = (group_words & 0x00FF).to(torch.uint8)
             else:
-                code[token_idx, head] = ((words.to(torch.int32) >> 8) & 0x00FF).to(torch.uint8)
-            norm[token_idx, head] = (
-                group[256 + group_row * 2 : 258 + group_row * 2]
-                .contiguous()
-                .view(norm_dtype)
-                .float()
-                .item()
-            )
+                code[token_idx, head] = ((group_words.to(torch.int32) >> 8) & 0x00FF).to(torch.uint8)
+
+            # Base zone: 16 floats at KEY_BLOCK_BASE_OFFSET + row*4
             base[token_idx, head] = _u8_to_float32(
-                group[260 + group_row * 4 : 264 + group_row * 4]
-            ).item()
-            step[token_idx, head] = _u8_to_float32(
-                group[268 + group_row * 4 : 272 + group_row * 4]
+                sub[KEY_BLOCK_BASE_OFFSET + row_in_sub_block * 4 : KEY_BLOCK_BASE_OFFSET + row_in_sub_block * 4 + 4]
             ).item()
 
-    return {"code": code, "norm": norm, "base": base, "step": step}
+            # Step zone: 16 floats at KEY_BLOCK_STEP_OFFSET + row*4
+            step[token_idx, head] = _u8_to_float32(
+                sub[KEY_BLOCK_STEP_OFFSET + row_in_sub_block * 4 : KEY_BLOCK_STEP_OFFSET + row_in_sub_block * 4 + 4]
+            ).item()
+
+    return {"code": code, "base": base, "step": step}
 
 
 def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Decode value cache using 16-row sub-block layout.
+
+    Sub-block layout: [code zone (1024)] [vmin zone (64)] [vstep zone (64)] = 1152 bytes
+    Each sub-block covers 16 rows (4 value groups of 4 rows each).
+    """
     cache_cpu = cache.cpu()
     slots_cpu = slots.cpu().to(torch.int64)
     t = slots_cpu.numel()
@@ -138,22 +167,38 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, t
     vmin = torch.empty(t, h, dtype=torch.float32)
     vstep = torch.empty(t, h, dtype=torch.float32)
 
+    sub_blocks_per_block = BS // BLOCK_ROWS
+
     for token_idx, slot in enumerate(slots_cpu.tolist()):
         block_idx = slot // BS
-        block_off = slot % BS
-        group_idx = block_off // VALUE_GROUP_ROWS
-        group_row = block_off % VALUE_GROUP_ROWS
-        group_base = group_idx * GROUP_STRIDE
-        shift = group_row * 4
+        pos_in_block = slot % BS
+        sub_block_in_block = pos_in_block // BLOCK_ROWS
+        row_in_sub_block = pos_in_block % BLOCK_ROWS
+        group_in_block = row_in_sub_block // VALUE_GROUP_ROWS
+        group_row = row_in_sub_block % VALUE_GROUP_ROWS
+
+        # Sub-block base offset in the per-head slice
+        sub_block_base = sub_block_in_block * VAL_BLOCK_STRIDE
+
         for head in range(h):
-            group = cache_cpu[block_idx, head, group_base : group_base + GROUP_STRIDE]
-            words = group[:256].contiguous().view(torch.uint16)
-            idx4[token_idx, head] = ((words.to(torch.int32) >> shift) & 0x000F).to(torch.uint8)
+            sub = cache_cpu[block_idx, head, sub_block_base : sub_block_base + VAL_BLOCK_STRIDE]
+
+            # Code zone: 4 groups × 256 bytes = 1024 bytes
+            # Each group stores 128 uint16 words packed with 4-bit idx4 values.
+            code_bytes = sub[:VAL_BLOCK_CODE_BYTES]
+            words = code_bytes.contiguous().view(torch.uint16)
+            group_words = words[group_in_block * 128 : group_in_block * 128 + 128]
+            shift = group_row * 4
+            idx4[token_idx, head] = ((group_words.to(torch.int32) >> shift) & 0x000F).to(torch.uint8)
+
+            # vmin zone: 16 floats at VAL_BLOCK_VMIN_OFFSET + row*4
             vmin[token_idx, head] = _u8_to_float32(
-                group[256 + group_row * 4 : 260 + group_row * 4]
+                sub[VAL_BLOCK_VMIN_OFFSET + row_in_sub_block * 4 : VAL_BLOCK_VMIN_OFFSET + row_in_sub_block * 4 + 4]
             ).item()
+
+            # vstep zone: 16 floats at VAL_BLOCK_VSTEP_OFFSET + row*4
             vstep[token_idx, head] = _u8_to_float32(
-                group[272 + group_row * 4 : 276 + group_row * 4]
+                sub[VAL_BLOCK_VSTEP_OFFSET + row_in_sub_block * 4 : VAL_BLOCK_VSTEP_OFFSET + row_in_sub_block * 4 + 4]
             ).item()
 
     return {"idx4": idx4, "vmin": vmin, "vstep": vstep}
@@ -162,25 +207,28 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, t
 def _reconstruct_key_vectors(key_dec: dict[str, torch.Tensor]) -> torch.Tensor:
     """Reconstruct approximate rotated vectors from decoded key cache data.
 
-    code = (q7 << 1) | sign, so q7 = code >> 1, sign = code & 1.
-    sign_val = sign ? +1/sqrt(D) : -1/sqrt(D).
-    err = base + q7 * step; y = err + sign_val.
+    Sign-reversal decode (no normalization):
+    code = (q7 << 1) | sign_bit
+    q7 = code >> 1, sign_bit = code & 1
+    sig_vec = 1 - 2*sign_bit → {+1.0 (sign_bit=0), -1.0 (sign_bit=1)}
+    err = base + q7 * step  (positive residual)
+    decoded = err * sig_vec  (restore original sign per dimension)
     """
     code = key_dec["code"]
     base = key_dec["base"]
     step = key_dec["step"]
     q7 = (code.to(torch.int32) >> 1).to(torch.float32)
-    sign = (code & 1).to(torch.float32)
-    sign_val = torch.where(sign == 1, INV_SQRT_D, -INV_SQRT_D)
+    sign_bit = (code & 1).to(torch.float32)
+    sig_vec = 1.0 - 2.0 * sign_bit  # {+1.0, -1.0}
     err = base.unsqueeze(-1) + q7 * step.unsqueeze(-1)
-    y = err + sign_val
+    y = err * sig_vec
     return y
 
 
 def _reconstruct_value_vectors(value_dec: dict[str, torch.Tensor]) -> torch.Tensor:
     """Reconstruct approximate rotated vectors from decoded value cache data.
 
-    idx4 ∈ [0,15]; y = vmin + idx4 * vstep.
+    idx4 ∈ [0,15]; y = vmin + idx4 * vstep (raw, no norm folding).
     """
     idx4 = value_dec["idx4"].to(torch.float32)
     vmin = value_dec["vmin"]
@@ -192,7 +240,6 @@ def _reconstruct_value_vectors(value_dec: dict[str, torch.Tensor]) -> torch.Tens
 def _assert_match(
     name: str,
     dtype: torch.dtype,
-    key_norms: torch.Tensor,
     key_dec: dict[str, torch.Tensor],
     value_dec: dict[str, torch.Tensor],
 ) -> None:
@@ -202,31 +249,21 @@ def _assert_match(
     (even in the same dtype on the same NPU), we cannot reproduce the kernel's
     pre-quantization output externally. Instead, we verify a chain of properties:
 
-    1. **Norm accuracy**: decoded norms match input L2 norms within dtype tolerance.
-       Catches wrong normalization (wrong norm, wrong eps, missing sqrt).
-    2. **QDQ round-trip exactness**: decoded q7/idx4 must precisely reconstruct
+    1. **QDQ round-trip exactness**: decoded q7/idx4 must precisely reconstruct
        the stored base/step/vmin/vstep — (err_recon - base)/step = q7 and
        (y_recon - vmin)/vstep = idx4. Catches wrong packing, wrong decode logic.
-    3. **Sign-bit consistency**: code = (q7 << 1) | sign must hold for every byte.
+    2. **Sign-bit consistency**: code = (q7 << 1) | sign must hold for every byte.
        Catches wrong bit-split logic.
-    4. **Encoding range validity**: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0.
+    3. **Encoding range validity**: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0.
        Catches encoding overflow/underflow.
-    5. **Non-degenerate check**: random input should produce non-zero range
+    4. **Non-degenerate check**: random input should produce non-zero range
        in most groups (step > 0). Catches kernel that outputs constant vectors.
-    6. **Sign bit balance**: for random input, sign=1 fraction should be
+    5. **Sign bit balance**: for random input, sign=1 fraction should be
        roughly balanced ([0.25, 0.75]). Catches kernel that always sets sign=0
        or sign=1 regardless of input.
     """
-    # 1. Norm accuracy check.
-    if dtype == torch.bfloat16:
-        norm_rtol, norm_atol = 0.02, 0.05
-    else:
-        norm_rtol, norm_atol = 0.01, 0.01
-    torch.testing.assert_close(
-        key_dec["norm"], key_norms, rtol=norm_rtol, atol=norm_atol
-    )
 
-    # 2. QDQ round-trip exactness.
+    # 1. QDQ round-trip exactness.
     # Key: err_recon = base + q7*step. Verify (err_recon - base) / step = q7.
     # For degenerate groups (step=1, q7=0), err_recon=base, so 0/1=0=q7 — OK.
     q7 = (key_dec["code"].to(torch.int32) >> 1).to(torch.float32)
@@ -263,7 +300,7 @@ def _assert_match(
             f"(should be < 0.5)"
         )
 
-    # 3. Sign-bit consistency: code = (q7 << 1) | sign for every byte.
+    # 2. Sign-bit consistency: code = (q7 << 1) | sign for every byte.
     q7_int = key_dec["code"].to(torch.int32) >> 1
     sign_int = key_dec["code"] & 1
     reconstructed_code = (q7_int << 1) | sign_int.to(torch.int32)
@@ -271,7 +308,7 @@ def _assert_match(
         f"{name}: sign-bit consistency violated: code != (q7<<1)|sign"
     )
 
-    # 4. Encoding range validity.
+    # 3. Encoding range validity.
     assert (q7_int >= 0).all() and (q7_int <= 127).all(), (
         f"{name}: q7 out of [0,127] range"
     )
@@ -281,21 +318,22 @@ def _assert_match(
     assert (key_dec["step"] >= 0).all(), f"{name}: negative key step"
     assert (value_dec["vstep"] >= 0).all(), f"{name}: negative value vstep"
 
-    # 5. Non-degenerate check: at least 75% of groups should have step > 0.
+    # 4. Non-degenerate check: at least 50% of groups should have step > 0.
+    # (sign-reversal quantization can produce more degenerate groups with narrow ranges)
     key_ratio = (step_valid.sum().item() / key_dec["step"].numel())
     val_ratio = (vstep_valid.sum().item() / value_dec["vstep"].numel())
-    assert key_ratio >= 0.75, (
+    assert key_ratio >= 0.5, (
         f"{name}: too many degenerate key groups: "
         f"{step_valid.sum().item()}/{key_dec['step'].numel()} "
-        f"(ratio={key_ratio:.2f}, expected >= 0.75)"
+        f"(ratio={key_ratio:.2f}, expected >= 0.5)"
     )
-    assert val_ratio >= 0.75, (
+    assert val_ratio >= 0.5, (
         f"{name}: too many degenerate value groups: "
         f"{vstep_valid.sum().item()}/{value_dec['vstep'].numel()} "
-        f"(ratio={val_ratio:.2f}, expected >= 0.75)"
+        f"(ratio={val_ratio:.2f}, expected >= 0.5)"
     )
 
-    # 6. Sign bit balance: sign=1 fraction in [0.25, 0.75].
+    # 5. Sign bit balance: sign=1 fraction in [0.25, 0.75].
     sign1_frac = (sign_int == 1).sum().item() / sign_int.numel()
     assert 0.25 <= sign1_frac <= 0.75, (
         f"{name}: sign bit distribution skewed: "
@@ -304,7 +342,7 @@ def _assert_match(
 
     print(
         f"PASS {name}: dtype={dtype}, "
-        f"norm=OK, qdq=OK, sign=OK({sign1_frac:.2f}), "
+        f"qdq=OK, sign=OK({sign1_frac:.2f}), "
         f"nondeg=OK(key={key_ratio:.2f},val={val_ratio:.2f})"
     )
 
@@ -324,15 +362,14 @@ def _run_case(
     qsl = torch.tensor([0, token_count], dtype=torch.int32, device=device)
     num_blocks = int((slot_offset + token_count + BS - 1) // BS + 1)
 
-    # Compute input L2 norms for norm accuracy check.
-    key_norms = key.cpu().float().norm(dim=-1)
+    sub_blocks_per_block = BS // BLOCK_ROWS
 
     key_cache_1 = torch.zeros(
-        num_blocks, H, (BS // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        num_blocks, H, sub_blocks_per_block * KEY_BLOCK_STRIDE,
         dtype=torch.uint8, device=device,
     )
     value_cache_1 = torch.zeros(
-        num_blocks, H, (BS // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        num_blocks, H, sub_blocks_per_block * VAL_BLOCK_STRIDE,
         dtype=torch.uint8, device=device,
     )
     key_cache_2 = torch.zeros_like(key_cache_1)
@@ -368,7 +405,7 @@ def _run_case(
     key_dec = _decode_key_cache(key_cache_1, slots, dtype)
     value_dec = _decode_value_cache(value_cache_1, slots)
     _assert_match(
-        name, dtype, key_norms, key_dec, value_dec
+        name, dtype, key_dec, value_dec
     )
 
 
@@ -394,14 +431,14 @@ def _run_multi_req_case(
     qsl = torch.tensor([0, t0, total], dtype=torch.int32, device=device)
     num_blocks = int((93 + BS - 1) // BS + 1)
 
-    key_norms = key.cpu().float().norm(dim=-1)
+    sub_blocks_per_block = BS // BLOCK_ROWS
 
     key_cache = torch.zeros(
-        num_blocks, H, (BS // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        num_blocks, H, sub_blocks_per_block * KEY_BLOCK_STRIDE,
         dtype=torch.uint8, device=device,
     )
     value_cache = torch.zeros(
-        num_blocks, H, (BS // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        num_blocks, H, sub_blocks_per_block * VAL_BLOCK_STRIDE,
         dtype=torch.uint8, device=device,
     )
 
@@ -413,7 +450,7 @@ def _run_multi_req_case(
     key_dec = _decode_key_cache(key_cache, slots, dtype)
     value_dec = _decode_value_cache(value_cache, slots)
     _assert_match(
-        name, dtype, key_norms, key_dec, value_dec
+        name, dtype, key_dec, value_dec
     )
 
 
@@ -451,13 +488,15 @@ def _run_rmw_case(
     slots2 = torch.arange(offset2, offset2 + t2_count, dtype=torch.int32, device=device)
     qsl2 = torch.tensor([0, t2_count], dtype=torch.int32, device=device)
 
+    sub_blocks_per_block = BS // BLOCK_ROWS
+
     num_blocks = 2
     key_cache = torch.zeros(
-        num_blocks, H, (BS // KEY_GROUP_ROWS) * GROUP_STRIDE,
+        num_blocks, H, sub_blocks_per_block * KEY_BLOCK_STRIDE,
         dtype=torch.uint8, device=device,
     )
     value_cache = torch.zeros(
-        num_blocks, H, (BS // VALUE_GROUP_ROWS) * GROUP_STRIDE,
+        num_blocks, H, sub_blocks_per_block * VAL_BLOCK_STRIDE,
         dtype=torch.uint8, device=device,
     )
 
@@ -467,7 +506,7 @@ def _run_rmw_case(
     )
     torch.npu.synchronize()
 
-    # Save phase 1 decoded data for slots [0..2] (should survive phase 2)
+    # Save phase 1 decoded data for slots [1..3] (should survive phase 2)
     preserved_slots = torch.arange(offset1, offset1 + 3, dtype=torch.int32, device=device)
     key_dec_preserved_1 = _decode_key_cache(key_cache, preserved_slots, dtype)
     value_dec_preserved_1 = _decode_value_cache(value_cache, preserved_slots)
@@ -482,7 +521,7 @@ def _run_rmw_case(
     key_dec_preserved_2 = _decode_key_cache(key_cache, preserved_slots, dtype)
     value_dec_preserved_2 = _decode_value_cache(value_cache, preserved_slots)
 
-    for field in ("code", "norm", "base", "step"):
+    for field in ("code", "base", "step"):
         torch.testing.assert_close(
             key_dec_preserved_1[field], key_dec_preserved_2[field],
             rtol=0, atol=0,
@@ -494,11 +533,10 @@ def _run_rmw_case(
         )
 
     # Verify: phase 2 slots [4..13] match phase 2 output
-    key_norms2 = key2.cpu().float().norm(dim=-1)
     key_dec_phase2 = _decode_key_cache(key_cache, slots2, dtype)
     value_dec_phase2 = _decode_value_cache(value_cache, slots2)
     _assert_match(
-        f"{name}_phase2", dtype, key_norms2, key_dec_phase2, value_dec_phase2,
+        f"{name}_phase2", dtype, key_dec_phase2, value_dec_phase2,
     )
 
     print(f"PASS {name}: preserved slots unchanged, phase2 data correct, dtype={dtype}")

@@ -8,10 +8,10 @@
  * http://www.apache.org/licenses/LICENSE-2.0
  */
 
-// BitResidual K8V4: fused sign+residual decode + paged attention.
+// BitResidual K8V4: fused sign-reversal decode + paged attention.
 // Reads packed KV cache in bit_residual format and performs attention:
-//   K: 8-bit code = (q7 << 1) | sign → sign_val + base + q7*step → y * norm
-//   V: 4-bit idx4 → vmin + idx4*vstep (no norm)
+//   K: 8-bit code = (q7 << 1) | sign → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
+//   V: 4-bit idx4 → vmin + idx4*vstep (raw, no norm folding)
 // Rotation: Q @ R^T (pre-rotate) and out @ R (post-rotate) via Cube KFC.
 
 #include "kernel_operator.h"
@@ -28,7 +28,9 @@ using namespace bit_residual_attn;
 // ---------------------------------------------------------------
 static constexpr uint32_t TQ_BR_UB_KV_TILE_CAP = 64;
 static constexpr uint32_t TQ_BR_UB_GQA_CAP = 8;
-static constexpr uint32_t TQ_BR_GROUP_COPY_BYTES = ((TQ_BR_GROUP_STRIDE + 31) / 32) * 32;  // 288 aligned to 32
+// Packed sub-block copy bytes (32B-aligned).
+// Key sub-block = 2176B, Val sub-block = 1152B. Use max for shared buffer.
+static constexpr uint32_t TQ_BR_BLOCK_COPY_BYTES = ((TQ_BR_KEY_BLOCK_STRIDE + 31) / 32) * 32;  // 2176 aligned to 32
 
 static constexpr uint32_t TQ_BR_DTYPE_BYTES = sizeof(uint16_t);
 
@@ -54,17 +56,12 @@ using TqQueryT = half;
 // We use a layout similar to the TQ 4-bit attention kernel but adapted for
 // bit_residual format. Key decode needs more scratch space (sign + q7 + base + step).
 
-// UB layout (total ~115 KiB, fits in 192 KiB on 910B):
-//   packedRawBuf:       KV_TILE_CAP / KEY_GROUP_ROWS * TQ_BR_GROUP_COPY_BYTES = 64/2 * 288 = 9216 bytes (key) + same for val
-//   But we time-share: load K group → extract → decode → load V group → extract → decode
-//   So only one set of raw group buffers needed.
-//   packedRawBuf:       TQ_BR_UB_KV_TILE_CAP * TQ_BR_GROUP_COPY_BYTES bytes  (but we load at most kvTileRows groups)
-//                       Upper bound: 64 * 288 = 18432 bytes
-
-// Simplified approach: allocate fixed-size buffers for worst-case kvTileRows=64.
+// UB layout (total fits in 192 KiB on 910B):
+//   packedRawBuf: holds one 16-row sub-block at a time (2176B max, 32B-aligned → 2176)
+//   We time-share: load K sub-block → extract → decode → load V sub-block → extract → decode
 
 constexpr uint32_t TQ_BR_UB_PACKED_RAW_OFFSET = 0;
-constexpr uint32_t TQ_BR_UB_PACKED_RAW_BYTES = TQ_BR_UB_KV_TILE_CAP * TQ_BR_GROUP_COPY_BYTES;  // 18432
+constexpr uint32_t TQ_BR_UB_PACKED_RAW_BYTES = TQ_BR_BLOCK_COPY_BYTES;  // 2176
 
 // codeI16 (extracted key code/value idx, kept as int16 for AscendC bit ops)
 constexpr uint32_t TQ_BR_UB_CODE_I16_OFFSET = TQ_BR_UB_PACKED_RAW_OFFSET + TQ_BR_UB_PACKED_RAW_BYTES;
@@ -82,12 +79,8 @@ constexpr uint32_t TQ_BR_UB_QGROUP_FLOAT_BYTES = TQ_BR_UB_GQA_CAP * TQ_BR_HEAD_S
 constexpr uint32_t TQ_BR_UB_SCORE_OFFSET = TQ_BR_UB_QGROUP_FLOAT_OFFSET + TQ_BR_UB_QGROUP_FLOAT_BYTES;
 constexpr uint32_t TQ_BR_UB_SCORE_BYTES = TQ_BR_UB_GQA_CAP * TQ_BR_UB_KV_TILE_CAP * sizeof(float);  // 2048
 
-// kNormBuf (key norms, kvTileRows floats)
-constexpr uint32_t TQ_BR_UB_KNORM_OFFSET = TQ_BR_UB_SCORE_OFFSET + TQ_BR_UB_SCORE_BYTES;
-constexpr uint32_t TQ_BR_UB_KNORM_BYTES = TQ_BR_UB_KV_TILE_CAP * sizeof(float);  // 256
-
 // kBaseBuf (key base, kvTileRows floats)
-constexpr uint32_t TQ_BR_UB_KBASE_OFFSET = TQ_BR_UB_KNORM_OFFSET + TQ_BR_UB_KNORM_BYTES;
+constexpr uint32_t TQ_BR_UB_KBASE_OFFSET = TQ_BR_UB_SCORE_OFFSET + TQ_BR_UB_SCORE_BYTES;
 constexpr uint32_t TQ_BR_UB_KBASE_BYTES = TQ_BR_UB_KV_TILE_CAP * sizeof(float);  // 256
 
 // kStepBuf (key step, kvTileRows floats)
@@ -117,7 +110,7 @@ constexpr uint32_t TQ_BR_UB_OUTACC_BYTES = TQ_BR_UB_GQA_CAP * TQ_BR_HEAD_SIZE * 
 constexpr uint32_t TQ_BR_UB_DECODED_OFFSET = TQ_BR_UB_OUTACC_OFFSET + TQ_BR_UB_OUTACC_BYTES;
 constexpr uint32_t TQ_BR_UB_DECODED_BYTES = TQ_BR_UB_KV_TILE_CAP * TQ_BR_HEAD_SIZE * sizeof(float);  // 32768
 
-// floatScratch for scalar reads (base/step/norm)
+// floatScratch for scalar reads (base/step/vmin/vstep)
 constexpr uint32_t TQ_BR_UB_FLOAT_SCRATCH_OFFSET = TQ_BR_UB_DECODED_OFFSET + TQ_BR_UB_DECODED_BYTES;
 constexpr uint32_t TQ_BR_UB_FLOAT_SCRATCH_BYTES = TQ_BR_HEAD_SIZE * 2 * sizeof(float);
 
@@ -213,10 +206,6 @@ private:
         return TqMakeVecCalcLocalTensor<float>(
             TQ_BR_UB_SCORE_OFFSET, TQ_BR_UB_SCORE_BYTES);
     }
-    __aicore__ inline LocalTensor<float> KNormBuf() {
-        return TqMakeVecCalcLocalTensor<float>(
-            TQ_BR_UB_KNORM_OFFSET, TQ_BR_UB_KNORM_BYTES);
-    }
     __aicore__ inline LocalTensor<float> KBaseBuf() {
         return TqMakeVecCalcLocalTensor<float>(
             TQ_BR_UB_KBASE_OFFSET, TQ_BR_UB_KBASE_BYTES);
@@ -260,13 +249,6 @@ private:
     __aicore__ inline LocalTensor<uint8_t> RotateWorkBuf() {
         return TqMakeVecCalcLocalTensor<uint8_t>(
             TQ_BR_UB_ROTATE_WORK_OFFSET, TQ_BR_UB_ROTATE_WORK_BYTES);
-    }
-
-    // Norm scratch (reuses floatScratch)
-    __aicore__ inline LocalTensor<QueryT> NormScratchBuf() {
-        return TqMakeVecCalcLocalTensor<QueryT>(
-            TQ_BR_UB_FLOAT_SCRATCH_OFFSET + TQ_BR_HEAD_SIZE * sizeof(float),
-            TQ_BR_HEAD_SIZE * sizeof(float));
     }
 
     // ---- Tiling data members ----
@@ -336,9 +318,9 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Ini
     // GM buffers
     queryGm_.SetGlobalBuffer((__gm__ QueryT*)query, numTokens_ * numHeads_ * headSize_);
     keyCacheGm_.SetGlobalBuffer((__gm__ uint8_t*)keyCache,
-        totalCacheBlocks_ * numKvHeads_ * (blockSize_ / TQ_BR_KEY_GROUP_ROWS) * TQ_BR_GROUP_STRIDE);
+        totalCacheBlocks_ * numKvHeads_ * (blockSize_ / TQ_BR_BLOCK_ROWS) * TQ_BR_KEY_BLOCK_STRIDE);
     valueCacheGm_.SetGlobalBuffer((__gm__ uint8_t*)valueCache,
-        totalCacheBlocks_ * numKvHeads_ * (blockSize_ / TQ_BR_VALUE_GROUP_ROWS) * TQ_BR_GROUP_STRIDE);
+        totalCacheBlocks_ * numKvHeads_ * (blockSize_ / TQ_BR_BLOCK_ROWS) * TQ_BR_VAL_BLOCK_STRIDE);
     blockTableGm_.SetGlobalBuffer((__gm__ int32_t*)blockTable, batchSize_ * maxBlocksPerSeq_);
     actualSeqLenQGm_.SetGlobalBuffer((__gm__ int64_t*)actualSeqLenQ, batchSize_);
     actualSeqLenKvGm_.SetGlobalBuffer((__gm__ int64_t*)actualSeqLenKv, batchSize_);
@@ -405,54 +387,55 @@ template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::LoadPackedKeyTileRows(
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows)
 {
-    // Key cache: [num_blocks, num_kv_heads, (block_size/2) * 288]
-    // Each 2-row group occupies 288 bytes.
-    // group_base = (block_id * num_kv_heads + kv_head) * (block_size/2) * 288 + group_in_block * 288
+    // Key cache: 16-row sub-block layout
+    // [code zone (8×256)] [base zone (16×float)] [step zone (16×float)] = 2176 bytes per sub-block
+    // blockSize/16 sub-blocks per block.
+    //
+    // For each row, find its 16-row sub-block in the block, load it, extract code + base + step.
 
-    const uint32_t keyBlockStride = (blockSize_ / TQ_BR_KEY_GROUP_ROWS) * TQ_BR_GROUP_STRIDE;
+    const uint32_t keySubBlocksPerBlock = blockSize_ / TQ_BR_BLOCK_ROWS;
     const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
     auto packedRaw = PackedRawBuf();
     auto codeI16 = CodeI16Buf();
-    auto normScratch = NormScratchBuf();
     auto floatScratch = FloatScratchBuf();
-    auto kNorm = KNormBuf();
     auto kBase = KBaseBuf();
     auto kStep = KStepBuf();
     auto mask = MaskBuf();
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
 
-    // Extract code bytes, norms, base, step per row.
-    // We load each group individually since the layout is different from TQ 4bit.
     for (uint32_t row = 0; row < mRows; ++row) {
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
         const uint32_t posInBlock = absPos % blockSize_;
-        const uint32_t groupIdx = posInBlock / TQ_BR_KEY_GROUP_ROWS;
-        const uint32_t groupRow = posInBlock % TQ_BR_KEY_GROUP_ROWS;
+        const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
+        const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
+        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_KEY_GROUP_ROWS;
+        const uint32_t groupRow = rowInSubBlock % TQ_BR_KEY_GROUP_ROWS;
 
         // Look up physical block from block_table.
         TqBrSync<HardEvent::S_MTE2>();
         const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
         TqBrSync<HardEvent::MTE2_S>();
 
-        // Compute GM offset for this group.
-        const uint64_t groupBase = static_cast<uint64_t>(blockId) * numKvHeads_ * keyBlockStride +
-                                   static_cast<uint64_t>(kvHead) * keyBlockStride +
-                                   static_cast<uint64_t>(groupIdx) * TQ_BR_GROUP_STRIDE;
+        // Compute GM offset for this sub-block.
+        const uint64_t subBlockBase =
+            static_cast<uint64_t>(blockId) * numKvHeads_ * keySubBlocksPerBlock * TQ_BR_KEY_BLOCK_STRIDE +
+            static_cast<uint64_t>(kvHead) * keySubBlocksPerBlock * TQ_BR_KEY_BLOCK_STRIDE +
+            static_cast<uint64_t>(subBlockInBlock) * TQ_BR_KEY_BLOCK_STRIDE;
 
-        DataCopyExtParams copyParams{1, TQ_BR_GROUP_STRIDE, 0, 0, 0};
+        DataCopyExtParams copyParams{1, TQ_BR_KEY_BLOCK_STRIDE, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, keyCacheGm_[groupBase], copyParams, padParams);
+        DataCopyPad(packedRaw, keyCacheGm_[subBlockBase], copyParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
 
         // Reinterpret as uint16 for code extraction.
-        auto groupU16 = packedRaw.template ReinterpretCast<uint16_t>();
+        // Code zone starts at groupInBlock * 256 bytes = groupInBlock * 128 uint16 words
+        auto packedU16 = packedRaw.template ReinterpretCast<uint16_t>();
+        const uint32_t codeWordOff = groupInBlock * TQ_BR_GROUP_INDEX_WORDS;
+        auto groupU16 = packedU16[codeWordOff];
 
         // Extract code byte for this group_row.
-        // Key uint16[d] = (code_row1[d] << 8) | code_row0[d]
-        // group_row == 0: low byte → And with 0x00FF
-        // group_row == 1: high byte → ShiftRight 8 then And with 0x00FF
         auto extractI16 = codeI16[row * D];
         auto extractU16 = extractI16.template ReinterpretCast<uint16_t>();
 
@@ -466,18 +449,13 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         }
         PipeBarrier<PIPE_V>();
 
-        // Read norm (fp16/bf16 word at byte offset 256 + groupRow*2).
-        const uint32_t normByteOff = TQ_BR_KEY_NORM_BYTE_OFFSET + groupRow * sizeof(QueryT);
-        const float norm = TqBrReadNormToFloat<QueryT>(packedRaw, normScratch, floatScratch, normByteOff);
-        kNorm.SetValue(row, norm);
-
-        // Read base (float at byte offset 260 + groupRow*4).
-        const uint32_t baseByteOff = TQ_BR_KEY_BASE_BYTE_OFFSET + groupRow * sizeof(float);
+        // Read base and step at new offsets (base at rowInSubBlock*4 within base zone,
+        // step at rowInSubBlock*4 within step zone).
+        const uint32_t baseByteOff = TQ_BR_KEY_BLOCK_BASE_OFFSET + rowInSubBlock * sizeof(float);
         const float base = TqBrReadFloatFromU8(packedRaw, floatScratch, baseByteOff);
         kBase.SetValue(row, base);
 
-        // Read step (float at byte offset 268 + groupRow*4).
-        const uint32_t stepByteOff = TQ_BR_KEY_STEP_BYTE_OFFSET + groupRow * sizeof(float);
+        const uint32_t stepByteOff = TQ_BR_KEY_BLOCK_STEP_OFFSET + rowInSubBlock * sizeof(float);
         const float step = TqBrReadFloatFromU8(packedRaw, floatScratch, stepByteOff);
         kStep.SetValue(row, step);
     }
@@ -491,11 +469,10 @@ template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::LoadPackedValueTileRows(
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows)
 {
-    // Value cache: [num_blocks, num_kv_heads, (block_size/4) * 288]
-    // Each 4-row group occupies 288 bytes.
-    // uint16[d] = (idx4_row3 << 12) | (idx4_row2 << 8) | (idx4_row1 << 4) | idx4_row0
+    // Value cache: 16-row sub-block layout
+    // [code zone (4×256)] [vmin zone (16×float)] [vstep zone (16×float)] = 1152 bytes per sub-block
 
-    const uint32_t valBlockStride = (blockSize_ / TQ_BR_VALUE_GROUP_ROWS) * TQ_BR_GROUP_STRIDE;
+    const uint32_t valSubBlocksPerBlock = blockSize_ / TQ_BR_BLOCK_ROWS;
     const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
     auto packedRaw = PackedRawBuf();
     auto codeI16 = CodeI16Buf();  // reuse for value idx4 extraction
@@ -514,26 +491,32 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
         const uint32_t posInBlock = absPos % blockSize_;
-        const uint32_t groupIdx = posInBlock / TQ_BR_VALUE_GROUP_ROWS;
-        const uint32_t groupRow = posInBlock % TQ_BR_VALUE_GROUP_ROWS;
+        const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
+        const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
+        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_VALUE_GROUP_ROWS;
+        const uint32_t groupRow = rowInSubBlock % TQ_BR_VALUE_GROUP_ROWS;
 
         TqBrSync<HardEvent::S_MTE2>();
         const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
         TqBrSync<HardEvent::MTE2_S>();
 
-        const uint64_t groupBase = static_cast<uint64_t>(blockId) * numKvHeads_ * valBlockStride +
-                                   static_cast<uint64_t>(kvHead) * valBlockStride +
-                                   static_cast<uint64_t>(groupIdx) * TQ_BR_GROUP_STRIDE;
+        // Compute GM offset for this sub-block.
+        const uint64_t subBlockBase =
+            static_cast<uint64_t>(blockId) * numKvHeads_ * valSubBlocksPerBlock * TQ_BR_VAL_BLOCK_STRIDE +
+            static_cast<uint64_t>(kvHead) * valSubBlocksPerBlock * TQ_BR_VAL_BLOCK_STRIDE +
+            static_cast<uint64_t>(subBlockInBlock) * TQ_BR_VAL_BLOCK_STRIDE;
 
-        DataCopyExtParams copyParams{1, TQ_BR_GROUP_STRIDE, 0, 0, 0};
+        DataCopyExtParams copyParams{1, TQ_BR_VAL_BLOCK_STRIDE, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, valueCacheGm_[groupBase], copyParams, padParams);
+        DataCopyPad(packedRaw, valueCacheGm_[subBlockBase], copyParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
 
-        auto groupI16 = packedRaw.template ReinterpretCast<int16_t>();
+        // Code zone: groupInBlock * 256 bytes = groupInBlock * 128 uint16 words
+        auto packedI16 = packedRaw.template ReinterpretCast<int16_t>();
+        const uint32_t codeWordOff = groupInBlock * TQ_BR_GROUP_INDEX_WORDS;
+        auto groupI16 = packedI16[codeWordOff];
 
         // Extract 4-bit index for this group_row.
-        // idx4 = (uint16 >> (groupRow * 4)) & 0x0F
         auto extractI16 = codeI16[row * D];
         auto extractU16 = extractI16.template ReinterpretCast<uint16_t>();
         ShiftRight(extractI16, groupI16, static_cast<int16_t>(groupRow * 4), D);
@@ -546,13 +529,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         Cast(codeFloat[row * D], extractI16, RoundMode::CAST_NONE, D);
         PipeBarrier<PIPE_V>();
 
-        // Read vmin (float at byte offset 256 + groupRow*4).
-        const uint32_t vminByteOff = TQ_BR_VAL_VMIN_BYTE_OFFSET + groupRow * sizeof(float);
+        // Read vmin and vstep at new offsets (rowInSubBlock*4 within vmin/vstep zone).
+        const uint32_t vminByteOff = TQ_BR_VAL_BLOCK_VMIN_OFFSET + rowInSubBlock * sizeof(float);
         const float vmin = TqBrReadFloatFromU8(packedRaw, floatScratch, vminByteOff);
         vminBuf.SetValue(row, vmin);
 
-        // Read vstep (float at byte offset 272 + groupRow*4).
-        const uint32_t vstepByteOff = TQ_BR_VAL_VSTEP_BYTE_OFFSET + groupRow * sizeof(float);
+        const uint32_t vstepByteOff = TQ_BR_VAL_BLOCK_VSTEP_OFFSET + rowInSubBlock * sizeof(float);
         const float vstep = TqBrReadFloatFromU8(packedRaw, floatScratch, vstepByteOff);
         vstepBuf.SetValue(row, vstep);
     }
@@ -573,26 +555,25 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     uint32_t mRows)
 {
     // Input: CodeI16Buf()[row*128] has the 8-bit code for each dimension.
-    // kNorm[k], kBase[k], kStep[k] are per-row scalar floats.
+    // kBase[k], kStep[k] are per-row scalar floats.
     //
     // Decode: code = (q7 << 1) | sign
-    //   sign = code & 1        → 0 or 1
-    //   q7   = code >> 1       → [0, 127]
-    //   sign_val = sign ? +INV_SQRT_D : -INV_SQRT_D
-    //   err = base + q7 * step (broadcast per-row)
-    //   y = sign_val + err     (in rotated space)
-    //   decoded = y * norm     (broadcast per-row)
+    //   sign_bit = code & 1        → 0=positive, 1=negative
+    //   q7       = code >> 1       → [0, 127]
+    //   sig_vec  = 1 - 2*sign_bit  → {+1.0, -1.0}
+    //   err      = base + q7 * step (positive residual)
+    //   decoded  = err * sig_vec   (restore original sign per dimension)
+    //   NO norm multiplication!
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
     const uint32_t n = mRows * D;
     auto codeI16 = CodeI16Buf();
     auto codeFloat = CodeFloatBuf();
     auto decoded = DecodedBuf();
-    auto kNorm = KNormBuf();
     auto kBase = KBaseBuf();
     auto kStep = KStepBuf();
 
-    // Step 1: Extract sign (code & 1) and q7 (code >> 1).
+    // Step 1: Extract sign_bit (code & 1) and q7 (code >> 1).
     auto signStorage = decoded.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
     auto codeU16 = codeI16.template ReinterpretCast<uint16_t>();
@@ -607,16 +588,16 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     ShiftRight(codeI16, codeI16, static_cast<int16_t>(1), n);
     PipeBarrier<PIPE_V>();
 
-    // Step 2: sign → sign_val = ±INV_SQRT_D
-    // sign = 0 → sign_val = -INV_SQRT_D
-    // sign = 1 → sign_val = +INV_SQRT_D
-    // sign_val = (2*sign - 1) * INV_SQRT_D = sign * 2*INV_SQRT_D - INV_SQRT_D
-    auto signF32Final = codeFloat;  // float tensor for sign_val
-    Cast(signF32Final, signStorage, RoundMode::CAST_NONE, n);  // sign: 0.0 or 1.0
+    // Step 2: sign_bit → sig_vec = ±1.0
+    // sign_bit = 0 (positive) → sig_vec = +1.0
+    // sign_bit = 1 (negative) → sig_vec = -1.0
+    // sig_vec = 1 - 2*sign_bit = Cast(sign) * (-2) + 1
+    auto signF32Final = codeFloat;
+    Cast(signF32Final, signStorage, RoundMode::CAST_NONE, n);  // sign_bit: 0.0 or 1.0
     PipeBarrier<PIPE_V>();
-    Muls(signF32Final, signF32Final, 2.0f * TQ_BR_INV_SQRT_D, n);
+    Muls(signF32Final, signF32Final, -2.0f, n);   // 0→0, 1→-2
     PipeBarrier<PIPE_V>();
-    Adds(signF32Final, signF32Final, -TQ_BR_INV_SQRT_D, n);  // 0→-0.08839, 1→+0.08839
+    Adds(signF32Final, signF32Final, 1.0f, n);    // 0→+1, 1→-1 = sig_vec
     PipeBarrier<PIPE_V>();
 
     // Step 3: q7 → float, then err = base + q7 * step (broadcast per-row)
@@ -635,17 +616,9 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
         PipeBarrier<PIPE_V>();
     }
 
-    // Step 4: y = sign_val + err
-    Add(decoded, signF32Final, q7F32, n);
+    // Step 4: decoded = err * sig_vec (restore sign per dimension)
+    Mul(decoded, q7F32, signF32Final, n);
     PipeBarrier<PIPE_V>();
-
-    // Step 5: y * norm (broadcast per-row)
-    for (uint32_t row = 0; row < mRows; ++row) {
-        const float norm = kNorm.GetValue(row);
-        auto rowFloat = decoded[row * D];
-        Muls(rowFloat, rowFloat, norm, D);
-        PipeBarrier<PIPE_V>();
-    }
 }
 
 // ---------------------------------------------------------------
@@ -796,7 +769,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         auto scoreBuf = ScoreBuf();
         auto reduceTmp = FloatScratchBuf();
         auto mulTmp = reduceTmp[TQ_BR_HEAD_SIZE];
-        auto reduceScalar = KNormBuf();
+        auto reduceScalar = KStepBuf();  // reuse KStep buffer as ReduceSum scalar temp
         turboquant_attn::VectorQkFloatPreScaled(
             qGroupFloat, decodedK, scoreBuf, reduceTmp, mulTmp, reduceScalar,
             gqaCount, mRows);

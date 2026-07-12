@@ -25,54 +25,63 @@ namespace bit_residual {
 
 using namespace AscendC;
 
-static constexpr int TQ_PACK_D = 128;
+// NOTE: TQ_UB_ALIGN used by TqAlignUp32; define it first.
 static constexpr uint32_t TQ_UB_ALIGN = 32;
+
+static constexpr uint32_t TqAlignUp32(uint32_t x) {
+    return (x + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
+}
+
+static constexpr int TQ_PACK_D = 128;
 static constexpr uint32_t TQ_KEY_GROUP_ROWS = 2;
 static constexpr uint32_t TQ_VAL_GROUP_ROWS = 4;
+static constexpr uint32_t TQ_BLOCK_ROWS = 16;  // rows per sub-block (lcm of key/val group rows)
+static constexpr uint32_t TQ_KEY_GROUPS_PER_BLOCK = TQ_BLOCK_ROWS / TQ_KEY_GROUP_ROWS;
+static constexpr uint32_t TQ_VAL_GROUPS_PER_BLOCK = TQ_BLOCK_ROWS / TQ_VAL_GROUP_ROWS;
 static constexpr uint32_t TQ_GROUP_INDEX_BYTES = TQ_PACK_D * sizeof(uint16_t);
-static constexpr uint32_t TQ_KEY_GROUP_NORM_BYTES = TQ_KEY_GROUP_ROWS * sizeof(uint16_t);
-static constexpr uint32_t TQ_KEY_GROUP_BASE_BYTES = TQ_KEY_GROUP_ROWS * sizeof(float);
-static constexpr uint32_t TQ_KEY_GROUP_STEP_BYTES = TQ_KEY_GROUP_ROWS * sizeof(float);
-static constexpr uint32_t TQ_KEY_GROUP_NORM_OFFSET = TQ_GROUP_INDEX_BYTES;
-static constexpr uint32_t TQ_KEY_GROUP_BASE_OFFSET =
-    TQ_KEY_GROUP_NORM_OFFSET + TQ_KEY_GROUP_NORM_BYTES;
-static constexpr uint32_t TQ_KEY_GROUP_STEP_OFFSET =
-    TQ_KEY_GROUP_BASE_OFFSET + TQ_KEY_GROUP_BASE_BYTES;
-static constexpr uint32_t TQ_KEY_GROUP_BYTES =
-    TQ_GROUP_INDEX_BYTES + TQ_KEY_GROUP_NORM_BYTES +
-    TQ_KEY_GROUP_BASE_BYTES + TQ_KEY_GROUP_STEP_BYTES;
-static constexpr uint32_t TQ_KEY_GROUP_STRIDE =
-    (TQ_KEY_GROUP_BYTES + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
-static constexpr uint32_t TQ_VAL_GROUP_VMIN_BYTES = TQ_VAL_GROUP_ROWS * sizeof(float);
-static constexpr uint32_t TQ_VAL_GROUP_VSTEP_BYTES = TQ_VAL_GROUP_ROWS * sizeof(float);
-static constexpr uint32_t TQ_VAL_GROUP_VMIN_OFFSET = TQ_GROUP_INDEX_BYTES;
-static constexpr uint32_t TQ_VAL_GROUP_VSTEP_OFFSET =
-    TQ_VAL_GROUP_VMIN_OFFSET + TQ_VAL_GROUP_VMIN_BYTES;
-static constexpr uint32_t TQ_VAL_GROUP_BYTES =
-    TQ_GROUP_INDEX_BYTES + TQ_VAL_GROUP_VMIN_BYTES + TQ_VAL_GROUP_VSTEP_BYTES;
-static constexpr uint32_t TQ_VAL_GROUP_STRIDE =
-    (TQ_VAL_GROUP_BYTES + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
-static constexpr uint32_t TQ_PACKED_GROUP_STRIDE =
-    TQ_KEY_GROUP_STRIDE > TQ_VAL_GROUP_STRIDE ? TQ_KEY_GROUP_STRIDE : TQ_VAL_GROUP_STRIDE;
+// ── 16-row sub-block layout: code zone | base zone | step zone ──────────────
+// Key sub-block: 8 groups × 256B code + 16 × 4B base + 16 × 4B step = 2176B
+// Value sub-block: 4 groups × 256B code + 16 × 4B vmin + 16 × 4B vstep = 1152B
+static constexpr uint32_t TQ_KEY_BLOCK_CODE_BYTES =
+    TQ_KEY_GROUPS_PER_BLOCK * TQ_GROUP_INDEX_BYTES;
+static constexpr uint32_t TQ_KEY_BLOCK_BASE_BYTES = TQ_BLOCK_ROWS * sizeof(float);
+static constexpr uint32_t TQ_KEY_BLOCK_STEP_BYTES = TQ_BLOCK_ROWS * sizeof(float);
+static constexpr uint32_t TQ_KEY_BLOCK_BASE_OFFSET = TQ_KEY_BLOCK_CODE_BYTES;
+static constexpr uint32_t TQ_KEY_BLOCK_STEP_OFFSET =
+    TQ_KEY_BLOCK_BASE_OFFSET + TQ_KEY_BLOCK_BASE_BYTES;
+static constexpr uint32_t TQ_KEY_BLOCK_STRIDE =
+    TqAlignUp32(TQ_KEY_BLOCK_CODE_BYTES + TQ_KEY_BLOCK_BASE_BYTES + TQ_KEY_BLOCK_STEP_BYTES);
+static constexpr uint32_t TQ_VAL_BLOCK_CODE_BYTES =
+    TQ_VAL_GROUPS_PER_BLOCK * TQ_GROUP_INDEX_BYTES;
+static constexpr uint32_t TQ_VAL_BLOCK_VMIN_BYTES = TQ_BLOCK_ROWS * sizeof(float);
+static constexpr uint32_t TQ_VAL_BLOCK_VSTEP_BYTES = TQ_BLOCK_ROWS * sizeof(float);
+static constexpr uint32_t TQ_VAL_BLOCK_VMIN_OFFSET = TQ_VAL_BLOCK_CODE_BYTES;
+static constexpr uint32_t TQ_VAL_BLOCK_VSTEP_OFFSET =
+    TQ_VAL_BLOCK_VMIN_OFFSET + TQ_VAL_BLOCK_VMIN_BYTES;
+static constexpr uint32_t TQ_VAL_BLOCK_STRIDE =
+    TqAlignUp32(TQ_VAL_BLOCK_CODE_BYTES + TQ_VAL_BLOCK_VMIN_BYTES + TQ_VAL_BLOCK_VSTEP_BYTES);
+static constexpr uint32_t TQ_PACKED_BLOCK_STRIDE =
+    TQ_KEY_BLOCK_STRIDE > TQ_VAL_BLOCK_STRIDE ? TQ_KEY_BLOCK_STRIDE : TQ_VAL_BLOCK_STRIDE;
 static constexpr uint32_t TQ_PACKED_GROUP_BUFFER_COUNT = 64;
+// ── Encoded row layout (intermediate format in UB before merge to cache) ────
+// Key encoded row: 128 × uint16 code + 1 × float base + 1 × float step
 static constexpr uint32_t TQ_KEY_ENCODED_ROW_BYTES =
-    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(uint16_t) + 2 * sizeof(float);
-static constexpr uint32_t TQ_KEY_ENCODED_NORM_WORD_OFFSET = TQ_PACK_D;
-static constexpr uint32_t TQ_KEY_ENCODED_BASE_BYTE_OFFSET =
-    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(uint16_t);
+    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(float);
+static constexpr uint32_t TQ_KEY_ENCODED_BASE_BYTE_OFFSET = TQ_PACK_D * sizeof(uint16_t);
 static constexpr uint32_t TQ_KEY_ENCODED_STEP_BYTE_OFFSET =
     TQ_KEY_ENCODED_BASE_BYTE_OFFSET + sizeof(float);
 static constexpr uint32_t TQ_KEY_ENCODED_ROW_STRIDE_BYTES =
-    (TQ_KEY_ENCODED_ROW_BYTES + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
+    TqAlignUp32(TQ_KEY_ENCODED_ROW_BYTES);
 static constexpr uint32_t TQ_KEY_ENCODED_ROW_STRIDE_WORDS =
     TQ_KEY_ENCODED_ROW_STRIDE_BYTES / sizeof(uint16_t);
+// Value encoded row: 128 × uint16 code + 1 × float vmin + 1 × float vstep
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_BYTES =
     TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(float);
 static constexpr uint32_t TQ_VAL_ENCODED_VMIN_BYTE_OFFSET = TQ_PACK_D * sizeof(uint16_t);
 static constexpr uint32_t TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET =
     TQ_VAL_ENCODED_VMIN_BYTE_OFFSET + sizeof(float);
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_BYTES =
-    (TQ_VAL_ENCODED_ROW_BYTES + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
+    TqAlignUp32(TQ_VAL_ENCODED_ROW_BYTES);
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_WORDS =
     TQ_VAL_ENCODED_ROW_STRIDE_BYTES / sizeof(uint16_t);
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
@@ -81,9 +90,9 @@ static constexpr uint32_t TQ_BATCH_ELEMS = TQ_MAX_BATCH_M * TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_K = TQ_PACK_D;
 static constexpr uint32_t TQ_ROT_N = TQ_PACK_D;
 static constexpr uint32_t TQ_DTYPE_BYTES = sizeof(uint16_t);
-static constexpr uint32_t TQ_NORM_STRIDE = TQ_UB_ALIGN / TQ_DTYPE_BYTES;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BYTE_OFFSET = 512 * 1024;
 static constexpr uint32_t TQ_MANUAL_GROUP_ROWS = TQ_VAL_GROUP_ROWS;
+static constexpr uint32_t TQ_MANUAL_STREAM_KIND_COUNT = 2;  // key stream + value stream per tile
 static constexpr uint32_t TQ_MANUAL_ROT_TILE_M = 32;
 static constexpr uint32_t TQ_MANUAL_ROT_TILE_ELEMS = TQ_MANUAL_ROT_TILE_M * TQ_ROT_K;
 static constexpr uint32_t TQ_MANUAL_HEADS_PER_TILE =
@@ -96,43 +105,20 @@ static constexpr uint32_t TQ_MANUAL_AIV_SLICE_ELEMS =
 static constexpr uint32_t TQ_MANUAL_ROT_A_L1_OFFSET = 0;
 static constexpr uint32_t TQ_MANUAL_ROT_B_L1_OFFSET =
     TQ_MANUAL_ROT_A_L1_OFFSET + TQ_MANUAL_ROT_TILE_ELEMS * TQ_DTYPE_BYTES;
-static constexpr uint32_t TQ_MANUAL_NORM_B_L0_BYTE_OFFSET =
-    TQ_ROT_K * TQ_ROT_N * TQ_DTYPE_BYTES;
-static constexpr uint32_t TQ_MANUAL_NORM_A_L0_BYTE_OFFSET =
-    TQ_MANUAL_ROT_TILE_M * TQ_ROT_K * TQ_DTYPE_BYTES;
-static constexpr uint32_t TQ_MANUAL_NORM_C_L0_BYTE_OFFSET =
-    TQ_MANUAL_ROT_TILE_M * TQ_ROT_N * sizeof(float);
-static constexpr uint32_t TQ_MANUAL_NORM_A_L0_EVENT = EVENT_ID0;
 static constexpr uint32_t TQ_MANUAL_ROT_A_L0_EVENT = EVENT_ID3;
-static constexpr uint32_t TQ_MANUAL_NORM_B_L0_EVENT = EVENT_ID2; 
-static constexpr uint32_t TQ_MANUAL_ROT_B_L0_EVENT = EVENT_ID1; 
-static constexpr uint32_t TQ_MANUAL_NORM_C_L0_EVENT = EVENT_ID0; 
-static constexpr uint32_t TQ_MANUAL_ROT_C_L0_EVENT = EVENT_ID1; 
+static constexpr uint32_t TQ_MANUAL_ROT_B_L0_EVENT = EVENT_ID1;
+static constexpr uint32_t TQ_MANUAL_ROT_C_L0_EVENT = EVENT_ID1;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT = 2;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_STRIDE_ELEMS = TQ_BATCH_ELEMS;
-static constexpr uint32_t TQ_MANUAL_NORM_MATRIX_DIM = TQ_MANUAL_AIV_SLICE_M;
-static constexpr uint32_t TQ_MANUAL_NORM_MATRIX_ELEMS =
-    TQ_MANUAL_NORM_MATRIX_DIM * TQ_MANUAL_NORM_MATRIX_DIM;
-static constexpr uint32_t TQ_MANUAL_NORM_WORKSPACE_STRIDE_FLOATS =
-    TQ_MANUAL_WORKSPACE_STRIDE_ELEMS * TQ_DTYPE_BYTES / sizeof(float);
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE =
     TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS * 2;
 static constexpr uint32_t TQ_MANUAL_C_WORKSPACE_ELEM_OFFSET =
     TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS;
-static constexpr uint32_t TQ_MANUAL_STREAM_KIND_COUNT = 2;
-static constexpr uint32_t TQ_MANUAL_NORM_BUFFER_COUNT = TQ_MANUAL_STREAM_KIND_COUNT;
-static constexpr uint32_t TQ_MANUAL_NORM_SLOT_ELEMS =
-    TQ_MANUAL_AIV_SLICE_M * TQ_NORM_STRIDE;
-static_assert(TQ_MANUAL_NORM_BUFFER_COUNT * TQ_MANUAL_NORM_SLOT_ELEMS <=
-              TQ_MAX_BATCH_M * TQ_NORM_STRIDE,
-              "Manual key1 norm ping-pong must fit in normsBuf_.");
 static constexpr uint16_t TQ_MANUAL_SYNC_A_FREE = 0;
 static constexpr uint16_t TQ_MANUAL_SYNC_A_READY = 1;
 static constexpr uint16_t TQ_MANUAL_SYNC_C_FREE = 2;
 static constexpr uint16_t TQ_MANUAL_SYNC_C_READY = 3;
 static constexpr uint16_t TQ_MANUAL_SYNC_PP_STRIDE = 4;
-static constexpr float TQ_NORM_EPS_F = 1e-10f;
-static constexpr float TQ_INV_SQRT_D_F = 0.08838834764831845f;
 static constexpr float TQ_KEY_QUANT_LEVELS_F = 127.0f;
 static constexpr float TQ_VAL_QUANT_LEVELS_F = 15.0f;
 static constexpr uint32_t TQ_SIGN_MASK_BYTES = 256;
@@ -154,9 +140,6 @@ struct ManualKey1StreamDesc {
 };
 
 // ── LocalTensor static buffer utilities (following turboquant_pack_kv_for_cache4bit) ──────
-static constexpr uint32_t TqAlignUp32(uint32_t x) {
-    return (x + TQ_UB_ALIGN - 1) / TQ_UB_ALIGN * TQ_UB_ALIGN;
-}
 
 template <typename T>
 __aicore__ inline AscendC::LocalTensor<T> TqMakeLocalTensor(
@@ -197,9 +180,8 @@ struct TqStaticLocalResource {
 // Hand-built LocalTensor buffer addresses live in one logical UB address space.
 // Do not reuse the same byte offsets across VECIN/VECOUT/VECCALC positions.
 // The pack pipeline only needs two large row buffers at the same time:
-//   normalize: XBatch + ABatch
-//   encode:    YBatch + EncodedBatch
-// Therefore X/Y share one slot, and A/encoded rows share another slot.
+//   encode: YBatch + EncodedBatch
+// Therefore X/Y share one slot, and encoded rows share another slot.
 static constexpr uint32_t TQ_UB_XY_BATCH_OFFSET = 0;
 static constexpr uint32_t TQ_UB_A_ENCODED_BATCH_OFFSET =
     TqAlignUp32(TQ_UB_XY_BATCH_OFFSET + TQ_BATCH_ELEMS * TQ_DTYPE_BYTES);
@@ -212,20 +194,16 @@ static constexpr uint32_t TQ_UB_A_ENCODED_BYTES =
     (TQ_BATCH_ELEMS * TQ_DTYPE_BYTES > TQ_UB_ENCODED_BATCH_BYTES)
         ? TQ_BATCH_ELEMS * TQ_DTYPE_BYTES
         : TQ_UB_ENCODED_BATCH_BYTES;
-static constexpr uint32_t TQ_UB_NORM_SCALAR_OFFSET =
-    TqAlignUp32(TQ_UB_A_ENCODED_BATCH_OFFSET + TQ_UB_A_ENCODED_BYTES);
-static constexpr uint32_t TQ_UB_NORMS_OFFSET =
-    TqAlignUp32(TQ_UB_NORM_SCALAR_OFFSET + TQ_UB_ALIGN);
 static constexpr uint32_t TQ_UB_SIGN_MASK_OFFSET =
-    TqAlignUp32(TQ_UB_NORMS_OFFSET + TQ_MAX_BATCH_M * TQ_NORM_STRIDE * TQ_DTYPE_BYTES);
+    TqAlignUp32(TQ_UB_A_ENCODED_BATCH_OFFSET + TQ_UB_A_ENCODED_BYTES);
 static constexpr uint32_t TQ_UB_Y_FP32_OFFSET =
     TqAlignUp32(TQ_UB_SIGN_MASK_OFFSET + TQ_SIGN_MASK_BYTES);
 static constexpr uint32_t TQ_UB_SIGN_VAL_OFFSET =
     TqAlignUp32(TQ_UB_Y_FP32_OFFSET + TQ_PACK_D * sizeof(float));
-static constexpr uint32_t TQ_UB_ERR_OFFSET =
+static constexpr uint32_t TQ_UB_REV_VEC_OFFSET =
     TqAlignUp32(TQ_UB_SIGN_VAL_OFFSET + TQ_PACK_D * sizeof(float));
 static constexpr uint32_t TQ_UB_QUANT_INDEX_OFFSET =
-    TqAlignUp32(TQ_UB_ERR_OFFSET + TQ_PACK_D * sizeof(float));
+    TqAlignUp32(TQ_UB_REV_VEC_OFFSET + TQ_PACK_D * sizeof(float));
 static constexpr uint32_t TQ_UB_QUANT_INDEX_U16_OFFSET =
     TqAlignUp32(TQ_UB_QUANT_INDEX_OFFSET + TQ_QUANT_INDEX_BYTES);
 static constexpr uint32_t TQ_UB_REDUCE_SCALAR_OFFSET =
@@ -237,13 +215,11 @@ static constexpr uint32_t TQ_UB_REDUCE_TMP_OFFSET =
 static constexpr uint32_t TQ_UB_PACKED_ROW_OFFSET =
     TqAlignUp32(TQ_UB_REDUCE_TMP_OFFSET + TQ_PACK_D * sizeof(float));
 static constexpr uint32_t TQ_UB_PACK_MERGE_OFFSET =
-    TqAlignUp32(TQ_UB_PACKED_ROW_OFFSET + TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_GROUP_STRIDE);
+    TqAlignUp32(TQ_UB_PACKED_ROW_OFFSET + TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_BLOCK_STRIDE);
 static constexpr uint32_t TQ_UB_PACK_MASK_OFFSET =
     TqAlignUp32(TQ_UB_PACK_MERGE_OFFSET + TQ_GROUP_INDEX_BYTES);
-static constexpr uint32_t TQ_UB_NORM_ONE_DIAG_OFFSET =
-    TqAlignUp32(TQ_UB_PACK_MASK_OFFSET + TQ_GROUP_INDEX_BYTES);
 static constexpr uint32_t TQ_UB_TOTAL_BYTES =
-    TqAlignUp32(TQ_UB_NORM_ONE_DIAG_OFFSET + TQ_MANUAL_AIV_SLICE_M * sizeof(float));
+    TqAlignUp32(TQ_UB_PACK_MASK_OFFSET + TQ_GROUP_INDEX_BYTES);
 static_assert(TQ_UB_TOTAL_BYTES <= TOTAL_UB_SIZE,
               "Bit-residual K8v4 static UB slices exceed UB size.");
 
@@ -415,15 +391,6 @@ public:
     }
 
     // ── VECCALC (UB compute scratch) ─────────────────────────────────────────
-    __aicore__ inline AscendC::LocalTensor<float> NormScalar() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_NORM_SCALAR_OFFSET, TQ_UB_ALIGN);
-    }
-    __aicore__ inline AscendC::LocalTensor<T> Norms() {
-        return local_.vecCalc.GetBufferByByte<T>(
-            TQ_UB_NORMS_OFFSET,
-            TQ_MAX_BATCH_M * TQ_NORM_STRIDE * TQ_DTYPE_BYTES);
-    }
     __aicore__ inline AscendC::LocalTensor<uint8_t> SignMask() {
         return local_.vecCalc.GetBufferByByte<uint8_t>(
             TQ_UB_SIGN_MASK_OFFSET, TQ_SIGN_MASK_BYTES);
@@ -436,9 +403,9 @@ public:
         return local_.vecCalc.GetBufferByByte<float>(
             TQ_UB_SIGN_VAL_OFFSET, TQ_PACK_D * sizeof(float));
     }
-    __aicore__ inline AscendC::LocalTensor<float> Err() {
+    __aicore__ inline AscendC::LocalTensor<float> RevVec() {
         return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_ERR_OFFSET, TQ_PACK_D * sizeof(float));
+            TQ_UB_REV_VEC_OFFSET, TQ_PACK_D * sizeof(float));
     }
     __aicore__ inline AscendC::LocalTensor<int32_t> QuantIndex() {
         return local_.vecCalc.GetBufferByByte<int32_t>(
@@ -456,37 +423,14 @@ public:
         return local_.vecCalc.GetBufferByByte<float>(
             TQ_UB_REDUCE_OUT_OFFSET, TQ_PACK_D * 3 * sizeof(float));
     }
-    // ── ReduceOut sub-slices for batch norm computation ──────────────────────
-    // Gram matrix occupies ReduceOut[0..255] (256 floats). After diagonal
-    // extraction, we use ReduceOut[256..303] for norm/invNorm float32 vectors.
-    __aicore__ inline AscendC::LocalTensor<float> NormDiagFp32() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REDUCE_OUT_OFFSET + TQ_MANUAL_NORM_MATRIX_ELEMS * sizeof(float),
-            TQ_MANUAL_AIV_SLICE_M * sizeof(float));
-    }
-    __aicore__ inline AscendC::LocalTensor<float> NormEpsDiagFp32() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REDUCE_OUT_OFFSET + (TQ_MANUAL_NORM_MATRIX_ELEMS + TQ_MANUAL_AIV_SLICE_M) * sizeof(float),
-            TQ_MANUAL_AIV_SLICE_M * sizeof(float));
-    }
-    __aicore__ inline AscendC::LocalTensor<float> InvNormDiagFp32() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REDUCE_OUT_OFFSET + (TQ_MANUAL_NORM_MATRIX_ELEMS + 2 * TQ_MANUAL_AIV_SLICE_M) * sizeof(float),
-            TQ_MANUAL_AIV_SLICE_M * sizeof(float));
-    }
     __aicore__ inline AscendC::LocalTensor<float> ReduceTmp() {
         return local_.vecCalc.GetBufferByByte<float>(
             TQ_UB_REDUCE_TMP_OFFSET, TQ_PACK_D * sizeof(float));
     }
-    // ── Constant-1 diagonal for norm Div ──────────────────────────────
-    __aicore__ inline AscendC::LocalTensor<float> NormOneDiag() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_NORM_ONE_DIAG_OFFSET, TQ_MANUAL_AIV_SLICE_M * sizeof(float));
-    }
     __aicore__ inline AscendC::LocalTensor<uint8_t> PackedRow() {
         return local_.vecCalc.GetBufferByByte<uint8_t>(
             TQ_UB_PACKED_ROW_OFFSET,
-            TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_GROUP_STRIDE);
+            TQ_PACKED_GROUP_BUFFER_COUNT * TQ_PACKED_BLOCK_STRIDE);
     }
     __aicore__ inline AscendC::LocalTensor<uint16_t> PackMerge() {
         return local_.vecCalc.GetBufferByByte<uint16_t>(
@@ -560,11 +504,11 @@ public:
         keyCacheGm_.SetGlobalBuffer(
             key_cache,
             (uint64_t)numBlocks_ * numHeads_ *
-                (blockSize_ / TQ_KEY_GROUP_ROWS) * TQ_KEY_GROUP_STRIDE);
+                (blockSize_ / TQ_BLOCK_ROWS) * TQ_KEY_BLOCK_STRIDE);
         valueCacheGm_.SetGlobalBuffer(
             value_cache,
             (uint64_t)numBlocks_ * numHeads_ *
-                (blockSize_ / TQ_VAL_GROUP_ROWS) * TQ_VAL_GROUP_STRIDE);
+                (blockSize_ / TQ_BLOCK_ROWS) * TQ_VAL_BLOCK_STRIDE);
 
         resource_.Init();
     }
@@ -573,14 +517,10 @@ public:
 
     __aicore__ inline void InitManualWorkspaceTensors(
         uint32_t manualGroupId,
-        AscendC::GlobalTensor<float>& normWorkGm,
         AscendC::GlobalTensor<T>& cWorkGm) const {
         __gm__ T* groupWork =
             manualWorkspace_ + static_cast<uint64_t>(manualGroupId) *
                                    TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE;
-        normWorkGm.SetGlobalBuffer(
-            reinterpret_cast<__gm__ float*>(groupWork),
-            TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_NORM_WORKSPACE_STRIDE_FLOATS);
         cWorkGm.SetGlobalBuffer(
             groupWork + TQ_MANUAL_C_WORKSPACE_ELEM_OFFSET,
             TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS);
@@ -596,14 +536,6 @@ public:
 
     __aicore__ inline uint32_t ManualBufferOffset(uint32_t streamOrdinal) const {
         return ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS;
-    }
-
-    __aicore__ inline uint32_t ManualNormBufferOffset(uint32_t streamOrdinal) const {
-        return ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_NORM_WORKSPACE_STRIDE_FLOATS;
-    }
-
-    __aicore__ inline AscendC::LocalTensor<T> ManualNorms(uint32_t streamOrdinal) {
-        return resource_.Norms()[ManualStreamBufferIndex(streamOrdinal) * TQ_MANUAL_NORM_SLOT_ELEMS];
     }
 
     __aicore__ inline uint64_t MakeInputSpan(

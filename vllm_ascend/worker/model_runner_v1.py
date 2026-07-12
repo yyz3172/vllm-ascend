@@ -2841,7 +2841,7 @@ class NPUModelRunner(GPUModelRunner):
                                     sz_i - k_part,
                                 )
                         # BitResidual k8v4: asymmetric slab layout with separate
-                        # key/value packed widths (288-byte group stride).
+                        # key/value packed widths (16-row sub-block layout).
                         # Compute the actual needed sizes from num_blocks (derived
                         # from sz_i / page_size_bytes) and k8v4 per-head packed widths.
                         if (
@@ -3106,7 +3106,7 @@ class NPUModelRunner(GPUModelRunner):
                                 and not self.model_config.use_mla):
                             turboquant_asym = True
                         # BitResidual k8v4: 8-bit key + 4-bit value with its own
-                        # slab layout (288-byte group stride, asymmetric K/V widths).
+                        # slab layout (16-row sub-block, asymmetric K/V widths).
                         if (self.ascend_config.turboquant_kv_bits_key == 8
                                 and self.ascend_config.turboquant_kv_bits_value == 4
                                 and kv_cache_spec.head_size == 128):

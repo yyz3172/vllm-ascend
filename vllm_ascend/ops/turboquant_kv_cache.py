@@ -734,21 +734,23 @@ def turboquant_slab_block_size(
 _TURBOQUANT_SLAB_GROUP_ROWS = 4
 
 # ---------------------------------------------------------------------------
-# BitResidual k8v4 cache layout constants
+# BitResidual k8v4 cache layout constants (sign-reversal, 16-row sub-blocks)
 # ---------------------------------------------------------------------------
-BIT_RESIDUAL_K8V4_GROUP_STRIDE = 288  # bytes per group (key or value)
-BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS = 2  # key rows per group
-BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS = 4  # value rows per group
+BIT_RESIDUAL_K8V4_BLOCK_ROWS = 16     # rows per sub-block
+BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS = 2  # key rows per group (within sub-block)
+BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS = 4  # value rows per group (within sub-block)
+BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE = 2176   # 8*256 code + 16*4 base + 16*4 step
+BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE = 1152   # 4*256 code + 16*4 vmin + 16*4 vstep
 
 
 def bit_residual_k8v4_key_packed_width(block_size: int) -> int:
-    """Packed byte width for key cache: (block_size / key_group_rows) * group_stride."""
-    return (block_size // BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS) * BIT_RESIDUAL_K8V4_GROUP_STRIDE
+    """Packed byte width for key cache: (block_size / block_rows) * key_block_stride."""
+    return (block_size // BIT_RESIDUAL_K8V4_BLOCK_ROWS) * BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
 
 
 def bit_residual_k8v4_value_packed_width(block_size: int) -> int:
-    """Packed byte width for value cache: (block_size / value_group_rows) * group_stride."""
-    return (block_size // BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS) * BIT_RESIDUAL_K8V4_GROUP_STRIDE
+    """Packed byte width for value cache: (block_size / block_rows) * val_block_stride."""
+    return (block_size // BIT_RESIDUAL_K8V4_BLOCK_ROWS) * BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE
 
 
 def _bit_residual_k8v4_slab_block_size_or_none(
@@ -761,12 +763,14 @@ def _bit_residual_k8v4_slab_block_size_or_none(
     if cache.ndim != 3:
         return None
     last_dim = cache.shape[-1]
-    if last_dim % BIT_RESIDUAL_K8V4_GROUP_STRIDE != 0:
-        return None
-    groups_per_head = last_dim // BIT_RESIDUAL_K8V4_GROUP_STRIDE
-    # Try key group rows (2) first, then value group rows (4)
-    if groups_per_head * BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS > 0:
-        return groups_per_head * BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS
+    # Try key block stride first
+    if last_dim % BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE == 0:
+        sub_blocks_per_head = last_dim // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
+        return sub_blocks_per_head * BIT_RESIDUAL_K8V4_BLOCK_ROWS
+    # Try value block stride
+    if last_dim % BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE == 0:
+        sub_blocks_per_head = last_dim // BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE
+        return sub_blocks_per_head * BIT_RESIDUAL_K8V4_BLOCK_ROWS
     return None
 
 
@@ -777,7 +781,10 @@ def bit_residual_k8v4_is_slab_cache(
     if cache.ndim != 3:
         return False
     last_dim = cache.shape[-1]
-    return last_dim % BIT_RESIDUAL_K8V4_GROUP_STRIDE == 0
+    return (
+        last_dim % BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE == 0
+        or last_dim % BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE == 0
+    )
 
 
 def _bit_residual_k8v4_rotation_t(
@@ -1364,7 +1371,7 @@ def turboquant_pack_kv_for_cache_to_cache(
 
     # ------------------------------------------------------------------
     # BitResidual k8v4 path: bits_key=8, bits_value=4
-    # Uses its own cache layout (288-byte group stride) and custom op.
+    # Sign-reversal quantization, 16-row sub-block layout.
     # ------------------------------------------------------------------
     if (
         bits_key == 8
@@ -1375,11 +1382,11 @@ def turboquant_pack_kv_for_cache_to_cache(
         and _c_ascend_turboquant_op_available("bit_residual_pack_k8v4")
     ):
         # Infer block_size from key_cache shape.
-        # key_cache: [num_blocks, num_kv_heads, (block_size/2)*288]
+        # key_cache: [num_blocks, num_kv_heads, (block_size/16)*2176]
         key_cache_last_dim = key_cache.shape[-1]
-        if key_cache_last_dim % BIT_RESIDUAL_K8V4_GROUP_STRIDE == 0:
-            groups_per_head = key_cache_last_dim // BIT_RESIDUAL_K8V4_GROUP_STRIDE
-            block_size_k8v4 = groups_per_head * BIT_RESIDUAL_K8V4_KEY_GROUP_ROWS
+        if key_cache_last_dim % BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE == 0:
+            sub_blocks_per_head = key_cache_last_dim // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
+            block_size_k8v4 = sub_blocks_per_head * BIT_RESIDUAL_K8V4_BLOCK_ROWS
             rotation_t = _bit_residual_k8v4_rotation_t(key.device, key.dtype)
             torch.ops._C_ascend.bit_residual_pack_k8v4(
                 key,
@@ -2312,7 +2319,7 @@ def bit_residual_attention_paged_k8v4(
     """
     if (
         head_size != 128
-        or block_size % BIT_RESIDUAL_K8V4_VALUE_GROUP_ROWS != 0
+        or block_size % BIT_RESIDUAL_K8V4_BLOCK_ROWS != 0
         or query.dtype not in (torch.float16, torch.bfloat16)
         or block_tables.numel() == 0
         or num_kv_heads <= 0
