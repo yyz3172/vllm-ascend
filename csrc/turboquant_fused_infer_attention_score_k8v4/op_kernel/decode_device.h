@@ -144,14 +144,12 @@ __aicore__ inline void DecodeRows8bit(
     rotateMm.SetTensorA(yHat, false);
     rotateMm.SetTensorB(rotationGm, false);
     rotateMm.SetLocalWorkspace(rotateWork);
-    // Match pack op: non-sequential GetTensorC per baseN tile assembles full [mPad,N]
-    // in cubeCGm; linear DataCopy(m*D) is valid. IterateAll does not reproduce this
-    // layout on MIX KFC (CANN: IterateAll expects continuous GM).
-    // while (rotateMm.Iterate()) {
-    //     rotateMm.GetTensorC(cubeCGm);
-    //     iterCount++;
-    // }
-    rotateMm.IterateAll(cubeCGm);
+    // Prefer Iterate+GetTensorC so each baseN tile lands at the correct GM offset
+    // in cubeCGm (design doc). IterateAll expects a contiguous C layout and can
+    // leave AIC scalar-spinning with aic_mac≈0 on MIX KFC.
+    while (rotateMm.Iterate()) {
+        rotateMm.GetTensorC(cubeCGm);
+    }
     rotateMm.End();
 
     AscendC::DataCopy(cubeFp32, cubeCGm, n);
