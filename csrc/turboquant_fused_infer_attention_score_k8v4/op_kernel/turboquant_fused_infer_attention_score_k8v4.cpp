@@ -213,14 +213,20 @@ private:
         uint32_t kvHead,
         uint32_t kvStart)
     {
+        // Prefetch block ids once per row (shared by index + norm copies).
+        uint32_t blockIds[TQ_UB_KV_TILE_CAP];
+        for (uint32_t t = 0; t < mRows; ++t) {
+            const uint32_t absPos = kvStart + t;
+            blockIds[t] = static_cast<uint32_t>(blockTableGm_.GetValue(
+                static_cast<uint64_t>(seqIdx) * maxBlocksPerSeq_ + (absPos / blockSize_)));
+        }
+
         AscendC::DataCopyExtParams copyParams{1, TQ_HEAD, 0, 0, 0};
         AscendC::DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         for (uint32_t t = 0; t < mRows; ++t) {
             const uint32_t absPos = kvStart + t;
-            const uint32_t blockId = static_cast<uint32_t>(blockTableGm_.GetValue(
-                static_cast<uint64_t>(seqIdx) * maxBlocksPerSeq_ + (absPos / blockSize_)));
             const uint32_t posInBlock = absPos % blockSize_;
-            const uint64_t srcOff = (((static_cast<uint64_t>(blockId) * blockSize_ + posInBlock) *
+            const uint64_t srcOff = (((static_cast<uint64_t>(blockIds[t]) * blockSize_ + posInBlock) *
                                       numKvHeads_ +
                                       kvHead) *
                                      keyRowBytes_);
@@ -231,10 +237,8 @@ private:
         const uint32_t normBase = mRows * TQ_HEAD;
         for (uint32_t t = 0; t < mRows; ++t) {
             const uint32_t absPos = kvStart + t;
-            const uint32_t blockId = static_cast<uint32_t>(blockTableGm_.GetValue(
-                static_cast<uint64_t>(seqIdx) * maxBlocksPerSeq_ + (absPos / blockSize_)));
             const uint32_t posInBlock = absPos % blockSize_;
-            const uint64_t srcOff = (((static_cast<uint64_t>(blockId) * blockSize_ + posInBlock) *
+            const uint64_t srcOff = (((static_cast<uint64_t>(blockIds[t]) * blockSize_ + posInBlock) *
                                       numKvHeads_ +
                                       kvHead) *
                                      keyRowBytes_);
@@ -252,16 +256,21 @@ private:
         uint32_t kvHead,
         uint32_t kvStart)
     {
+        uint32_t blockIds[TQ_UB_KV_TILE_CAP];
+        for (uint32_t t = 0; t < mRows; ++t) {
+            const uint32_t absPos = kvStart + t;
+            blockIds[t] = static_cast<uint32_t>(blockTableGm_.GetValue(
+                static_cast<uint64_t>(seqIdx) * maxBlocksPerSeq_ + (absPos / blockSize_)));
+        }
+
         auto valueRaw = valueRawBuf_.Get<uint8_t>();
         auto nibbleMask = nibbleMaskBuf_.Get<uint8_t>();
         AscendC::DataCopyExtParams copyParams{1, TQ_V_PACKED, 0, 0, 0};
         AscendC::DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         for (uint32_t t = 0; t < mRows; ++t) {
             const uint32_t absPos = kvStart + t;
-            const uint32_t blockId = static_cast<uint32_t>(blockTableGm_.GetValue(
-                static_cast<uint64_t>(seqIdx) * maxBlocksPerSeq_ + (absPos / blockSize_)));
             const uint32_t posInBlock = absPos % blockSize_;
-            const uint64_t srcOff = (((static_cast<uint64_t>(blockId) * blockSize_ + posInBlock) *
+            const uint64_t srcOff = (((static_cast<uint64_t>(blockIds[t]) * blockSize_ + posInBlock) *
                                       numKvHeads_ +
                                       kvHead) *
                                      valueRowBytes_);
