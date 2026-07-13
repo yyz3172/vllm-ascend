@@ -52,14 +52,14 @@ from vllm_ascend.utils import enable_custom_op
 
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
-KEY_BLOCK_STRIDE = 2176
-VALUE_BLOCK_STRIDE = 1152
+KEY_BLOCK_STRIDE = 2112
+VALUE_BLOCK_STRIDE = 1088
 KEY_ROW_CODE_BYTES = HEAD_SIZE
 VALUE_ROW_CODE_BYTES = HEAD_SIZE // 2
 KEY_BLOCK_BASE_OFFSET = BLOCK_SIZE * KEY_ROW_CODE_BYTES
-KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_BASE_OFFSET + BLOCK_SIZE * 4
+KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_BASE_OFFSET + BLOCK_SIZE * 2
 VALUE_BLOCK_VMIN_OFFSET = BLOCK_SIZE * VALUE_ROW_CODE_BYTES
-VALUE_BLOCK_VSTEP_OFFSET = VALUE_BLOCK_VMIN_OFFSET + BLOCK_SIZE * 4
+VALUE_BLOCK_VSTEP_OFFSET = VALUE_BLOCK_VMIN_OFFSET + BLOCK_SIZE * 2
 INV_SQRT_D = 1.0 / math.sqrt(HEAD_SIZE)
 SEED = 2026
 
@@ -127,11 +127,11 @@ def _write_manual_single_kv_cache(
 
     key_block = key_cache[0, 0]
     key_block[:KEY_ROW_CODE_BYTES].zero_()
-    key_block[KEY_BLOCK_BASE_OFFSET : KEY_BLOCK_BASE_OFFSET + 4] = _scalar_bytes(
-        INV_SQRT_D, torch.float32
+    key_block[KEY_BLOCK_BASE_OFFSET : KEY_BLOCK_BASE_OFFSET + 2] = _scalar_bytes(
+        INV_SQRT_D, dtype
     )
-    key_block[KEY_BLOCK_STEP_OFFSET : KEY_BLOCK_STEP_OFFSET + 4] = _scalar_bytes(
-        0.0, torch.float32
+    key_block[KEY_BLOCK_STEP_OFFSET : KEY_BLOCK_STEP_OFFSET + 2] = _scalar_bytes(
+        0.0, dtype
     )
 
     value_block = value_cache[0, 0]
@@ -139,11 +139,11 @@ def _write_manual_single_kv_cache(
     value_block[:VALUE_ROW_CODE_BYTES] = (
         value_idx[0::2] | (value_idx[1::2] << 4)
     )
-    value_block[VALUE_BLOCK_VMIN_OFFSET : VALUE_BLOCK_VMIN_OFFSET + 4] = (
-        _scalar_bytes(-1.0, torch.float32)
+    value_block[VALUE_BLOCK_VMIN_OFFSET : VALUE_BLOCK_VMIN_OFFSET + 2] = (
+        _scalar_bytes(-1.0, dtype)
     )
-    value_block[VALUE_BLOCK_VSTEP_OFFSET : VALUE_BLOCK_VSTEP_OFFSET + 4] = (
-        _scalar_bytes(0.25, torch.float32)
+    value_block[VALUE_BLOCK_VSTEP_OFFSET : VALUE_BLOCK_VSTEP_OFFSET + 2] = (
+        _scalar_bytes(0.25, dtype)
     )
 
     return key_cache, value_cache, block_table
@@ -166,12 +166,12 @@ def _decode_key_row(
     q7 = (code >> 1).float()
     sign = (code & 1).float()
     sign_val = torch.where(sign == 0, 1.0, -1.0)
-    base = _read_float32(block[
-        KEY_BLOCK_BASE_OFFSET + pos_in_block * 4 : KEY_BLOCK_BASE_OFFSET + pos_in_block * 4 + 4
-    ])
-    step = _read_float32(block[
-        KEY_BLOCK_STEP_OFFSET + pos_in_block * 4 : KEY_BLOCK_STEP_OFFSET + pos_in_block * 4 + 4
-    ])
+    base = _read_dtype_scalar(block[
+        KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 : KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 + 2
+    ], dtype)
+    step = _read_dtype_scalar(block[
+        KEY_BLOCK_STEP_OFFSET + pos_in_block * 2 : KEY_BLOCK_STEP_OFFSET + pos_in_block * 2 + 2
+    ], dtype)
     return (base + q7 * step) * sign_val
 
 
@@ -181,6 +181,7 @@ def _decode_value_row(
     seq_idx: int,
     kv_head: int,
     abs_pos: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
     pos_in_block = abs_pos % BLOCK_SIZE
@@ -190,12 +191,12 @@ def _decode_value_row(
     idx4 = torch.empty(HEAD_SIZE, dtype=torch.float32)
     idx4[0::2] = (code & 0x0F).float()
     idx4[1::2] = (code >> 4).float()
-    vmin = _read_float32(block[
-        VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 4 : VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 4 + 4
-    ])
-    vstep = _read_float32(block[
-        VALUE_BLOCK_VSTEP_OFFSET + pos_in_block * 4 : VALUE_BLOCK_VSTEP_OFFSET + pos_in_block * 4 + 4
-    ])
+    vmin = _read_dtype_scalar(block[
+        VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 2 : VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 2 + 2
+    ], dtype)
+    vstep = _read_dtype_scalar(block[
+        VALUE_BLOCK_VSTEP_OFFSET + pos_in_block * 2 : VALUE_BLOCK_VSTEP_OFFSET + pos_in_block * 2 + 2
+    ], dtype)
     return vmin + idx4 * vstep
 
 
@@ -237,7 +238,7 @@ def _golden_attention(
             )
             values = torch.stack(
                 [
-                    _decode_value_row(value_cache, block_table, seq_idx, kv_head, pos)
+                    _decode_value_row(value_cache, block_table, seq_idx, kv_head, pos, dtype)
                     for pos in range(causal_end)
                 ],
                 dim=0,
@@ -344,7 +345,7 @@ def _decode_cache_rows(
         [
             torch.stack(
                 [
-                    _decode_value_row(value_cache, block_table, 0, head_idx, token_idx)
+                    _decode_value_row(value_cache, block_table, 0, head_idx, token_idx, dtype)
                     for head_idx in range(num_kv_heads)
                 ],
                 dim=0,

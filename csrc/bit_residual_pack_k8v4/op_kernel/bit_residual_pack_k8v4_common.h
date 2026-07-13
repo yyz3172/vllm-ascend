@@ -36,7 +36,7 @@ static constexpr int TQ_PACK_D = 128;
 static constexpr uint32_t TQ_BLOCK_ROWS = 16;
 static constexpr uint32_t TQ_KEY_ROW_CODE_BYTES = TQ_PACK_D;
 static constexpr uint32_t TQ_VAL_ROW_CODE_BYTES = TQ_PACK_D / 2;
-static constexpr uint32_t TQ_ROW_META_BYTES = sizeof(float);
+static constexpr uint32_t TQ_ROW_META_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_META_TILE_BYTES = TQ_BLOCK_ROWS * TQ_ROW_META_BYTES;
 static constexpr uint32_t TQ_PACKED_TILE_SCRATCH_BYTES =
     TQ_BLOCK_ROWS * TQ_KEY_ROW_CODE_BYTES;
@@ -488,11 +488,11 @@ public:
         keyCacheGm_.SetGlobalBuffer(
             key_cache,
             (uint64_t)numBlocks_ * numHeads_ *
-                blockSize_ * (TQ_KEY_ROW_CODE_BYTES + 2 * sizeof(float)));
+                blockSize_ * TQ_KEY_BYTES_PER_ROW);
         valueCacheGm_.SetGlobalBuffer(
             value_cache,
             (uint64_t)numBlocks_ * numHeads_ *
-                blockSize_ * (TQ_VAL_ROW_CODE_BYTES + 2 * sizeof(float)));
+                blockSize_ * TQ_VAL_BYTES_PER_ROW);
 
         resource_.Init();
     }

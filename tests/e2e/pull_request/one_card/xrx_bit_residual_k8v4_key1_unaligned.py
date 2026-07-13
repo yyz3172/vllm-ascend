@@ -55,18 +55,16 @@ H = 8
 BS = 128
 BLOCK_ROWS = 16
 # 16-row sub-block layout constants (matching kernel)
-KEY_BLOCK_STRIDE = 2176   # 16*128 code + 16*4 base + 16*4 step
-VAL_BLOCK_STRIDE = 1152   # 16*64 code + 16*4 vmin + 16*4 vstep
+KEY_BLOCK_STRIDE = 2112   # 16*128 code + 16*2 base + 16*2 step
+VAL_BLOCK_STRIDE = 1088   # 16*64 code + 16*2 vmin + 16*2 vstep
 KEY_ROW_CODE_BYTES = 128
 VAL_ROW_CODE_BYTES = 64
-KEY_GROUP_ROWS = 2
-VALUE_GROUP_ROWS = 4
 KEY_BLOCK_CODE_BYTES = BLOCK_ROWS * KEY_ROW_CODE_BYTES
 KEY_BLOCK_BASE_OFFSET = KEY_BLOCK_CODE_BYTES          # 2048
-KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_CODE_BYTES + 16 * 4  # 2112
+KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_CODE_BYTES + 16 * 2  # 2080
 VAL_BLOCK_CODE_BYTES = BLOCK_ROWS * VAL_ROW_CODE_BYTES
 VAL_BLOCK_VMIN_OFFSET = VAL_BLOCK_CODE_BYTES           # 1024
-VAL_BLOCK_VSTEP_OFFSET = VAL_BLOCK_CODE_BYTES + 16 * 4  # 1088
+VAL_BLOCK_VSTEP_OFFSET = VAL_BLOCK_CODE_BYTES + 16 * 2  # 1056
 
 SEED = 42
 # offset=0 aligned; offsets 1,2,3 cover unaligned key/value group rows;
@@ -97,6 +95,10 @@ def _u8_to_float32(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().view(torch.float32).clone()
 
 
+def _u8_to_dtype_float(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return x.contiguous().view(dtype).float().clone()
+
+
 def _decode_key_cache(
     cache: torch.Tensor,
     slots: torch.Tensor,
@@ -120,41 +122,23 @@ def _decode_key_cache(
     for token_idx, slot in enumerate(slots_cpu.tolist()):
         block_idx = slot // BS
         pos_in_block = slot % BS
-        sub_block_in_block = pos_in_block // BLOCK_ROWS
-        row_in_sub_block = pos_in_block % BLOCK_ROWS
-
-        # Sub-block base offset in the per-head slice
-        sub_block_base = sub_block_in_block * KEY_BLOCK_STRIDE
-
         for head in range(h):
-            sub = cache_cpu[block_idx, head, sub_block_base : sub_block_base + KEY_BLOCK_STRIDE]
-
-            group_idx = row_in_sub_block // KEY_GROUP_ROWS
-            group_row = row_in_sub_block % KEY_GROUP_ROWS
-            words = sub[:KEY_BLOCK_CODE_BYTES].contiguous().view(torch.uint16)
-            group_words = words[group_idx * D : (group_idx + 1) * D].to(torch.int32)
-            if group_row == 0:
-                first = group_words & 0xFF
-                code[token_idx, head] = (
-                    ((first & 0x7F) << 1) | (first >> 7)
-                ).to(torch.uint8)
-            else:
-                code[token_idx, head] = (group_words >> 8).to(torch.uint8)
-
-            # Base zone: 16 floats at KEY_BLOCK_BASE_OFFSET + row*4
-            base[token_idx, head] = _u8_to_float32(
-                sub[KEY_BLOCK_BASE_OFFSET + row_in_sub_block * 4 : KEY_BLOCK_BASE_OFFSET + row_in_sub_block * 4 + 4]
+            slab = cache_cpu[block_idx, head]
+            code_off = pos_in_block * KEY_ROW_CODE_BYTES
+            code[token_idx, head] = slab[code_off : code_off + D]
+            base_off = BS * KEY_ROW_CODE_BYTES + pos_in_block * 2
+            step_off = BS * (KEY_ROW_CODE_BYTES + 2) + pos_in_block * 2
+            base[token_idx, head] = _u8_to_dtype_float(
+                slab[base_off : base_off + 2], dtype
             ).item()
-
-            # Step zone: 16 floats at KEY_BLOCK_STEP_OFFSET + row*4
-            step[token_idx, head] = _u8_to_float32(
-                sub[KEY_BLOCK_STEP_OFFSET + row_in_sub_block * 4 : KEY_BLOCK_STEP_OFFSET + row_in_sub_block * 4 + 4]
+            step[token_idx, head] = _u8_to_dtype_float(
+                slab[step_off : step_off + 2], dtype
             ).item()
 
     return {"code": code, "base": base, "step": step}
 
 
-def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, torch.Tensor]:
+def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor, dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """Decode value cache using 16-row sub-block layout.
 
     Sub-block layout: [code zone (1024)] [vmin zone (64)] [vstep zone (64)] = 1152 bytes
@@ -173,31 +157,19 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor) -> dict[str, t
     for token_idx, slot in enumerate(slots_cpu.tolist()):
         block_idx = slot // BS
         pos_in_block = slot % BS
-        sub_block_in_block = pos_in_block // BLOCK_ROWS
-        row_in_sub_block = pos_in_block % BLOCK_ROWS
-
-        # Sub-block base offset in the per-head slice
-        sub_block_base = sub_block_in_block * VAL_BLOCK_STRIDE
-
         for head in range(h):
-            sub = cache_cpu[block_idx, head, sub_block_base : sub_block_base + VAL_BLOCK_STRIDE]
-
-            group_idx = row_in_sub_block // VALUE_GROUP_ROWS
-            group_row = row_in_sub_block % VALUE_GROUP_ROWS
-            words = sub[:VAL_BLOCK_CODE_BYTES].contiguous().view(torch.uint16)
-            group_words = words[group_idx * D : (group_idx + 1) * D].to(torch.int32)
-            idx4[token_idx, head] = (
-                (group_words >> (group_row * 4)) & 0x0F
-            ).to(torch.uint8)
-
-            # vmin zone: 16 floats at VAL_BLOCK_VMIN_OFFSET + row*4
-            vmin[token_idx, head] = _u8_to_float32(
-                sub[VAL_BLOCK_VMIN_OFFSET + row_in_sub_block * 4 : VAL_BLOCK_VMIN_OFFSET + row_in_sub_block * 4 + 4]
+            slab = cache_cpu[block_idx, head]
+            code_off = pos_in_block * VAL_ROW_CODE_BYTES
+            packed = slab[code_off : code_off + VAL_ROW_CODE_BYTES]
+            idx4[token_idx, head, 0::2] = packed & 0x0F
+            idx4[token_idx, head, 1::2] = packed >> 4
+            vmin_off = BS * VAL_ROW_CODE_BYTES + pos_in_block * 2
+            vstep_off = BS * (VAL_ROW_CODE_BYTES + 2) + pos_in_block * 2
+            vmin[token_idx, head] = _u8_to_dtype_float(
+                slab[vmin_off : vmin_off + 2], dtype
             ).item()
-
-            # vstep zone: 16 floats at VAL_BLOCK_VSTEP_OFFSET + row*4
-            vstep[token_idx, head] = _u8_to_float32(
-                sub[VAL_BLOCK_VSTEP_OFFSET + row_in_sub_block * 4 : VAL_BLOCK_VSTEP_OFFSET + row_in_sub_block * 4 + 4]
+            vstep[token_idx, head] = _u8_to_dtype_float(
+                slab[vstep_off : vstep_off + 2], dtype
             ).item()
 
     return {"idx4": idx4, "vmin": vmin, "vstep": vstep}
@@ -402,7 +374,7 @@ def _run_case(
         )
 
     key_dec = _decode_key_cache(key_cache_1, slots, dtype)
-    value_dec = _decode_value_cache(value_cache_1, slots)
+    value_dec = _decode_value_cache(value_cache_1, slots, dtype)
     _assert_match(
         name, dtype, key_dec, value_dec
     )
@@ -447,7 +419,7 @@ def _run_multi_req_case(
     torch.npu.synchronize()
 
     key_dec = _decode_key_cache(key_cache, slots, dtype)
-    value_dec = _decode_value_cache(value_cache, slots)
+    value_dec = _decode_value_cache(value_cache, slots, dtype)
     _assert_match(
         name, dtype, key_dec, value_dec
     )
@@ -508,7 +480,7 @@ def _run_rmw_case(
     # Save phase 1 decoded data for slots [1..3] (should survive phase 2)
     preserved_slots = torch.arange(offset1, offset1 + 3, dtype=torch.int32, device=device)
     key_dec_preserved_1 = _decode_key_cache(key_cache, preserved_slots, dtype)
-    value_dec_preserved_1 = _decode_value_cache(value_cache, preserved_slots)
+    value_dec_preserved_1 = _decode_value_cache(value_cache, preserved_slots, dtype)
 
     # Phase 2 write (overlapping)
     torch.ops._C_ascend.bit_residual_pack_k8v4(
@@ -518,7 +490,7 @@ def _run_rmw_case(
 
     # Verify: preserved slots [1..3] from phase 1 are unchanged
     key_dec_preserved_2 = _decode_key_cache(key_cache, preserved_slots, dtype)
-    value_dec_preserved_2 = _decode_value_cache(value_cache, preserved_slots)
+    value_dec_preserved_2 = _decode_value_cache(value_cache, preserved_slots, dtype)
 
     for field in ("code", "base", "step"):
         torch.testing.assert_close(
@@ -533,7 +505,7 @@ def _run_rmw_case(
 
     # Verify: phase 2 slots [4..13] match phase 2 output
     key_dec_phase2 = _decode_key_cache(key_cache, slots2, dtype)
-    value_dec_phase2 = _decode_value_cache(value_cache, slots2)
+    value_dec_phase2 = _decode_value_cache(value_cache, slots2, dtype)
     _assert_match(
         f"{name}_phase2", dtype, key_dec_phase2, value_dec_phase2,
     )

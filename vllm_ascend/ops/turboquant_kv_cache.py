@@ -737,8 +737,8 @@ _TURBOQUANT_SLAB_GROUP_ROWS = 4
 # BitResidual k8v4 cache layout constants (sign-reversal, 16-row sub-blocks)
 # ---------------------------------------------------------------------------
 BIT_RESIDUAL_K8V4_BLOCK_ROWS = 16     # rows per sub-block
-BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE = 2176   # 8*256 code + 16*4 base + 16*4 step
-BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE = 1152   # 4*256 code + 16*4 vmin + 16*4 vstep
+BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE = 2112   # 16*128 code + 16*2 base + 16*2 step
+BIT_RESIDUAL_K8V4_VAL_BLOCK_STRIDE = 1088   # 16*64 code + 16*2 vmin + 16*2 vstep
 
 
 def bit_residual_k8v4_key_packed_width(block_size: int) -> int:
@@ -1380,7 +1380,7 @@ def turboquant_pack_kv_for_cache_to_cache(
         and _c_ascend_turboquant_op_available("bit_residual_pack_k8v4")
     ):
         # Infer block_size from key_cache shape.
-        # key_cache: [num_blocks, num_kv_heads, (block_size/16)*2176]
+        # key_cache: [num_blocks, num_kv_heads, (block_size/16)*2112]
         key_cache_last_dim = key_cache.shape[-1]
         if key_cache_last_dim % BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE == 0:
             sub_blocks_per_head = key_cache_last_dim // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
