@@ -6,7 +6,7 @@ cd "${ROOT_DIR}"
 
 source xrx_infoenvs
 
-RUNNER=${RUNNER:-"${ROOT_DIR}/mytmp/flex_tq_4bit_perf/flex_tq_4bit_perf"}
+RUNNER=${RUNNER:-"${ROOT_DIR}/ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf"}
 DEVICE=${DEVICE:-0}
 SEQ_LEN=${SEQ_LEN:-512}
 DECODE_SEQ_LEN=${DECODE_SEQ_LEN:-2048}

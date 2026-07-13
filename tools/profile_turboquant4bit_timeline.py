@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tmp-dir",
         default=os.getenv("TQ4BIT_TIMELINE_TMP_DIR",
-                          "mytmp/turboquant4bit_timeline"))
+                          "ztmp/turboquant4bit_timeline"))
     return parser.parse_args()
 
 

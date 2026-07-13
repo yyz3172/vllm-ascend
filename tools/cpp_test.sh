@@ -8,7 +8,7 @@ VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD=fast
 ATB_STREAM_SYNC_EVERY_RUNNER_ENABLE=0
 ASCEND_RT_VISIBLE_DEVICES=0
 ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE=0
-VLLM_TORCH_PROFILER_DIR=${SCRIPT_DIR}../mytmp/logs
+VLLM_TORCH_PROFILER_DIR=${SCRIPT_DIR}../ztmp/logs
 ATB_OPSRUNNER_KERNEL_CACHE_GLOABL_COUNT=5
 LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:
 ATB_HOME_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1
@@ -52,6 +52,6 @@ g++ -std=c++17 test_tq_decode.cpp \
     -L${CUSTOM_OPP_PATH}/op_api/lib \
     -lascendcl -lacl_op_compiler -lcust_opapi -lnnopbase \
     -Wl,-rpath,${CUSTOM_OPP_PATH}/op_api/lib \
-    -o ${ROOT_DIR}/mytmp/test_turboquant_decode_paged8bit
+    -o ${ROOT_DIR}/ztmp/test_turboquant_decode_paged8bit
 
 

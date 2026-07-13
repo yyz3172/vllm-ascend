@@ -160,6 +160,8 @@ def analyze_profile(base_dir: str) -> None:
             ),
         ),
         ("aten::contiguous", "aten::contiguous", None),
+        ("BitResidualPackK8v4", "BitResidualPackK8v4", None),
+        ("BitResidualAttentionPagedK8v4", "BitResidualAttentionPagedK8v4", None),
         ("TurboquantPackKvForCache4bit", "TurboquantPackKvForCache4bit", None),
         ("TurboquantAttentionPaged4bit", "TurboquantAttentionPaged4bit", None),
         ("TurboquantAttentionPaged8bit", "TurboquantAttentionPaged8bit", None),

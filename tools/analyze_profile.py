@@ -198,7 +198,7 @@ def main() -> None:
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <profile_directory>")
         print("\nExample:")
-        print(f"  {sys.argv[0]} /root/x00827378/perflog2/rank0_365135_20260615111639773_ascend_pt")
+        print(f"  {sys.argv[0]} /root/x00827378/ztmp/perflog2/rank0_365135_20260615111639773_ascend_pt")
         sys.exit(1)
 
     base_dir = sys.argv[1]

@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${ROOT_DIR}"
 
-OUT_DIR=${OUT_DIR:-"${ROOT_DIR}/mytmp/pack4bit_branch_profiles"}
-RUNNER=${RUNNER:-"${ROOT_DIR}/mytmp/flex_tq_4bit_perf/flex_tq_4bit_perf"}
-DEBUG_BUILD_DIR=${DEBUG_BUILD_DIR:-"${ROOT_DIR}/mytmp/build_libcust_opapi_nodebug_debug_line"}
+OUT_DIR=${OUT_DIR:-"${ROOT_DIR}/ztmp/pack4bit_branch_profiles"}
+RUNNER=${RUNNER:-"${ROOT_DIR}/ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf"}
+DEBUG_BUILD_DIR=${DEBUG_BUILD_DIR:-"${ROOT_DIR}/ztmp/build_libcust_opapi_nodebug_debug_line"}
 SOC_DIR=${SOC_DIR:-ascend910b}
 PACK_TOKENS=${PACK_TOKENS:-512}
 HEADS=${HEADS:-16}
@@ -91,14 +91,14 @@ EOF
         if [[ -z "${opprof}" || "${dir}" -nt "${opprof}" ]]; then
             opprof="${dir}"
         fi
-    done < <(find "${ROOT_DIR}/mytmp" -maxdepth 1 -type d -name 'OPPROF_*' -newer "${marker}")
+    done < <(find "${ROOT_DIR}/ztmp" -maxdepth 1 -type d -name 'OPPROF_*' -newer "${marker}")
 
     if [[ -z "${opprof}" ]]; then
         while IFS= read -r dir; do
             if [[ -z "${opprof}" || "${dir}" -nt "${opprof}" ]]; then
                 opprof="${dir}"
             fi
-        done < <(find "${ROOT_DIR}/mytmp" -maxdepth 1 -type d -name 'OPPROF_*')
+        done < <(find "${ROOT_DIR}/ztmp" -maxdepth 1 -type d -name 'OPPROF_*')
     fi
 
     if [[ -z "${opprof}" ]]; then

@@ -51,6 +51,11 @@ def _parse_turboquant_kv_bits_pair(raw: object) -> tuple[int, int]:
                 "additional_config['turboquant_kv_bits'] "
                 f"{name} width must be 4 or 8, got {b}"
             )
+    if k == 8 and v == 4:
+        # BitResidual k8v4: 8-bit key residual + 4-bit value uniform.
+        # Valid combination supported by bit_residual_pack_k8v4 /
+        # bit_residual_attention_paged_k8v4 kernels.
+        pass
     return k, v
 
 

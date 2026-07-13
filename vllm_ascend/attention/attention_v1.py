@@ -59,6 +59,8 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.turboquant_kv_cache import (
     _try_8bit_decode_paged,
+    bit_residual_attention_paged_k8v4,
+    bit_residual_k8v4_key_packed_width,
     turboquant_4bit_slab_cache_enabled,
     turboquant_attention_paged4bit,
     turboquant_attention_paged8bit,
@@ -191,6 +193,10 @@ class AscendAttentionBackend(AttentionBackend):
                 bits_value = cfg.turboquant_kv_bits_value
             except Exception:
                 bits_key = bits_value = None
+            # BitResidual k8v4: asymmetric 3D slab layout.
+            if bits_key == 8 and bits_value == 4 and head_size == 128:
+                key_width = bit_residual_k8v4_key_packed_width(block_size)
+                return (2, num_blocks, num_kv_heads, key_width)
             if turboquant_4bit_slab_cache_enabled(
                 bits_key, bits_value
             ):
@@ -532,6 +538,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_kv_heads=self.num_kv_heads,
                         scale=self.scale,
                     )
+                # Warm up BitResidual k8v4 rotation tensors (lazy-init quantizer).
+                if (
+                    self.turboquant_kv_bits_key == 8
+                    and self.turboquant_kv_bits_value == 4
+                    and head_size == 128
+                ):
+                    from vllm_ascend.ops.turboquant_kv_cache import (
+                        _bit_residual_k8v4_rotation_t,
+                        _bit_residual_k8v4_rotation,
+                    )
+                    _bit_residual_k8v4_rotation_t(
+                        torch.device("npu"), self.vllm_config.model_config.dtype
+                    )
+                    _bit_residual_k8v4_rotation(
+                        torch.device("npu"), self.vllm_config.model_config.dtype
+                    )
             except Exception:
                 pass
         else:
@@ -859,6 +881,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata):
         def _cache_view_for_fia(cache: torch.Tensor) -> tuple[int, torch.Tensor]:
             if self.kv_cache_dtype == "turboquant":
+                # BitResidual k8v4 uses its own attention op; cache is 3D slab.
+                # If k8v4 attention returns None (fallback), we need a view for
+                # standard FIA. For now, return a placeholder — k8v4 should not
+                # fall through to standard FIA.
+                if (
+                    self.turboquant_kv_bits_key == 8
+                    and self.turboquant_kv_bits_value == 4
+                    and cache.ndim == 3
+                ):
+                    # k8v4 cache: [num_blocks, num_heads, packed_width]
+                    # No valid FIA view; return cache directly as placeholder.
+                    block_size = self.vllm_config.cache_config.block_size
+                    return block_size, cache
                 slab_block_size = turboquant_slab_block_size_or_none(
                     cache,
                     head_size=self.head_size,
@@ -962,6 +997,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
+
+            # BitResidual k8v4 paged attention: 8-bit key + 4-bit value.
+            if (
+                self.turboquant_kv_bits_key == 8
+                and self.turboquant_kv_bits_value == 4
+                and self.head_size == 128
+                and attn_metadata.attn_state in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.ChunkedPrefill,
+                )
+            ):
+                attn_output = bit_residual_attention_paged_k8v4(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                )
+                if attn_output is not None:
+                    output[:num_tokens] = attn_output[:num_tokens]
+                    return output
+
             slab_block_size = turboquant_slab_block_size_or_none(
                 self.key_cache,
                 head_size=self.head_size,
@@ -1146,6 +1209,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value_cache = self.value_cache
         if self.kv_cache_dtype == "turboquant":
             assert key_cache is not None and value_cache is not None
+            # BitResidual k8v4: use its own paged attention op.
+            if (
+                self.turboquant_kv_bits_key == 8
+                and self.turboquant_kv_bits_value == 4
+                and self.head_size == 128
+            ):
+                attn_output = bit_residual_attention_paged_k8v4(
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_tables=block_table,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=self.vllm_config.cache_config.block_size,
+                    scale=self.scale,
+                )
+                if attn_output is not None:
+                    output.copy_(attn_output)
+                    return output
             key_cache, value_cache, block_table = turboquant_decode_kv_cache_compact(
                 key_cache=key_cache,
                 value_cache=value_cache,
