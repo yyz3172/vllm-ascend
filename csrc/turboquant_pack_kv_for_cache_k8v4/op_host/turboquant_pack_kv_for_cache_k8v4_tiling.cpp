@@ -189,8 +189,8 @@ static ge::graphStatus TurboquantPackKvForCacheK8v4TilingFunc(gert::TilingContex
     }
     // Decode-sized nVec: force small batches so multiple MIX groups parallelize
     // the 8-bit Key encode (dominant cost). Host attr may still pass align16(nVec).
-    if (nVec <= 32U && vecPerCore > 4U) {
-        vecPerCore = 4;
+    if (nVec <= 32U && vecPerCore > 2U) {
+        vecPerCore = 2;
     } else if (vecPerCore > 128) {
         vecPerCore = 128;
     }

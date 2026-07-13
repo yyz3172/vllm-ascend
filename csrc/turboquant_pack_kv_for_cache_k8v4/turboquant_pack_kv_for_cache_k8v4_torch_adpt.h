@@ -64,7 +64,7 @@ inline void turboquant_pack_kv_for_cache_k8v4(
     // (8-bit argmin) parallelizes across AICs. Cube mPad still AlignUp16(m).
     uint32_t vec_per_core = 128;
     if (n_vec <= 32) {
-        vec_per_core = 4;
+        vec_per_core = 2;
     } else if (n_vec < 128) {
         vec_per_core = 16;
     }
