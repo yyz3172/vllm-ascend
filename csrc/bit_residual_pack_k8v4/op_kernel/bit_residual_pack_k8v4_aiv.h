@@ -111,6 +111,129 @@ public:
     }
 
 private:
+    /*
+    
+        buf0=yBatch
+        原始数据 row_vec = buf0
+        计算绝对值
+        abs_vec = buf2 = abs(row_vec)
+        计算16个最大值
+        for (i:m) {
+        max_vec = ResuceMax(abs_vec, buf3, call_index=false)
+        }
+        把每个最大值填充乘一个Block
+        max_vec_blk = brcb(max_vec)
+        把abs_vec缩小max倍，降低取值范围到[0,1]
+        buf3 = div(abs_vec, max_vec_blk)
+        // 降低精度到16位
+        norm_vec_16 = buf4 = Cast(buf3)
+        // 提取首位符号位
+        buf2 = ShiftRight(row_vec, 31)
+        转化为u16
+        bit_vec_16=Cast(buf2)
+        // 计算16个最小值
+        for (i:m) {
+        base[i] = ResuceMax(norm_vec_16, , call_index=false)
+        }
+        max = {1,1,...}
+        gap = max - base
+        step = Divs(gap, 127)
+        // 每个base，step填充一个block
+        base_blk = brcb(base, 16)
+        step_blk = brcb(step，16)
+        对norm_vec_16进行量化 (x - base)/step
+        buf = sub(norm_vec_16, base_blk, repeatParams)
+        quant_16 = div(buf, step_blk, repeatParams)
+        quant_u16 = cast(quant_16)
+        buf = ShiftLeft(bit_vec_16, 7)
+        final_quant_16= or(buf, quant_u16)
+
+
+        base *= max_vec
+        step *= max_vec
+
+    */
+    __aicore__ inline void EncodeKeyBatchNew(uint32_t m) {
+        static constexpr uint32_t typePerBlock = 32 / sizeof(T);
+        static constexpr T quantStep = 1/127.0;
+        auto yBatch = context_.resource_.YBatchFloat();
+        auto encodedBatch = context_.resource_.KeyEncodedBatch();
+        auto buf0 = yBatch;
+        auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
+        auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<float>();
+        auto buf3 = context_.resource_.EncodeBuffer3().template ReinterpretCast<float>();
+        auto buf4 = context_.resource_.EncodeBuffer4().template ReinterpretCast<T>();
+        auto buf5 = context_.resource_.EncodeBuffer5().template ReinterpretCast<T>();
+        auto buf6 = context_.resource_.EncodeBuffer6().template ReinterpretCast<T>();
+        auto buf7 = context_.resource_.EncodeBuffer7().template ReinterpretCast<T>();
+        auto buf8 = context_.resource_.EncodeBuffer8().template ReinterpretCast<T>();
+
+        auto absVec = buf1;
+        auto maxVec = buf2;
+        AscendC::Abs(absVec, yBatch, TQ_PACK_D * m);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t yOff = i * TQ_ROT_N;
+            const uint32_t encodedOff = i * TQ_KEY_ENCODED_ROW_STRIDE_WORDS;
+            AscendC::ReduceMax<float>(maxVec[i], absVec[yOff], buf3, TQ_ROT_N);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        auto maxVecBlk = buf3;
+        AscendC::Brcb(maxVecBlk, maxVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        auto normVec = buf2;
+        AscendC::Div(normVec, absVec, maxVecBlk, 2048, 16, AscendC::BinaryRepeatParams(16, 16, 1, 8, 8, 0));
+        AscendC::PipeBarrier<PIPE_V>();
+        auto normVec16 = buf4;
+        AscendC::Cast(normVec16, normVec, AscendC::RoundMode::ROUND_HALF_UP);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto signVec = buf1.template ReinterpretCast<int32_t>();
+        AscendC::ShiftRight(signVec, yBatch.template ReinterpretCast<int32_t>(), 31, TQ_PACK_D * m);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto signVecU16 = buf5.template ReinterpretCast<uint16_t>();
+        AscendC::Cast(signVecU16, signVec, AscendC::RoundMode::CAST_NONE, TQ_PACK_D * m);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto baseVec = buf6;
+        auto stepVec = buf6[16];
+        auto gapVec = buf6[2*16];
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t yOff = i * TQ_ROT_N;
+            const uint32_t encodedOff = i * TQ_KEY_ENCODED_ROW_STRIDE_WORDS;
+            AscendC::ReduceMin<float>(baseVec[i], normVec16[yOff], buf3.template ReinterpretCast<float>(), TQ_ROT_N);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        auto oneVec = buf6[3*16];
+        AscendC::Duplicate(oneVec, static_cast<T>(1.0), typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(gapVec, oneVec, baseVec, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(stepVec, gapVec, quantStep, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto baseBlk = buf7;
+        auto stepBlk = buf7[16 * typePerBlock];
+        AscendC::Brcb(baseBlk, baseVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Brcb(stepBlk, stepVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        auto buf_vec = buf1.template ReinterpretCast<T>();
+        AscendC::Sub(buf_vec, normVec16, baseBlk, 2048, 16, AscendC::BinaryRepeatParams(16, 16, 1, 8, 8, 0));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Div(normVec16, buf_vec, stepBlk, 2048, 16, AscendC::BinaryRepeatParams(16, 16, 1, 8, 8, 0));
+        AscendC::PipeBarrier<PIPE_V>();
+        auto quant_u16 = buf_vec.template ReinterpretCast<uint16_t>();
+        AscendC::Cast(quant_u16, normVec16, AscendC::RoundMode::ROUND_HALF_UP);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto sig_buf = buf2.template ReinterpretCast<uint16_t>();
+        AscendC::ShiftLeft(sig_buf, signVecU16, 7, TQ_PACK_D * m);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto final_quant_16 = buf3.template ReinterpretCast<uint16_t>();
+        AscendC::Or(final_quant_16, sig_buf, quant_u16, TQ_PACK_D * m);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(baseVec, baseVec, maxVec, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(stepVec, stepVec, maxVec, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
     // ── Sign-reversal quantization for key rows ───────────────────────────
     // After rotation y = x @ R^T:
     //   sig_vec[d] = sign(y[d]) ? +1 : -1  (positive→+1, negative→-1)
