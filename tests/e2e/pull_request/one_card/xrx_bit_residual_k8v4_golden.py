@@ -56,8 +56,6 @@ KEY_BLOCK_STRIDE = 2176
 VALUE_BLOCK_STRIDE = 1152
 KEY_ROW_CODE_BYTES = HEAD_SIZE
 VALUE_ROW_CODE_BYTES = HEAD_SIZE // 2
-KEY_GROUP_ROWS = 2
-VALUE_GROUP_ROWS = 4
 KEY_BLOCK_BASE_OFFSET = BLOCK_SIZE * KEY_ROW_CODE_BYTES
 KEY_BLOCK_STEP_OFFSET = KEY_BLOCK_BASE_OFFSET + BLOCK_SIZE * 4
 VALUE_BLOCK_VMIN_OFFSET = BLOCK_SIZE * VALUE_ROW_CODE_BYTES
@@ -137,8 +135,10 @@ def _write_manual_single_kv_cache(
     )
 
     value_block = value_cache[0, 0]
-    value_idx = (torch.arange(HEAD_SIZE, dtype=torch.int32) % 16).to(torch.uint16)
-    value_block[:256] = value_idx.contiguous().view(torch.uint8)
+    value_idx = (torch.arange(HEAD_SIZE, dtype=torch.int32) % 16).to(torch.uint8)
+    value_block[:VALUE_ROW_CODE_BYTES] = (
+        value_idx[0::2] | (value_idx[1::2] << 4)
+    )
     value_block[VALUE_BLOCK_VMIN_OFFSET : VALUE_BLOCK_VMIN_OFFSET + 4] = (
         _scalar_bytes(-1.0, torch.float32)
     )
@@ -160,16 +160,8 @@ def _decode_key_row(
     block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
     pos_in_block = abs_pos % BLOCK_SIZE
     block = key_cache[block_id, kv_head]
-    group_idx = pos_in_block // KEY_GROUP_ROWS
-    group_row = pos_in_block % KEY_GROUP_ROWS
-    words = block[
-        group_idx * 256 : (group_idx + 1) * 256
-    ].contiguous().view(torch.uint16).to(torch.int32)
-    if group_row == 0:
-        first = words & 0xFF
-        code = ((first & 0x7F) << 1) | (first >> 7)
-    else:
-        code = words >> 8
+    code_off = pos_in_block * KEY_ROW_CODE_BYTES
+    code = block[code_off : code_off + KEY_ROW_CODE_BYTES].to(torch.int32)
 
     q7 = (code >> 1).float()
     sign = (code & 1).float()
@@ -193,12 +185,11 @@ def _decode_value_row(
     block_id = int(block_table[seq_idx, abs_pos // BLOCK_SIZE])
     pos_in_block = abs_pos % BLOCK_SIZE
     block = value_cache[block_id, kv_head]
-    group_idx = pos_in_block // VALUE_GROUP_ROWS
-    group_row = pos_in_block % VALUE_GROUP_ROWS
-    words = block[
-        group_idx * 256 : (group_idx + 1) * 256
-    ].contiguous().view(torch.uint16).to(torch.int32)
-    idx4 = ((words >> (group_row * 4)) & 0x0F).float()
+    code_off = pos_in_block * VALUE_ROW_CODE_BYTES
+    code = block[code_off : code_off + VALUE_ROW_CODE_BYTES].to(torch.int32)
+    idx4 = torch.empty(HEAD_SIZE, dtype=torch.float32)
+    idx4[0::2] = (code & 0x0F).float()
+    idx4[1::2] = (code >> 4).float()
     vmin = _read_float32(block[
         VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 4 : VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 4 + 4
     ])
@@ -314,6 +305,14 @@ def _assert_min_cosine(
         actual_cpu, expected_cpu, dim=0
     ).item()
     if cosine < min_cosine:
+        print(f"{name} actual[:16]={actual_cpu[:16]}")
+        print(f"{name} expected[:16]={expected_cpu[:16]}")
+        print(f"{name} row_cos={torch.nn.functional.cosine_similarity(actual.float().cpu().reshape(-1, HEAD_SIZE), expected.float().cpu().reshape(-1, HEAD_SIZE), dim=-1)}")
+        a0 = actual.float().cpu().reshape(-1, HEAD_SIZE)[0]
+        e0 = expected.float().cpu().reshape(-1, HEAD_SIZE)[0]
+        print(f"{name} sign_match_chunks={[(a0[i:i+16].sign() == e0[i:i+16].sign()).sum().item() for i in range(0, HEAD_SIZE, 16)]}")
+        print(f"{name} actual_chunks={[a0[i:i+4].tolist() for i in range(0, HEAD_SIZE, 16)]}")
+        print(f"{name} expected_chunks={[e0[i:i+4].tolist() for i in range(0, HEAD_SIZE, 16)]}")
         raise AssertionError(
             f"{name} cosine {cosine:.6f} is lower than {min_cosine:.6f}"
         )
