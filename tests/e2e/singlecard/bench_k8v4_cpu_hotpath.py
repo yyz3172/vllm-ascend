@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Microbench for K8V4 CPU hot-path helpers (C1/C2/C3/C4)."""
+"""Microbench for K8V4 CPU hot-path helpers (C2/C4 + bf16→fp16 rewrite)."""
 
 from __future__ import annotations
 
@@ -36,17 +36,14 @@ def main() -> None:
     seq = [1, 2]
     seq2 = [1, 2]  # same values, new list object
 
-    # Cold then warm seq cache
     cold = _us(lambda: _int32_seq_lens_on_device([3, 5, 9], device), iters=50)
     warm = _us(lambda: _int32_seq_lens_on_device(seq2, device), iters=500)
-    # Prime cache for seq
     t = _int32_seq_lens_on_device(seq, device)
     warm2 = _us(lambda: _int32_seq_lens_on_device(seq, device), iters=500)
     assert t.data_ptr() == _int32_seq_lens_on_device(seq, device).data_ptr()
 
     mask = torch.zeros(2, 1, 1, 256, dtype=torch.bfloat16, device=device)
     m0 = _us(lambda: _fp16_mask_on_device(mask), iters=200)
-    m1 = _us(lambda: _fp16_mask_on_device(mask), iters=500)
 
     cache = torch.zeros(4, 16, 8, 130, dtype=torch.uint8, device=device)
     prep = _us(
@@ -54,21 +51,22 @@ def main() -> None:
             cache, cache, head_size=128, bits_key=8, bits_value=4,
             activation_dtype=torch.bfloat16,
         ),
-        iters=500,
+        iters=50,
     )
     k, v = _prepare_k8v4_fused_read_caches(
         cache, cache, head_size=128, bits_key=8, bits_value=4,
         activation_dtype=torch.bfloat16,
     )
-    assert k.data_ptr() == cache.data_ptr() and v.data_ptr() == cache.data_ptr()
+    # Rewrite must clone (bf16 pack norms -> fp16 for fused FIA).
+    assert k.data_ptr() != cache.data_ptr() and v.data_ptr() != cache.data_ptr()
 
     gate = _us(lambda: (_get_fused_fia_k8v4_op(), _get_pack_k8v4_op()), iters=2000)
 
     print(f"seq cold(new lens)     {cold:.1f} us")
     print(f"seq warm(same values)  {warm:.1f} us")
     print(f"seq warm(same list)    {warm2:.1f} us")
-    print(f"mask first/cached      {m0:.1f} / {m1:.1f} us")
-    print(f"prep_cache (no-op)   {prep:.1f} us")
+    print(f"mask bf16->fp16        {m0:.1f} us")
+    print(f"prep_cache (rewrite)   {prep:.1f} us")
     print(f"gate handle cache      {gate:.1f} us")
     print("PASS")
 
