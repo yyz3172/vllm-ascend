@@ -269,7 +269,7 @@ private:
     //
     __aicore__ inline void EncodeValueBatch(uint32_t m) {
         auto yBatch = context_.resource_.YBatchFloat();
-        auto encodedBatch = context_.resource_.ValEncodedBatch();
+        auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto yFp32 = context_.resource_.YFp32();
         auto qFp32 = context_.resource_.RevVec();  // reuse RevVec buffer for value quant
         auto qI32 = context_.resource_.QuantIndex();
@@ -413,7 +413,7 @@ private:
             EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M);
         }
         TqSyncVToS();
-        auto encoded = IS_KEY ? op.resource_.KeyEncodedBatch() : op.resource_.ValEncodedBatch();
+        auto encoded = op.resource_.KeyEncodedBatch();
         auto scratch = op.resource_.PackedRow();
         const uint32_t codeBytes = IS_KEY ? TQ_KEY_ROW_CODE_BYTES : TQ_VAL_ROW_CODE_BYTES;
         const uint32_t headStride = HeadStride<IS_KEY>();
