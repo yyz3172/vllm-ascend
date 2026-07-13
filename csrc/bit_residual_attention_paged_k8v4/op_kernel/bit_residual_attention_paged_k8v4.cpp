@@ -414,19 +414,19 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
         TqBrSync<HardEvent::MTE2_S>();
 
-        const uint32_t headStride = blockSize_ * (TQ_BR_HEAD_SIZE + 2 * sizeof(float));
+        const uint32_t headStride = blockSize_ * (TQ_BR_HEAD_SIZE + 2 * sizeof(QueryT));
         const uint64_t headBase =
             (static_cast<uint64_t>(blockId) * numKvHeads_ + kvHead) * headStride;
         DataCopyExtParams copyParams{1, TQ_BR_HEAD_SIZE, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         DataCopyPad(packedRaw, keyCacheGm_[headBase + posInBlock * TQ_BR_HEAD_SIZE], copyParams, padParams);
-        DataCopyExtParams metaParams{1, sizeof(float), 0, 0, 0};
+        DataCopyExtParams metaParams{1, sizeof(QueryT), 0, 0, 0};
         DataCopyPad(packedRaw[TQ_BR_HEAD_SIZE],
-            keyCacheGm_[headBase + blockSize_ * TQ_BR_HEAD_SIZE + posInBlock * sizeof(float)],
+            keyCacheGm_[headBase + blockSize_ * TQ_BR_HEAD_SIZE + posInBlock * sizeof(QueryT)],
             metaParams, padParams);
         DataCopyPad(packedRaw[TQ_BR_HEAD_SIZE + 32],
-            keyCacheGm_[headBase + blockSize_ * (TQ_BR_HEAD_SIZE + sizeof(float)) +
-                        posInBlock * sizeof(float)], metaParams, padParams);
+            keyCacheGm_[headBase + blockSize_ * (TQ_BR_HEAD_SIZE + sizeof(QueryT)) +
+                        posInBlock * sizeof(QueryT)], metaParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
         TqBrSync<HardEvent::MTE2_S>();
 
@@ -437,10 +437,10 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
 
         // Read base and step at new offsets (base at rowInSubBlock*4 within base zone,
         // step at rowInSubBlock*4 within step zone).
-        const float base = TqBrReadFloatFromU8(packedRaw, floatScratch, TQ_BR_HEAD_SIZE);
+        const float base = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, TQ_BR_HEAD_SIZE);
         kBase.SetValue(row, base);
 
-        const float step = TqBrReadFloatFromU8(packedRaw, floatScratch, TQ_BR_HEAD_SIZE + 32);
+        const float step = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, TQ_BR_HEAD_SIZE + 32);
         kStep.SetValue(row, step);
     }
     TqBrSync<HardEvent::V_S>();
@@ -478,19 +478,19 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         TqBrSync<HardEvent::MTE2_S>();
 
         const uint32_t rowBytes = TQ_BR_HEAD_SIZE / 2;
-        const uint32_t headStride = blockSize_ * (rowBytes + 2 * sizeof(float));
+        const uint32_t headStride = blockSize_ * (rowBytes + 2 * sizeof(QueryT));
         const uint64_t headBase =
             (static_cast<uint64_t>(blockId) * numKvHeads_ + kvHead) * headStride;
         DataCopyExtParams copyParams{1, rowBytes, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
         DataCopyPad(packedRaw, valueCacheGm_[headBase + posInBlock * rowBytes], copyParams, padParams);
-        DataCopyExtParams metaParams{1, sizeof(float), 0, 0, 0};
+        DataCopyExtParams metaParams{1, sizeof(QueryT), 0, 0, 0};
         DataCopyPad(packedRaw[rowBytes],
-            valueCacheGm_[headBase + blockSize_ * rowBytes + posInBlock * sizeof(float)],
+            valueCacheGm_[headBase + blockSize_ * rowBytes + posInBlock * sizeof(QueryT)],
             metaParams, padParams);
         DataCopyPad(packedRaw[rowBytes + 32],
-            valueCacheGm_[headBase + blockSize_ * (rowBytes + sizeof(float)) +
-                          posInBlock * sizeof(float)], metaParams, padParams);
+            valueCacheGm_[headBase + blockSize_ * (rowBytes + sizeof(QueryT)) +
+                          posInBlock * sizeof(QueryT)], metaParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
         TqBrSync<HardEvent::MTE2_S>();
 
@@ -506,10 +506,10 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         PipeBarrier<PIPE_V>();
 
         // Read vmin and vstep at new offsets (rowInSubBlock*4 within vmin/vstep zone).
-        const float vmin = TqBrReadFloatFromU8(packedRaw, floatScratch, rowBytes);
+        const float vmin = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, rowBytes);
         vminBuf.SetValue(row, vmin);
 
-        const float vstep = TqBrReadFloatFromU8(packedRaw, floatScratch, rowBytes + 32);
+        const float vstep = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, rowBytes + 32);
         vstepBuf.SetValue(row, vstep);
     }
 

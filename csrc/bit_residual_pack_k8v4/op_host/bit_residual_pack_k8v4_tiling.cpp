@@ -160,8 +160,9 @@ static ge::graphStatus BitResidualPackK8v4TilingFunc(gert::TilingContext* contex
                   "num_blocks/num_reqs/strides must be positive");
         return ge::GRAPH_FAILED;
     }
-    if (blockSize % 4 != 0) {
-        OPS_LOG_E(nodeName, "4-bit group cache layout requires block_size multiple of 4, got %u",
+    if (blockSize % 16 != 0) {
+        OPS_LOG_E(nodeName,
+                  "independent-row cache layout requires block_size multiple of 16, got %u",
                   blockSize);
         return ge::GRAPH_FAILED;
     }

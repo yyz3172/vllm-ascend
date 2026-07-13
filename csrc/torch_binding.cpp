@@ -543,8 +543,8 @@ void bit_residual_pack_k8v4(
     int64_t block_size) {
     constexpr int64_t kHeadSize = 128;
     constexpr int64_t kBlockRows = 16;
-    constexpr int64_t kKeyBlockStride = 2176;
-    constexpr int64_t kValBlockStride = 1152;
+    constexpr int64_t kKeyBlockStride = 2112;
+    constexpr int64_t kValBlockStride = 1088;
     constexpr int64_t kKeyGroupRows = 2;
     constexpr int64_t kValueGroupRows = 4;
     TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
@@ -580,9 +580,9 @@ void bit_residual_pack_k8v4(
     TORCH_CHECK(block_size % kBlockRows == 0,
                 "BitResidual k8v4 cache layout requires block_size to be a multiple of 16");
     TORCH_CHECK(key_cache.size(2) == (block_size / kBlockRows) * kKeyBlockStride,
-                "key_cache last dim must equal (block_size / 16) * 2176");
+                "key_cache last dim must equal (block_size / 16) * 2112");
     TORCH_CHECK(value_cache.size(2) == (block_size / kBlockRows) * kValBlockStride,
-                "value_cache last dim must equal (block_size / 16) * 1152");
+                "value_cache last dim must equal (block_size / 16) * 1088");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous(),
                 "BitResidual caches must be contiguous");
 
@@ -712,8 +712,8 @@ at::Tensor bit_residual_attention_paged_k8v4(
     constexpr int64_t kBlockRows = 16;
     constexpr int64_t kKeyGroupRows = 2;
     constexpr int64_t kValueGroupRows = 4;
-    constexpr int64_t kKeyBlockStride = 2176;
-    constexpr int64_t kValBlockStride = 1152;
+    constexpr int64_t kKeyBlockStride = 2112;
+    constexpr int64_t kValBlockStride = 1088;
     TORCH_CHECK(query.is_privateuseone(), "query must be on NPU");
     TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
     TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
@@ -744,9 +744,9 @@ at::Tensor bit_residual_attention_paged_k8v4(
     TORCH_CHECK(key_cache.size(1) == num_kv_heads && value_cache.size(1) == num_kv_heads,
                 "cache num_kv_heads mismatch");
     TORCH_CHECK(key_cache.size(2) == (block_size / kBlockRows) * kKeyBlockStride,
-                "key_cache last dim must equal (block_size / 16) * 2176");
+                "key_cache last dim must equal (block_size / 16) * 2112");
     TORCH_CHECK(value_cache.size(2) == (block_size / kBlockRows) * kValBlockStride,
-                "value_cache last dim must equal (block_size / 16) * 1152");
+                "value_cache last dim must equal (block_size / 16) * 1088");
     TORCH_CHECK(actual_seq_len_q.size() > 0, "actual_seq_len_q must not be empty");
     TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(),
                 "actual_seq_len_q and actual_seq_len_kv must have the same length");
