@@ -463,6 +463,22 @@ __aicore__ inline void OnlineSoftmaxUpdateTileFloatGqa2(
 // eliminating all GetValue/SetValue implicit V↔S sync overhead (the primary
 // bottleneck in decode-only scenarios).
 
+// Vector PV for fp32 V tiles: prob[m] * V[m,:] accumulated into out row.
+__aicore__ inline void VectorPvFp32PreScaled(
+    AscendC::LocalTensor<float> scoreVec,
+    AscendC::LocalTensor<float> vTileFloat,
+    AscendC::LocalTensor<float> outAccRow,
+    AscendC::LocalTensor<float> weightedValue,
+    uint32_t mRows)
+{
+    for (uint32_t m = 0; m < mRows; ++m) {
+        const float beta = scoreVec.GetValue(m);
+        AscendC::Muls(weightedValue, vTileFloat[m * TQ_ATTN_HEAD], beta, TQ_ATTN_HEAD);
+        AscendC::Add(outAccRow, outAccRow, weightedValue, TQ_ATTN_HEAD);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
 // Online softmax update with V rows already scaled by their row norm (Scalar m/s).
 __aicore__ inline void OnlineSoftmaxUpdateTileFloatPreScaledScalar(
     AscendC::LocalTensor<float> scoreTile,
@@ -502,12 +518,8 @@ __aicore__ inline void OnlineSoftmaxUpdateTileFloatPreScaledScalar(
             AscendC::Muls(outAcc[outBase], outAcc[outBase], alpha, TQ_ATTN_HEAD);
             AscendC::PipeBarrier<PIPE_V>();
         }
-        for (uint32_t m = 0; m < mRows; ++m) {
-            const float beta = scoreVec.GetValue(m);
-            AscendC::Axpy(outAcc[outBase], vTileFloat[m * TQ_ATTN_HEAD], beta,
-                          TQ_ATTN_HEAD);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
+        VectorPvFp32PreScaled(
+            scoreVec, vTileFloat, outAcc[outBase], weightedValue, mRows);
         const float tileS = expBuf.GetValue(0);
         sState[g] = oldS * alpha + tileS;
         mState[g] = mNew;

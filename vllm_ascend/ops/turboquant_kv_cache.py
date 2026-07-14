@@ -65,7 +65,16 @@ _KNOWN_OPS = [
     "turboquant_attention_paged8bit",
     "turboquant_attention_paged4bit",
     "turboquant_pack_kv_for_cache_4bit",
+    "bit_residual_pack_k8v4",
+    "bit_residual_attention_paged_k8v4",
 ]
+
+_BIT_RESIDUAL_PACK_OP: object | bool | None = None
+_BIT_RESIDUAL_ATTN_OP: object | bool | None = None
+_SEQ_LEN_LIST_CACHE: dict[tuple[int, ...], list[int]] = {}
+_SEQ_LEN_LIST_CACHE_MAX = 256
+_BIT_RESIDUAL_K8V4_ROTATION_CACHE: dict[tuple[str, int, int], torch.Tensor] = {}
+_BIT_RESIDUAL_K8V4_LAYOUT_CACHE: dict[tuple, bool] = {}
 
 
 def _init_custom_op_cache() -> None:
@@ -101,6 +110,54 @@ def _c_ascend_turboquant_op_available(op_name: str) -> bool:
 
 # Initialize cache at module load time
 _init_custom_op_cache()
+
+
+def _get_bit_residual_pack_k8v4_op():
+    global _BIT_RESIDUAL_PACK_OP
+    if _BIT_RESIDUAL_PACK_OP is False:
+        return None
+    if _BIT_RESIDUAL_PACK_OP is not None:
+        return _BIT_RESIDUAL_PACK_OP
+    if not _c_ascend_turboquant_op_available("bit_residual_pack_k8v4"):
+        _BIT_RESIDUAL_PACK_OP = False
+        return None
+    _BIT_RESIDUAL_PACK_OP = torch.ops._C_ascend.bit_residual_pack_k8v4
+    return _BIT_RESIDUAL_PACK_OP
+
+
+def _get_bit_residual_attention_paged_k8v4_op():
+    global _BIT_RESIDUAL_ATTN_OP
+    if _BIT_RESIDUAL_ATTN_OP is False:
+        return None
+    if _BIT_RESIDUAL_ATTN_OP is not None:
+        return _BIT_RESIDUAL_ATTN_OP
+    if not _c_ascend_turboquant_op_available("bit_residual_attention_paged_k8v4"):
+        _BIT_RESIDUAL_ATTN_OP = False
+        return None
+    _BIT_RESIDUAL_ATTN_OP = torch.ops._C_ascend.bit_residual_attention_paged_k8v4
+    return _BIT_RESIDUAL_ATTN_OP
+
+
+def _cached_int_seq_lens(
+    seq_lens: list[int] | torch.Tensor | tuple[int, ...],
+) -> list[int]:
+    """Return a stable int list for int[] custom-op args, reusing across layers."""
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.detach().cpu().tolist()
+    if isinstance(seq_lens, tuple):
+        seq_lens = list(seq_lens)
+    if isinstance(seq_lens, list) and seq_lens and all(isinstance(x, int) for x in seq_lens):
+        ints = seq_lens
+    else:
+        ints = [int(x) for x in seq_lens]
+    key = tuple(ints)
+    cached = _SEQ_LEN_LIST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_SEQ_LEN_LIST_CACHE) >= _SEQ_LEN_LIST_CACHE_MAX:
+        _SEQ_LEN_LIST_CACHE.clear()
+    _SEQ_LEN_LIST_CACHE[key] = ints
+    return ints
 
 
 def pack_uint4(indices: torch.Tensor) -> torch.Tensor:
@@ -793,6 +850,11 @@ def _bit_residual_k8v4_rotation_t(
 
     Uses the same Haar orthogonal matrix (seed=42, dim=128) as TurboQuant MSE.
     """
+    device = _normalize_turboquant_device(device)
+    cache_key = (str(device), str(dtype), 0)
+    cached = _BIT_RESIDUAL_K8V4_ROTATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     quantizer = _get_quantizer(dim=128, bits=8, device=device)
     if dtype == torch.bfloat16:
         if (
@@ -802,11 +864,13 @@ def _bit_residual_k8v4_rotation_t(
             quantizer._rotation_t_bf16 = quantizer.rotation_t.to(
                 device=device, dtype=torch.bfloat16
             )
-        return quantizer._rotation_t_bf16
-    if dtype == torch.float16:
-        return quantizer._rotation_t_fp16.to(device=device)
-    # float32 fallback
-    return quantizer.rotation_t.to(device=device, dtype=dtype)
+        rotation = quantizer._rotation_t_bf16
+    elif dtype == torch.float16:
+        rotation = quantizer._rotation_t_fp16.to(device=device)
+    else:
+        rotation = quantizer.rotation_t.to(device=device, dtype=dtype)
+    _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key] = rotation
+    return rotation
 
 
 def _bit_residual_k8v4_rotation(
@@ -817,6 +881,11 @@ def _bit_residual_k8v4_rotation(
 
     Uses the same Haar orthogonal matrix (seed=42, dim=128) as TurboQuant MSE.
     """
+    device = _normalize_turboquant_device(device)
+    cache_key = (str(device), str(dtype), 1)
+    cached = _BIT_RESIDUAL_K8V4_ROTATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     quantizer = _get_quantizer(dim=128, bits=8, device=device)
     if dtype == torch.bfloat16:
         if (
@@ -826,10 +895,38 @@ def _bit_residual_k8v4_rotation(
             quantizer._rotation_bf16 = quantizer.rotation.to(
                 device=device, dtype=torch.bfloat16
             )
-        return quantizer._rotation_bf16
-    if dtype == torch.float16:
-        return quantizer._rotation_fp16.to(device=device)
-    return quantizer.rotation.to(device=device, dtype=dtype)
+        rotation = quantizer._rotation_bf16
+    elif dtype == torch.float16:
+        rotation = quantizer._rotation_fp16.to(device=device)
+    else:
+        rotation = quantizer.rotation.to(device=device, dtype=dtype)
+    _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key] = rotation
+    return rotation
+
+
+def _bit_residual_k8v4_layout_ok(
+    *,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_size: int,
+) -> bool:
+    cache_key = (
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
+        int(block_size),
+        str(key_cache.device),
+    )
+    cached = _BIT_RESIDUAL_K8V4_LAYOUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    expected_key_width = bit_residual_k8v4_key_packed_width(block_size)
+    expected_value_width = bit_residual_k8v4_value_packed_width(block_size)
+    ok = (
+        key_cache.shape[-1] == expected_key_width
+        and value_cache.shape[-1] == expected_value_width
+    )
+    _BIT_RESIDUAL_K8V4_LAYOUT_CACHE[cache_key] = ok
+    return ok
 
 
 def _require_group4_slab_block_size(block_size: int) -> None:
@@ -1377,8 +1474,9 @@ def turboquant_pack_kv_for_cache_to_cache(
         and head_size == 128
         and key.dtype in (torch.float16, torch.bfloat16)
         and key.device.type in ("npu", "privateuseone")
-        and _c_ascend_turboquant_op_available("bit_residual_pack_k8v4")
+        and _get_bit_residual_pack_k8v4_op() is not None
     ):
+        pack_op = _get_bit_residual_pack_k8v4_op()
         # Infer block_size from key_cache shape.
         # key_cache: [num_blocks, num_kv_heads, (block_size/16)*2176]
         key_cache_last_dim = key_cache.shape[-1]
@@ -1386,7 +1484,7 @@ def turboquant_pack_kv_for_cache_to_cache(
             sub_blocks_per_head = key_cache_last_dim // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
             block_size_k8v4 = sub_blocks_per_head * BIT_RESIDUAL_K8V4_BLOCK_ROWS
             rotation_t = _bit_residual_k8v4_rotation_t(key.device, key.dtype)
-            torch.ops._C_ascend.bit_residual_pack_k8v4(
+            pack_op(
                 key,
                 value,
                 slot_mapping,
@@ -2309,6 +2407,7 @@ def bit_residual_attention_paged_k8v4(
     num_kv_heads: int,
     block_size: int,
     scale: float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Call the bit_residual k8v4 paged attention op for decode/chunked-prefill.
 
@@ -2326,18 +2425,19 @@ def bit_residual_attention_paged_k8v4(
         return None
 
     # Verify cache shapes match k8v4 layout.
-    key_last_dim = key_cache.shape[-1]
-    value_last_dim = value_cache.shape[-1]
-    expected_key_width = bit_residual_k8v4_key_packed_width(block_size)
-    expected_value_width = bit_residual_k8v4_value_packed_width(block_size)
-    if key_last_dim != expected_key_width or value_last_dim != expected_value_width:
+    if not _bit_residual_k8v4_layout_ok(
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_size=block_size,
+    ):
         return None
 
-    if not _c_ascend_turboquant_op_available("bit_residual_attention_paged_k8v4"):
+    attn_op = _get_bit_residual_attention_paged_k8v4_op()
+    if attn_op is None:
         return None
 
-    actual_seq_lengths_q = [int(length) for length in actual_seq_lengths_q]
-    actual_seq_lengths_kv = [int(length) for length in actual_seq_lengths_kv]
+    actual_seq_lengths_q = _cached_int_seq_lens(actual_seq_lengths_q)
+    actual_seq_lengths_kv = _cached_int_seq_lens(actual_seq_lengths_kv)
     if (
         not actual_seq_lengths_q
         or len(actual_seq_lengths_q) != len(actual_seq_lengths_kv)
@@ -2354,20 +2454,29 @@ def bit_residual_attention_paged_k8v4(
     rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
     rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
 
-    out = torch.ops._C_ascend.bit_residual_attention_paged_k8v4(
-        _contiguous_if_needed(query),
-        _contiguous_if_needed(_uint8_storage_view(key_cache)),
-        _contiguous_if_needed(_uint8_storage_view(value_cache)),
-        _int32_contiguous_if_needed(block_tables),
+    query_work = query if query.is_contiguous() else query.contiguous()
+    key_work = key_cache if key_cache.is_contiguous() else key_cache
+    value_work = value_cache if value_cache.is_contiguous() else value_cache
+    block_work = _int32_contiguous_if_needed(block_tables)
+
+    out_buf = out if out is not None else None
+    result = attn_op(
+        query_work,
+        _uint8_storage_view(key_work),
+        _uint8_storage_view(value_work),
+        block_work,
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
-        _contiguous_if_needed(rotation_key),
-        _contiguous_if_needed(rotation_value),
+        rotation_key,
+        rotation_value,
         int(num_heads),
         int(num_kv_heads),
         int(head_size),
         int(block_size),
         int(max_actual_seq_len),
         float(scale),
+        out_buf,
     )
-    return out.view(query.shape[0], num_heads, head_size)
+    if out is not None:
+        return out.view(query.shape[0], num_heads, head_size)
+    return result.view(query.shape[0], num_heads, head_size)

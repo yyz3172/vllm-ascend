@@ -146,6 +146,39 @@ void SplitBn(uint32_t bn, uint32_t coreNum, uint32_t& usedCoreNum,
     }
 }
 
+constexpr float TQ_BR_FLASH_DECODE_BN_RATIO = 0.5f;
+constexpr uint32_t TQ_BR_FLASH_DECODE_MIN_KV_LEN = 1024;
+constexpr uint32_t TQ_BR_FLASH_DECODE_MIN_SEGMENT = 512;
+
+bool IsFlashDecodeK8v4(uint32_t taskCount, uint32_t maxKvLen, uint32_t aicNum)
+{
+    if (maxKvLen < TQ_BR_FLASH_DECODE_MIN_KV_LEN) {
+        return false;
+    }
+    return taskCount <= static_cast<uint32_t>(TQ_BR_FLASH_DECODE_BN_RATIO * aicNum);
+}
+
+void SplitBns(uint32_t bn, uint32_t maxKvLen, uint32_t blockSize, uint32_t coreNum,
+              uint32_t& usedCoreNum, uint32_t& kvSplitPart, uint32_t& kvSegmentLen,
+              uint32_t& formerCoreNum, uint32_t& blockSplitRange, uint32_t& tailSplitRange)
+{
+    formerCoreNum = 0;
+    blockSplitRange = 1;
+    tailSplitRange = 1;
+    kvSplitPart = (bn > 0 && coreNum >= bn) ? (coreNum / bn) : 1;
+    if (kvSplitPart == 0) {
+        kvSplitPart = 1;
+    }
+    while (((maxKvLen / kvSplitPart) < TQ_BR_FLASH_DECODE_MIN_SEGMENT) && (kvSplitPart > 1)) {
+        kvSplitPart--;
+    }
+    usedCoreNum = bn * kvSplitPart;
+    kvSegmentLen = (maxKvLen + kvSplitPart - 1) / kvSplitPart;
+    if (blockSize > 0) {
+        kvSegmentLen = AlignUp(kvSegmentLen, blockSize);
+    }
+}
+
 size_t CalcSystemWorkspaceSize(const platform_ascendc::PlatformAscendC& platform)
 {
     size_t ws = static_cast<size_t>(platform.GetLibApiWorkSpaceSize());
@@ -327,16 +360,25 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
         return ge::GRAPH_FAILED;
     }
 
-    // Initial release: only SplitBN Vector mode.
-    const uint32_t splitMode = TQ_BR_ATTN_SPLIT_BN;
+    // SplitBN for decode; SplitBNS + FlashDecode combine for long KV.
+    uint32_t splitMode = TQ_BR_ATTN_SPLIT_BN;
     const uint32_t qkPvMode = TQ_BR_ATTN_QKPV_VECTOR;
 
     uint32_t usedCoreNum = 0;
     uint32_t formerCoreNum = 0;
     uint32_t blockSplitRange = 0;
     uint32_t tailSplitRange = 0;
-    SplitBn(taskCount, parallelCoreNum, usedCoreNum, formerCoreNum, blockSplitRange,
-            tailSplitRange);
+    uint32_t kvSplitPart = 1;
+    uint32_t kvSegmentLen = maxActualSeqLen;
+    const bool flashDecode = IsFlashDecodeK8v4(taskCount, maxActualSeqLen, parallelCoreNum);
+    if (flashDecode) {
+        splitMode = TQ_BR_ATTN_SPLIT_BNS;
+        SplitBns(taskCount, maxActualSeqLen, blockSize, parallelCoreNum, usedCoreNum,
+                 kvSplitPart, kvSegmentLen, formerCoreNum, blockSplitRange, tailSplitRange);
+    } else {
+        SplitBn(taskCount, parallelCoreNum, usedCoreNum, formerCoreNum, blockSplitRange,
+                tailSplitRange);
+    }
 
     tiling.set_numTokens(numTokens);
     tiling.set_batchSize(batchSize);
@@ -353,7 +395,17 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
     tiling.set_usedCoreNum(usedCoreNum);
     tiling.set_splitMode(splitMode);
     tiling.set_qkPvMode(qkPvMode);
-    tiling.set_kvSegmentLen(maxActualSeqLen);
+    tiling.set_kvSegmentLen(kvSegmentLen);
+    tiling.set_kvSplitPart(kvSplitPart);
+    if (splitMode == TQ_BR_ATTN_SPLIT_BNS) {
+        tiling.set_accumOutSize(numTokens * numHeads * kvSplitPart * headSize);
+        tiling.set_logSumExpSize(numTokens * numHeads * kvSplitPart * 2);
+        tiling.set_partialWorkspaceOffset(CalcSystemWorkspaceSize(ascendcPlatform));
+    } else {
+        tiling.set_accumOutSize(0);
+        tiling.set_logSumExpSize(0);
+        tiling.set_partialWorkspaceOffset(0);
+    }
     tiling.set_formerCoreNum(formerCoreNum);
     tiling.set_blockSplitRange(blockSplitRange);
     tiling.set_tailSplitRange(tailSplitRange);
@@ -369,8 +421,7 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
 
     const uint32_t mixBlockDim =
         ascendcPlatform.CalcTschBlockDim(TQ_KFC_AIV_NUM, TQ_KFC_AIC_NUM, TQ_KFC_AIV_NUM);
-    const uint32_t dataCores = parallelCoreNum;
-    const uint32_t blockDim = dataCores * mixBlockDim;
+    const uint32_t blockDim = usedCoreNum * mixBlockDim;
 
     size_t* workspaces = context->GetWorkspaceSizes(1);
     if (workspaces == nullptr) {
@@ -378,20 +429,29 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
         return ge::GRAPH_FAILED;
     }
     workspaces[0] = CalcSystemWorkspaceSize(ascendcPlatform);
+    if (splitMode == TQ_BR_ATTN_SPLIT_BNS) {
+        const size_t accumBytes =
+            static_cast<size_t>(numTokens) * numHeads * kvSplitPart * headSize * sizeof(float);
+        const size_t lseBytes =
+            static_cast<size_t>(numTokens) * numHeads * kvSplitPart * 2 * sizeof(float);
+        workspaces[0] += accumBytes + lseBytes;
+    }
     if (workspaces[0] > MAX_USER_WORKSPACE) {
         OPS_LOG_E(nodeName, "workspace size %zu exceeds cap %zu", workspaces[0], MAX_USER_WORKSPACE);
         return ge::GRAPH_FAILED;
     }
 
     context->SetBlockDim(blockDim);
-    const uint64_t tilingKey = TQ_BR_ATTN_KEY_SPLITBN_VECTOR;
+    const uint64_t tilingKey = (splitMode == TQ_BR_ATTN_SPLIT_BNS)
+        ? TQ_BR_ATTN_KEY_SPLITBNS_VECTOR
+        : TQ_BR_ATTN_KEY_SPLITBN_VECTOR;
     context->SetTilingKey(tilingKey);
     OPS_LOG_I(nodeName,
               "BitResidualAttentionPagedK8v4 tiling: tokens=%u tasks=%u gqa=%u "
               "maxKv=%u maxActual=%u split=%u qkpv=%u kvTile=%u usedCore=%u "
               "dataCores=%u blockRange=%u tailRange=%u key=%lu ws=%zu",
               numTokens, taskCount, gqaGroup, maxKvLen, maxActualSeqLen,
-              splitMode, qkPvMode, kvTileRows, usedCoreNum, dataCores,
+              splitMode, qkPvMode, kvTileRows, usedCoreNum, parallelCoreNum,
               blockSplitRange, tailSplitRange, tilingKey, workspaces[0]);
     return ge::GRAPH_SUCCESS;
 }

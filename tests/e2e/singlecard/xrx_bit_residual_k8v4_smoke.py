@@ -34,8 +34,8 @@ from vllm import LLM, SamplingParams
 
 from vllm_ascend.ascend_config import clear_ascend_config
 
-MODEL_PATH = os.getenv("K8V4_SMOKE_MODEL_PATH", "../model/Qwen3-0.6B")
-PROFILE_DIR = os.getenv("K8V4_SMOKE_PROFILE_DIR", "perflog")
+MODEL_PATH = "/root/yyz/models/Qwen3-0.6B"
+PROFILE_DIR = "/root/yyz/pytorch_profiler/BitResidual/260713/k8v4_0.6B"
 PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_WARMUP_ITERATIONS", "2"))
 PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_ACTIVE_ITERATIONS", "2"))
 
@@ -84,7 +84,7 @@ def main() -> None:
             max_model_len=256,
             block_size=16,
             kv_cache_dtype="turboquant",
-            gpu_memory_utilization=0.03,
+            gpu_memory_utilization=0.05,
             # bits_key=8, bits_value=4 activates the BitResidual k8v4 path
             additional_config={"turboquant_kv_bits": [8, 4]},
             enforce_eager=True,

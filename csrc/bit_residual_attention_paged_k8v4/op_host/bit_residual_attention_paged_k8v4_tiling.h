@@ -26,7 +26,8 @@ constexpr uint32_t TQ_BR_ATTN_QKPV_VECTOR = 0;
 constexpr uint32_t TQ_BR_ATTN_QKPV_CUBE = 1;
 
 // Tiling keys (initial release: only key 0 = SplitBN Vector).
-constexpr uint64_t TQ_BR_ATTN_KEY_SPLITBN_VECTOR = 0;
+constexpr uint32_t TQ_BR_ATTN_KEY_SPLITBN_VECTOR = 0;
+constexpr uint64_t TQ_BR_ATTN_KEY_SPLITBNS_VECTOR = 1;
 
 BEGIN_TILING_DATA_DEF(BitResidualAttentionPagedK8v4TilingData)
 TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, decodeRotateTiling);
@@ -49,6 +50,10 @@ TILING_DATA_FIELD_DEF(uint32_t, kvSegmentLen);
 TILING_DATA_FIELD_DEF(uint32_t, formerCoreNum);
 TILING_DATA_FIELD_DEF(uint32_t, blockSplitRange);
 TILING_DATA_FIELD_DEF(uint32_t, tailSplitRange);
+TILING_DATA_FIELD_DEF(uint32_t, kvSplitPart);
+TILING_DATA_FIELD_DEF(uint32_t, accumOutSize);
+TILING_DATA_FIELD_DEF(uint32_t, logSumExpSize);
+TILING_DATA_FIELD_DEF(uint64_t, partialWorkspaceOffset);
 TILING_DATA_FIELD_DEF(float, scaleValue);
 END_TILING_DATA_DEF;
 

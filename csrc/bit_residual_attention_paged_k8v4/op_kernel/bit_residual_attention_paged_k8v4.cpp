@@ -28,6 +28,8 @@ using namespace bit_residual_attn;
 // ---------------------------------------------------------------
 static constexpr uint32_t TQ_BR_UB_KV_TILE_CAP = 64;
 static constexpr uint32_t TQ_BR_UB_GQA_CAP = 8;
+static constexpr uint32_t TQ_BR_SEQ_BINSEARCH_MIN_BATCH = 16;
+static constexpr uint32_t TQ_BR_MIX_AIV_SUB = 2;
 // Packed sub-block copy bytes (32B-aligned).
 // Key sub-block = 2176B, Val sub-block = 1152B. Use max for shared buffer.
 static constexpr uint32_t TQ_BR_BLOCK_COPY_BYTES = ((TQ_BR_KEY_BLOCK_STRIDE + 31) / 32) * 32;  // 2176 aligned to 32
@@ -114,16 +116,34 @@ constexpr uint32_t TQ_BR_UB_DECODED_BYTES = TQ_BR_UB_KV_TILE_CAP * TQ_BR_HEAD_SI
 constexpr uint32_t TQ_BR_UB_FLOAT_SCRATCH_OFFSET = TQ_BR_UB_DECODED_OFFSET + TQ_BR_UB_DECODED_BYTES;
 constexpr uint32_t TQ_BR_UB_FLOAT_SCRATCH_BYTES = TQ_BR_HEAD_SIZE * 2 * sizeof(float);
 
-// packedMaskBuf (uint16 mask constant, filled once)
+// packedMaskBuf (uint16 mask constants, filled once)
 constexpr uint32_t TQ_BR_UB_MASK_OFFSET = TQ_BR_UB_FLOAT_SCRATCH_OFFSET + TQ_BR_UB_FLOAT_SCRATCH_BYTES;
 constexpr uint32_t TQ_BR_UB_MASK_BYTES = TQ_BR_HEAD_SIZE * sizeof(uint16_t);
 
+constexpr uint32_t TQ_BR_UB_VAL_MASK_OFFSET = TQ_BR_UB_MASK_OFFSET + TQ_BR_UB_MASK_BYTES;
+constexpr uint32_t TQ_BR_UB_VAL_MASK_BYTES = TQ_BR_HEAD_SIZE * sizeof(uint16_t);
+
 // rotateWorkBuf (for Cube matmul workspace)
-constexpr uint32_t TQ_BR_UB_ROTATE_WORK_OFFSET = TQ_BR_UB_MASK_OFFSET + TQ_BR_UB_MASK_BYTES;
+constexpr uint32_t TQ_BR_UB_ROTATE_WORK_OFFSET = TQ_BR_UB_VAL_MASK_OFFSET + TQ_BR_UB_VAL_MASK_BYTES;
 constexpr uint32_t TQ_BR_UB_ROTATE_WORK_BYTES = TQ_BR_HEAD_SIZE * TQ_BR_HEAD_SIZE * TQ_BR_DTYPE_BYTES;  // 32768
 
 constexpr uint32_t TQ_BR_UB_TOTAL_BYTES = TQ_BR_UB_ROTATE_WORK_OFFSET + TQ_BR_UB_ROTATE_WORK_BYTES;
 static_assert(TQ_BR_UB_TOTAL_BYTES <= 192 * 1024, "UB budget exceeded");
+
+__aicore__ inline uint32_t TqBrAlignUp16(uint32_t x)
+{
+    return (x + 15U) / 16U * 16U;
+}
+
+template <typename T>
+__aicore__ inline void TqBrDuplicateZero(LocalTensor<T> dst, uint32_t count)
+{
+    if (count == 0) {
+        return;
+    }
+    Duplicate(dst, static_cast<T>(0), count);
+    PipeBarrier<PIPE_V>();
+}
 
 template <typename T>
 __aicore__ inline LocalTensor<T> TqMakeVecCalcLocalTensor(
@@ -155,13 +175,15 @@ public:
     __aicore__ inline void Init(GM_ADDR query, GM_ADDR keyCache, GM_ADDR valueCache,
                                 GM_ADDR blockTable, GM_ADDR actualSeqLenQ,
                                 GM_ADDR actualSeqLenKv, GM_ADDR rotationKey,
-                                GM_ADDR rotationValue, GM_ADDR out,
+                                GM_ADDR rotationValue, GM_ADDR out, GM_ADDR workspace,
                                 const TilingT* tilingData, TPipe* pipe,
                                 TqRotateMatmulOp<QueryT>* rotateMm);
     __aicore__ inline void Process();
 
 private:
     __aicore__ inline void ProcessSplitBn(uint32_t coreIdx);
+    __aicore__ inline void ProcessSplitBns(uint32_t coreIdx);
+    __aicore__ inline void CombineFlashDecode();
 
     // ---- KV tile loading ----
     __aicore__ inline void LoadPackedKeyTileRows(uint32_t seqIdx, uint32_t kvHead,
@@ -175,14 +197,29 @@ private:
 
     // ---- Attention compute ----
     __aicore__ inline void ComputeAttention(uint32_t tokenIdx, uint32_t kvHead,
-                                            uint32_t gqaStart, uint32_t gqaCount);
+                                            uint32_t gqaStart, uint32_t gqaCount,
+                                            uint32_t kvLoopStart = 0,
+                                            uint32_t kvLoopEnd = 0xFFFFFFFFu,
+                                            bool writePartial = false,
+                                            uint32_t segIdx = 0);
+    __aicore__ inline void WriteEmptyPartial(uint32_t tokenIdx, uint32_t kvHead,
+                                             uint32_t segIdx, uint32_t gqaStart,
+                                             uint32_t gqaCount);
+    __aicore__ inline void WritePartial(uint32_t tokenIdx, uint32_t kvHead, uint32_t segIdx,
+                                        float* mStateScalar, float* sStateScalar,
+                                        LocalTensor<float> outAcc, uint32_t gqaStart,
+                                        uint32_t gqaCount);
     __aicore__ inline void RotateRowsFloatScalar(LocalTensor<float> rows,
                                               GlobalTensor<QueryT>& rotationGm,
                                               uint32_t rowCount);
+    __aicore__ inline void RotateRowsInPlace(LocalTensor<float> rows,
+                                             GlobalTensor<QueryT>& rotationGm,
+                                             uint32_t rowCount);
 
     // ---- Helpers ----
     __aicore__ inline uint32_t GetCausalKvEnd(uint32_t tokenIdx, uint32_t seqIdx);
     __aicore__ inline void InitPackedMask();
+    __aicore__ inline uint32_t FindSeqIdx(uint32_t tokenIdx);
     __aicore__ inline float ReadSeqLenKv(uint32_t seqIdx);
 
     // ---- UB buffers (LocalTensor at static offsets) ----
@@ -246,6 +283,10 @@ private:
         return TqMakeVecCalcLocalTensor<uint16_t>(
             TQ_BR_UB_MASK_OFFSET, TQ_BR_UB_MASK_BYTES);
     }
+    __aicore__ inline LocalTensor<uint16_t> ValMaskBuf() {
+        return TqMakeVecCalcLocalTensor<uint16_t>(
+            TQ_BR_UB_VAL_MASK_OFFSET, TQ_BR_UB_VAL_MASK_BYTES);
+    }
     __aicore__ inline LocalTensor<uint8_t> RotateWorkBuf() {
         return TqMakeVecCalcLocalTensor<uint8_t>(
             TQ_BR_UB_ROTATE_WORK_OFFSET, TQ_BR_UB_ROTATE_WORK_BYTES);
@@ -266,7 +307,10 @@ private:
     uint32_t kvTileRows_ = 0;
     uint32_t usedCoreNum_ = 0;
     uint32_t splitMode_ = 0;
+    uint32_t kvSplitPart_ = 1;
+    uint32_t kvSegmentLen_ = 0;
     float scaleValue_ = 0.f;
+    __gm__ uint8_t* partialWorkspace_ = nullptr;
 
     // ---- GM tensors ----
     GlobalTensor<QueryT> queryGm_;
@@ -278,10 +322,13 @@ private:
     GlobalTensor<QueryT> rotationKeyGm_;
     GlobalTensor<QueryT> rotationValueGm_;
     GlobalTensor<QueryT> outGm_;
+    GlobalTensor<float> partialOutGm_;
+    GlobalTensor<float> partialLseGm_;
 
     // ---- Cube matmul ----
     TPipe* pipe_ = nullptr;
     TqRotateMatmulOp<QueryT>* rotateMm_ = nullptr;
+    bool matmulReady_ = false;
 };
 
 // ---------------------------------------------------------------
@@ -292,7 +339,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Ini
     GM_ADDR query, GM_ADDR keyCache, GM_ADDR valueCache,
     GM_ADDR blockTable, GM_ADDR actualSeqLenQ,
     GM_ADDR actualSeqLenKv, GM_ADDR rotationKey,
-    GM_ADDR rotationValue, GM_ADDR out,
+    GM_ADDR rotationValue, GM_ADDR out, GM_ADDR workspace,
     const TilingT* tilingData, TPipe* pipe,
     TqRotateMatmulOp<QueryT>* rotateMm)
 {
@@ -313,6 +360,8 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Ini
     kvTileRows_ = tiling_.kvTileRows;
     usedCoreNum_ = tiling_.usedCoreNum;
     splitMode_ = tiling_.splitMode;
+    kvSplitPart_ = tiling_.kvSplitPart;
+    kvSegmentLen_ = tiling_.kvSegmentLen;
     scaleValue_ = tiling_.scaleValue;
 
     // GM buffers
@@ -328,6 +377,19 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Ini
     rotationValueGm_.SetGlobalBuffer((__gm__ QueryT*)rotationValue, headSize_ * headSize_);
     outGm_.SetGlobalBuffer((__gm__ QueryT*)out, numTokens_ * numHeads_ * headSize_);
 
+    if (splitMode_ == 1 && tiling_.partialWorkspaceOffset > 0 && workspace != nullptr) {
+        partialWorkspace_ =
+            reinterpret_cast<__gm__ uint8_t*>(workspace) + tiling_.partialWorkspaceOffset;
+        const size_t accumBytes =
+            static_cast<size_t>(tiling_.accumOutSize) * sizeof(float);
+        partialOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(partialWorkspace_),
+                                      tiling_.accumOutSize);
+        partialLseGm_.SetGlobalBuffer(
+            reinterpret_cast<__gm__ float*>(partialWorkspace_ + accumBytes),
+            tiling_.logSumExpSize);
+    }
+
+    matmulReady_ = (GetSysWorkSpacePtr() != nullptr);
     InitPackedMask();
 }
 
@@ -336,10 +398,46 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Ini
 // ---------------------------------------------------------------
 template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::InitPackedMask() {
-    // Fill mask buffer with 0x00FF for key code byte extraction (8-bit code in uint16)
-    auto mask = MaskBuf();
-    Duplicate(mask, static_cast<uint16_t>(0x00FF), TQ_BR_HEAD_SIZE);
+    auto keyMask = MaskBuf();
+    Duplicate(keyMask, static_cast<uint16_t>(0x00FF), TQ_BR_HEAD_SIZE);
+    auto valMask = ValMaskBuf();
+    Duplicate(valMask, static_cast<uint16_t>(0x000F), TQ_BR_HEAD_SIZE);
     PipeBarrier<PIPE_V>();
+}
+
+// ---------------------------------------------------------------
+// FindSeqIdx() - map token index to batch sequence
+// ---------------------------------------------------------------
+template <typename TilingT, typename QueryT>
+__aicore__ inline uint32_t BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::FindSeqIdx(
+    uint32_t tokenIdx)
+{
+    TqBrSync<HardEvent::S_MTE2>();
+    if (batchSize_ <= TQ_BR_SEQ_BINSEARCH_MIN_BATCH) {
+        for (uint32_t i = 0; i < batchSize_; ++i) {
+            const int64_t end = actualSeqLenQGm_.GetValue(i);
+            if (static_cast<int64_t>(tokenIdx) < end) {
+                TqBrSync<HardEvent::MTE2_S>();
+                return i;
+            }
+        }
+        TqBrSync<HardEvent::MTE2_S>();
+        return batchSize_ > 0 ? batchSize_ - 1 : 0;
+    }
+
+    uint32_t lo = 0;
+    uint32_t hi = batchSize_;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        const int64_t end = actualSeqLenQGm_.GetValue(mid);
+        if (static_cast<int64_t>(tokenIdx) < end) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    TqBrSync<HardEvent::MTE2_S>();
+    return lo < batchSize_ ? lo : (batchSize_ > 0 ? batchSize_ - 1 : 0);
 }
 
 // ---------------------------------------------------------------
@@ -403,17 +501,24 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
 
+    int32_t blockIds[TQ_BR_UB_KV_TILE_CAP];
     for (uint32_t row = 0; row < mRows; ++row) {
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
+        blockIds[row] = blockTableGm_.GetValue(seqBlockBase + blockOffset);
+    }
+    TqBrSync<HardEvent::MTE2_S>();
+
+    uint64_t cachedSubBlockBase = UINT64_MAX;
+    DataCopyExtParams copyParams{1, TQ_BR_KEY_BLOCK_STRIDE, 0, 0, 0};
+    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+    for (uint32_t row = 0; row < mRows; ++row) {
+        const uint32_t absPos = absStart + row;
         const uint32_t posInBlock = absPos % blockSize_;
         const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
         const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
 
-        // Look up physical block from block_table.
-        TqBrSync<HardEvent::S_MTE2>();
-        const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
-        TqBrSync<HardEvent::MTE2_S>();
+        const int32_t blockId = blockIds[row];
 
         // Compute GM offset for this sub-block.
         const uint64_t subBlockBase =
@@ -421,11 +526,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
             static_cast<uint64_t>(kvHead) * keySubBlocksPerBlock * TQ_BR_KEY_BLOCK_STRIDE +
             static_cast<uint64_t>(subBlockInBlock) * TQ_BR_KEY_BLOCK_STRIDE;
 
-        DataCopyExtParams copyParams{1, TQ_BR_KEY_BLOCK_STRIDE, 0, 0, 0};
-        DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, keyCacheGm_[subBlockBase], copyParams, padParams);
-        TqBrSync<HardEvent::MTE2_V>();
-        TqBrSync<HardEvent::MTE2_S>();
+        if (subBlockBase != cachedSubBlockBase) {
+            DataCopyPad(packedRaw, keyCacheGm_[subBlockBase], copyParams, padParams);
+            TqBrSync<HardEvent::MTE2_V>();
+            TqBrSync<HardEvent::MTE2_S>();
+            cachedSubBlockBase = subBlockBase;
+        }
 
         const uint32_t groupInBlock = rowInSubBlock / TQ_BR_KEY_GROUP_ROWS;
         const uint32_t groupRow = rowInSubBlock % TQ_BR_KEY_GROUP_ROWS;
@@ -481,16 +587,24 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
 
+    int32_t blockIds[TQ_BR_UB_KV_TILE_CAP];
     for (uint32_t row = 0; row < mRows; ++row) {
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
+        blockIds[row] = blockTableGm_.GetValue(seqBlockBase + blockOffset);
+    }
+    TqBrSync<HardEvent::MTE2_S>();
+
+    uint64_t cachedSubBlockBase = UINT64_MAX;
+    DataCopyExtParams copyParams{1, TQ_BR_VAL_BLOCK_STRIDE, 0, 0, 0};
+    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+    for (uint32_t row = 0; row < mRows; ++row) {
+        const uint32_t absPos = absStart + row;
         const uint32_t posInBlock = absPos % blockSize_;
         const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
         const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
 
-        TqBrSync<HardEvent::S_MTE2>();
-        const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
-        TqBrSync<HardEvent::MTE2_S>();
+        const int32_t blockId = blockIds[row];
 
         // Compute GM offset for this sub-block.
         const uint64_t subBlockBase =
@@ -498,11 +612,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
             static_cast<uint64_t>(kvHead) * valSubBlocksPerBlock * TQ_BR_VAL_BLOCK_STRIDE +
             static_cast<uint64_t>(subBlockInBlock) * TQ_BR_VAL_BLOCK_STRIDE;
 
-        DataCopyExtParams copyParams{1, TQ_BR_VAL_BLOCK_STRIDE, 0, 0, 0};
-        DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, valueCacheGm_[subBlockBase], copyParams, padParams);
-        TqBrSync<HardEvent::MTE2_V>();
-        TqBrSync<HardEvent::MTE2_S>();
+        if (subBlockBase != cachedSubBlockBase) {
+            DataCopyPad(packedRaw, valueCacheGm_[subBlockBase], copyParams, padParams);
+            TqBrSync<HardEvent::MTE2_V>();
+            TqBrSync<HardEvent::MTE2_S>();
+            cachedSubBlockBase = subBlockBase;
+        }
 
         const uint32_t groupInBlock = rowInSubBlock / TQ_BR_VAL_GROUP_ROWS;
         const uint32_t groupRow = rowInSubBlock % TQ_BR_VAL_GROUP_ROWS;
@@ -510,9 +625,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         auto groupI16 = packedI16[groupInBlock * TQ_BR_GROUP_INDEX_WORDS];
         auto extractI16 = codeI16[row * D];
         auto extractU16 = extractI16.template ReinterpretCast<uint16_t>();
-        auto valMask = MaskBuf();
-        Duplicate(valMask, static_cast<uint16_t>(0x000f), D);
-        PipeBarrier<PIPE_V>();
+        auto valMask = ValMaskBuf();
         ShiftRight(
             extractI16, groupI16, static_cast<int16_t>(groupRow * 4), D);
         PipeBarrier<PIPE_V>();
@@ -532,11 +645,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const float vstep = TqBrReadFloatFromU8(packedRaw, floatScratch, vstepByteOff);
         vstepBuf.SetValue(row, vstep);
     }
-
-    // Restore key mask for next K tile load.
-    auto mask = MaskBuf();
-    Duplicate(mask, static_cast<uint16_t>(0x00FF), TQ_BR_HEAD_SIZE);
-    PipeBarrier<PIPE_V>();
 
     TqBrSync<HardEvent::V_S>();
 }
@@ -678,45 +786,76 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Rot
     }
 }
 
+template <typename TilingT, typename QueryT>
+__aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::RotateRowsInPlace(
+    LocalTensor<float> rows, GlobalTensor<QueryT>& rotationGm, uint32_t rowCount)
+{
+    if (rowCount == 0) {
+        return;
+    }
+    if (!matmulReady_ || rotateMm_ == nullptr) {
+        RotateRowsFloatScalar(rows, rotationGm, rowCount);
+        return;
+    }
+
+    const uint32_t n = rowCount * TQ_BR_HEAD_SIZE;
+    const uint32_t mPad = TqBrAlignUp16(rowCount);
+    auto rotateHalf = DecodedBuf().template ReinterpretCast<QueryT>();
+    auto inputHalf = rotateHalf;
+    auto outputHalf = rotateHalf[mPad * TQ_BR_HEAD_SIZE];
+
+    Cast(inputHalf, rows, RoundMode::CAST_RINT, n);
+    PipeBarrier<PIPE_V>();
+    if (mPad > rowCount) {
+        TqBrDuplicateZero(inputHalf[n], (mPad - rowCount) * TQ_BR_HEAD_SIZE);
+    }
+
+    rotateMm_->SetOrgShape(mPad, TQ_BR_HEAD_SIZE, TQ_BR_HEAD_SIZE);
+    rotateMm_->SetSingleShape(rowCount, TQ_BR_HEAD_SIZE, TQ_BR_HEAD_SIZE);
+    rotateMm_->SetTensorA(inputHalf, false);
+    rotateMm_->SetTensorB(rotationGm, false);
+    rotateMm_->SetLocalWorkspace(RotateWorkBuf());
+    rotateMm_->IterateAll(outputHalf);
+    rotateMm_->End();
+
+    Cast(rows, outputHalf, RoundMode::CAST_NONE, n);
+    PipeBarrier<PIPE_V>();
+}
+
 // ---------------------------------------------------------------
 // ComputeAttention() - single-token decode
 // ---------------------------------------------------------------
 template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::ComputeAttention(
-    uint32_t tokenIdx, uint32_t kvHead, uint32_t gqaStart, uint32_t gqaCount)
+    uint32_t tokenIdx, uint32_t kvHead, uint32_t gqaStart, uint32_t gqaCount,
+    uint32_t kvLoopStart, uint32_t kvLoopEnd, bool writePartial, uint32_t segIdx)
 {
     const uint32_t D = TQ_BR_HEAD_SIZE;
 
     // Determine KV range.
-    uint32_t seqIdx = 0;
-    // Find which sequence this token belongs to.
-    {
-        int64_t prev = 0;
-        TqBrSync<HardEvent::S_MTE2>();
-        for (uint32_t i = 0; i < batchSize_; ++i) {
-            const int64_t end = actualSeqLenQGm_.GetValue(i);
-            if (static_cast<int64_t>(tokenIdx) < end) {
-                seqIdx = i;
-                break;
-            }
-            prev = end;
-        }
-        TqBrSync<HardEvent::MTE2_S>();
-    }
+    const uint32_t seqIdx = FindSeqIdx(tokenIdx);
 
     const uint32_t causalKvEnd = GetCausalKvEnd(tokenIdx, seqIdx);
-    if (causalKvEnd == 0) {
-        // Zero-length KV: output is zero.
-        auto outTmp = DecodedBuf().template ReinterpretCast<QueryT>();
-        Duplicate(outTmp, static_cast<QueryT>(0), gqaCount * D);
-        PipeBarrier<PIPE_V>();
-        TqBrSync<HardEvent::V_MTE3>();
-        for (uint32_t g = 0; g < gqaCount; ++g) {
-            const uint32_t headIdx = kvHead * gqaGroupSize_ + gqaStart + g;
-            auto outRow = outGm_[tokenIdx * numHeads_ * D + headIdx * D];
-            DataCopy(outRow, outTmp[g * D], D);
+    uint32_t kvStart = kvLoopStart;
+    uint32_t kvEnd = causalKvEnd;
+    if (kvLoopEnd < causalKvEnd) {
+        kvEnd = kvLoopEnd;
+    }
+    if (kvStart >= kvEnd) {
+        if (writePartial) {
+            WriteEmptyPartial(tokenIdx, kvHead, segIdx, gqaStart, gqaCount);
+        } else if (causalKvEnd == 0) {
+            auto outTmp = DecodedBuf().template ReinterpretCast<QueryT>();
+            Duplicate(outTmp, static_cast<QueryT>(0), gqaCount * D);
+            PipeBarrier<PIPE_V>();
+            TqBrSync<HardEvent::V_MTE3>();
+            for (uint32_t g = 0; g < gqaCount; ++g) {
+                const uint32_t headIdx = kvHead * gqaGroupSize_ + gqaStart + g;
+                auto outRow = outGm_[tokenIdx * numHeads_ * D + headIdx * D];
+                DataCopy(outRow, outTmp[g * D], D);
+            }
+            TqBrSync<HardEvent::MTE3_V>();
         }
-        TqBrSync<HardEvent::MTE3_V>();
         return;
     }
 
@@ -731,7 +870,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
     TqBrSync<HardEvent::MTE2_V>();
     Cast(qGroupFloat, qGroupHalfBuf, RoundMode::CAST_NONE, gqaCount * D);
     PipeBarrier<PIPE_V>();
-    RotateRowsFloatScalar(qGroupFloat, rotationKeyGm_, gqaCount);
+    RotateRowsInPlace(qGroupFloat, rotationKeyGm_, gqaCount);
     PipeBarrier<PIPE_V>();
     Muls(qGroupFloat, qGroupFloat, scaleValue_, gqaCount * D);
     PipeBarrier<PIPE_V>();
@@ -749,8 +888,8 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
     PipeBarrier<PIPE_V>();
 
     // Main KV tile loop.
-    for (uint32_t pos = 0; pos < causalKvEnd; pos += kvTileRows_) {
-        const uint32_t remainRows = causalKvEnd - pos;
+    for (uint32_t pos = kvStart; pos < kvEnd; pos += kvTileRows_) {
+        const uint32_t remainRows = kvEnd - pos;
         const uint32_t mRows = (kvTileRows_ < remainRows) ? kvTileRows_ : remainRows;
 
         // Load and decode K tile.
@@ -776,7 +915,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
 
         auto expBuf = FloatScratchBuf();
         auto softmaxReduceTmp = expBuf[TQ_BR_HEAD_SIZE];
-        auto weightedValue = expBuf[TQ_BR_HEAD_SIZE];
+        auto weightedValue = mulTmp;
         turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledScalar(
             scoreBuf, decodedV, mStateScalar, sStateScalar, outAcc, expBuf,
             softmaxReduceTmp, weightedValue,
@@ -791,8 +930,14 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         PipeBarrier<PIPE_V>();
     }
 
+    if (writePartial) {
+        WritePartial(tokenIdx, kvHead, segIdx, mStateScalar, sStateScalar, outAcc,
+                     gqaStart, gqaCount);
+        return;
+    }
+
     // Post-rotate: out @ rotationValue (R).
-    RotateRowsFloatScalar(outAcc, rotationValueGm_, gqaCount);
+    RotateRowsInPlace(outAcc, rotationValueGm_, gqaCount);
     PipeBarrier<PIPE_V>();
 
     // Write output to GM.
@@ -806,6 +951,56 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         DataCopy(outRow, outLocal[g * D], D);
     }
     TqBrSync<HardEvent::MTE3_V>();
+}
+
+template <typename TilingT, typename QueryT>
+__aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::WriteEmptyPartial(
+    uint32_t tokenIdx, uint32_t kvHead, uint32_t segIdx, uint32_t gqaStart, uint32_t gqaCount)
+{
+    if (partialWorkspace_ == nullptr) {
+        return;
+    }
+    const uint32_t D = TQ_BR_HEAD_SIZE;
+    const uint32_t qBaseHead = kvHead * gqaGroupSize_ + gqaStart;
+    auto zero = FloatScratchBuf();
+    Duplicate(zero, 0.f, D);
+    PipeBarrier<PIPE_V>();
+    TqBrSync<HardEvent::V_MTE3>();
+    for (uint32_t g = 0; g < gqaCount; ++g) {
+        const uint32_t headIdx = qBaseHead + g;
+        const uint32_t partIdx = (tokenIdx * numHeads_ + headIdx) * kvSplitPart_ + segIdx;
+        partialLseGm_.SetValue(partIdx * 2, -3.402823466e+38f);
+        partialLseGm_.SetValue(partIdx * 2 + 1, 0.f);
+        DataCopy(partialOutGm_[partIdx * D], zero, D);
+    }
+    TqBrSync<HardEvent::MTE3_V>();
+    TqBrSync<HardEvent::MTE3_MTE2>();
+}
+
+template <typename TilingT, typename QueryT>
+__aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::WritePartial(
+    uint32_t tokenIdx, uint32_t kvHead, uint32_t segIdx, float* mStateScalar,
+    float* sStateScalar, LocalTensor<float> outAcc, uint32_t gqaStart, uint32_t gqaCount)
+{
+    if (partialWorkspace_ == nullptr) {
+        return;
+    }
+    const uint32_t D = TQ_BR_HEAD_SIZE;
+    const uint32_t qBaseHead = kvHead * gqaGroupSize_ + gqaStart;
+    for (uint32_t g = 0; g < gqaCount; ++g) {
+        const uint32_t headIdx = qBaseHead + g;
+        const uint32_t partIdx = (tokenIdx * numHeads_ + headIdx) * kvSplitPart_ + segIdx;
+        partialLseGm_.SetValue(partIdx * 2, mStateScalar[g]);
+        partialLseGm_.SetValue(partIdx * 2 + 1, sStateScalar[g]);
+    }
+    TqBrSync<HardEvent::V_MTE3>();
+    for (uint32_t g = 0; g < gqaCount; ++g) {
+        const uint32_t headIdx = qBaseHead + g;
+        const uint32_t partIdx = (tokenIdx * numHeads_ + headIdx) * kvSplitPart_ + segIdx;
+        DataCopy(partialOutGm_[partIdx * D], outAcc[g * D], D);
+    }
+    TqBrSync<HardEvent::MTE3_V>();
+    TqBrSync<HardEvent::MTE3_MTE2>();
 }
 
 // ---------------------------------------------------------------
@@ -841,13 +1036,118 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Pro
     }
 }
 
+template <typename TilingT, typename QueryT>
+__aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::ProcessSplitBns(
+    uint32_t coreIdx)
+{
+    if (coreIdx >= usedCoreNum_) {
+        return;
+    }
+
+    const uint32_t gqaGroup = numHeads_ / numKvHeads_;
+    const uint32_t gqaChunkCount = (gqaGroup + TQ_BR_UB_GQA_CAP - 1) / TQ_BR_UB_GQA_CAP;
+    const uint32_t headChunkScale = numKvHeads_ * gqaChunkCount;
+    const uint32_t seqTaskScale = headChunkScale * kvSplitPart_;
+
+    uint32_t taskIdx = 0;
+    for (uint32_t tokenIdx = 0; tokenIdx < numTokens_; ++tokenIdx) {
+        for (uint32_t kvHead = 0; kvHead < numKvHeads_; ++kvHead) {
+            for (uint32_t gqaChunk = 0; gqaChunk < gqaChunkCount; ++gqaChunk) {
+                for (uint32_t segIdx = 0; segIdx < kvSplitPart_; ++segIdx) {
+                    if (taskIdx % usedCoreNum_ == coreIdx) {
+                        const uint32_t gqaStart = gqaChunk * TQ_BR_UB_GQA_CAP;
+                        const uint32_t gqaTileEnd = gqaStart + TQ_BR_UB_GQA_CAP;
+                        const uint32_t gqaEnd = (gqaTileEnd < gqaGroup) ? gqaTileEnd : gqaGroup;
+                        const uint32_t gqaCount = gqaEnd - gqaStart;
+                        const uint32_t kvStart = segIdx * kvSegmentLen_;
+                        const uint32_t kvEnd = (segIdx + 1) * kvSegmentLen_;
+                        const bool writePartial = kvSplitPart_ > 1;
+                        ComputeAttention(tokenIdx, kvHead, gqaStart, gqaCount, kvStart, kvEnd,
+                                         writePartial, segIdx);
+                    }
+                    ++taskIdx;
+                }
+            }
+        }
+    }
+}
+
+template <typename TilingT, typename QueryT>
+__aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::CombineFlashDecode()
+{
+    const uint32_t D = TQ_BR_HEAD_SIZE;
+    auto expLocal = FloatScratchBuf();
+    auto globalOut = QGroupFloatBuf();
+    auto partFloat = OutAccBuf();
+    auto outLocal = DecodedBuf().template ReinterpretCast<QueryT>();
+    for (uint32_t tokenIdx = 0; tokenIdx < numTokens_; ++tokenIdx) {
+        for (uint32_t headIdx = 0; headIdx < numHeads_; ++headIdx) {
+            float bestM = -3.402823466e+38f;
+            for (uint32_t p = 0; p < kvSplitPart_; ++p) {
+                const uint32_t partIdx = (tokenIdx * numHeads_ + headIdx) * kvSplitPart_ + p;
+                const float partM = partialLseGm_.GetValue(partIdx * 2);
+                const float partS = partialLseGm_.GetValue(partIdx * 2 + 1);
+                if (partS > 0.f && partM > bestM) {
+                    bestM = partM;
+                }
+            }
+            float globalS = 0.f;
+            Duplicate(globalOut, 0.f, D);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t p = 0; p < kvSplitPart_; ++p) {
+                const uint32_t partIdx = (tokenIdx * numHeads_ + headIdx) * kvSplitPart_ + p;
+                const float partM = partialLseGm_.GetValue(partIdx * 2);
+                const float partS = partialLseGm_.GetValue(partIdx * 2 + 1);
+                if (partS <= 0.f) {
+                    continue;
+                }
+                const float weight = turboquant_attn::ExpScalar(expLocal, partM - bestM) * partS;
+                globalS += weight;
+                DataCopy(partFloat, partialOutGm_[partIdx * D], D);
+                TqBrSync<HardEvent::MTE2_V>();
+                Muls(partFloat, partFloat, weight, D);
+                PipeBarrier<PIPE_V>();
+                Add(globalOut, globalOut, partFloat, D);
+                PipeBarrier<PIPE_V>();
+            }
+            const float invS = (globalS > 0.f) ? (1.f / globalS) : 0.f;
+            Muls(globalOut, globalOut, invS, D);
+            PipeBarrier<PIPE_V>();
+            RotateRowsInPlace(globalOut, rotationValueGm_, 1);
+            Cast(outLocal, globalOut, RoundMode::CAST_RINT, D);
+            PipeBarrier<PIPE_V>();
+            TqBrSync<HardEvent::V_MTE3>();
+            DataCopy(outGm_[(tokenIdx * numHeads_ + headIdx) * D], outLocal, D);
+            TqBrSync<HardEvent::MTE3_V>();
+            TqBrSync<HardEvent::MTE3_MTE2>();
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Process()
 // ---------------------------------------------------------------
 template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Process()
 {
-    // AIC returns — this kernel is AIV-only for SplitBN mode.
+    if (splitMode_ == 1) {
+        const uint32_t coreIdx = GetBlockIdx() / TQ_BR_MIX_AIV_SUB;
+        if ASCEND_IS_AIC {
+            SyncAll();
+            return;
+        }
+        const bool isPrimaryAiv = ((GetSubBlockIdx() % TQ_BR_MIX_AIV_SUB) == 0);
+        if (isPrimaryAiv && coreIdx < usedCoreNum_) {
+            ProcessSplitBns(coreIdx);
+        }
+        SyncAll();
+        if (isPrimaryAiv && coreIdx == 0) {
+            CombineFlashDecode();
+        }
+        return;
+    }
+
+    // AIC returns — SplitBN mode is AIV-only.
     if ASCEND_IS_AIC {
         return;
     }
@@ -870,6 +1170,8 @@ extern "C" __global__ __aicore__ void bit_residual_attention_paged_k8v4(
 {
     if (TILING_KEY_IS(0)) {
         KERNEL_TASK_TYPE(0, KERNEL_TYPE_MIX_AIC_1_2);
+    } else if (TILING_KEY_IS(1)) {
+        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
     } else {
         return;
     }
@@ -884,14 +1186,13 @@ extern "C" __global__ __aicore__ void bit_residual_attention_paged_k8v4(
     TPipe pipe;
     using TilingT = BitResidualAttentionPagedK8v4TilingData;
     using QueryT = TqQueryT;
+    TCubeTiling decodeTiling = tilingData.decodeRotateTiling;
     TqRotateMatmulOp<QueryT> rotateMm;
-
-    // Register matmul object (required for KFC).
-    REGIST_MATMUL_OBJ_STATIC(&pipe, GetSysWorkSpacePtr(), rotateMm, (TCubeTiling*)nullptr);
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), rotateMm, &decodeTiling);
 
     BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT> op;
     op.Init(query, key_cache, value_cache, block_table,
             actual_seq_len_q, actual_seq_len_kv, rotation_key,
-            rotation_value, out, &tilingData, &pipe, &rotateMm);
+            rotation_value, out, workspace, &tilingData, &pipe, &rotateMm);
     op.Process();
 }
