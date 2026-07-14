@@ -10,7 +10,7 @@
 
 // BitResidual K8V4: fused sign-reversal decode + paged attention.
 // Reads packed KV cache in bit_residual format and performs attention:
-//   K: 8-bit code = (q7 << 1) | sign → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
+//   K: 8-bit code = q7 | (sign<<7) → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
 //   V: 4-bit idx4 → vmin + idx4*vstep (raw, no norm folding)
 // Rotation: Q @ R^T (pre-rotate) and out @ R (post-rotate) via Cube KFC.
 
@@ -531,9 +531,9 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     // Input: CodeI16Buf()[row*128] has the 8-bit code for each dimension.
     // kBase[k], kStep[k] are per-row scalar floats.
     //
-    // Decode: code = (q7 << 1) | sign
-    //   sign_bit = code & 1        → 0=positive, 1=negative
-    //   q7       = code >> 1       → [0, 127]
+    // Decode: code = q7 | (sign << 7)
+    //   sign_bit = code >> 7       → 0=positive, 1=negative
+    //   q7       = code & 0x7f     → [0, 127]
     //   sig_vec  = 1 - 2*sign_bit  → {+1.0, -1.0}
     //   err      = base + q7 * step (positive residual)
     //   decoded  = err * sig_vec   (restore original sign per dimension)
@@ -547,19 +547,24 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     auto kBase = KBaseBuf();
     auto kStep = KStepBuf();
 
-    // Step 1: Extract sign_bit (code & 1) and q7 (code >> 1).
+    // Step 1: Extract sign_bit (code >> 7) and q7 (code & 0x7f).
     auto signStorage = decoded.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
     auto codeU16 = codeI16.template ReinterpretCast<uint16_t>();
     auto signMask = MaskBuf();
-    Duplicate(signMask, static_cast<uint16_t>(1), D);
+    Duplicate(signMask, static_cast<uint16_t>(0x80), D);
     PipeBarrier<PIPE_V>();
     for (uint32_t row = 0; row < mRows; ++row) {
         And(signStorageU16[row * D], codeU16[row * D], signMask, D);
     }
     PipeBarrier<PIPE_V>();
-
-    ShiftRight(codeI16, codeI16, static_cast<int16_t>(1), n);
+    ShiftRight(signStorage, signStorage, static_cast<int16_t>(7), n);
+    PipeBarrier<PIPE_V>();
+    Duplicate(signMask, static_cast<uint16_t>(0x7f), D);
+    PipeBarrier<PIPE_V>();
+    for (uint32_t row = 0; row < mRows; ++row) {
+        And(codeU16[row * D], codeU16[row * D], signMask, D);
+    }
     PipeBarrier<PIPE_V>();
 
     // Step 2: sign_bit → sig_vec = ±1.0

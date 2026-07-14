@@ -14,14 +14,30 @@
 1. FP32 `abs` 和 `ReduceMax` 得到 `abs_max`。
 2. 向量除以 `abs_max`，转换为输入 dtype，再转回 FP32 继续量化。
 3. Key 对绝对值做 7-bit min/max 均匀量化，code 为
-   `(q7 << 1) | sign`；base/step 乘回 `abs_max`。
+   `q7 | (sign << 7)`；base/step 乘回 `abs_max`。
 4. Value 对有符号值做 4-bit min/max 均匀量化，每个 byte 保存同一行相邻
    两个维度的 nibble；vmin/vstep 乘回 `abs_max`。
 5. base、step、vmin、vstep 均以输入 dtype 的 16-bit 表示保存。
 
-量化主体使用向量指令。C220 的整数 bitwise wrapper 对 128 元素不能可靠覆盖，
-因此 Key 最后的 128 个 code 合并使用标量 `GetValue/SetValue`；此前的 abs、
-reduce、缩放、clamp 和 cast 仍为向量计算。
+量化主体使用向量指令。Key 先将 sign 和 7-bit quant code 做 OR，再将后 64 维
+左移 8 bit，并与前 64 维做 OR，得到连续的 64 个 uint16 packed code。编码和
+metadata 组装均不使用标量 `GetValue/SetValue`。
+
+## AIC/AIV 双缓冲
+
+旋转结果的 GM bridge 使用两块 ping-pong buffer。每块保存完整的
+`32 * 128` 个 FP32 元素（16 KiB），其中两个 AIV 分别处理不重叠的
+`16 * 128` 切片；每个 AIC 对应的 bridge 总计占用 32 KiB。
+
+- buffer 下标为 `stream_ordinal & 1`，相邻 stream 在两块区域间轮转；
+- AIC 等待两个 AIV 的 `C_FREE` 后才覆盖对应 buffer；
+- AIC 完成 Fixpipe 写出后发布 `C_READY`；
+- AIV 等待 `C_READY`，把自己的切片从 GM 搬入 UB 后发布 `C_FREE`。
+
+这样 AIC 可以计算下一批旋转，同时 AIV 编码上一批数据，且不会反复覆盖尚未
+搬入 UB 的结果。AIV 内部编码暂不增加第二套完整 UB scratch：每个 AIV 已独占
+UB，当前 stream 仍需顺序完成 cache 的 read-modify-write；额外复制整套 scratch
+会显著增加 UB 占用，但不能形成对应的流水重叠。
 
 ## Cache layout
 
