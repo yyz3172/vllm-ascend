@@ -494,13 +494,21 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         TqBrSync<HardEvent::MTE2_V>();
         TqBrSync<HardEvent::MTE2_S>();
 
+#if 0
         auto extractI16 = codeI16[row * D];
         for (uint32_t d = 0; d < D / 2; ++d) {
             const uint8_t code = packedRaw.GetValue(d);
             extractI16.SetValue(2 * d, static_cast<int16_t>(code & 0x0f));
             extractI16.SetValue(2 * d + 1, static_cast<int16_t>(code >> 4));
         }
-
+#else
+        auto extractI16 = codeI16[row * D].template ReinterpretCast<half>();
+        AscendC::Cast(extractI16, packedRaw.template ReinterpretCast<int4b_t>(),
+            AscendC::RoundMode::CAST_NONE, D);
+        PipeBarrier<PIPE_V>();
+        AscendC::Adds(extractI16, extractI16, static_cast<half>(8.0f), D);
+        PipeBarrier<PIPE_V>();
+#endif
         // Cast extracted idx4 to float for decode.
         Cast(codeFloat[row * D], extractI16, RoundMode::CAST_NONE, D);
         PipeBarrier<PIPE_V>();

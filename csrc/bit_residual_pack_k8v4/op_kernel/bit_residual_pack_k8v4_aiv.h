@@ -516,6 +516,7 @@ private:
                       static_cast<ComputeT>(TQ_VAL_QUANT_LEVELS_F), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
+#if 0
         AscendC::Cast(normFp32, normVec16, AscendC::RoundMode::CAST_NONE,
                       totalElems);
         AscendC::PipeBarrier<PIPE_V>();
@@ -527,10 +528,14 @@ private:
         AscendC::Cast(quantI16, quantI32, AscendC::RoundMode::CAST_NONE,
                       totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::DataCopy(
-            encodedBatch.template ReinterpretCast<int16_t>(), quantI16,
-            totalElems);
+#else
+        auto range16 = normFp32.template ReinterpretCast<ComputeT>();
+        AscendC::Adds(range16, normVec16, static_cast<ComputeT>(-8.0f), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
+        auto quantI4 = encodedBatch.template ReinterpretCast<int4b_t>();
+        AscendC::Cast(quantI4, range16, AscendC::RoundMode::CAST_NONE, totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+#endif
 
         AscendC::Mul(minVec, minVec, maxVecT, typePerBlock);
         AscendC::PipeBarrier<PIPE_V>();
@@ -649,15 +654,13 @@ private:
                             .template ReinterpretCast<T>().GetValue(0));
                 }
             } else {
+                auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
+                const uint32_t srcOff = (desc.startGroupRow + rowOff) * TQ_VAL_ROW_CODE_BYTES;
+                auto codeOutAll = scratch[2 * TQ_META_TILE_BYTES];
+                DataCopy(codeOutAll, encodedBytes[srcOff], rows * TQ_VAL_ROW_CODE_BYTES);
+                PipeBarrier<PIPE_V>();
                 for (uint32_t r = 0; r < rows; ++r) {
                     const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
-                    const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
-                    auto codeOut = scratch[2 * TQ_META_TILE_BYTES + r * codeBytes];
-                    for (uint32_t d = 0; d < TQ_PACK_D / 2; ++d) {
-                        const uint8_t lo = static_cast<uint8_t>(encoded.GetValue(encodedOff + 2 * d));
-                        const uint8_t hi = static_cast<uint8_t>(encoded.GetValue(encodedOff + 2 * d + 1));
-                        codeOut.SetValue(d, static_cast<uint8_t>(lo | (hi << 4)));
-                    }
                     meta0.SetValue(tileRow + r, encoded[
                         TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
                         encodedRow]
