@@ -237,10 +237,11 @@ private:
         // Extract all sign bits once; buf1 is free after the normalized cast.
         auto signVec = buf1.template ReinterpretCast<uint32_t>();
         auto signMask = buf3.template ReinterpretCast<uint32_t>();
+        auto yBits = yBatch.template ReinterpretCast<uint32_t>();
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::ShiftRight(signVec, yBits, static_cast<int32_t>(31), totalElems);
+        AscendC::ShiftRight(signVec, yBits, static_cast<uint32_t>(31), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(buf5, signVec, AscendC::RoundMode::CAST_NONE, totalElems);
+        AscendC::Cast(buf5, signVec.template ReinterpretCast<int32_t>(), AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
         // One T-domain minimum per row.  max(normVec16) is exactly 1 for every
