@@ -173,6 +173,8 @@ private:
         const uint32_t totalElems = m * TQ_PACK_D;
         constexpr uint32_t codeBatchElems =
             (TQ_VECTOR_BATCH / 2) * TQ_PACK_D;
+        constexpr uint32_t binaryRepeatBatchF16 = 128;
+        constexpr uint32_t binaryRepeatBatchF32 = 64;
 
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
@@ -202,30 +204,28 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::WholeReduceMax<float, false>(
             maxVec, maxFold, static_cast<int32_t>(TQ_ROT_N / 2), m, 1, 1,
-            TQ_ROT_N / 16, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+            8, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
 
         auto maxVecT = buf6;
-        auto baseVec = buf6[typePerBlock];
-        auto stepVec = buf6[2 * typePerBlock];
-        auto gapVec = buf6[3 * typePerBlock];
-        auto safeStepVec = buf6[4 * typePerBlock];
-        auto oneVec = buf6[5 * typePerBlock];
+        auto baseVec = buf6[m];
+        auto stepVec = buf6[2 * m];
+        auto gapVec = buf6[3 * m];
+        auto safeStepVec = buf6[4 * m];
+        auto oneVec = buf6[5 * m];
         AscendC::Cast(maxVecT, maxVec, AscendC::RoundMode::CAST_RINT, m);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Maxs(maxVec, maxVec, safeFp32Divisor, m);
         AscendC::PipeBarrier<PIPE_V>();
 
         auto maxVecBlk = buf3;
-        AscendC::Brcb(maxVecBlk.template ReinterpretCast<uint32_t>(),
-                      maxVec.template ReinterpretCast<uint32_t>(), 2,
-                      AscendC::BrcbRepeatParams(1, 8));
+        AscendC::Brcb(maxVecBlk, maxVec, 2, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t rowOff = i * TQ_PACK_D;
             AscendC::Div<float, false>(
                 normFp32[rowOff], absVec[rowOff], maxVecBlk[i * 8],
-                static_cast<uint64_t>(0), 2,
+                binaryRepeatBatchF32, 2,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -235,22 +235,12 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         // Extract all sign bits once; buf1 is free after the normalized cast.
-        auto signVec = buf1.template ReinterpretCast<int32_t>();
-        auto signMask = buf3.template ReinterpretCast<int32_t>();
-        AscendC::Duplicate(signMask, static_cast<int32_t>(1), codeBatchElems);
+        auto signVec = buf1.template ReinterpretCast<uint32_t>();
+        auto signMask = buf3.template ReinterpretCast<uint32_t>();
         AscendC::PipeBarrier<PIPE_V>();
-        auto yBits = yBatch.template ReinterpretCast<int32_t>();
-        for (uint32_t batch = 0; batch < 2; ++batch) {
-            const uint32_t batchOff = batch * codeBatchElems;
-            AscendC::ShiftRight(signVec[batchOff], yBits[batchOff],
-                               static_cast<int32_t>(31), codeBatchElems);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::And(signVec[batchOff], signVec[batchOff], signMask,
-                         codeBatchElems);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(buf5[batchOff], signVec[batchOff],
-                          AscendC::RoundMode::CAST_NONE, codeBatchElems);
-        }
+        AscendC::ShiftRight(signVec, yBits, static_cast<int32_t>(31), totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(buf5, signVec, AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
         // One T-domain minimum per row.  max(normVec16) is exactly 1 for every
@@ -260,22 +250,21 @@ private:
             TQ_ROT_N / typePerBlock,
             AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(oneVec, static_cast<ComputeT>(1.0f), typePerBlock);
+        AscendC::Duplicate(oneVec, static_cast<ComputeT>(1.0f), m);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Sub(gapVec, oneVec, baseVec, typePerBlock);
+        AscendC::Sub(gapVec, oneVec, baseVec, m);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(stepVec, gapVec, quantStep, typePerBlock);
+        AscendC::Muls(stepVec, gapVec, quantStep, m);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(safeStepVec, stepVec, static_cast<ComputeT>(0.0f),
-                      typePerBlock);
+        AscendC::Adds(safeStepVec, stepVec, static_cast<ComputeT>(0.0f), m);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Maxs(safeStepVec, safeStepVec, safeTDivisor, typePerBlock);
+        AscendC::Maxs(safeStepVec, safeStepVec, safeTDivisor, m);
         AscendC::PipeBarrier<PIPE_V>();
 
         // Brcb produces one 32-byte scalar block per row.  Each row call keeps
         // src1RepStrideIn=0 so its repeat(s) reuse that same scalar block.
         auto baseBlk = buf7;
-        auto stepBlk = buf7[16 * typePerBlock];
+        auto stepBlk = buf7[m * typePerBlock];
         AscendC::Brcb(baseBlk, baseVec, 2, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Brcb(stepBlk, safeStepVec, 2,
@@ -286,7 +275,7 @@ private:
             const uint32_t blockOff = i * typePerBlock;
             AscendC::Sub<ComputeT, false>(
                 normVec16[rowOff], normVec16[rowOff], baseBlk[blockOff],
-                static_cast<uint64_t>(0), 1,
+                binaryRepeatBatchF16, 1,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -295,7 +284,7 @@ private:
             const uint32_t blockOff = i * typePerBlock;
             AscendC::Div<ComputeT, false>(
                 normVec16[rowOff], normVec16[rowOff], stepBlk[blockOff],
-                static_cast<uint64_t>(0), 1,
+                binaryRepeatBatchF16, 1,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -417,6 +406,8 @@ private:
             static_cast<ComputeT>(1.0f / TQ_VAL_QUANT_LEVELS_F);
         const ComputeT safeTDivisor = static_cast<ComputeT>(1.0e-6f);
         const uint32_t totalElems = m * TQ_PACK_D;
+        constexpr uint32_t binaryRepeatBatchF16 = 128;
+        constexpr uint32_t binaryRepeatBatchF32 = 64;
 
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
@@ -445,11 +436,11 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         auto maxVecT = buf6;
-        auto minVec = buf6[typePerBlock];
-        auto maxNormVec = buf6[2 * typePerBlock];
-        auto rangeVec = buf6[3 * typePerBlock];
-        auto stepVec = buf6[4 * typePerBlock];
-        auto safeStepVec = buf6[5 * typePerBlock];
+        auto minVec = buf6[m];
+        auto maxNormVec = buf6[2 * m];
+        auto rangeVec = buf6[3 * m];
+        auto stepVec = buf6[4 * m];
+        auto safeStepVec = buf6[5 * m];
         AscendC::Cast(maxVecT, maxVec, AscendC::RoundMode::CAST_RINT, m);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Maxs(maxVec, maxVec, safeFp32Divisor, m);
@@ -464,7 +455,7 @@ private:
             const uint32_t rowOff = i * TQ_PACK_D;
             AscendC::Div<float, false>(
                 normFp32[rowOff], yBatch[rowOff], maxVecBlk[i * 8],
-                static_cast<uint64_t>(0), 2,
+                binaryRepeatBatchF32, 2,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -505,7 +496,7 @@ private:
             const uint32_t blockOff = i * typePerBlock;
             AscendC::Sub<ComputeT, false>(
                 normVec16[rowOff], normVec16[rowOff], minBlk[blockOff],
-                static_cast<uint64_t>(0), 1,
+                binaryRepeatBatchF16, 1,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -514,7 +505,7 @@ private:
             const uint32_t blockOff = i * typePerBlock;
             AscendC::Div<ComputeT, false>(
                 normVec16[rowOff], normVec16[rowOff], stepBlk[blockOff],
-                static_cast<uint64_t>(0), 1,
+                binaryRepeatBatchF16, 1,
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
