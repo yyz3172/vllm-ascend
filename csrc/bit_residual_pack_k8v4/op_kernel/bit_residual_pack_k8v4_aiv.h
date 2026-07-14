@@ -236,7 +236,6 @@ private:
 
         // Extract all sign bits once; buf1 is free after the normalized cast.
         auto signVec = buf1.template ReinterpretCast<uint32_t>();
-        auto signMask = buf3.template ReinterpretCast<uint32_t>();
         auto yBits = yBatch.template ReinterpretCast<uint32_t>();
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::ShiftRight(signVec, yBits, static_cast<uint32_t>(31), totalElems);
