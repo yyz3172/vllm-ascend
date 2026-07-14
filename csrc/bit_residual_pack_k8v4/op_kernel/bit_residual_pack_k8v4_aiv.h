@@ -629,17 +629,17 @@ private:
             copy_packed_gm_to_ub(meta1Bytes, packedGm,
                 meta1Base + tileStart * TQ_ROW_META_BYTES, TQ_META_TILE_BYTES);
             TqSyncMte2ToS();
-            for (uint32_t r = 0; r < rows; ++r) {
-                const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
-                const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
-                auto codeOut = scratch[2 * TQ_META_TILE_BYTES + r * codeBytes];
-                if constexpr (IS_KEY) {
-                    auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
-                    auto encodedRowBytes =
-                        encodedBytes[encodedRow * TQ_KEY_ENCODED_ROW_BYTES];
-                    for (uint32_t d = 0; d < TQ_KEY_ROW_CODE_BYTES; ++d) {
-                        codeOut.SetValue(d, encodedRowBytes.GetValue(d));
-                    }
+            // ── Batch DataCopy for key code bytes (eliminates per-row 128×SetValue) ──
+            if constexpr (IS_KEY) {
+                auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
+                const uint32_t srcOff = (desc.startGroupRow + rowOff) * TQ_KEY_ROW_CODE_BYTES;
+                auto codeOutAll = scratch[2 * TQ_META_TILE_BYTES];
+                // rows×128 bytes contiguous in both src and dst
+                DataCopy(codeOutAll, encodedBytes[srcOff], rows * TQ_KEY_ROW_CODE_BYTES);
+                PipeBarrier<PIPE_V>();
+                // Metadata only: 2 scalar SetValue per row
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
                     meta0.SetValue(tileRow + r, encoded[
                         TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
                         encodedRow]
@@ -648,7 +648,12 @@ private:
                         TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
                         encodedRow]
                             .template ReinterpretCast<T>().GetValue(0));
-                } else {
+                }
+            } else {
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
+                    const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
+                    auto codeOut = scratch[2 * TQ_META_TILE_BYTES + r * codeBytes];
                     for (uint32_t d = 0; d < TQ_PACK_D / 2; ++d) {
                         const uint8_t lo = static_cast<uint8_t>(encoded.GetValue(encodedOff + 2 * d));
                         const uint8_t hi = static_cast<uint8_t>(encoded.GetValue(encodedOff + 2 * d + 1));
