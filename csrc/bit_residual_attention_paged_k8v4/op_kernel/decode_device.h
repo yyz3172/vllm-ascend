@@ -11,8 +11,8 @@
 // BitResidual K8V4 decode primitives for fused attention.
 //
 // Key decode (sign-reversal quantization, no normalization):
-//   sign_bit = code & 1 (0=positive, 1=negative)
-//   q7 = code >> 1
+//   sign_bit = code >> 7 (0=positive, 1=negative)
+//   q7 = code & 0x7f
 //   sig_vec[d] = 1 - 2*sign_bit → {+1, -1}
 //   err = base + q7 * step (all positive residual)
 //   decoded_K = err * sig_vec (restore original sign per dimension)
@@ -41,16 +41,16 @@ static constexpr uint32_t TQ_BR_GROUP_INDEX_BYTES =
 // 16-row sub-block layout:
 static constexpr uint32_t TQ_BR_KEY_BLOCK_CODE_BYTES =
     (TQ_BR_BLOCK_ROWS / TQ_BR_KEY_GROUP_ROWS) * TQ_BR_GROUP_INDEX_BYTES;
-static constexpr uint32_t TQ_BR_KEY_BLOCK_BASE_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
-static constexpr uint32_t TQ_BR_KEY_BLOCK_STEP_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
+static constexpr uint32_t TQ_BR_KEY_BLOCK_BASE_BYTES = TQ_BR_BLOCK_ROWS * sizeof(uint16_t);
+static constexpr uint32_t TQ_BR_KEY_BLOCK_STEP_BYTES = TQ_BR_BLOCK_ROWS * sizeof(uint16_t);
 static constexpr uint32_t TQ_BR_KEY_BLOCK_BASE_OFFSET = TQ_BR_KEY_BLOCK_CODE_BYTES;
 static constexpr uint32_t TQ_BR_KEY_BLOCK_STEP_OFFSET = TQ_BR_KEY_BLOCK_BASE_OFFSET + TQ_BR_KEY_BLOCK_BASE_BYTES;
 static constexpr uint32_t TQ_BR_KEY_BLOCK_STRIDE = TQ_BR_KEY_BLOCK_CODE_BYTES + TQ_BR_KEY_BLOCK_BASE_BYTES + TQ_BR_KEY_BLOCK_STEP_BYTES;  // 2176
 
 static constexpr uint32_t TQ_BR_VAL_BLOCK_CODE_BYTES =
     (TQ_BR_BLOCK_ROWS / TQ_BR_VAL_GROUP_ROWS) * TQ_BR_GROUP_INDEX_BYTES;
-static constexpr uint32_t TQ_BR_VAL_BLOCK_VMIN_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
-static constexpr uint32_t TQ_BR_VAL_BLOCK_VSTEP_BYTES = TQ_BR_BLOCK_ROWS * sizeof(float);
+static constexpr uint32_t TQ_BR_VAL_BLOCK_VMIN_BYTES = TQ_BR_BLOCK_ROWS * sizeof(uint16_t);
+static constexpr uint32_t TQ_BR_VAL_BLOCK_VSTEP_BYTES = TQ_BR_BLOCK_ROWS * sizeof(uint16_t);
 static constexpr uint32_t TQ_BR_VAL_BLOCK_VMIN_OFFSET = TQ_BR_VAL_BLOCK_CODE_BYTES;
 static constexpr uint32_t TQ_BR_VAL_BLOCK_VSTEP_OFFSET = TQ_BR_VAL_BLOCK_VMIN_OFFSET + TQ_BR_VAL_BLOCK_VMIN_BYTES;
 static constexpr uint32_t TQ_BR_VAL_BLOCK_STRIDE = TQ_BR_VAL_BLOCK_CODE_BYTES + TQ_BR_VAL_BLOCK_VMIN_BYTES + TQ_BR_VAL_BLOCK_VSTEP_BYTES;  // 1152
@@ -108,6 +108,18 @@ __aicore__ inline float TqBrReadFloatFromU8(
     (void)floatScratch;
     auto packedF32 = packed.template ReinterpretCast<float>();
     return packedF32.GetValue(byteOffset / sizeof(float));
+}
+
+template <typename T>
+__aicore__ inline float TqBrRead16FromU8(
+    const AscendC::LocalTensor<uint8_t>& packed,
+    const AscendC::LocalTensor<float>& floatScratch,
+    uint32_t byteOffset) {
+    auto packedT = packed.template ReinterpretCast<T>();
+    AscendC::Cast(floatScratch, packedT[byteOffset / sizeof(T)],
+                  AscendC::RoundMode::CAST_NONE, 1);
+    TqBrSync<AscendC::HardEvent::V_S>();
+    return floatScratch.GetValue(0);
 }
 
 }  // namespace bit_residual_attn

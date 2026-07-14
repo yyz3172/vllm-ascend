@@ -160,8 +160,9 @@ static ge::graphStatus BitResidualPackK8v4TilingFunc(gert::TilingContext* contex
                   "num_blocks/num_reqs/strides must be positive");
         return ge::GRAPH_FAILED;
     }
-    if (blockSize % 4 != 0) {
-        OPS_LOG_E(nodeName, "4-bit group cache layout requires block_size multiple of 4, got %u",
+    if (blockSize % 16 != 0) {
+        OPS_LOG_E(nodeName,
+                  "independent-row cache layout requires block_size multiple of 16, got %u",
                   blockSize);
         return ge::GRAPH_FAILED;
     }
@@ -268,9 +269,9 @@ static ge::graphStatus BitResidualPackK8v4TilingFunc(gert::TilingContext* contex
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    // 512 KiB is reserved before the manual A/C bridge workspace. The bridge
-    // needs 2 ping-pong buffers * (A + C) * 64*128 elements per data group,
-    // so 16 MiB is enough for current 910B/C MIX 1C2V group counts.
+    // 512 KiB is reserved before the manual C bridge workspace. Each data
+    // group needs two 32x128 FP32 ping-pong buffers; the system workspace is
+    // sufficient for all current 910B/C MIX 1C2V groups.
     workspaces[0] = SYSTEM_NEED_WORKSPACE;
     context->SetBlockDim(blockDim);
     context->SetTilingKey(tilingKey);

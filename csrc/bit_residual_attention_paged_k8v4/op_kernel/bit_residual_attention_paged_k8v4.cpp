@@ -10,7 +10,7 @@
 
 // BitResidual K8V4: fused sign-reversal decode + paged attention.
 // Reads packed KV cache in bit_residual format and performs attention:
-//   K: 8-bit code = (q7 << 1) | sign → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
+//   K: 8-bit code = q7 | (sign<<7) → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
 //   V: 4-bit idx4 → vmin + idx4*vstep (raw, no norm folding)
 // Rotation: Q @ R^T (pre-rotate) and out @ R (post-rotate) via Cube KFC.
 
@@ -407,7 +407,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
         const uint32_t posInBlock = absPos % blockSize_;
-        const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
         const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
 
         // Look up physical block from block_table.
@@ -415,46 +414,33 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
         TqBrSync<HardEvent::MTE2_S>();
 
-        // Compute GM offset for this sub-block.
-        const uint64_t subBlockBase =
-            static_cast<uint64_t>(blockId) * numKvHeads_ * keySubBlocksPerBlock * TQ_BR_KEY_BLOCK_STRIDE +
-            static_cast<uint64_t>(kvHead) * keySubBlocksPerBlock * TQ_BR_KEY_BLOCK_STRIDE +
-            static_cast<uint64_t>(subBlockInBlock) * TQ_BR_KEY_BLOCK_STRIDE;
-
-        DataCopyExtParams copyParams{1, TQ_BR_KEY_BLOCK_STRIDE, 0, 0, 0};
+        const uint32_t headStride = blockSize_ * (TQ_BR_HEAD_SIZE + 2 * sizeof(QueryT));
+        const uint64_t headBase =
+            (static_cast<uint64_t>(blockId) * numKvHeads_ + kvHead) * headStride;
+        DataCopyExtParams copyParams{1, TQ_BR_HEAD_SIZE, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, keyCacheGm_[subBlockBase], copyParams, padParams);
+        DataCopyPad(packedRaw, keyCacheGm_[headBase + posInBlock * TQ_BR_HEAD_SIZE], copyParams, padParams);
+        DataCopyExtParams metaParams{1, sizeof(QueryT), 0, 0, 0};
+        DataCopyPad(packedRaw[TQ_BR_HEAD_SIZE],
+            keyCacheGm_[headBase + blockSize_ * TQ_BR_HEAD_SIZE + posInBlock * sizeof(QueryT)],
+            metaParams, padParams);
+        DataCopyPad(packedRaw[TQ_BR_HEAD_SIZE + 32],
+            keyCacheGm_[headBase + blockSize_ * (TQ_BR_HEAD_SIZE + sizeof(QueryT)) +
+                        posInBlock * sizeof(QueryT)], metaParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
         TqBrSync<HardEvent::MTE2_S>();
 
-        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_KEY_GROUP_ROWS;
-        const uint32_t groupRow = rowInSubBlock % TQ_BR_KEY_GROUP_ROWS;
-        auto packedU16 = packedRaw.template ReinterpretCast<uint16_t>();
         auto extractI16 = codeI16[row * D];
-        const uint32_t codeWordOff =
-            groupInBlock * TQ_BR_GROUP_INDEX_WORDS;
         for (uint32_t d = 0; d < D; ++d) {
-            const uint16_t word = packedU16.GetValue(codeWordOff + d);
-            uint16_t genericCode;
-            if (groupRow == 0) {
-                const uint16_t firstCode = word & 0x00ffu;
-                const uint16_t q7 = firstCode & 0x007fu;
-                const uint16_t sign = firstCode >> 7;
-                genericCode = (q7 << 1) | sign;
-            } else {
-                genericCode = word >> 8;
-            }
-            extractI16.SetValue(d, static_cast<int16_t>(genericCode));
+            extractI16.SetValue(d, static_cast<int16_t>(packedRaw.GetValue(d)));
         }
 
         // Read base and step at new offsets (base at rowInSubBlock*4 within base zone,
         // step at rowInSubBlock*4 within step zone).
-        const uint32_t baseByteOff = TQ_BR_KEY_BLOCK_BASE_OFFSET + rowInSubBlock * sizeof(float);
-        const float base = TqBrReadFloatFromU8(packedRaw, floatScratch, baseByteOff);
+        const float base = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, TQ_BR_HEAD_SIZE);
         kBase.SetValue(row, base);
 
-        const uint32_t stepByteOff = TQ_BR_KEY_BLOCK_STEP_OFFSET + rowInSubBlock * sizeof(float);
-        const float step = TqBrReadFloatFromU8(packedRaw, floatScratch, stepByteOff);
+        const float step = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, TQ_BR_HEAD_SIZE + 32);
         kStep.SetValue(row, step);
     }
     TqBrSync<HardEvent::V_S>();
@@ -485,51 +471,45 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
         const uint32_t posInBlock = absPos % blockSize_;
-        const uint32_t subBlockInBlock = posInBlock / TQ_BR_BLOCK_ROWS;
         const uint32_t rowInSubBlock = posInBlock % TQ_BR_BLOCK_ROWS;
 
         TqBrSync<HardEvent::S_MTE2>();
         const int32_t blockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
         TqBrSync<HardEvent::MTE2_S>();
 
-        // Compute GM offset for this sub-block.
-        const uint64_t subBlockBase =
-            static_cast<uint64_t>(blockId) * numKvHeads_ * valSubBlocksPerBlock * TQ_BR_VAL_BLOCK_STRIDE +
-            static_cast<uint64_t>(kvHead) * valSubBlocksPerBlock * TQ_BR_VAL_BLOCK_STRIDE +
-            static_cast<uint64_t>(subBlockInBlock) * TQ_BR_VAL_BLOCK_STRIDE;
-
-        DataCopyExtParams copyParams{1, TQ_BR_VAL_BLOCK_STRIDE, 0, 0, 0};
+        const uint32_t rowBytes = TQ_BR_HEAD_SIZE / 2;
+        const uint32_t headStride = blockSize_ * (rowBytes + 2 * sizeof(QueryT));
+        const uint64_t headBase =
+            (static_cast<uint64_t>(blockId) * numKvHeads_ + kvHead) * headStride;
+        DataCopyExtParams copyParams{1, rowBytes, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, valueCacheGm_[subBlockBase], copyParams, padParams);
+        DataCopyPad(packedRaw, valueCacheGm_[headBase + posInBlock * rowBytes], copyParams, padParams);
+        DataCopyExtParams metaParams{1, sizeof(QueryT), 0, 0, 0};
+        DataCopyPad(packedRaw[rowBytes],
+            valueCacheGm_[headBase + blockSize_ * rowBytes + posInBlock * sizeof(QueryT)],
+            metaParams, padParams);
+        DataCopyPad(packedRaw[rowBytes + 32],
+            valueCacheGm_[headBase + blockSize_ * (rowBytes + sizeof(QueryT)) +
+                          posInBlock * sizeof(QueryT)], metaParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
         TqBrSync<HardEvent::MTE2_S>();
 
-        const uint32_t groupInBlock = rowInSubBlock / TQ_BR_VAL_GROUP_ROWS;
-        const uint32_t groupRow = rowInSubBlock % TQ_BR_VAL_GROUP_ROWS;
-        auto packedI16 = packedRaw.template ReinterpretCast<int16_t>();
-        auto groupI16 = packedI16[groupInBlock * TQ_BR_GROUP_INDEX_WORDS];
         auto extractI16 = codeI16[row * D];
-        auto extractU16 = extractI16.template ReinterpretCast<uint16_t>();
-        auto valMask = MaskBuf();
-        Duplicate(valMask, static_cast<uint16_t>(0x000f), D);
-        PipeBarrier<PIPE_V>();
-        ShiftRight(
-            extractI16, groupI16, static_cast<int16_t>(groupRow * 4), D);
-        PipeBarrier<PIPE_V>();
-        And(extractU16, extractU16, valMask, D);
-        PipeBarrier<PIPE_V>();
+        for (uint32_t d = 0; d < D / 2; ++d) {
+            const uint8_t code = packedRaw.GetValue(d);
+            extractI16.SetValue(2 * d, static_cast<int16_t>(code & 0x0f));
+            extractI16.SetValue(2 * d + 1, static_cast<int16_t>(code >> 4));
+        }
 
         // Cast extracted idx4 to float for decode.
         Cast(codeFloat[row * D], extractI16, RoundMode::CAST_NONE, D);
         PipeBarrier<PIPE_V>();
 
         // Read vmin and vstep at new offsets (rowInSubBlock*4 within vmin/vstep zone).
-        const uint32_t vminByteOff = TQ_BR_VAL_BLOCK_VMIN_OFFSET + rowInSubBlock * sizeof(float);
-        const float vmin = TqBrReadFloatFromU8(packedRaw, floatScratch, vminByteOff);
+        const float vmin = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, rowBytes);
         vminBuf.SetValue(row, vmin);
 
-        const uint32_t vstepByteOff = TQ_BR_VAL_BLOCK_VSTEP_OFFSET + rowInSubBlock * sizeof(float);
-        const float vstep = TqBrReadFloatFromU8(packedRaw, floatScratch, vstepByteOff);
+        const float vstep = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, rowBytes + 32);
         vstepBuf.SetValue(row, vstep);
     }
 
@@ -551,9 +531,9 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     // Input: CodeI16Buf()[row*128] has the 8-bit code for each dimension.
     // kBase[k], kStep[k] are per-row scalar floats.
     //
-    // Decode: code = (q7 << 1) | sign
-    //   sign_bit = code & 1        → 0=positive, 1=negative
-    //   q7       = code >> 1       → [0, 127]
+    // Decode: code = q7 | (sign << 7)
+    //   sign_bit = code >> 7       → 0=positive, 1=negative
+    //   q7       = code & 0x7f     → [0, 127]
     //   sig_vec  = 1 - 2*sign_bit  → {+1.0, -1.0}
     //   err      = base + q7 * step (positive residual)
     //   decoded  = err * sig_vec   (restore original sign per dimension)
@@ -567,19 +547,24 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     auto kBase = KBaseBuf();
     auto kStep = KStepBuf();
 
-    // Step 1: Extract sign_bit (code & 1) and q7 (code >> 1).
+    // Step 1: Extract sign_bit (code >> 7) and q7 (code & 0x7f).
     auto signStorage = decoded.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
     auto codeU16 = codeI16.template ReinterpretCast<uint16_t>();
     auto signMask = MaskBuf();
-    Duplicate(signMask, static_cast<uint16_t>(1), D);
+    Duplicate(signMask, static_cast<uint16_t>(0x80), D);
     PipeBarrier<PIPE_V>();
     for (uint32_t row = 0; row < mRows; ++row) {
         And(signStorageU16[row * D], codeU16[row * D], signMask, D);
     }
     PipeBarrier<PIPE_V>();
-
-    ShiftRight(codeI16, codeI16, static_cast<int16_t>(1), n);
+    ShiftRight(signStorage, signStorage, static_cast<int16_t>(7), n);
+    PipeBarrier<PIPE_V>();
+    Duplicate(signMask, static_cast<uint16_t>(0x7f), D);
+    PipeBarrier<PIPE_V>();
+    for (uint32_t row = 0; row < mRows; ++row) {
+        And(codeU16[row * D], codeU16[row * D], signMask, D);
+    }
     PipeBarrier<PIPE_V>();
 
     // Step 2: sign_bit → sig_vec = ±1.0
