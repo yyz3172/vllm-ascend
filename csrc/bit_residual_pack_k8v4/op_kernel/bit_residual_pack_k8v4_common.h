@@ -322,33 +322,27 @@ static constexpr uint32_t TQ_UB_BASE_SIZE = 0;
 
 static constexpr uint32_t TQ_BATCH_ELEMS = TQ_VECTOR_BATCH * TQ_PACK_D;
 static constexpr uint32_t TQ_UB_ENCODE_FP32_ROW_BYTES = TQ_PACK_D * sizeof(float);  // 512 B per fp32 row
+// buf7 holds two Brcb broadcast tile outputs (baseBlk + stepBlk or minBlk + stepBlk).
+// Each is m × typePerBlock × sizeof(ComputeT) = 16 × 16 × 2 = 512 bytes.
+static constexpr uint32_t TQ_UB_BRCB_TILE_BYTES = TqAlignUp32(2 * TQ_VECTOR_BATCH * 16 * 2);
 static constexpr uint32_t TQ_UB_ENCODE_SMALL_BUF = 4096;   // 4 KB
 static constexpr uint32_t TQ_UB_ENCODE_LARGE_BUF = TQ_UB_ENCODE_SMALL_BUF * 2;  // 8 KB (16 fp32 rows)
 
 // ── Chained layout via UB_VARIBALE_AND_OFF ────────────────────────────────────
 UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH,        TQ_BATCH_ELEMS * sizeof(float), TQ_UB_BASE)
 UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH1,       TQ_BATCH_ELEMS * sizeof(float), TQ_UB_XY_BATCH)
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER1,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_XY_BATCH1)   // buf0: row_vec fp32
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER2,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_ENCODE_BUFFER1)  // buf2: abs/sign fp32
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER3,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_ENCODE_BUFFER2)  // buf3: reduce/div fp32
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER4,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER3)  // buf4: norm_vec_16
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER5,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER4)  // buf5: base_blk/quant
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER6,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER5)  // buf6: step_blk/bit/final
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER7,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER6)  // spare
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER8,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER7)  // spare
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER1,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_XY_BATCH1)   // buf1: absVec/signVec/quantI32 (fp32/u32/i32)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER2,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_ENCODE_BUFFER1)  // buf2: normFp32/metadataFp32 (fp32)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER3,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER2)  // buf3: maxFold/maxVecBlk (fp32)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER4,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER3)  // buf4: normVec16/quantI16 (f16/bf16/i16)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER5,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER4)  // buf5: signVecU16 (u16) — key only
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER6,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER5)  // buf6: reduceScalars/shiftedSign (f16/u16)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER7,  TQ_UB_BRCB_TILE_BYTES,            TQ_UB_ENCODE_BUFFER6)  // buf7: baseBlk+stepBlk (brcb broadcast)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER8,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER7)  // buf8: maxVec/finalCodes (fp32/u16)
 UB_VARIBALE_AND_OFF(TQ_UB_A_ENCODED_BATCH, TQ_UB_ENCODED_BATCH_BYTES, TQ_UB_ENCODE_BUFFER8)
-UB_VARIBALE_AND_OFF(TQ_UB_SIGN_MASK,       TQ_PACK_D * sizeof(int16_t),  TQ_UB_A_ENCODED_BATCH)
-UB_VARIBALE_AND_OFF(TQ_UB_Y_FP32,          TQ_PACK_D * sizeof(float),    TQ_UB_SIGN_MASK)
-UB_VARIBALE_AND_OFF(TQ_UB_REV_VEC,         TQ_PACK_D * sizeof(float),    TQ_UB_Y_FP32)
-UB_VARIBALE_AND_OFF(TQ_UB_QUANT_INDEX,     TQ_PACK_D * sizeof(int32_t),  TQ_UB_REV_VEC)
-UB_VARIBALE_AND_OFF(TQ_UB_QUANT_INDEX_U16, TQ_PACK_D * sizeof(int16_t),  TQ_UB_QUANT_INDEX)
-UB_VARIBALE_AND_OFF(TQ_UB_REDUCE_SCALAR,   TQ_UB_ALIGN,                  TQ_UB_QUANT_INDEX_U16)
-UB_VARIBALE_AND_OFF(TQ_UB_REDUCE_OUT,      TQ_PACK_D * 3 * sizeof(float),TQ_UB_REDUCE_SCALAR)
-UB_VARIBALE_AND_OFF(TQ_UB_REDUCE_TMP,      TQ_PACK_D * sizeof(float),    TQ_UB_REDUCE_OUT)
-UB_VARIBALE_AND_OFF(TQ_UB_PACKED_ROW,      TQ_PACKED_TILE_SCRATCH_BYTES, TQ_UB_REDUCE_TMP)
-UB_VARIBALE_AND_OFF(TQ_UB_PACK_MERGE,      TQ_PACK_D * sizeof(uint16_t), TQ_UB_PACKED_ROW)
+UB_VARIBALE_AND_OFF(TQ_UB_PACKED_ROW,      TQ_PACKED_TILE_SCRATCH_BYTES, TQ_UB_A_ENCODED_BATCH)
 static constexpr uint32_t TQ_UB_TOTAL_BYTES =
-    TqAlignUp32(TQ_UB_PACK_MERGE_OFFSET + TQ_UB_PACK_MERGE_SIZE);
+    TqAlignUp32(TQ_UB_PACKED_ROW_OFFSET + TQ_UB_PACKED_ROW_SIZE);
 static_assert(TQ_UB_TOTAL_BYTES <= TOTAL_UB_SIZE,
               "Bit-residual K8v4 static UB slices exceed UB size.");
 
@@ -412,45 +406,9 @@ public:
     }
 
     // ── VECCALC (UB compute scratch) ─────────────────────────────────────────
-    __aicore__ inline AscendC::LocalTensor<uint8_t> SignMask() {
-        return local_.vecCalc.GetBufferByByte<uint8_t>(
-            TQ_UB_SIGN_MASK_OFFSET, TQ_UB_SIGN_MASK_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<float> YFp32() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_Y_FP32_OFFSET, TQ_UB_Y_FP32_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<float> RevVec() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REV_VEC_OFFSET, TQ_UB_REV_VEC_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<int32_t> QuantIndex() {
-        return local_.vecCalc.GetBufferByByte<int32_t>(
-            TQ_UB_QUANT_INDEX_OFFSET, TQ_UB_QUANT_INDEX_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<int16_t> QuantIndexU16() {
-        return local_.vecCalc.GetBufferByByte<int16_t>(
-            TQ_UB_QUANT_INDEX_U16_OFFSET, TQ_UB_QUANT_INDEX_U16_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<float> ReduceScalar() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REDUCE_SCALAR_OFFSET, TQ_UB_REDUCE_SCALAR_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<float> ReduceOut() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REDUCE_OUT_OFFSET, TQ_UB_REDUCE_OUT_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<float> ReduceTmp() {
-        return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_REDUCE_TMP_OFFSET, TQ_UB_REDUCE_TMP_SIZE);
-    }
     __aicore__ inline AscendC::LocalTensor<uint8_t> PackedRow() {
         return local_.vecCalc.GetBufferByByte<uint8_t>(
             TQ_UB_PACKED_ROW_OFFSET, TQ_UB_PACKED_ROW_SIZE);
-    }
-    __aicore__ inline AscendC::LocalTensor<uint16_t> PackMerge() {
-        return local_.vecCalc.GetBufferByByte<uint16_t>(
-            TQ_UB_PACK_MERGE_OFFSET, TQ_UB_PACK_MERGE_SIZE);
     }
 
 private:
