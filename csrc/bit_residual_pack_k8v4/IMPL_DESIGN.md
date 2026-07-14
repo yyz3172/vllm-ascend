@@ -35,9 +35,10 @@ metadata 组装均不使用标量 `GetValue/SetValue`。
 - AIV 等待 `C_READY`，把自己的切片从 GM 搬入 UB 后发布 `C_FREE`。
 
 这样 AIC 可以计算下一批旋转，同时 AIV 编码上一批数据，且不会反复覆盖尚未
-搬入 UB 的结果。AIV 内部编码暂不增加第二套完整 UB scratch：每个 AIV 已独占
-UB，当前 stream 仍需顺序完成 cache 的 read-modify-write；额外复制整套 scratch
-会显著增加 UB 占用，但不能形成对应的流水重叠。
+搬入 UB 的结果。AIV 另设两块 8 KiB 的 FP32 输入 UB：当前批次进入向量流水后，
+MTE2 将下一批从 GM bridge 预取到另一块 UB，再执行当前批次的 cache
+read-modify-write。编码 scratch 和 encoded output 保持单份，避免复制约 64 KiB
+工作区；它们在写回完成后才由下一批复用。
 
 ## Cache layout
 
