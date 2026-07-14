@@ -20,8 +20,9 @@
 5. base、step、vmin、vstep 均以输入 dtype 的 16-bit 表示保存。
 
 量化主体使用向量指令。Key 先将 sign 和 7-bit quant code 做 OR，再将后 64 维
-左移 8 bit，并与前 64 维做 OR，得到连续的 64 个 uint16 packed code。编码和
-metadata 组装均不使用标量 `GetValue/SetValue`。
+左移 8 bit，并与前 64 维做 OR，得到连续的 64 个 uint16 packed code。Value
+同样一次处理 16 行，批量完成 FP32 abs/max、FP16 归一化、min/max、Brcb 和
+4-bit 量化。两种编码的 metadata 组装均不使用标量 `GetValue/SetValue`。
 
 ## AIC/AIV 双缓冲
 

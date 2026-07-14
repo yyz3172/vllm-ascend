@@ -84,6 +84,7 @@ static constexpr uint32_t TQ_KEY_ROW_CODE_BYTES = TQ_PACK_D;
 static constexpr uint32_t TQ_VAL_ROW_CODE_BYTES = TQ_PACK_D / 2;
 static constexpr uint32_t TQ_ROW_META_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_META_TILE_BYTES = TQ_BLOCK_ROWS * TQ_ROW_META_BYTES;
+static constexpr uint32_t TQ_MAX_UINT8_DATACOPY_BYTES = 1024;
 static constexpr uint32_t TQ_PACKED_TILE_SCRATCH_BYTES =
     2 * TQ_META_TILE_BYTES + TQ_BLOCK_ROWS * TQ_KEY_ROW_CODE_BYTES;
 static constexpr uint32_t TQ_KEY_BYTES_PER_ROW = TQ_KEY_ROW_CODE_BYTES + 2 * TQ_ROW_META_BYTES;
@@ -100,16 +101,21 @@ static constexpr uint32_t TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET =
     TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET + TQ_VECTOR_BATCH * sizeof(uint16_t);
 static constexpr uint32_t TQ_KEY_ENCODED_BATCH_BYTES =
     TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET + TQ_VECTOR_BATCH * sizeof(uint16_t);
-// Value encoded row: 128 × uint16 code + 1 × uint16 vmin + 1 × uint16 vstep
+// Value: 16 contiguous 128-word code rows, then 16 vmins, then 16 vsteps.
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_BYTES =
-    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(uint16_t);
-static constexpr uint32_t TQ_VAL_ENCODED_VMIN_BYTE_OFFSET = TQ_PACK_D * sizeof(uint16_t);
-static constexpr uint32_t TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET =
-    TQ_VAL_ENCODED_VMIN_BYTE_OFFSET + sizeof(uint16_t);
+    TQ_PACK_D * sizeof(uint16_t);
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_BYTES =
-    TqAlignUp32(TQ_VAL_ENCODED_ROW_BYTES);
+    TQ_VAL_ENCODED_ROW_BYTES;
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_WORDS =
     TQ_VAL_ENCODED_ROW_STRIDE_BYTES / sizeof(uint16_t);
+static constexpr uint32_t TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET =
+    TQ_VECTOR_BATCH * TQ_VAL_ENCODED_ROW_BYTES;
+static constexpr uint32_t TQ_VAL_ENCODED_VSTEP_BATCH_BYTE_OFFSET =
+    TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET +
+    TQ_VECTOR_BATCH * sizeof(uint16_t);
+static constexpr uint32_t TQ_VAL_ENCODED_BATCH_BYTES =
+    TQ_VAL_ENCODED_VSTEP_BATCH_BYTE_OFFSET +
+    TQ_VECTOR_BATCH * sizeof(uint16_t);
 
 struct ManualKey1StreamDesc {
     uint32_t tokenStart;
@@ -306,8 +312,6 @@ __aicore__ inline void copy_packed_gm_to_ub(
 // ── Base variable (offset = 0, no predecessor) ────────────────────────────────
 
 // ── A_ENCODED has a max-expression size; pre-compute before chaining ──────────
-static constexpr uint32_t TQ_VAL_ENCODED_BATCH_BYTES =
-    TQ_VECTOR_BATCH * TQ_VAL_ENCODED_ROW_STRIDE_BYTES;
 static constexpr uint32_t TQ_UB_ENCODED_BATCH_BYTES =
     (TQ_KEY_ENCODED_BATCH_BYTES > TQ_VAL_ENCODED_BATCH_BYTES)
         ? TQ_KEY_ENCODED_BATCH_BYTES

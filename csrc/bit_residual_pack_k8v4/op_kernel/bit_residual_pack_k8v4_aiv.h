@@ -171,6 +171,8 @@ private:
             static_cast<ComputeT>(1.0f / TQ_KEY_QUANT_LEVELS_F);
         const ComputeT safeTDivisor = static_cast<ComputeT>(1.0e-6f);
         const uint32_t totalElems = m * TQ_PACK_D;
+        constexpr uint32_t codeBatchElems =
+            (TQ_VECTOR_BATCH / 2) * TQ_PACK_D;
 
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
@@ -235,14 +237,20 @@ private:
         // Extract all sign bits once; buf1 is free after the normalized cast.
         auto signVec = buf1.template ReinterpretCast<int32_t>();
         auto signMask = buf3.template ReinterpretCast<int32_t>();
-        AscendC::ShiftRight(signVec, yBatch.template ReinterpretCast<int32_t>(),
-                            static_cast<int32_t>(31), totalElems);
+        AscendC::Duplicate(signMask, static_cast<int32_t>(1), codeBatchElems);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(signMask, static_cast<int32_t>(1), totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::And(signVec, signVec, signMask, totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(buf5, signVec, AscendC::RoundMode::CAST_NONE, totalElems);
+        auto yBits = yBatch.template ReinterpretCast<int32_t>();
+        for (uint32_t batch = 0; batch < 2; ++batch) {
+            const uint32_t batchOff = batch * codeBatchElems;
+            AscendC::ShiftRight(signVec[batchOff], yBits[batchOff],
+                               static_cast<int32_t>(31), codeBatchElems);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(signVec[batchOff], signVec[batchOff], signMask,
+                         codeBatchElems);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(buf5[batchOff], signVec[batchOff],
+                          AscendC::RoundMode::CAST_NONE, codeBatchElems);
+        }
         AscendC::PipeBarrier<PIPE_V>();
 
         // One T-domain minimum per row.  max(normVec16) is exactly 1 for every
@@ -291,25 +299,32 @@ private:
                 AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
         }
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Maxs(normVec16, normVec16, static_cast<ComputeT>(0.0f),
-                      totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mins(normVec16, normVec16,
-                      static_cast<ComputeT>(TQ_KEY_QUANT_LEVELS_F), totalElems);
+        for (uint32_t batch = 0; batch < 2; ++batch) {
+            const uint32_t batchOff = batch * codeBatchElems;
+            AscendC::Maxs(normVec16[batchOff], normVec16[batchOff],
+                          static_cast<ComputeT>(0.0f), codeBatchElems);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(normVec16[batchOff], normVec16[batchOff],
+                          static_cast<ComputeT>(TQ_KEY_QUANT_LEVELS_F),
+                          codeBatchElems);
+        }
         AscendC::PipeBarrier<PIPE_V>();
 
         // C220 does not provide the required T->int16 conversion directly.
         // Convert through FP32/int32 before vectorized code assembly.
-        AscendC::Cast(normFp32, normVec16, AscendC::RoundMode::CAST_NONE,
-                      totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
         auto quantI32 = buf1.template ReinterpretCast<int32_t>();
-        AscendC::Cast(quantI32, normFp32, AscendC::RoundMode::CAST_RINT,
-                      totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
         auto quantI16 = buf4.template ReinterpretCast<int16_t>();
-        AscendC::Cast(quantI16, quantI32, AscendC::RoundMode::CAST_NONE,
-                      totalElems);
+        for (uint32_t batch = 0; batch < 2; ++batch) {
+            const uint32_t batchOff = batch * codeBatchElems;
+            AscendC::Cast(normFp32[batchOff], normVec16[batchOff],
+                          AscendC::RoundMode::CAST_NONE, codeBatchElems);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(quantI32[batchOff], normFp32[batchOff],
+                          AscendC::RoundMode::CAST_RINT, codeBatchElems);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(quantI16[batchOff], quantI32[batchOff],
+                          AscendC::RoundMode::CAST_NONE, codeBatchElems);
+        }
         AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::Mul(baseVec, baseVec, maxVecT, typePerBlock);
@@ -341,9 +356,9 @@ private:
         }
         AscendC::PipeBarrier<PIPE_V>();
 
-        // First assemble the key's 128 q7/sign bytes as uint16 elements.  Then
-        // shift dimensions [64, 128) into the high byte and OR them with
-        // dimensions [0, 64), producing one 64-word encoded row.
+        // First assemble the key's 128 q7/sign bytes as uint16 elements.  Pack
+        // adjacent dimensions into each uint16 so its byte view is exactly
+        // dim0, dim1, dim2, ... and can be copied directly to cache.
         auto signVecU16 = buf5.template ReinterpretCast<uint16_t>();
         auto quantU16 = quantI16.template ReinterpretCast<uint16_t>();
         auto shiftedSign = context_.resource_.EncodeBuffer6()
@@ -358,125 +373,202 @@ private:
                         shiftedSign[rowOff], TQ_PACK_D);
         }
         AscendC::PipeBarrier<PIPE_V>();
+        AscendC::GatherMaskParams gatherParams;
+        gatherParams.repeatTimes = 1;
+        gatherParams.src0BlockStride = 1;
+        gatherParams.src0RepeatStride = 8;
+        gatherParams.src1RepeatStride = 0;
+        uint64_t gatheredCount = 0;
         for (uint32_t i = 0; i < m; ++i) {
             const uint32_t rowOff = i * TQ_PACK_D;
             const uint32_t encodedOff = i * TQ_KEY_ENCODED_ROW_STRIDE_WORDS;
-            AscendC::ShiftLeft(shiftedSign[encodedOff],
-                               finalCodes[rowOff + TQ_PACK_D / 2],
-                               static_cast<uint16_t>(8), TQ_PACK_D / 2);
+            // Built-in patterns 1 and 2 select even and odd elements.
+            AscendC::GatherMask(encodedBatch[encodedOff], finalCodes[rowOff],
+                                static_cast<uint8_t>(1), false,
+                                static_cast<uint32_t>(0), gatherParams,
+                                gatheredCount);
+            AscendC::GatherMask(shiftedSign[encodedOff], finalCodes[rowOff],
+                                static_cast<uint8_t>(2), false,
+                                static_cast<uint32_t>(0), gatherParams,
+                                gatheredCount);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t rowOff = i * TQ_PACK_D;
-            const uint32_t encodedOff = i * TQ_KEY_ENCODED_ROW_STRIDE_WORDS;
-            AscendC::Or(encodedBatch[encodedOff], finalCodes[rowOff],
-                        shiftedSign[encodedOff], TQ_PACK_D / 2);
-        }
+        AscendC::ShiftLeft(shiftedSign, shiftedSign,
+                           static_cast<uint16_t>(8),
+                           m * TQ_KEY_ENCODED_ROW_STRIDE_WORDS);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Or(encodedBatch, encodedBatch, shiftedSign,
+                    m * TQ_KEY_ENCODED_ROW_STRIDE_WORDS);
         AscendC::PipeBarrier<PIPE_V>();
     }
-    // ── Value quantization (no norm folding) ──────────────────────────────
-    // vmin/vstep stored as raw values (not multiplied by norm).
-    // Decode: y = vmin + idx4 * vstep
-    //
+    // ── Value quantization ────────────────────────────────────────────────
+    // Process all 16 rows as one vector batch.  Values are normalized through
+    // FP16 before 4-bit min/max quantization; vmin/vstep are scaled back to the
+    // original domain and stored in the input dtype.
     __aicore__ inline void EncodeValueBatch(
         uint32_t m,
         AscendC::LocalTensor<float>& yBatch) {
+        using ComputeT = half;
+        static_assert(TQ_MANUAL_AIV_SLICE_M == TQ_VECTOR_BATCH,
+                      "value encoder expects one physical 16-row tile");
+        constexpr uint32_t typePerBlock = 32 / sizeof(ComputeT);
+        constexpr float safeFp32Divisor = 1.0e-12f;
+        const ComputeT quantStep =
+            static_cast<ComputeT>(1.0f / TQ_VAL_QUANT_LEVELS_F);
+        const ComputeT safeTDivisor = static_cast<ComputeT>(1.0e-6f);
+        const uint32_t totalElems = m * TQ_PACK_D;
+
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
-        auto yFp32 = context_.resource_.YFp32();
-        auto qFp32 = context_.resource_.RevVec();  // reuse RevVec buffer for value quant
-        auto qI32 = context_.resource_.QuantIndex();
-        auto qI16 = context_.resource_.QuantIndexU16();
-        auto normalized = context_.resource_.SignMask().template ReinterpretCast<T>();
-        auto reduceScalar = context_.resource_.ReduceScalar();
-        auto vminAcc = reduceScalar;
-        auto vmaxAcc = reduceScalar[1];
-        auto reduceTmp = context_.resource_.ReduceTmp();
-        auto metadataFp32 = context_.resource_.ReduceOut();
+        auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
+        auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<float>();
+        auto buf3 = context_.resource_.EncodeBuffer3().template ReinterpretCast<float>();
+        auto buf4 = context_.resource_.EncodeBuffer4().template ReinterpretCast<ComputeT>();
+        auto buf6 = context_.resource_.EncodeBuffer6().template ReinterpretCast<ComputeT>();
+        auto buf7 = context_.resource_.EncodeBuffer7().template ReinterpretCast<ComputeT>();
+        auto buf8 = context_.resource_.EncodeBuffer8().template ReinterpretCast<float>();
 
+        auto absVec = buf1;
+        auto normFp32 = buf2;
+        auto maxFold = buf3;
+        auto maxVec = buf8;
+        AscendC::Abs(absVec, yBatch, totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t yOff = i * TQ_ROT_N;
-            const uint32_t encodedOff = i * TQ_VAL_ENCODED_ROW_STRIDE_WORDS;
-
-            AscendC::Abs(qFp32, yBatch[yOff], TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ReduceMax<float>(vmaxAcc, qFp32, reduceTmp, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            TqSyncVToS();
-            const float absMaxF = vmaxAcc.GetValue(0);
-            const float invAbsMaxF = absMaxF > 0.0f ? 1.0f / absMaxF : 0.0f;
-            TqSyncSToV();
-            AscendC::Muls(yFp32, yBatch[yOff], invAbsMaxF, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(normalized, yFp32, AscendC::RoundMode::CAST_RINT, TQ_PACK_D / 2);
-            AscendC::Cast(normalized[TQ_PACK_D / 2], yFp32[TQ_PACK_D / 2],
-                          AscendC::RoundMode::CAST_RINT, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(yFp32, normalized, AscendC::RoundMode::CAST_NONE, TQ_PACK_D / 2);
-            AscendC::Cast(yFp32[TQ_PACK_D / 2], normalized[TQ_PACK_D / 2],
-                          AscendC::RoundMode::CAST_NONE, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ReduceMin<float>(vminAcc, yFp32, reduceTmp, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ReduceMax<float>(vmaxAcc, yFp32, reduceTmp, TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-            TqSyncVToS();
-            const float vminNormF = vminAcc.GetValue(0);
-            const float vmaxNormF = vmaxAcc.GetValue(0);
-            const float rangeNormF = vmaxNormF - vminNormF;
-            const float vstepNormF = rangeNormF > 0.0f ? rangeNormF / TQ_VAL_QUANT_LEVELS_F : 1.0f;
-            const float invStepNormF = rangeNormF > 0.0f ? 1.0f / vstepNormF : 0.0f;
-            const float vminF = vminNormF * absMaxF;
-            const float vstepF = vstepNormF * absMaxF;
-            TqSyncSToV();
-
-            // Quantize: idx4 = (yFp32 - vminF) * invStepF, clamped [0, 15]
-            // Store raw vmin/vstep (no norm folding)
-            AscendC::Adds(qFp32, yFp32, -vminNormF, TQ_PACK_D / 2);
-            AscendC::Adds(qFp32[TQ_PACK_D / 2], yFp32[TQ_PACK_D / 2],
-                          -vminNormF, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(qFp32, qFp32, invStepNormF, TQ_PACK_D / 2);
-            AscendC::Muls(qFp32[TQ_PACK_D / 2], qFp32[TQ_PACK_D / 2],
-                          invStepNormF, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Maxs(qFp32, qFp32, 0.0f, TQ_PACK_D / 2);
-            AscendC::Maxs(qFp32[TQ_PACK_D / 2], qFp32[TQ_PACK_D / 2],
-                          0.0f, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mins(qFp32, qFp32, TQ_VAL_QUANT_LEVELS_F, TQ_PACK_D / 2);
-            AscendC::Mins(qFp32[TQ_PACK_D / 2], qFp32[TQ_PACK_D / 2],
-                          TQ_VAL_QUANT_LEVELS_F, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI32, qFp32, AscendC::RoundMode::CAST_RINT, TQ_PACK_D / 2);
-            AscendC::Cast(qI32[TQ_PACK_D / 2], qFp32[TQ_PACK_D / 2],
-                          AscendC::RoundMode::CAST_RINT, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qI16, qI32, AscendC::RoundMode::CAST_NONE, TQ_PACK_D / 2);
-            AscendC::Cast(qI16[TQ_PACK_D / 2], qI32[TQ_PACK_D / 2],
-                          AscendC::RoundMode::CAST_NONE, TQ_PACK_D / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::DataCopy(
-                encodedBatch[encodedOff].template ReinterpretCast<int16_t>(),
-                qI16,
-                TQ_PACK_D);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            auto vminOut = encodedBatch[
-                encodedOff + TQ_VAL_ENCODED_VMIN_BYTE_OFFSET / sizeof(uint16_t)]
-                               .template ReinterpretCast<T>();
-            auto vstepOut = encodedBatch[
-                encodedOff + TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET / sizeof(uint16_t)]
-                                .template ReinterpretCast<T>();
-            AscendC::Duplicate(metadataFp32, vminF, 1);
-            AscendC::Duplicate(metadataFp32[8], vstepF, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(normalized, metadataFp32, AscendC::RoundMode::CAST_RINT, 1);
-            AscendC::Cast(normalized[16], metadataFp32[8], AscendC::RoundMode::CAST_RINT, 1);
-            TqSyncVToS();
-            vminOut.SetValue(0, normalized.GetValue(0));
-            vstepOut.SetValue(0, normalized.GetValue(16));
+            const uint32_t rowOff = i * TQ_ROT_N;
+            AscendC::Max(maxFold[i * TQ_ROT_N / 2], absVec[rowOff],
+                         absVec[rowOff + TQ_ROT_N / 2], TQ_ROT_N / 2);
         }
-        TqSyncSToV();
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceMax<float, false>(
+            maxVec, maxFold, static_cast<int32_t>(TQ_ROT_N / 2), m, 1, 1,
+            TQ_ROT_N / 16, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto maxVecT = buf6;
+        auto minVec = buf6[typePerBlock];
+        auto maxNormVec = buf6[2 * typePerBlock];
+        auto rangeVec = buf6[3 * typePerBlock];
+        auto stepVec = buf6[4 * typePerBlock];
+        auto safeStepVec = buf6[5 * typePerBlock];
+        AscendC::Cast(maxVecT, maxVec, AscendC::RoundMode::CAST_RINT, m);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Maxs(maxVec, maxVec, safeFp32Divisor, m);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto maxVecBlk = buf3;
+        AscendC::Brcb(maxVecBlk.template ReinterpretCast<uint32_t>(),
+                      maxVec.template ReinterpretCast<uint32_t>(), 2,
+                      AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t rowOff = i * TQ_PACK_D;
+            AscendC::Div<float, false>(
+                normFp32[rowOff], yBatch[rowOff], maxVecBlk[i * 8],
+                static_cast<uint64_t>(0), 2,
+                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        auto normVec16 = buf4;
+        AscendC::Cast(normVec16, normFp32, AscendC::RoundMode::CAST_RINT,
+                      totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::WholeReduceMin<ComputeT, false>(
+            minVec, normVec16, static_cast<int32_t>(TQ_ROT_N), m, 1, 1,
+            TQ_ROT_N / typePerBlock,
+            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceMax<ComputeT, false>(
+            maxNormVec, normVec16, static_cast<int32_t>(TQ_ROT_N), m, 1, 1,
+            TQ_ROT_N / typePerBlock,
+            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(rangeVec, maxNormVec, minVec, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(stepVec, rangeVec, quantStep, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(safeStepVec, stepVec, static_cast<ComputeT>(0.0f),
+                      typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Maxs(safeStepVec, safeStepVec, safeTDivisor, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto minBlk = buf7;
+        auto stepBlk = buf7[16 * typePerBlock];
+        AscendC::Brcb(minBlk, minVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Brcb(stepBlk, safeStepVec, 2,
+                      AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t rowOff = i * TQ_PACK_D;
+            const uint32_t blockOff = i * typePerBlock;
+            AscendC::Sub<ComputeT, false>(
+                normVec16[rowOff], normVec16[rowOff], minBlk[blockOff],
+                static_cast<uint64_t>(0), 1,
+                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t rowOff = i * TQ_PACK_D;
+            const uint32_t blockOff = i * typePerBlock;
+            AscendC::Div<ComputeT, false>(
+                normVec16[rowOff], normVec16[rowOff], stepBlk[blockOff],
+                static_cast<uint64_t>(0), 1,
+                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Maxs(normVec16, normVec16, static_cast<ComputeT>(0.0f),
+                      totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(normVec16, normVec16,
+                      static_cast<ComputeT>(TQ_VAL_QUANT_LEVELS_F), totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Cast(normFp32, normVec16, AscendC::RoundMode::CAST_NONE,
+                      totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto quantI32 = buf1.template ReinterpretCast<int32_t>();
+        AscendC::Cast(quantI32, normFp32, AscendC::RoundMode::CAST_RINT,
+                      totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        auto quantI16 = buf4.template ReinterpretCast<int16_t>();
+        AscendC::Cast(quantI16, quantI32, AscendC::RoundMode::CAST_NONE,
+                      totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(
+            encodedBatch.template ReinterpretCast<int16_t>(), quantI16,
+            totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Mul(minVec, minVec, maxVecT, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(stepVec, stepVec, maxVecT, typePerBlock);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        auto metadataMinT = encodedBatch[
+            TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
+                                .template ReinterpretCast<T>();
+        auto metadataStepT = encodedBatch[
+            TQ_VAL_ENCODED_VSTEP_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
+                                 .template ReinterpretCast<T>();
+        if constexpr (std::is_same<T, bfloat16_t>::value) {
+            auto metadataMinFp32 = buf2;
+            auto metadataStepFp32 = buf2[typePerBlock];
+            AscendC::Cast(metadataMinFp32, minVec,
+                          AscendC::RoundMode::CAST_NONE, m);
+            AscendC::Cast(metadataStepFp32, stepVec,
+                          AscendC::RoundMode::CAST_NONE, m);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(metadataMinT, metadataMinFp32,
+                          AscendC::RoundMode::CAST_RINT, m);
+            AscendC::Cast(metadataStepT, metadataStepFp32,
+                          AscendC::RoundMode::CAST_RINT, m);
+        } else {
+            AscendC::Adds(metadataMinT, minVec, static_cast<half>(0.0f), m);
+            AscendC::Adds(metadataStepT, stepVec, static_cast<half>(0.0f), m);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void CopyManualCToYBatch(
@@ -550,12 +642,11 @@ private:
                 const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
                 auto codeOut = scratch[2 * TQ_META_TILE_BYTES + r * codeBytes];
                 if constexpr (IS_KEY) {
-                    for (uint32_t d = 0; d < TQ_PACK_D / 2; ++d) {
-                        const uint16_t packedCode = encoded.GetValue(encodedOff + d);
-                        codeOut.SetValue(d,
-                                         static_cast<uint8_t>(packedCode & 0xffU));
-                        codeOut.SetValue(d + TQ_PACK_D / 2,
-                                         static_cast<uint8_t>(packedCode >> 8U));
+                    auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
+                    auto encodedRowBytes =
+                        encodedBytes[encodedRow * TQ_KEY_ENCODED_ROW_BYTES];
+                    for (uint32_t d = 0; d < TQ_KEY_ROW_CODE_BYTES; ++d) {
+                        codeOut.SetValue(d, encodedRowBytes.GetValue(d));
                     }
                     meta0.SetValue(tileRow + r, encoded[
                         TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
@@ -572,17 +663,40 @@ private:
                         codeOut.SetValue(d, static_cast<uint8_t>(lo | (hi << 4)));
                     }
                     meta0.SetValue(tileRow + r, encoded[
-                        encodedOff + TQ_VAL_ENCODED_VMIN_BYTE_OFFSET / sizeof(uint16_t)]
+                        TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
+                        encodedRow]
                             .template ReinterpretCast<T>().GetValue(0));
                     meta1.SetValue(tileRow + r, encoded[
-                        encodedOff + TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET / sizeof(uint16_t)]
+                        TQ_VAL_ENCODED_VSTEP_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
+                        encodedRow]
                             .template ReinterpretCast<T>().GetValue(0));
                 }
             }
             TqSyncSToMte3();
-            copy_packed_ub_to_gm(packedGm,
-                headBase + static_cast<uint64_t>(blockRow) * codeBytes,
-                codeBytesUb, rows * codeBytes);
+            if constexpr (IS_KEY) {
+                constexpr uint32_t maxRowsPerCopy =
+                    TQ_MAX_UINT8_DATACOPY_BYTES / TQ_KEY_ROW_CODE_BYTES;
+                uint32_t copiedRows = 0;
+                while (copiedRows < rows) {
+                    const uint32_t remainingRows = rows - copiedRows;
+                    const uint32_t copyRows = remainingRows > maxRowsPerCopy
+                        ? maxRowsPerCopy
+                        : remainingRows;
+                    auto scratchCodeBytes =
+                        codeBytesUb[copiedRows * TQ_KEY_ROW_CODE_BYTES];
+                    copy_packed_ub_to_gm(
+                        packedGm,
+                        headBase + static_cast<uint64_t>(blockRow + copiedRows) *
+                                           codeBytes,
+                        scratchCodeBytes, copyRows * codeBytes);
+                    copiedRows += copyRows;
+                }
+            } else {
+                copy_packed_ub_to_gm(
+                    packedGm,
+                    headBase + static_cast<uint64_t>(blockRow) * codeBytes,
+                    codeBytesUb, rows * codeBytes);
+            }
             copy_packed_ub_to_gm(packedGm, meta0Base + tileStart * TQ_ROW_META_BYTES,
                 scratch, TQ_META_TILE_BYTES);
             copy_packed_ub_to_gm(packedGm, meta1Base + tileStart * TQ_ROW_META_BYTES,
@@ -601,6 +715,12 @@ private:
 
         TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_READY);
         CopyManualCToYBatch(cWorkGm, bufferOffset, aivSlice, inputBuffer);
+        // Cross-core flag operations are not a completion fence for the GM->UB
+        // transfer.  Wait on MTE2 from S before releasing the workspace buffer,
+        // otherwise AIC may overwrite it while the copy is still in flight.
+        // For steady-state streams this scalar wait overlaps the already-issued
+        // vector encoding of the previous UB buffer.
+        TqSyncMte2ToS();
         TqCrossCoreSet<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_FREE);
         // The dependency is inserted after the copy on MTE2 and after any
         // already-issued work on V.  It therefore protects the prefetched UB
