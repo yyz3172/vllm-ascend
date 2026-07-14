@@ -80,6 +80,17 @@ def _identity(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     return torch.eye(HEAD_SIZE, dtype=dtype, device=device).contiguous()
 
 
+def _dense_rotation(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Fixed dense orthogonal R^T used to expose rotation/layout bugs."""
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(SEED)
+    matrix = torch.randn(
+        (HEAD_SIZE, HEAD_SIZE), dtype=torch.float32, generator=generator
+    )
+    rotation, _ = torch.linalg.qr(matrix)
+    return rotation.to(device=device, dtype=dtype).contiguous()
+
+
 def _scalar_bytes(value: float, dtype: torch.dtype) -> torch.Tensor:
     return torch.tensor([value], dtype=dtype).view(torch.uint8).reshape(-1)
 
@@ -305,6 +316,10 @@ def _assert_min_cosine(
     cosine = torch.nn.functional.cosine_similarity(
         actual_cpu, expected_cpu, dim=0
     ).item()
+    abs_error = (actual_cpu - expected_cpu).abs()
+    sign_mismatch = (
+        (actual_cpu < 0) != (expected_cpu < 0)
+    ).float().mean().item()
     if cosine < min_cosine:
         print(f"{name} actual[:16]={actual_cpu[:16]}")
         print(f"{name} expected[:16]={expected_cpu[:16]}")
@@ -317,7 +332,81 @@ def _assert_min_cosine(
         raise AssertionError(
             f"{name} cosine {cosine:.6f} is lower than {min_cosine:.6f}"
         )
-    print(f"PASS {name}: dtype={actual.dtype}, cosine={cosine:.6f}")
+    print(
+        f"PASS {name}: dtype={actual.dtype}, cosine={cosine:.6f}, "
+        f"maxerr={abs_error.max().item():.6f}, "
+        f"meanerr={abs_error.mean().item():.6f}, "
+        f"sign_mismatch={sign_mismatch:.6f}"
+    )
+
+
+def _diagnose_key_encoding(
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    rotated_key: torch.Tensor,
+    dtype: torch.dtype,
+) -> None:
+    """Compare cache bytes with a CPU emulation of the vector Key encoder."""
+    actual_codes = []
+    actual_bases = []
+    actual_steps = []
+    num_tokens, num_heads, _ = rotated_key.shape
+    for token_idx in range(num_tokens):
+        block_id = int(block_table[0, token_idx // BLOCK_SIZE])
+        pos_in_block = token_idx % BLOCK_SIZE
+        for head_idx in range(num_heads):
+            block = key_cache[block_id, head_idx]
+            code_off = pos_in_block * KEY_ROW_CODE_BYTES
+            actual_codes.append(
+                block[code_off : code_off + KEY_ROW_CODE_BYTES].to(torch.int32)
+            )
+            actual_bases.append(_read_dtype_scalar(block[
+                KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 :
+                KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 + 2
+            ], dtype))
+            actual_steps.append(_read_dtype_scalar(block[
+                KEY_BLOCK_STEP_OFFSET + pos_in_block * 2 :
+                KEY_BLOCK_STEP_OFFSET + pos_in_block * 2 + 2
+            ], dtype))
+
+    rows = rotated_key.reshape(-1, HEAD_SIZE).float()
+    abs_rows = rows.abs()
+    abs_max = abs_rows.amax(dim=-1)
+    normalized = (abs_rows / abs_max.clamp_min(1.0e-12).unsqueeze(-1)).half()
+    base_norm = normalized.amin(dim=-1)
+    step_norm = ((torch.ones_like(base_norm) - base_norm) / 127.0).half()
+    safe_step = step_norm.clamp_min(torch.tensor(1.0e-6, dtype=torch.float16))
+    expected_q = torch.round(
+        ((normalized - base_norm.unsqueeze(-1)) / safe_step.unsqueeze(-1)).float()
+    ).clamp(0, 127).to(torch.int32)
+    expected_sign = (rows < 0).to(torch.int32)
+    expected_codes = expected_q | (expected_sign << 7)
+    expected_bases = (base_norm * abs_max.half()).to(dtype).float()
+    expected_steps = (step_norm * abs_max.half()).to(dtype).float()
+
+    actual_codes_t = torch.stack(actual_codes)
+    actual_bases_t = torch.tensor(actual_bases)
+    actual_steps_t = torch.tensor(actual_steps)
+    code_mismatch = actual_codes_t != expected_codes
+    q_mismatch = (actual_codes_t & 0x7F) != expected_q
+    sign_mismatch = (actual_codes_t >> 7) != expected_sign
+    print(
+        "KEY ENCODING DIAG: "
+        f"code_mismatch={code_mismatch.float().mean().item():.6f}, "
+        f"q_mismatch={q_mismatch.float().mean().item():.6f}, "
+        f"sign_mismatch={sign_mismatch.float().mean().item():.6f}, "
+        f"base_maxerr={(actual_bases_t - expected_bases).abs().max().item():.6f}, "
+        f"step_maxerr={(actual_steps_t - expected_steps).abs().max().item():.6f}"
+    )
+    if code_mismatch.any():
+        row, dim = code_mismatch.nonzero()[0].tolist()
+        print(
+            f"KEY FIRST MISMATCH row={row} dim={dim}: "
+            f"actual={actual_codes_t[row, dim].item()}, "
+            f"expected={expected_codes[row, dim].item()}, "
+            f"normalized={normalized[row, dim].item()}, "
+            f"base={base_norm[row].item()}, step={step_norm[row].item()}"
+        )
 
 
 def _decode_cache_rows(
@@ -436,10 +525,10 @@ def _run_zero_kv(dtype: torch.dtype, device: torch.device) -> None:
 
 def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
     torch.manual_seed(SEED)
-    num_kv_tokens = 6
+    num_kv_tokens = 9
     num_query_tokens = 3
     num_kv_heads = 8
-    num_heads = num_kv_heads
+    num_heads = 2 * num_kv_heads
     scale = HEAD_SIZE**-0.5
     block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
     key = torch.randn(
@@ -451,7 +540,8 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
     query = torch.randn(
         (num_query_tokens, num_heads, HEAD_SIZE), dtype=dtype, device=device
     ).contiguous()
-    rotation = _identity(dtype, device)
+    rotation_t = _dense_rotation(dtype, device)
+    rotation = rotation_t.transpose(0, 1).contiguous()
     slot_mapping = torch.arange(num_kv_tokens, dtype=torch.int32, device=device)
     query_start_loc = torch.tensor([0, num_kv_tokens], dtype=torch.int32, device=device)
     key_cache = torch.zeros(
@@ -474,7 +564,7 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
         value,
         slot_mapping,
         query_start_loc,
-        rotation,
+        rotation_t,
         key_cache,
         value_cache,
         1,
@@ -489,8 +579,13 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
         num_kv_heads,
         dtype,
     )
-    _assert_min_cosine("pack_key_decode", decoded_key, key.cpu(), 0.999)
-    _assert_min_cosine("pack_value_decode", decoded_value, value.cpu(), 0.990)
+    rotated_key = torch.matmul(key.float(), rotation_t.float()).cpu()
+    rotated_value = torch.matmul(value.float(), rotation_t.float()).cpu()
+    _diagnose_key_encoding(
+        key_cache.cpu(), block_table_cpu, rotated_key, dtype
+    )
+    _assert_min_cosine("pack_key_decode", decoded_key, rotated_key, 0.999)
+    _assert_min_cosine("pack_value_decode", decoded_value, rotated_value, 0.990)
 
     actual_seq_lens_q = [num_query_tokens]
     actual_seq_lens_kv = [num_kv_tokens]
@@ -501,7 +596,7 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
         block_table=block_table_cpu.to(device),
         actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
-        rotation_key=rotation,
+        rotation_key=rotation_t,
         rotation_value=rotation,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -516,7 +611,7 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
         block_table=block_table_cpu,
         actual_seq_lens_q=actual_seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
-        rotation_key=rotation.cpu(),
+        rotation_key=rotation_t.cpu(),
         rotation_value=rotation.cpu(),
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
