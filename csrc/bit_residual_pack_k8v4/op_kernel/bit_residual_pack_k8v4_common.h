@@ -64,7 +64,8 @@ static constexpr uint32_t TQ_MANUAL_ROT_A_L1_OFFSET = 0;
 static constexpr uint32_t TQ_MANUAL_ROT_B_L1_OFFSET =
     TQ_MANUAL_ROT_A_L1_OFFSET + TQ_MANUAL_ROT_TILE_ELEMS * TQ_DTYPE_BYTES;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT = 2;
-static constexpr uint32_t TQ_MANUAL_WORKSPACE_STRIDE_ELEMS = TQ_CUBE_BATCH_ELEMS;
+static constexpr uint32_t TQ_MANUAL_WORKSPACE_STRIDE_ELEMS =
+    TQ_MANUAL_ROT_TILE_M * TQ_ROT_N;
 static constexpr uint32_t TQ_MANUAL_C_WORKSPACE_FLOATS_PER_CORE =
     TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE =
@@ -84,26 +85,27 @@ static constexpr uint32_t TQ_VAL_ROW_CODE_BYTES = TQ_PACK_D / 2;
 static constexpr uint32_t TQ_ROW_META_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_META_TILE_BYTES = TQ_BLOCK_ROWS * TQ_ROW_META_BYTES;
 static constexpr uint32_t TQ_PACKED_TILE_SCRATCH_BYTES =
-    TQ_BLOCK_ROWS * TQ_KEY_ROW_CODE_BYTES;
+    2 * TQ_META_TILE_BYTES + TQ_BLOCK_ROWS * TQ_KEY_ROW_CODE_BYTES;
 static constexpr uint32_t TQ_KEY_BYTES_PER_ROW = TQ_KEY_ROW_CODE_BYTES + 2 * TQ_ROW_META_BYTES;
 static constexpr uint32_t TQ_VAL_BYTES_PER_ROW = TQ_VAL_ROW_CODE_BYTES + 2 * TQ_ROW_META_BYTES;
-// ── Encoded row layout (intermediate format in UB before merge to cache) ────
-// Key encoded row: 128 × uint16 code + 1 × float base + 1 × float step
-static constexpr uint32_t TQ_KEY_ENCODED_ROW_BYTES =
-    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(float);
-static constexpr uint32_t TQ_KEY_ENCODED_BASE_BYTE_OFFSET = TQ_PACK_D * sizeof(uint16_t);
-static constexpr uint32_t TQ_KEY_ENCODED_STEP_BYTE_OFFSET =
-    TQ_KEY_ENCODED_BASE_BYTE_OFFSET + sizeof(float);
-static constexpr uint32_t TQ_KEY_ENCODED_ROW_STRIDE_BYTES =
-    TqAlignUp32(TQ_KEY_ENCODED_ROW_BYTES);
+// ── Encoded tile layout (intermediate format in UB before merge to cache) ──
+// Key: 16 contiguous 64-word encoded rows, then 16 bases, then 16 steps.
+static constexpr uint32_t TQ_KEY_ENCODED_ROW_BYTES = TQ_PACK_D * sizeof(uint8_t);
+static constexpr uint32_t TQ_KEY_ENCODED_ROW_STRIDE_BYTES = TQ_KEY_ENCODED_ROW_BYTES;
 static constexpr uint32_t TQ_KEY_ENCODED_ROW_STRIDE_WORDS =
     TQ_KEY_ENCODED_ROW_STRIDE_BYTES / sizeof(uint16_t);
-// Value encoded row: 128 × uint16 code + 1 × float vmin + 1 × float vstep
+static constexpr uint32_t TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET =
+    TQ_VECTOR_BATCH * TQ_KEY_ENCODED_ROW_BYTES;
+static constexpr uint32_t TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET =
+    TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET + TQ_VECTOR_BATCH * sizeof(uint16_t);
+static constexpr uint32_t TQ_KEY_ENCODED_BATCH_BYTES =
+    TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET + TQ_VECTOR_BATCH * sizeof(uint16_t);
+// Value encoded row: 128 × uint16 code + 1 × uint16 vmin + 1 × uint16 vstep
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_BYTES =
-    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(float);
+    TQ_PACK_D * sizeof(uint16_t) + 2 * sizeof(uint16_t);
 static constexpr uint32_t TQ_VAL_ENCODED_VMIN_BYTE_OFFSET = TQ_PACK_D * sizeof(uint16_t);
 static constexpr uint32_t TQ_VAL_ENCODED_VSTEP_BYTE_OFFSET =
-    TQ_VAL_ENCODED_VMIN_BYTE_OFFSET + sizeof(float);
+    TQ_VAL_ENCODED_VMIN_BYTE_OFFSET + sizeof(uint16_t);
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_BYTES =
     TqAlignUp32(TQ_VAL_ENCODED_ROW_BYTES);
 static constexpr uint32_t TQ_VAL_ENCODED_ROW_STRIDE_WORDS =
@@ -176,7 +178,8 @@ using TqDataT = half;
 
 __aicore__ inline uint32_t TqManualRawBlockIdx() {
     if ASCEND_IS_AIV {
-        return static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
+        return static_cast<uint32_t>(AscendC::GetBlockIdx() /
+                                     AscendC::GetSubBlockNum());
     }
     return static_cast<uint32_t>(AscendC::GetBlockIdx());
 }
@@ -303,9 +306,12 @@ __aicore__ inline void copy_packed_gm_to_ub(
 // ── Base variable (offset = 0, no predecessor) ────────────────────────────────
 
 // ── A_ENCODED has a max-expression size; pre-compute before chaining ──────────
-static constexpr uint32_t TQ_UB_ENCODED_BATCH_BYTES = TQ_VECTOR_BATCH *
-    ((TQ_KEY_ENCODED_ROW_STRIDE_BYTES > TQ_VAL_ENCODED_ROW_STRIDE_BYTES)
-        ? TQ_KEY_ENCODED_ROW_STRIDE_BYTES : TQ_VAL_ENCODED_ROW_STRIDE_BYTES);
+static constexpr uint32_t TQ_VAL_ENCODED_BATCH_BYTES =
+    TQ_VECTOR_BATCH * TQ_VAL_ENCODED_ROW_STRIDE_BYTES;
+static constexpr uint32_t TQ_UB_ENCODED_BATCH_BYTES =
+    (TQ_KEY_ENCODED_BATCH_BYTES > TQ_VAL_ENCODED_BATCH_BYTES)
+        ? TQ_KEY_ENCODED_BATCH_BYTES
+        : TQ_VAL_ENCODED_BATCH_BYTES;
 
 static constexpr uint32_t TQ_UB_BASE_OFFSET = 0;
 static constexpr uint32_t TQ_UB_BASE_SIZE = 0;

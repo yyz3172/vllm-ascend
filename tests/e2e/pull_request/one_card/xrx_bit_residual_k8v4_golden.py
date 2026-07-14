@@ -163,8 +163,8 @@ def _decode_key_row(
     code_off = pos_in_block * KEY_ROW_CODE_BYTES
     code = block[code_off : code_off + KEY_ROW_CODE_BYTES].to(torch.int32)
 
-    q7 = (code >> 1).float()
-    sign = (code & 1).float()
+    q7 = (code & 0x7F).float()
+    sign = (code >> 7).float()
     sign_val = torch.where(sign == 0, 1.0, -1.0)
     base = _read_dtype_scalar(block[
         KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 : KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 + 2
@@ -481,7 +481,6 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
         BLOCK_SIZE,
     )
     torch.npu.synchronize()
-
     decoded_key, decoded_value = _decode_cache_rows(
         key_cache.cpu(),
         value_cache.cpu(),
