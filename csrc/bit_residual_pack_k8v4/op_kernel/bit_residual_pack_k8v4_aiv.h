@@ -53,6 +53,9 @@ public:
         const uint32_t headTileCount =
             (op.numHeads_ + TQ_MANUAL_HEADS_PER_TILE - 1) /
             TQ_MANUAL_HEADS_PER_TILE;
+        bool hasPending = false;
+        uint32_t pendingInputBuffer = 0;
+        ManualKey1StreamDesc pendingDesc {};
         for (uint32_t reqIdx = 0; reqIdx < op.numReqs_; ++reqIdx) {
             uint32_t seqStart = 0;
             uint32_t seqEnd = 0;
@@ -100,14 +103,17 @@ public:
                             tokenStart, slot, blockIdx, valueGroupInBlock,
                             headTileStart, startGroupRow, validRows, keyStream + 1,
                             preserveValue, true};
-                        FinishC(cWorkGm, keyDesc, aivSlice);
-                        FinishC(cWorkGm, valueDesc, aivSlice);
+                        SubmitStream(cWorkGm, keyDesc, aivSlice, hasPending,
+                                     pendingDesc, pendingInputBuffer);
+                        SubmitStream(cWorkGm, valueDesc, aivSlice, hasPending,
+                                     pendingDesc, pendingInputBuffer);
                         ++manualTileOrdinal;
                     }
                 }
                 rowOff += validRows;
             }
         }
+        DrainStream(aivSlice, hasPending, pendingDesc, pendingInputBuffer);
     }
 
 private:
@@ -153,7 +159,9 @@ private:
         step *= max_vec
 
     */
-    __aicore__ inline void EncodeKeyBatch(uint32_t m) {
+    __aicore__ inline void EncodeKeyBatch(
+        uint32_t m,
+        AscendC::LocalTensor<float>& yBatch) {
         using ComputeT = half;
         static_assert(TQ_MANUAL_AIV_SLICE_M == TQ_VECTOR_BATCH,
                       "key encoder expects one physical 16-row tile");
@@ -164,7 +172,6 @@ private:
         const ComputeT safeTDivisor = static_cast<ComputeT>(1.0e-6f);
         const uint32_t totalElems = m * TQ_PACK_D;
 
-        auto yBatch = context_.resource_.YBatchFloat();
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
         auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<float>();
@@ -371,8 +378,9 @@ private:
     // vmin/vstep stored as raw values (not multiplied by norm).
     // Decode: y = vmin + idx4 * vstep
     //
-    __aicore__ inline void EncodeValueBatch(uint32_t m) {
-        auto yBatch = context_.resource_.YBatchFloat();
+    __aicore__ inline void EncodeValueBatch(
+        uint32_t m,
+        AscendC::LocalTensor<float>& yBatch) {
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
         auto yFp32 = context_.resource_.YFp32();
         auto qFp32 = context_.resource_.RevVec();  // reuse RevVec buffer for value quant
@@ -474,8 +482,9 @@ private:
     __aicore__ inline void CopyManualCToYBatch(
         AscendC::GlobalTensor<float>& cWorkGm,
         uint32_t bufferOffset,
-        uint32_t aivSlice) {
-        auto yBatch = context_.resource_.YBatchFloat();
+        uint32_t aivSlice,
+        uint32_t inputBuffer) {
+        auto yBatch = context_.resource_.YBatchFloat(inputBuffer);
         static constexpr uint32_t SLICE_ELEMS =
             TQ_MANUAL_AIV_SLICE_M * TQ_ROT_N;  // 16×128 = 2048
         const uint32_t sliceElemOffset = aivSlice * SLICE_ELEMS;
@@ -483,8 +492,6 @@ private:
             yBatch,
             cWorkGm[bufferOffset + sliceElemOffset],
             SLICE_ELEMS);
-        TqSyncMte2ToV();
-        TqSyncMte2ToS();
     }
 
     template <bool IS_KEY>
@@ -502,7 +509,7 @@ private:
     }
 
     template <bool IS_KEY>
-    __aicore__ inline void EncodeSliceToCache(
+    __aicore__ inline void WriteEncodedSliceToCache(
         AscendC::GlobalTensor<uint8_t>& packedGm,
         const ManualKey1StreamDesc& desc,
         uint32_t aivSlice) {
@@ -510,11 +517,6 @@ private:
         const uint32_t headIdx = desc.headTileStart + aivSlice;
         if (headIdx >= op.numHeads_) {
             return;
-        }
-        if constexpr (IS_KEY) {
-            EncodeKeyBatch(TQ_MANUAL_AIV_SLICE_M);
-        } else {
-            EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M);
         }
         TqSyncVToS();
         auto encoded = op.resource_.KeyEncodedBatch();
@@ -589,21 +591,79 @@ private:
         }
     }
 
-    __aicore__ inline void FinishC(
+    __aicore__ inline void PrefetchStream(
         AscendC::GlobalTensor<float>& cWorkGm,
         const ManualKey1StreamDesc& desc,
-        uint32_t aivSlice) {
+        uint32_t aivSlice,
+        uint32_t inputBuffer) {
         const uint16_t flagBase = context_.ManualFlagBase(desc.streamOrdinal);
         const uint32_t bufferOffset = context_.ManualBufferOffset(desc.streamOrdinal);
 
         TqCrossCoreWait<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_READY);
-        CopyManualCToYBatch(cWorkGm, bufferOffset, aivSlice);
+        CopyManualCToYBatch(cWorkGm, bufferOffset, aivSlice, inputBuffer);
         TqCrossCoreSet<PIPE_MTE2>(flagBase + TQ_MANUAL_SYNC_C_FREE);
+        // The dependency is inserted after the copy on MTE2 and after any
+        // already-issued work on V.  It therefore protects the prefetched UB
+        // slot without draining the current stream's vector pipeline.
+        TqSyncMte2ToV();
+    }
+
+    __aicore__ inline void EncodeStream(
+        const ManualKey1StreamDesc& desc,
+        uint32_t inputBuffer) {
+        auto yBatch = context_.resource_.YBatchFloat(inputBuffer);
         if (desc.isValue) {
-            EncodeSliceToCache<false>(context_.valueCacheGm_, desc, aivSlice);
+            EncodeValueBatch(TQ_MANUAL_AIV_SLICE_M, yBatch);
         } else {
-            EncodeSliceToCache<true>(context_.keyCacheGm_, desc, aivSlice);
+            EncodeKeyBatch(TQ_MANUAL_AIV_SLICE_M, yBatch);
         }
+    }
+
+    __aicore__ inline void WriteStream(
+        const ManualKey1StreamDesc& desc,
+        uint32_t aivSlice) {
+        if (desc.isValue) {
+            WriteEncodedSliceToCache<false>(
+                context_.valueCacheGm_, desc, aivSlice);
+        } else {
+            WriteEncodedSliceToCache<true>(
+                context_.keyCacheGm_, desc, aivSlice);
+        }
+    }
+
+    __aicore__ inline void SubmitStream(
+        AscendC::GlobalTensor<float>& cWorkGm,
+        const ManualKey1StreamDesc& nextDesc,
+        uint32_t aivSlice,
+        bool& hasPending,
+        ManualKey1StreamDesc& pendingDesc,
+        uint32_t& pendingInputBuffer) {
+        if (!hasPending) {
+            pendingInputBuffer = 0;
+            PrefetchStream(cWorkGm, nextDesc, aivSlice, pendingInputBuffer);
+            pendingDesc = nextDesc;
+            hasPending = true;
+            return;
+        }
+
+        EncodeStream(pendingDesc, pendingInputBuffer);
+        const uint32_t nextInputBuffer = pendingInputBuffer ^ 1u;
+        PrefetchStream(cWorkGm, nextDesc, aivSlice, nextInputBuffer);
+        WriteStream(pendingDesc, aivSlice);
+        pendingDesc = nextDesc;
+        pendingInputBuffer = nextInputBuffer;
+    }
+
+    __aicore__ inline void DrainStream(
+        uint32_t aivSlice,
+        bool hasPending,
+        const ManualKey1StreamDesc& pendingDesc,
+        uint32_t pendingInputBuffer) {
+        if (!hasPending) {
+            return;
+        }
+        EncodeStream(pendingDesc, pendingInputBuffer);
+        WriteStream(pendingDesc, aivSlice);
     }
 
     BitResidualPackK8v4Context<T>& context_;

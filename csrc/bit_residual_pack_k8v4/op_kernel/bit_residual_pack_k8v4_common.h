@@ -300,9 +300,9 @@ __aicore__ inline void copy_packed_gm_to_ub(
 //
 // Hand-built LocalTensor buffer addresses live in one logical UB address space.
 // Do not reuse the same byte offsets across VECIN/VECOUT/VECCALC positions.
-// The pack pipeline only needs two large row buffers at the same time:
-//   encode: YBatch + EncodedBatch
-// Therefore X/Y share one slot, and encoded rows share another slot.
+// The rotated FP32 input uses two slots so MTE2 can prefetch stream N+1 while
+// the vector pipeline encodes stream N.  Encode scratch and encoded output stay
+// single-buffered because they are consumed in order by the cache RMW stage.
 // ── Base variable (offset = 0, no predecessor) ────────────────────────────────
 
 // ── A_ENCODED has a max-expression size; pre-compute before chaining ──────────
@@ -323,7 +323,8 @@ static constexpr uint32_t TQ_UB_ENCODE_LARGE_BUF = TQ_UB_ENCODE_SMALL_BUF * 2;  
 
 // ── Chained layout via UB_VARIBALE_AND_OFF ────────────────────────────────────
 UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH,        TQ_BATCH_ELEMS * sizeof(float), TQ_UB_BASE)
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER1,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_XY_BATCH)   // buf0: row_vec fp32
+UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH1,       TQ_BATCH_ELEMS * sizeof(float), TQ_UB_XY_BATCH)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER1,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_XY_BATCH1)   // buf0: row_vec fp32
 UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER2,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_ENCODE_BUFFER1)  // buf2: abs/sign fp32
 UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER3,  TQ_UB_ENCODE_LARGE_BUF,            TQ_UB_ENCODE_BUFFER2)  // buf3: reduce/div fp32
 UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_BUFFER4,  TQ_UB_ENCODE_SMALL_BUF,            TQ_UB_ENCODE_BUFFER3)  // buf4: norm_vec_16
@@ -356,9 +357,13 @@ public:
     //   Time-shared views: XY_BATCH and A_ENCODED_BATCH each hold multiple
     //   accessors with different element types/counts.  Use _SIZE for the full
     //   slot size; sub-view counts are derived from the raw constants.
-    __aicore__ inline AscendC::LocalTensor<float> YBatchFloat() {
+    __aicore__ inline AscendC::LocalTensor<float> YBatchFloat(
+        uint32_t bufferIndex = 0) {
+        const uint32_t offset = bufferIndex == 0
+            ? TQ_UB_XY_BATCH_OFFSET
+            : TQ_UB_XY_BATCH1_OFFSET;
         return local_.vecCalc.GetBufferByByte<float>(
-            TQ_UB_XY_BATCH_OFFSET,
+            offset,
             TQ_UB_XY_BATCH_SIZE);
     }
 
