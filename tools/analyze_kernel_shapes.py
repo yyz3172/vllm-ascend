@@ -99,10 +99,11 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
 
         shapes = parse_shape_field(shape_str)
         rows = shapes[0][0] if len(shapes) > 0 and len(shapes[0]) > 0 else 0
-        # For BitResidualPackK8v4: 5th input is group_size
-        # (number of rows sharing one set of quant parameters)
-        group_size = shapes[4][0] if len(shapes) > 4 and len(shapes[4]) > 0 else 0
-        num_groups = rows // group_size if group_size > 0 else 0
+        # For BitResidualPackK8v4: 5th input is query_start_loc.
+        # query_start_loc values are prefix token offsets; profiler Input Shapes
+        # only gives its dim0, which is num_reqs + 1.
+        q_start_loc_dim0 = shapes[4][0] if len(shapes) > 4 and len(shapes[4]) > 0 else 0
+        num_reqs = q_start_loc_dim0 - 1 if q_start_loc_dim0 > 0 else 0
 
         bottleneck = "SCALAR" if avg_scalar > avg_vec else "VEC"
 
@@ -112,8 +113,8 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
         shape_info.append({
             "shape_str": shape_str,
             "rows": rows,
-            "group_size": group_size,
-            "num_groups": num_groups,
+            "q_start_loc_dim0": q_start_loc_dim0,
+            "num_reqs": num_reqs,
             "count": len(events),
             "avg_dur": avg_dur,
             "p50": durs[p50_idx],
@@ -127,6 +128,7 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
             "dur_per_row": avg_dur / rows if rows > 0 else 0,
             "scalar_per_row": avg_scalar / rows if rows > 0 else 0,
             "vec_per_row": avg_vec / rows if rows > 0 else 0,
+            "rows_per_req": rows / num_reqs if num_reqs > 0 else 0,
             "output": events[0]["output"],
             "input_dtype": events[0]["input_dtype"],
         })
@@ -137,8 +139,8 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
         print("Input Shape:  %s" % info["shape_str"])
         print("Output Shape: %s" % info["output"])
         print("Input Dtype:  %s" % info["input_dtype"])
-        print("Rows=%d, GroupSize=%d, NumGroups=%d, Count=%d" %
-              (info["rows"], info["group_size"], info["num_groups"], info["count"]))
+        print("Rows=%d, QStartLocDim0=%d, NumReqs=%d, Count=%d" %
+              (info["rows"], info["q_start_loc_dim0"], info["num_reqs"], info["count"]))
         print("Avg Duration: %.2fus  P50: %.2fus  P90: %.2fus  Max: %.2fus" %
               (info["avg_dur"], info["p50"], info["p90"], info["max"]))
         print()
@@ -154,6 +156,7 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
         print()
         print("  Per-row: %.1fus/row (scalar %.1fus/row, vec %.1fus/row)" %
               (info["dur_per_row"], info["scalar_per_row"], info["vec_per_row"]))
+        print("  Avg rows/request: %.1f" % info["rows_per_req"])
         print("  Bottleneck: %s" % info["bottleneck"])
 
     # Summary table
@@ -161,14 +164,14 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
     print("=" * 90)
     print("SHAPE SUMMARY TABLE")
     print("=" * 90)
-    header_fmt = "%-6s %-10s %-11s %-10s %-7s %-8s %-7s %-7s %-7s %-9s"
+    header_fmt = "%-6s %-10s %-8s %-10s %-7s %-8s %-7s %-7s %-7s %-9s"
     print(header_fmt % (
-        "Rows", "GroupSize", "NumGroups", "Count", "Avg(us)", "Scalar%", "Vec%",
+        "Rows", "QStartDim", "NumReqs", "Count", "Avg(us)", "Scalar%", "Vec%",
         "MTE2%", "MTE3%", "Bottleneck"))
     print("-" * 90)
     for info in sorted(shape_info, key=lambda x: -x["avg_dur"]):
         print(header_fmt % (
-            info["rows"], info["group_size"], info["num_groups"], info["count"],
+            info["rows"], info["q_start_loc_dim0"], info["num_reqs"], info["count"],
             "%.0f" % info["avg_dur"],
             "%.1f" % compute_pct(info["avg_scalar"], info["avg_dur"]),
             "%.1f" % compute_pct(info["avg_vec"], info["avg_dur"]),
@@ -181,10 +184,10 @@ def analyze_kernel_shapes(base_dir: str, kernel_name: str) -> None:
     print("=" * 90)
     print("PER-ROW COST COMPARISON")
     print("=" * 90)
-    row_fmt = "Rows=%-6d GS=%-3d | dur=%-7.0fus (%.1fus/r) | scalar=%-7.0fus (%.1fus/r) | vec=%-6.0fus (%.1fus/r)"
+    row_fmt = "Rows=%-6d Reqs=%-3d | dur=%-7.0fus (%.1fus/r) | scalar=%-7.0fus (%.1fus/r) | vec=%-6.0fus (%.1fus/r)"
     for info in sorted(shape_info, key=lambda x: -x["avg_dur"]):
         print(row_fmt % (
-            info["rows"], info["group_size"],
+            info["rows"], info["num_reqs"],
             info["avg_dur"], info["dur_per_row"],
             info["avg_scalar"], info["scalar_per_row"],
             info["avg_vec"], info["vec_per_row"]))
