@@ -236,7 +236,6 @@ private:
 
         // Extract all sign bits once; buf1 is free after the normalized cast.
         auto signVec = buf1.template ReinterpretCast<uint32_t>();
-        auto signMask = buf3.template ReinterpretCast<uint32_t>();
         auto yBits = yBatch.template ReinterpretCast<uint32_t>();
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::ShiftRight(signVec, yBits, static_cast<uint32_t>(31), totalElems);
@@ -517,6 +516,7 @@ private:
                       static_cast<ComputeT>(TQ_VAL_QUANT_LEVELS_F), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
+#if 0
         AscendC::Cast(normFp32, normVec16, AscendC::RoundMode::CAST_NONE,
                       totalElems);
         AscendC::PipeBarrier<PIPE_V>();
@@ -528,10 +528,14 @@ private:
         AscendC::Cast(quantI16, quantI32, AscendC::RoundMode::CAST_NONE,
                       totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::DataCopy(
-            encodedBatch.template ReinterpretCast<int16_t>(), quantI16,
-            totalElems);
+#else
+        auto range16 = normFp32.template ReinterpretCast<ComputeT>();
+        AscendC::Adds(range16, normVec16, static_cast<ComputeT>(-8.0f), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
+        auto quantI4 = encodedBatch.template ReinterpretCast<int4b_t>();
+        AscendC::Cast(quantI4, range16, AscendC::RoundMode::CAST_NONE, totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+#endif
 
         AscendC::Mul(minVec, minVec, maxVecT, typePerBlock);
         AscendC::PipeBarrier<PIPE_V>();
@@ -629,17 +633,17 @@ private:
             copy_packed_gm_to_ub(meta1Bytes, packedGm,
                 meta1Base + tileStart * TQ_ROW_META_BYTES, TQ_META_TILE_BYTES);
             TqSyncMte2ToS();
-            for (uint32_t r = 0; r < rows; ++r) {
-                const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
-                const uint32_t encodedOff = encodedRow * EncodedRowStrideWords<IS_KEY>();
-                auto codeOut = scratch[2 * TQ_META_TILE_BYTES + r * codeBytes];
-                if constexpr (IS_KEY) {
-                    auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
-                    auto encodedRowBytes =
-                        encodedBytes[encodedRow * TQ_KEY_ENCODED_ROW_BYTES];
-                    for (uint32_t d = 0; d < TQ_KEY_ROW_CODE_BYTES; ++d) {
-                        codeOut.SetValue(d, encodedRowBytes.GetValue(d));
-                    }
+            // ── Batch DataCopy for key code bytes (eliminates per-row 128×SetValue) ──
+            if constexpr (IS_KEY) {
+                auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
+                const uint32_t srcOff = (desc.startGroupRow + rowOff) * TQ_KEY_ROW_CODE_BYTES;
+                auto codeOutAll = scratch[2 * TQ_META_TILE_BYTES];
+                // rows×128 bytes contiguous in both src and dst
+                DataCopy(codeOutAll, encodedBytes[srcOff], rows * TQ_KEY_ROW_CODE_BYTES);
+                PipeBarrier<PIPE_V>();
+                // Metadata only: 2 scalar SetValue per row
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
                     meta0.SetValue(tileRow + r, encoded[
                         TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
                         encodedRow]
@@ -648,12 +652,15 @@ private:
                         TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
                         encodedRow]
                             .template ReinterpretCast<T>().GetValue(0));
-                } else {
-                    for (uint32_t d = 0; d < TQ_PACK_D / 2; ++d) {
-                        const uint8_t lo = static_cast<uint8_t>(encoded.GetValue(encodedOff + 2 * d));
-                        const uint8_t hi = static_cast<uint8_t>(encoded.GetValue(encodedOff + 2 * d + 1));
-                        codeOut.SetValue(d, static_cast<uint8_t>(lo | (hi << 4)));
-                    }
+                }
+            } else {
+                auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
+                const uint32_t srcOff = (desc.startGroupRow + rowOff) * TQ_VAL_ROW_CODE_BYTES;
+                auto codeOutAll = scratch[2 * TQ_META_TILE_BYTES];
+                DataCopy(codeOutAll, encodedBytes[srcOff], rows * TQ_VAL_ROW_CODE_BYTES);
+                PipeBarrier<PIPE_V>();
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const uint32_t encodedRow = desc.startGroupRow + rowOff + r;
                     meta0.SetValue(tileRow + r, encoded[
                         TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET / sizeof(uint16_t) +
                         encodedRow]

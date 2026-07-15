@@ -59,7 +59,7 @@ fi
 if [[ "${BUILD_BITRESIDUAL}" == true ]]; then
     echo "[build_debug_perf] Building bit_residual_pack_k8v4 C++ runner..."
     mkdir -p "$(dirname "${BIT_RES_RUNNER}")"
-    bash "${ROOT_DIR}/tools/build_bit_residual_pack_k8v4_perf.sh" "${BIT_RES_RUNNER}"
+    bash "${ROOT_DIR}/tools/build_bit_residual_k8v4_debug_perf.sh" "${BIT_RES_RUNNER}"
 
     echo "[build_debug_perf] Verifying bit_residual C++ runner debug line section..."
     if ! readelf -SW "${BIT_RES_RUNNER}" 2>/dev/null | grep -q '\.debug_line'; then

@@ -90,7 +90,7 @@ def main() -> None:
         "XRX_K8V4_LONG_MAX_MODEL_LEN",
         max(256, prompt_tokens + max_tokens + 32),
     )
-    gpu_memory_utilization = _float_env("XRX_K8V4_GPU_MEMORY_UTILIZATION", 0.30)
+    gpu_memory_utilization = _float_env("XRX_K8V4_GPU_MEMORY_UTILIZATION", 0.05)
     enable_profile = os.getenv("XRX_K8V4_ENABLE_PROFILE", "1") == "1"
     profile_warmup_generates = _int_env("XRX_K8V4_PROFILE_WARMUP_GENERATES", 0)
 

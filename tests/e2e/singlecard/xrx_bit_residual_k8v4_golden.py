@@ -103,6 +103,25 @@ def _read_dtype_scalar(x: torch.Tensor, dtype: torch.dtype) -> float:
     return x.contiguous().view(dtype)[0].float().item()
 
 
+def _pack_value_idx4(value_idx: torch.Tensor) -> torch.Tensor:
+    """Pack logical idx4 [0, 15] into signed int4 bytes used by int4b_t."""
+    signed_idx = ((value_idx.to(torch.int16) - 8) & 0x0F).to(torch.uint8)
+    return signed_idx[0::2] | (signed_idx[1::2] << 4)
+
+
+def _unpack_value_idx4(code: torch.Tensor) -> torch.Tensor:
+    """Unpack signed int4 cache bytes back to logical idx4 [0, 15]."""
+    code_i32 = code.to(torch.int32)
+    low = code_i32 & 0x0F
+    high = (code_i32 >> 4) & 0x0F
+    low = torch.where(low >= 8, low - 16, low) + 8
+    high = torch.where(high >= 8, high - 16, high) + 8
+    idx4 = torch.empty(HEAD_SIZE, dtype=torch.float32)
+    idx4[0::2] = low.float()
+    idx4[1::2] = high.float()
+    return idx4
+
+
 def _build_block_table(actual_seq_lens_kv: list[int]) -> tuple[torch.Tensor, int]:
     blocks_per_seq = [
         max(1, (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
@@ -147,9 +166,7 @@ def _write_manual_single_kv_cache(
 
     value_block = value_cache[0, 0]
     value_idx = (torch.arange(HEAD_SIZE, dtype=torch.int32) % 16).to(torch.uint8)
-    value_block[:VALUE_ROW_CODE_BYTES] = (
-        value_idx[0::2] | (value_idx[1::2] << 4)
-    )
+    value_block[:VALUE_ROW_CODE_BYTES] = _pack_value_idx4(value_idx)
     value_block[VALUE_BLOCK_VMIN_OFFSET : VALUE_BLOCK_VMIN_OFFSET + 2] = (
         _scalar_bytes(-1.0, dtype)
     )
@@ -199,9 +216,7 @@ def _decode_value_row(
     block = value_cache[block_id, kv_head]
     code_off = pos_in_block * VALUE_ROW_CODE_BYTES
     code = block[code_off : code_off + VALUE_ROW_CODE_BYTES].to(torch.int32)
-    idx4 = torch.empty(HEAD_SIZE, dtype=torch.float32)
-    idx4[0::2] = (code & 0x0F).float()
-    idx4[1::2] = (code >> 4).float()
+    idx4 = _unpack_value_idx4(code)
     vmin = _read_dtype_scalar(block[
         VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 2 : VALUE_BLOCK_VMIN_OFFSET + pos_in_block * 2 + 2
     ], dtype)
