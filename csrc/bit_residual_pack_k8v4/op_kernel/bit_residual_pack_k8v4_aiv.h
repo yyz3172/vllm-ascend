@@ -327,158 +327,114 @@ private:
         // minVec (buf4), stepVec (buf3) are dead.
     }
     // ── Value quantization ────────────────────────────────────────────────
-    // Process all 16 rows as one vector batch.  Values are normalized through
-    // FP16 before 4-bit min/max quantization; vmin/vstep are scaled back to the
-    // original domain and stored in the input dtype.
+    // Process all 16 rows as one vector batch.  Convert to FP16 up front,
+    // then compute per-row max/min directly on the raw (signed) data and
+    // quantize (x - vmin) / vstep into 4-bit.  No normalization, no abs,
+    // no sign extraction — vmin/vstep are already in the original domain.
     __aicore__ inline void EncodeValueBatch(
         uint32_t m,
         AscendC::LocalTensor<float>& yBatch) {
-        using ComputeT = half;
-        static constexpr float TQ_VAL_QUANT_LEVELS_F = 15.0f;
+        static constexpr float TQ_VAL_QUANT_LEVELS_F = 1.0f / 15.0f;
         static_assert(TQ_MANUAL_AIV_SLICE_M == TQ_VECTOR_BATCH,
                       "value encoder expects one physical 16-row tile");
-        constexpr uint32_t typePerBlock = 32 / sizeof(ComputeT);
-        constexpr float safeFp32Divisor = 1.0e-12f;
-        const ComputeT quantStep =
-            static_cast<ComputeT>(1.0f / TQ_VAL_QUANT_LEVELS_F);
-        const ComputeT safeTDivisor = static_cast<ComputeT>(1.0e-6f);
+        constexpr uint32_t typePerBlock = 32 / sizeof(half);
+        const half safeDivisor = static_cast<half>(1.0e-6f);
         const uint32_t totalElems = m * TQ_PACK_D;
         constexpr uint32_t binaryRepeatBatchF16 = 128;
-        constexpr uint32_t binaryRepeatBatchF32 = 64;
 
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
-        auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<float>();
-        auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<float>();
-        auto buf3 = context_.resource_.EncodeBuffer3().template ReinterpretCast<float>();
-        auto buf4 = context_.resource_.EncodeBuffer4().template ReinterpretCast<ComputeT>();
-        auto buf6 = context_.resource_.EncodeBuffer6().template ReinterpretCast<ComputeT>();
-        auto buf7 = context_.resource_.EncodeBuffer7().template ReinterpretCast<ComputeT>();
-        auto buf8 = context_.resource_.EncodeBuffer8().template ReinterpretCast<float>();
+        // All buffers are 16-bit (half) base views, assigned in order of first
+        // use and recycled when the owner becomes dead.
+        auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<half>();
+        auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<half>();
+        auto buf3 = context_.resource_.EncodeBuffer3().template ReinterpretCast<half>();
+        auto buf4 = context_.resource_.EncodeBuffer4().template ReinterpretCast<half>();
+        auto buf5 = context_.resource_.EncodeBuffer5().template ReinterpretCast<half>();
+        auto buf6 = context_.resource_.EncodeBuffer6().template ReinterpretCast<half>();
+        auto buf7 = context_.resource_.EncodeBuffer7().template ReinterpretCast<half>();
+        (void)buf2;
 
-        auto absVec = buf1;
-        auto normFp32 = buf2;
-        auto maxFold = buf3;
-        auto maxVec = buf8;
-        AscendC::Abs(absVec, yBatch, totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t rowOff = i * TQ_ROT_N;
-            AscendC::Max(maxFold[i * TQ_ROT_N / 2], absVec[rowOff],
-                         absVec[rowOff + TQ_ROT_N / 2], TQ_ROT_N / 2);
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::WholeReduceMax<float, false>(
-            maxVec, maxFold, static_cast<int32_t>(TQ_ROT_N / 2), m, 1, 1,
-            TQ_ROT_N / 16, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        auto maxVecT = buf6;
-        auto minVec = buf6[m];
-        auto maxNormVec = buf6[2 * m];
-        auto rangeVec = buf6[3 * m];
-        auto stepVec = buf6[4 * m];
-        auto safeStepVec = buf6[5 * m];
-        AscendC::Cast(maxVecT, maxVec, AscendC::RoundMode::CAST_RINT, m);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Maxs(maxVec, maxVec, safeFp32Divisor, m);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        auto maxVecBlk = buf3;
-        AscendC::Brcb(maxVecBlk.template ReinterpretCast<uint32_t>(),
-                      maxVec.template ReinterpretCast<uint32_t>(), 2,
-                      AscendC::BrcbRepeatParams(1, 8));
-        AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t rowOff = i * TQ_PACK_D;
-            AscendC::Div<float, false>(
-                normFp32[rowOff], yBatch[rowOff], maxVecBlk[i * 8],
-                binaryRepeatBatchF32, 2,
-                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        auto normVec16 = buf4;
-        AscendC::Cast(normVec16, normFp32, AscendC::RoundMode::CAST_RINT,
+        // ── Step 1: origBatch16(half) in buf1 = Cast(yBatch fp32) ──
+        auto origBatch16 = buf1;
+        AscendC::Cast(origBatch16, yBatch, AscendC::RoundMode::CAST_NONE,
                       totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
-        AscendC::WholeReduceMin<ComputeT, false>(
-            minVec, normVec16, static_cast<int32_t>(TQ_ROT_N), m, 1, 1,
-            TQ_ROT_N / typePerBlock,
-            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::WholeReduceMax<ComputeT, false>(
-            maxNormVec, normVec16, static_cast<int32_t>(TQ_ROT_N), m, 1, 1,
-            TQ_ROT_N / typePerBlock,
-            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Sub(rangeVec, maxNormVec, minVec, typePerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(stepVec, rangeVec, quantStep, typePerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(safeStepVec, stepVec, static_cast<ComputeT>(0.0f),
-                      typePerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Maxs(safeStepVec, safeStepVec, safeTDivisor, typePerBlock);
+        // ── Step 2: maxVec(half) in buf3 = WholeReduceMax(origBatch16, per row) ──
+        //    No Abs — value quantizes the raw (signed) data directly.
+        auto maxVec = buf3;
+        AscendC::WholeReduceMax<half, false>(
+            maxVec, origBatch16, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
+            TQ_PACK_D / typePerBlock, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
 
-        auto minBlk = buf7;
-        auto stepBlk = buf7[16 * typePerBlock];
+        // ── Step 3: minVec(half) in buf4 = WholeReduceMin(origBatch16, per row) ──
+        auto minVec = buf4;
+        AscendC::WholeReduceMin<half, false>(
+            minVec, origBatch16, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
+            TQ_PACK_D / typePerBlock, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // ── Step 4: rangeVec(half) in buf5 = maxVec - minVec ──
+        auto rangeVec = buf5;
+        AscendC::Sub(rangeVec, maxVec, minVec, m);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // ── Step 5: stepVec(half) in buf5 (in-place) = Muls(rangeVec, 1/15),
+        //            with a safe lower bound to avoid div-by-zero on rows
+        //            where max == min (range == 0).
+        auto stepVec = buf5;
+        AscendC::Muls(stepVec, rangeVec,
+                      static_cast<half>(TQ_VAL_QUANT_LEVELS_F), m);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Maxs(stepVec, stepVec, safeDivisor, m);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // ── Step 6a: minBlk(half) in buf3 (reuse, maxVec dead) = Brcb(minVec) ──
+        auto minBlk = buf3;
         AscendC::Brcb(minBlk, minVec, 2, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Brcb(stepBlk, safeStepVec, 2,
-                      AscendC::BrcbRepeatParams(1, 8));
-        AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t rowOff = i * TQ_PACK_D;
-            const uint32_t blockOff = i * typePerBlock;
-            AscendC::Sub<ComputeT, false>(
-                normVec16[rowOff], normVec16[rowOff], minBlk[blockOff],
-                binaryRepeatBatchF16, 1,
-                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t i = 0; i < m; ++i) {
-            const uint32_t rowOff = i * TQ_PACK_D;
-            const uint32_t blockOff = i * typePerBlock;
-            AscendC::Div<ComputeT, false>(
-                normVec16[rowOff], normVec16[rowOff], stepBlk[blockOff],
-                binaryRepeatBatchF16, 1,
-                AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 0));
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Maxs(normVec16, normVec16, static_cast<ComputeT>(0.0f),
-                      totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mins(normVec16, normVec16,
-                      static_cast<ComputeT>(TQ_VAL_QUANT_LEVELS_F), totalElems);
+
+        // ── Step 6b: stepBlk(half) in buf6 = Brcb(stepVec) ──
+        auto stepBlk = buf6;
+        AscendC::Brcb(stepBlk, stepVec, 2, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
 
-#if 0
-        AscendC::Cast(normFp32, normVec16, AscendC::RoundMode::CAST_NONE,
-                      totalElems);
+        // ── Step 7: quant_16(half) in buf7 = Sub(origBatch16, minBlk) ──
+        //    Quantize raw values directly (no abs, no sign extraction).
+        //    BinaryRepeatParams(1,1,0, 8,8,1): same as key encoder.
+        auto quant_16 = buf7;
+        AscendC::Sub<half, false>(
+            quant_16, origBatch16, minBlk,
+            binaryRepeatBatchF16, m,
+            AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 1));
         AscendC::PipeBarrier<PIPE_V>();
-        auto quantI32 = buf1.template ReinterpretCast<int32_t>();
-        AscendC::Cast(quantI32, normFp32, AscendC::RoundMode::CAST_RINT,
-                      totalElems);
+        // minBlk (buf3), origBatch16 (buf1) are dead.
+
+        // ── Step 8: quant_16 = Div(quant_16, stepBlk) ──
+        AscendC::Div<half, false>(
+            quant_16, quant_16, stepBlk,
+            binaryRepeatBatchF16, m,
+            AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 1));
         AscendC::PipeBarrier<PIPE_V>();
-        auto quantI16 = buf4.template ReinterpretCast<int16_t>();
-        AscendC::Cast(quantI16, quantI32, AscendC::RoundMode::CAST_NONE,
-                      totalElems);
+        // stepBlk (buf6) is dead.
+
+        // ── Step 9: range16(half) in buf7 (in-place) = Adds(quant_16, -8) ──
+        //    Shift [0, 15] → [-8, 7] for signed int4 Cast.
+        AscendC::Adds(quant_16, quant_16, static_cast<half>(-8.0f), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-#else
-        auto range16 = normFp32.template ReinterpretCast<ComputeT>();
-        AscendC::Adds(range16, normVec16, static_cast<ComputeT>(-8.0f), totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
+        auto range16 = quant_16;
+
+        // ── Step 10: Cast range16 → int4b_t directly into encodedBatch ──
         auto quantI4 = encodedBatch.template ReinterpretCast<int4b_t>();
         AscendC::Cast(quantI4, range16, AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-#endif
+        // range16 (buf7) is dead.
 
-        AscendC::Mul(minVec, minVec, maxVecT, typePerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mul(stepVec, stepVec, maxVecT, typePerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-
+        // ── Step 11: write vmin/vstep metadata to encodedBatch ──
+        //    vmin/vstep are already in the original (half) domain — no scale-
+        //    back needed because we quantized origBatch16 directly (no prior
+        //    normalization).
         auto metadataMinT = encodedBatch[
             TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
                                 .template ReinterpretCast<T>();
@@ -486,8 +442,8 @@ private:
             TQ_VAL_ENCODED_VSTEP_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
                                  .template ReinterpretCast<T>();
         if constexpr (std::is_same<T, bfloat16_t>::value) {
-            auto metadataMinFp32 = buf2;
-            auto metadataStepFp32 = buf2[typePerBlock];
+            auto metadataMinFp32 = buf1.template ReinterpretCast<float>();
+            auto metadataStepFp32 = metadataMinFp32[typePerBlock];
             AscendC::Cast(metadataMinFp32, minVec,
                           AscendC::RoundMode::CAST_NONE, m);
             AscendC::Cast(metadataStepFp32, stepVec,
@@ -502,6 +458,7 @@ private:
             AscendC::Adds(metadataStepT, stepVec, static_cast<half>(0.0f), m);
         }
         AscendC::PipeBarrier<PIPE_V>();
+        // minVec (buf4), stepVec (buf5) are dead.
     }
 
     __aicore__ inline void CopyManualCToYBatch(
