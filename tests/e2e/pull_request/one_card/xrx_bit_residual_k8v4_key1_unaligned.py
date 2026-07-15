@@ -99,6 +99,19 @@ def _u8_to_dtype_float(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return x.contiguous().view(dtype).float().clone()
 
 
+def _unpack_value_idx4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack signed int4 cache bytes back to logical idx4 [0, 15]."""
+    code = packed.to(torch.int32)
+    low = code & 0x0F
+    high = (code >> 4) & 0x0F
+    low = torch.where(low >= 8, low - 16, low) + 8
+    high = torch.where(high >= 8, high - 16, high) + 8
+    idx4 = torch.empty(D, dtype=torch.uint8)
+    idx4[0::2] = low.to(torch.uint8)
+    idx4[1::2] = high.to(torch.uint8)
+    return idx4
+
+
 def _decode_key_cache(
     cache: torch.Tensor,
     slots: torch.Tensor,
@@ -161,8 +174,7 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor, dtype: torch.d
             slab = cache_cpu[block_idx, head]
             code_off = pos_in_block * VAL_ROW_CODE_BYTES
             packed = slab[code_off : code_off + VAL_ROW_CODE_BYTES]
-            idx4[token_idx, head, 0::2] = packed & 0x0F
-            idx4[token_idx, head, 1::2] = packed >> 4
+            idx4[token_idx, head] = _unpack_value_idx4(packed)
             vmin_off = BS * VAL_ROW_CODE_BYTES + pos_in_block * 2
             vstep_off = BS * (VAL_ROW_CODE_BYTES + 2) + pos_in_block * 2
             vmin[token_idx, head] = _u8_to_dtype_float(
