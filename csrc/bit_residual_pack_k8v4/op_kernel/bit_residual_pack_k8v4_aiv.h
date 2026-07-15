@@ -120,32 +120,45 @@ private:
     /*
         Key 7-bit + sign quantization, half precision, no normalization.
 
-        原始数据 origin16 = cast(yBatch)             (fp32 → half)
-        计算绝对值 abs_vec = abs(origin16)
-        计算16个最大值 max_vec = WholeReduceMax(abs_vec, per row)
-        计算16个最小值 min_vec = WholeReduceMin(abs_vec, per row)
-        base = min_vec
-        gap  = max_vec - min_vec
-        step = Divs(gap, 127)                        // safe-clamped to > 0
-        // 每个base，step填充一个block（每行1个block，Brcb广播）
-        base_blk = brcb(base, 16)
-        step_blk = brcb(step, 16)
+        Two physical UB slots carry every live value:
+          fat  (EncodeBuffer1, 4 KB half)
+            A(orig) → quant_16 → quant_i16 → final_quant → pack_u8
+          scal (EncodeBuffer2, sub-blocked; slots are TQ_ENCODE_SCALAR_TILE_ELEMS half apart)
+            slot0 [0×]   : maxVec → baseBlk   (max dead after gap; reused)
+            slot1 [1×]   : minVec              (long-lived → metadata base)
+            slot2 [2×]   : gap → step (in-place, long-lived → metadata step)
+            slot3 [3×]   : stepBlk             (freed after Div)
 
-        // 直接对 origin16 量化，无需 scale-back
-        buf      = sub(origin16, base_blk, repeatParams)
-        quant_16 = div(buf, step_blk, repeatParams)
-        quant_u16 = cast(quant_16)                   // half → uint16
+        The rotated FP32 input slot (yBatch, 8 KB) is split into two 4 KB
+        half views y1/y2 once A = Cast(y) has consumed the fp32 data and the
+        fp32 input is dead:
+          y1 (front, half[0])      : abs → shiftedSign
+          y2 (rear,  half[totalElems]) : sign → pack_half
 
-        // 提取首位符号位（half 的 bit 15）
-        bit_vec_16 = ShiftRight(origin16, 15)        // 视为 u16 操作
-        buf = ShiftLeft(bit_vec_16, 7)
-        final_quant_16 = or(buf, quant_u16)          // bit7=sign, bits0..6=q7
-
-        // 通过数值 Cast 把 8-bit 值截到 uint8
-        pack_half = cast(final_quant_16, half)       // u16(0..255) → half
-        pack_u8   = cast(pack_half, uint8)           // half(0..255) → u8
+        origin16 = cast(yBatch)                       (fp32 → half)  [fat]
+        sign     = ShiftRight(origin16, 15)          (bit15)        [y2]
+        abs      = Abs(origin16)                                      [y1]
+        // origin16 dead; fat free
+        max      = WholeReduceMax(abs, per row)                       [scal slot0]
+        min      = WholeReduceMin(abs, per row)       (=base)         [scal slot1]
+        gap      = Sub(max, min)                                      [scal slot2]
+        step     = Maxs(Muls(gap, 1/127), eps)        (in-place)      [scal slot2]
+        // max dead; slot0 free
+        baseBlk  = Brcb(min, 16)                      (reuse slot0)
+        stepBlk  = Brcb(step, 16)                                     [scal slot3]
+        quant    = Sub(abs, baseBlk)                                  [fat]
+        // abs dead; y1 free
+        quant    = Div(quant, stepBlk)               (in-place)       [fat]
+        // stepBlk dead; slot3 free
+        q_i16    = Cast(quant, RINT)                 (in-place)       [fat]
+        shSign   = ShiftLeft(sign, 7)                                [y1]
+        // sign dead; y2 free
+        final    = Or(q_i16, shSign)                  (in-place)       [fat]
+        // shSign dead; y1 free
+        pack_h   = Cast(final, half)                                 [y2]
+        pack_u8  = Cast(pack_h, u8)                  (in-place)       [fat]
         DataCopy(encodedBatch, pack_u8)
-        // 写 base / step 元数据（直接是 half 域，不需要 scale-back）
+        // base/step metadata already half-domain — no scale-back.
     */
     __aicore__ inline void EncodeKeyBatch(
         uint32_t m,
@@ -154,153 +167,154 @@ private:
         using ComputeT = half;
         static_assert(TQ_MANUAL_AIV_SLICE_M == TQ_VECTOR_BATCH,
                       "key encoder expects one physical 16-row tile");
-        constexpr uint32_t typePerBlock = 32 / sizeof(ComputeT);
+        constexpr uint32_t typePerBlock = ASCEND_BLOCK_BYTES / sizeof(ComputeT);
         const ComputeT safeDivisor = static_cast<ComputeT>(1.0e-6f);
         const uint32_t totalElems = m * TQ_PACK_D;
         constexpr uint32_t binaryRepeatBatchF16 = 128;
+        constexpr uint32_t repeatsOfRows = TQ_VECTOR_BATCH / 8;
 
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
-        // All buffers are 16-bit base views (TQ_UB_ENCODE_SMALL_BUF = 4KB =
-        // 2048 half; buf1/buf2 are 8KB).  Layout assigned in order of first
-        // use and recycled when the owner becomes dead.
-        auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<half>();
-        auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<half>();
-        auto buf3 = context_.resource_.EncodeBuffer3().template ReinterpretCast<half>();
-        auto buf4 = context_.resource_.EncodeBuffer4().template ReinterpretCast<half>();
-        auto buf5 = context_.resource_.EncodeBuffer5().template ReinterpretCast<half>();
-        auto buf6 = context_.resource_.EncodeBuffer6().template ReinterpretCast<half>();
-        auto buf7 = context_.resource_.EncodeBuffer7().template ReinterpretCast<half>();
-        auto buf8 = context_.resource_.EncodeBuffer8().template ReinterpretCast<half>();
-        (void)buf8;
 
-        // ── Step 1: origBatch16(half) in buf1 = Cast(yBatch fp32) ──
-        auto origBatch16 = buf1;
+        // ── Two physical slots, reused as the pipeline progresses ────────
+        auto fat = context_.resource_.EncodeBuffer1().template ReinterpretCast<half>();
+        auto scal = context_.resource_.EncodeBuffer2().template ReinterpretCast<half>();
+        // scal sub-blocks: one Brcb/reduce tile per slot
+        // (TQ_ENCODE_SCALAR_TILE_ELEMS half apart).
+        auto sMaxVec = scal;            // slot0: max → baseBlk (reused after max dead)
+        auto minVec = scal[TQ_ENCODE_SCALAR_TILE_ELEMS];         // slot1: min (long-lived → base meta)
+        auto stepVec = scal[2 * TQ_ENCODE_SCALAR_TILE_ELEMS];    // slot2: gap → step (in-place, long-lived)
+        auto stepBlk = scal[3 * TQ_ENCODE_SCALAR_TILE_ELEMS];    // slot3: stepBlk (freed after Div)
+        auto baseBlk = sMaxVec;         // slot0 reused
+
+        // yBatch fp32 input (8 KB) split into two 4 KB half views once
+        // Cast(y→half) has consumed the fp32 data.
+        auto yHalf = yBatch.template ReinterpretCast<half>();
+        auto y1 = yHalf;              // front 4 KB: abs → shiftedSign
+        auto y2 = yHalf[totalElems];  // rear  4 KB: sign → pack_half
+
+        // ── Step 1: origBatch16(half) in fat = Cast(yBatch fp32) ──
+        //    yBatch is an 8 KB fp32 input slot.  The 4 KB half output would
+        //    overlap the still-live fp32 source if written in place, so A lands
+        //    in the dedicated fat slot.
+        auto origBatch16 = fat;
         AscendC::Cast(origBatch16, yBatch, AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
+        // yBatch fp32 input is now dead → split it into two 4 KB half views.
+        auto signVec = y2.template ReinterpretCast<uint16_t>();
+        auto absVec = y1;
 
-        // ── Step 2: absVec(half) in buf2 = |origBatch16| ──
-        auto absVec = buf2;
-        AscendC::Abs(absVec, origBatch16, totalElems);
+        // ── Step 2: signVec(u16) in y2 = sign bit (bit 15) of origBatch16 ──
+        //    Hoisted before Abs so origBatch16 dies earlier, freeing fat for
+        //    the quant chain while sign lives in y2.
+        AscendC::ShiftRight(signVec,
+                            origBatch16.template ReinterpretCast<uint16_t>(),
+                            static_cast<uint16_t>(15), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 3a: maxVec(half) in buf3 = WholeReduceMax(absVec, per row) ─
-        auto maxVec = buf3;
+        // ── Step 3: absVec(half) in y1 = |origBatch16| ──
+        AscendC::Abs(absVec, origBatch16, totalElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        // origBatch16 (fat) is dead → fat free for quant chain.
+
+        // ── Step 4: maxVec(half) in scal slot0 = WholeReduceMax(absVec) ──
         AscendC::WholeReduceMax<half, false>(
-            maxVec, absVec, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
+            sMaxVec, absVec, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
             TQ_PACK_D / typePerBlock, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 3b: minVec(half, =base) in buf4 = WholeReduceMin(absVec) ──
-        auto minVec = buf4;
+        // ── Step 5: minVec(half, =base) in scal slot1 = WholeReduceMin(absVec) ──
         AscendC::WholeReduceMin<half, false>(
             minVec, absVec, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
             TQ_PACK_D / typePerBlock, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 4: gapVec(half) in buf5 = maxVec - minVec ──
-        //    (absVec in buf2 still needed for Step 7 quantization.)
-        auto gapVec = buf5;
-        AscendC::Sub(gapVec, maxVec, minVec, m);
+        // ── Step 6: gap→step in scal slot2 (in-place) = (max-min)*1/127 ──
+        //    maxVec dies here (last use in gap).  stepVec must survive to the
+        //    metadata write (Step 16).
+        AscendC::Sub(stepVec, sMaxVec, minVec, m);
         AscendC::PipeBarrier<PIPE_V>();
-
-        // ── Step 5: stepVec(half) in buf5 (in-place) = Muls(gapVec, 1/127),
-        //            with a safe lower bound to avoid div-by-zero on rows
-        //            where max == min (gap == 0).
-        auto stepVec = buf5;
-        AscendC::Muls(stepVec, gapVec,
+        // sMaxVec (slot0) is dead → reusable for baseBlk.
+        AscendC::Muls(stepVec, stepVec,
                       static_cast<half>(TQ_KEY_QUANT_LEVELS_F), m);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Maxs(stepVec, stepVec, safeDivisor, m);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 6a: baseBlk(half) in buf3 (reuse, maxVec dead) = Brcb(minVec)
+        // ── Step 7a: baseBlk(half) in scal slot0 (reuse) = Brcb(minVec) ──
         //    Each repeat takes 8 src scalars → 8 datablocks (16 half each).
         //    2 repeats → 16 datablocks (one per row), 256 half total.
-        auto baseBlk = buf3;
-        AscendC::Brcb(baseBlk, minVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::Brcb(baseBlk, minVec, repeatsOfRows, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 6b: stepBlk(half) in buf6 = Brcb(stepVec) ──
-        auto stepBlk = buf6;
-        AscendC::Brcb(stepBlk, stepVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        // ── Step 7b: stepBlk(half) in scal slot3 = Brcb(stepVec) ──
+        AscendC::Brcb(stepBlk, stepVec, repeatsOfRows, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 7: quant_16(half) in buf7 = Sub(absVec, baseBlk) ──
-        //    Quantize |x| (not x) because base/step are computed in the |x|
-        //    domain.  Sign is extracted separately from origBatch16.
-        //    mask=128 (8 blocks), repeatTimes=16 (16 rows)
-        //    BinaryRepeatParams(1,1,0, 8,8,1):
-        //      small-loop: dst/src0 +1 block, src1 reuse (broadcasts 1 block
-        //                  across the 8 blocks of one row)
-        //      big-loop:   dst/src0 +8 blocks (= 1 row), src1 +1 block
-        //                  (next row's base/step)
-        auto quant_16 = buf7;
+        // ── Step 8: quant_16(half) in fat = Sub(absVec, baseBlk) ──
+        //    Quantize |x| (not x): base/step live in the |x| domain; sign is
+        //    recombined later from signVec.  absVec is consumed here and dies.
+        //    mask=128 (8 blocks), repeatTimes=16 (16 rows).
+        //    BinaryRepeatParams(1,1,0, 8,8,1): per-row src1 broadcast.
+        auto quant_16 = fat;
         AscendC::Sub<half, false>(
             quant_16, absVec, baseBlk,
             binaryRepeatBatchF16, m,
             AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 1));
         AscendC::PipeBarrier<PIPE_V>();
-        // baseBlk (buf3), absVec (buf2) are dead.
+        // baseBlk (slot0), absVec (y1) are dead → y1 free for shiftedSign.
 
-        // ── Step 8: quant_16 = Div(quant_16, stepBlk) ──
+        // ── Step 9: quant_16 = Div(quant_16, stepBlk) (in-place in fat) ──
         AscendC::Div<half, false>(
             quant_16, quant_16, stepBlk,
             binaryRepeatBatchF16, m,
             AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 1));
         AscendC::PipeBarrier<PIPE_V>();
-        // stepBlk (buf6) is dead.
+        // stepBlk (slot3) is dead.
 
-        // ── Step 9: signVec(u16) in buf2 (reuse) = sign bit (bit 15) of origBatch16 ─
-        auto signVec = buf2.template ReinterpretCast<uint16_t>();
-        AscendC::ShiftRight(signVec,
-                            origBatch16.template ReinterpretCast<uint16_t>(),
-                            static_cast<uint16_t>(15), totalElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        // origBatch16 (buf1) is dead.
-
-        // ── Step 10: quant_i16(i16) in buf7 (reuse) = Cast(quant_16, RINT) ──
-        auto quant_i16 = buf7.template ReinterpretCast<int16_t>();
+        // ── Step 10: quant_i16(i16) in fat (in-place) = Cast(quant_16, RINT) ──
+        auto quant_i16 = fat.template ReinterpretCast<int16_t>();
         AscendC::Cast(quant_i16, quant_16, AscendC::RoundMode::CAST_RINT, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 11: shiftedSign(u16) in buf1 = ShiftLeft(signVec, 7) ──
-        auto shiftedSign = buf1.template ReinterpretCast<int16_t>();
+        // ── Step 11: shiftedSign(i16) in y1 = ShiftLeft(signVec, 7) ──
+        auto shiftedSign = y1.template ReinterpretCast<int16_t>();
         AscendC::ShiftLeft(shiftedSign, signVec.template ReinterpretCast<int16_t>(),
                            static_cast<int16_t>(7), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // signVec (buf2) is dead.
+        // signVec (y2) is dead → y2 free for pack_half.
 
-        // ── Step 12: final_quant_16(i16) in buf7 (in-place)
+        // ── Step 12: final_quant_16(i16) in fat (in-place)
         //            = Or(quant_i16, shiftedSign) — bit 7 = sign, bits 0..6 =
         //            7-bit quant code (0..127).
         AscendC::Or(quant_i16, quant_i16, shiftedSign, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // shiftedSign (buf1) is dead.
+        // shiftedSign (y1) is dead.
         auto final_quant_16 = quant_i16;
 
-        // ── Step 13: pack_half(half) in buf1 = Cast(final_quant_16 → half) ─
+        // ── Step 13: pack_half(half) in y2 = Cast(final_quant_16 → half) ──
         //    Numerical cast: uint16 value 0..255 → half 0.0..255.0.
-        auto pack_half = buf1;
+        auto pack_half = y2;
         AscendC::Cast(pack_half, final_quant_16, AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // final_quant_16 (buf7) is dead.
+        // final_quant_16 (fat) is dead → fat free for pack_u8.
 
-        // ── Step 14: pack_u8(uint8) in buf7 (reuse) = Cast(pack_half → u8) ─
-        auto pack_u8 = buf7.template ReinterpretCast<uint8_t>();
+        // ── Step 14: pack_u8(uint8) in fat = Cast(pack_half → u8) ──
+        auto pack_u8 = fat.template ReinterpretCast<uint8_t>();
         AscendC::Cast(pack_u8, pack_half, AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // pack_half (buf1) is dead.
+        // pack_half (y2) is dead.
 
         // ── Step 15: DataCopy 2048 code bytes to encodedBatch[0..2047] ──
         auto encodedBytes = encodedBatch.template ReinterpretCast<uint8_t>();
         AscendC::DataCopy(encodedBytes, pack_u8, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // pack_u8 (buf7) is dead.
+        // pack_u8 (fat) is dead.
 
         // ── Step 16: write base/step metadata to encodedBatch ──
         //    base/step are already in the original (half) domain — no scale-
         //    back needed because we quantized origBatch16 directly (no prior
-        //    normalization).
+        //    normalization).  quant chain is done → fat is free as fp32 scratch
+        //    for the bf16 metadata path; minVec/stepVec live in scal slots 1/2.
         auto metadataBaseT = encodedBatch[
             TQ_KEY_ENCODED_BASE_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
                                  .template ReinterpretCast<T>();
@@ -308,7 +322,7 @@ private:
             TQ_KEY_ENCODED_STEP_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
                                  .template ReinterpretCast<T>();
         if constexpr (std::is_same<T, bfloat16_t>::value) {
-            auto metadataBaseFp32 = buf2.template ReinterpretCast<float>();
+            auto metadataBaseFp32 = fat.template ReinterpretCast<float>();
             auto metadataStepFp32 = metadataBaseFp32[TQ_BLOCK_ROWS];
             AscendC::Cast(metadataBaseFp32, minVec,
                           AscendC::RoundMode::CAST_NONE, m);
@@ -324,117 +338,124 @@ private:
             AscendC::Adds(metadataStepT, stepVec, static_cast<half>(0.0f), m);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        // minVec (buf4), stepVec (buf3) are dead.
+        // minVec (scal slot1), stepVec (scal slot2) are dead.
     }
     // ── Value quantization ────────────────────────────────────────────────
     // Process all 16 rows as one vector batch.  Convert to FP16 up front,
     // then compute per-row max/min directly on the raw (signed) data and
     // quantize (x - vmin) / vstep into 4-bit.  No normalization, no abs,
     // no sign extraction — vmin/vstep are already in the original domain.
+    //
+    // Two physical UB slots:
+    //   fat  (EncodeBuffer1, 4 KB half): A(orig) until quant; then free for
+    //        the bf16 metadata fp32 scratch.
+    //   y1   (front half of the dead yBatch fp32 slot): quant → range16.
+    //   scal (EncodeBuffer2, sub-blocked; slots are TQ_ENCODE_SCALAR_TILE_ELEMS half apart):
+    //        slot0 [0×]  : max → minBlk (reused after max dead)
+    //        slot1 [1×]  : min (long-lived → vmin meta)
+    //        slot2 [2×]  : range → step (in-place, long-lived → vstep meta)
+    //        slot3 [3×]  : stepBlk (freed after Div)
     __aicore__ inline void EncodeValueBatch(
         uint32_t m,
         AscendC::LocalTensor<float>& yBatch) {
         static constexpr float TQ_VAL_QUANT_LEVELS_F = 1.0f / 15.0f;
         static_assert(TQ_MANUAL_AIV_SLICE_M == TQ_VECTOR_BATCH,
                       "value encoder expects one physical 16-row tile");
-        constexpr uint32_t typePerBlock = 32 / sizeof(half);
+        constexpr uint32_t typePerBlock = ASCEND_BLOCK_BYTES / sizeof(half);
         const half safeDivisor = static_cast<half>(1.0e-6f);
         const uint32_t totalElems = m * TQ_PACK_D;
         constexpr uint32_t binaryRepeatBatchF16 = 128;
+        constexpr uint32_t repeatsOfRows = TQ_VECTOR_BATCH / 8;
 
         auto encodedBatch = context_.resource_.KeyEncodedBatch();
-        // All buffers are 16-bit (half) base views, assigned in order of first
-        // use and recycled when the owner becomes dead.
-        auto buf1 = context_.resource_.EncodeBuffer1().template ReinterpretCast<half>();
-        auto buf2 = context_.resource_.EncodeBuffer2().template ReinterpretCast<half>();
-        auto buf3 = context_.resource_.EncodeBuffer3().template ReinterpretCast<half>();
-        auto buf4 = context_.resource_.EncodeBuffer4().template ReinterpretCast<half>();
-        auto buf5 = context_.resource_.EncodeBuffer5().template ReinterpretCast<half>();
-        auto buf6 = context_.resource_.EncodeBuffer6().template ReinterpretCast<half>();
-        auto buf7 = context_.resource_.EncodeBuffer7().template ReinterpretCast<half>();
-        (void)buf2;
+        // ── Two physical slots, reused as the pipeline progresses ────────
+        auto fat = context_.resource_.EncodeBuffer1().template ReinterpretCast<half>();
+        auto scal = context_.resource_.EncodeBuffer2().template ReinterpretCast<half>();
+        // scal sub-blocks: one Brcb/reduce tile per slot
+        // (TQ_ENCODE_SCALAR_TILE_ELEMS half apart).
+        auto sMaxVec = scal;            // slot0: max → minBlk (reused after max dead)
+        auto minVec = scal[TQ_ENCODE_SCALAR_TILE_ELEMS];         // slot1: min (long-lived → vmin meta)
+        auto stepVec = scal[2 * TQ_ENCODE_SCALAR_TILE_ELEMS];    // slot2: range → step (in-place, long-lived)
+        auto stepBlk = scal[3 * TQ_ENCODE_SCALAR_TILE_ELEMS];    // slot3: stepBlk (freed after Div)
+        auto minBlk = sMaxVec;          // slot0 reused
 
-        // ── Step 1: origBatch16(half) in buf1 = Cast(yBatch fp32) ──
-        auto origBatch16 = buf1;
+        // ── Step 1: origBatch16(half) in fat = Cast(yBatch fp32) ──
+        auto origBatch16 = fat;
         AscendC::Cast(origBatch16, yBatch, AscendC::RoundMode::CAST_NONE,
                       totalElems);
         AscendC::PipeBarrier<PIPE_V>();
+        // yBatch fp32 input is now dead → its front 4 KB is free as y1.
+        auto yHalf = yBatch.template ReinterpretCast<half>();
+        auto y1 = yHalf;
 
-        // ── Step 2: maxVec(half) in buf3 = WholeReduceMax(origBatch16, per row) ──
+        // ── Step 2: maxVec(half) in scal slot0 = WholeReduceMax(origBatch16) ──
         //    No Abs — value quantizes the raw (signed) data directly.
-        auto maxVec = buf3;
         AscendC::WholeReduceMax<half, false>(
-            maxVec, origBatch16, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
+            sMaxVec, origBatch16, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
             TQ_PACK_D / typePerBlock, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 3: minVec(half) in buf4 = WholeReduceMin(origBatch16, per row) ──
-        auto minVec = buf4;
+        // ── Step 3: minVec(half) in scal slot1 = WholeReduceMin(origBatch16) ──
         AscendC::WholeReduceMin<half, false>(
             minVec, origBatch16, static_cast<int32_t>(TQ_PACK_D), m, 1, 1,
             TQ_PACK_D / typePerBlock, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 4: rangeVec(half) in buf5 = maxVec - minVec ──
-        auto rangeVec = buf5;
-        AscendC::Sub(rangeVec, maxVec, minVec, m);
+        // ── Step 4: range→step in scal slot2 (in-place) = (max-min)*1/15 ──
+        //    maxVec dies here (last use in range).  stepVec must survive to
+        //    the metadata write (Step 11).
+        AscendC::Sub(stepVec, sMaxVec, minVec, m);
         AscendC::PipeBarrier<PIPE_V>();
-
-        // ── Step 5: stepVec(half) in buf5 (in-place) = Muls(rangeVec, 1/15),
-        //            with a safe lower bound to avoid div-by-zero on rows
-        //            where max == min (range == 0).
-        auto stepVec = buf5;
-        AscendC::Muls(stepVec, rangeVec,
+        // sMaxVec (slot0) is dead → reusable for minBlk.
+        AscendC::Muls(stepVec, stepVec,
                       static_cast<half>(TQ_VAL_QUANT_LEVELS_F), m);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Maxs(stepVec, stepVec, safeDivisor, m);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 6a: minBlk(half) in buf3 (reuse, maxVec dead) = Brcb(minVec) ──
-        auto minBlk = buf3;
-        AscendC::Brcb(minBlk, minVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        // ── Step 5a: minBlk(half) in scal slot0 (reuse) = Brcb(minVec) ──
+        AscendC::Brcb(minBlk, minVec, repeatsOfRows, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 6b: stepBlk(half) in buf6 = Brcb(stepVec) ──
-        auto stepBlk = buf6;
-        AscendC::Brcb(stepBlk, stepVec, 2, AscendC::BrcbRepeatParams(1, 8));
+        // ── Step 5b: stepBlk(half) in scal slot3 = Brcb(stepVec) ──
+        AscendC::Brcb(stepBlk, stepVec, repeatsOfRows, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 7: quant_16(half) in buf7 = Sub(origBatch16, minBlk) ──
-        //    Quantize raw values directly (no abs, no sign extraction).
-        //    BinaryRepeatParams(1,1,0, 8,8,1): same as key encoder.
-        auto quant_16 = buf7;
+        // ── Step 6: quant_16(half) in y1 = Sub(origBatch16, minBlk) ──
+        //    origBatch16 lives in fat and is consumed here (then dies).
+        //    BinaryRepeatParams(1,1,0, 8,8,1): per-row src1 broadcast.
+        auto quant_16 = y1;
         AscendC::Sub<half, false>(
             quant_16, origBatch16, minBlk,
             binaryRepeatBatchF16, m,
             AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 1));
         AscendC::PipeBarrier<PIPE_V>();
-        // minBlk (buf3), origBatch16 (buf1) are dead.
+        // minBlk (slot0), origBatch16 (fat) are dead → fat free.
 
-        // ── Step 8: quant_16 = Div(quant_16, stepBlk) ──
+        // ── Step 7: quant_16 = Div(quant_16, stepBlk) (in-place in y1) ──
         AscendC::Div<half, false>(
             quant_16, quant_16, stepBlk,
             binaryRepeatBatchF16, m,
             AscendC::BinaryRepeatParams(1, 1, 0, 8, 8, 1));
         AscendC::PipeBarrier<PIPE_V>();
-        // stepBlk (buf6) is dead.
+        // stepBlk (slot3) is dead.
 
-        // ── Step 9: range16(half) in buf7 (in-place) = Adds(quant_16, -8) ──
+        // ── Step 8: range16(half) in y1 (in-place) = Adds(quant_16, -8) ──
         //    Shift [0, 15] → [-8, 7] for signed int4 Cast.
         AscendC::Adds(quant_16, quant_16, static_cast<half>(-8.0f), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
         auto range16 = quant_16;
 
-        // ── Step 10: Cast range16 → int4b_t directly into encodedBatch ──
+        // ── Step 9: Cast range16 → int4b_t directly into encodedBatch ──
         auto quantI4 = encodedBatch.template ReinterpretCast<int4b_t>();
         AscendC::Cast(quantI4, range16, AscendC::RoundMode::CAST_NONE, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // range16 (buf7) is dead.
+        // range16 (y1) is dead.
 
-        // ── Step 11: write vmin/vstep metadata to encodedBatch ──
+        // ── Step 10: write vmin/vstep metadata to encodedBatch ──
         //    vmin/vstep are already in the original (half) domain — no scale-
         //    back needed because we quantized origBatch16 directly (no prior
-        //    normalization).
+        //    normalization).  fat is free as fp32 scratch for the bf16 path.
         auto metadataMinT = encodedBatch[
             TQ_VAL_ENCODED_VMIN_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
                                 .template ReinterpretCast<T>();
@@ -442,7 +463,7 @@ private:
             TQ_VAL_ENCODED_VSTEP_BATCH_BYTE_OFFSET / sizeof(uint16_t)]
                                  .template ReinterpretCast<T>();
         if constexpr (std::is_same<T, bfloat16_t>::value) {
-            auto metadataMinFp32 = buf1.template ReinterpretCast<float>();
+            auto metadataMinFp32 = fat.template ReinterpretCast<float>();
             auto metadataStepFp32 = metadataMinFp32[typePerBlock];
             AscendC::Cast(metadataMinFp32, minVec,
                           AscendC::RoundMode::CAST_NONE, m);
@@ -458,7 +479,7 @@ private:
             AscendC::Adds(metadataStepT, stepVec, static_cast<half>(0.0f), m);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        // minVec (buf4), stepVec (buf5) are dead.
+        // minVec (scal slot1), stepVec (scal slot2) are dead.
     }
 
     __aicore__ inline void CopyManualCToYBatch(
