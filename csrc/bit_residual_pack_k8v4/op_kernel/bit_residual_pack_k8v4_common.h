@@ -84,7 +84,6 @@ static constexpr uint32_t TQ_KEY_ROW_CODE_BYTES = TQ_PACK_D;
 static constexpr uint32_t TQ_VAL_ROW_CODE_BYTES = TQ_PACK_D / 2;
 static constexpr uint32_t TQ_ROW_META_BYTES = sizeof(uint16_t);
 static constexpr uint32_t TQ_META_TILE_BYTES = TQ_BLOCK_ROWS * TQ_ROW_META_BYTES;
-static constexpr uint32_t TQ_MAX_UINT8_DATACOPY_BYTES = 1024;
 static constexpr uint32_t TQ_PACKED_TILE_SCRATCH_BYTES =
     2 * TQ_META_TILE_BYTES + TQ_BLOCK_ROWS * TQ_KEY_ROW_CODE_BYTES;
 static constexpr uint32_t TQ_KEY_BYTES_PER_ROW = TQ_KEY_ROW_CODE_BYTES + 2 * TQ_ROW_META_BYTES;
@@ -324,9 +323,9 @@ static constexpr uint32_t TQ_BATCH_ELEMS = TQ_VECTOR_BATCH * TQ_PACK_D;
 static constexpr uint32_t TQ_UB_ENCODE_FP32_ROW_BYTES = TQ_PACK_D * sizeof(float);  // 512 B per fp32 row
 // buf7 holds two Brcb broadcast tile outputs (baseBlk + stepBlk or minBlk + stepBlk).
 // Each is m × typePerBlock × sizeof(ComputeT) = 16 × 16 × 2 = 512 bytes.
-static constexpr uint32_t TQ_UB_BRCB_TILE_BYTES = TqAlignUp32(2 * TQ_VECTOR_BATCH * 16 * 2);
-static constexpr uint32_t TQ_UB_ENCODE_SMALL_BUF = 4096;   // 4 KB
-static constexpr uint32_t TQ_UB_ENCODE_LARGE_BUF = TQ_UB_ENCODE_SMALL_BUF * 2;  // 8 KB (16 fp32 rows)
+static constexpr uint32_t TQ_UB_BRCB_TILE_BYTES = TqAlignUp32(2 * TQ_VECTOR_BATCH * TQ_BLOCK_ROWS * sizeof(half));
+static constexpr uint32_t TQ_UB_ENCODE_SMALL_BUF = TQ_BLOCK_ROWS * TQ_PACK_D * sizeof(half);   // 4 KB
+static constexpr uint32_t TQ_UB_ENCODE_LARGE_BUF = TQ_BLOCK_ROWS * TQ_PACK_D * sizeof(float);  // 8 KB
 
 // ── Chained layout via UB_VARIBALE_AND_OFF ────────────────────────────────────
 UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH,        TQ_BATCH_ELEMS * sizeof(float), TQ_UB_BASE)
