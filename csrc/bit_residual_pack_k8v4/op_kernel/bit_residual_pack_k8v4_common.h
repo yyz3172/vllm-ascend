@@ -77,8 +77,6 @@ static constexpr uint16_t TQ_MANUAL_SYNC_C_READY = 3;
 static constexpr uint16_t TQ_MANUAL_SYNC_PP_STRIDE = 4;
 
 // -----------vector--------------------------------------------------------
-static constexpr float TQ_KEY_QUANT_LEVELS_F = 127.0f;
-static constexpr float TQ_VAL_QUANT_LEVELS_F = 15.0f;
 static constexpr uint32_t TQ_AIV_SUB_BLOCKS = 2;
 static constexpr uint32_t TQ_KEY_ROW_CODE_BYTES = TQ_PACK_D;
 static constexpr uint32_t TQ_VAL_ROW_CODE_BYTES = TQ_PACK_D / 2;
