@@ -633,7 +633,16 @@ private:
             copy_packed_gm_to_ub(meta1Bytes, packedGm,
                 meta1Base + tileStart * TQ_ROW_META_BYTES, TQ_META_TILE_BYTES);
             TqSyncMte2ToS();
-            // ── Batch DataCopy for key code bytes (eliminates per-row 128×SetValue) ──
+            // ── Code bytes: DataCopy (32B aligned) + Meta: Copy (non-aligned UB→UB) ──
+            auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
+            const uint32_t codeRowBytes = IS_KEY ? TQ_KEY_ROW_CODE_BYTES : TQ_VAL_ROW_CODE_BYTES;
+            const uint32_t codeSrcOff = (desc.startGroupRow + rowOff) * codeRowBytes;
+            auto codeOutAll = scratch[2 * TQ_META_TILE_BYTES];
+            DataCopy(codeOutAll, encodedBytes[codeSrcOff], rows * codeRowBytes);
+            PipeBarrier<PIPE_V>();
+            // Meta0/meta1: Copy (V-pipe, supports non-aligned offsets)
+            auto encodedT = encoded.template ReinterpretCast<T>();
+            const uint32_t metaEncodedRow = desc.startGroupRow + rowOff;
             if constexpr (IS_KEY) {
                 auto encodedBytes = encoded.template ReinterpretCast<uint8_t>();
                 const uint32_t srcOff = (desc.startGroupRow + rowOff) * TQ_KEY_ROW_CODE_BYTES;
@@ -672,30 +681,10 @@ private:
                 }
             }
             TqSyncSToMte3();
-            if constexpr (IS_KEY) {
-                constexpr uint32_t maxRowsPerCopy =
-                    TQ_MAX_UINT8_DATACOPY_BYTES / TQ_KEY_ROW_CODE_BYTES;
-                uint32_t copiedRows = 0;
-                while (copiedRows < rows) {
-                    const uint32_t remainingRows = rows - copiedRows;
-                    const uint32_t copyRows = remainingRows > maxRowsPerCopy
-                        ? maxRowsPerCopy
-                        : remainingRows;
-                    auto scratchCodeBytes =
-                        codeBytesUb[copiedRows * TQ_KEY_ROW_CODE_BYTES];
-                    copy_packed_ub_to_gm(
-                        packedGm,
-                        headBase + static_cast<uint64_t>(blockRow + copiedRows) *
-                                           codeBytes,
-                        scratchCodeBytes, copyRows * codeBytes);
-                    copiedRows += copyRows;
-                }
-            } else {
-                copy_packed_ub_to_gm(
-                    packedGm,
-                    headBase + static_cast<uint64_t>(blockRow) * codeBytes,
-                    codeBytesUb, rows * codeBytes);
-            }
+            copy_packed_ub_to_gm(
+                packedGm,
+                headBase + static_cast<uint64_t>(blockRow) * codeBytes,
+                codeBytesUb, rows * codeBytes);
             copy_packed_ub_to_gm(packedGm, meta0Base + tileStart * TQ_ROW_META_BYTES,
                 scratch, TQ_META_TILE_BYTES);
             copy_packed_ub_to_gm(packedGm, meta1Base + tileStart * TQ_ROW_META_BYTES,
