@@ -408,15 +408,19 @@ int main()
     }
 
     double scaleValue = 1.0 / sqrt(static_cast<double>(kHeadDim));
-    LOG_PRINT("TurboquantFiaMse8bit TND+PA: Pi=[%ld,%ld] gamma=[%ld,%ld] kvSeq=%ld\n", kHeadDim, kHeadDim, kKvTokens,
-              kNumKvHeads, kvSeqLen);
+    // Match FIA TQ example: sparseMode=3 (right-down causal) + 2048x2048 compress mask (0=keep).
+    constexpr int64_t kPreTokens = 2147483647;
+    constexpr int64_t kNextTokens = 2147483647;
+    constexpr int64_t kSparseMode = 3;
+    LOG_PRINT("TurboquantFiaMse8bit TND+PA: Pi=[%ld,%ld] gamma=[%ld,%ld] kvSeq=%ld sparseMode=%ld\n",
+              kHeadDim, kHeadDim, kKvTokens, kNumKvHeads, kvSeqLen, kSparseMode);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor *executor = nullptr;
     ret = aclnnTurboquantFiaMse8bitGetWorkspaceSize(
         queryTensor, keyTensor, valueTensor, blockTableTensor, actualSeqQArr, actualSeqKvArr, attenMaskTensor,
         keyGammaTensor, valueGammaTensor, piTensor, kNumHeads, kNumKvHeads, kHeadDim, kBlockSize, scaleValue,
-        outTensor, &workspaceSize, &executor);
+        kPreTokens, kNextTokens, kSparseMode, outTensor, &workspaceSize, &executor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) {
         LOG_PRINT("aclnnTurboquantFiaMse8bitGetWorkspaceSize failed. ERROR: %d\n", ret);
         return ret;

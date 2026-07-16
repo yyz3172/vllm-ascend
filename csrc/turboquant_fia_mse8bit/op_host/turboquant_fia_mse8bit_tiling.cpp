@@ -22,17 +22,131 @@ namespace {
 
 constexpr uint32_t kPreLoadNum = 2;
 constexpr uint32_t kS2BaseSize = 512;
-constexpr uint32_t kMBaseSize = 256;
+// Align with FIA TND CalcMBaseSize (M_BASE_SIZE_512), not the non-TND 256 tier.
+constexpr uint32_t kMBaseSize = 512;
 constexpr uint32_t kFdGS1BaseSize = 8;
 constexpr uint32_t kByteBlock = 32;
 constexpr uint32_t kBlockTableElemByte = 4;
 constexpr uint32_t kLibApiWorkspaceFallback = 16 * 1024 * 1024;
 constexpr uint64_t kTilingKeyNoFd = 0;
 constexpr uint64_t kTilingKeyFd = 1;
+constexpr int64_t kSparseModeIntMax = 2147483647;
+constexpr int32_t kSparseModeNoMask = 0;
+constexpr int32_t kSparseModeAllMask = 1;
+constexpr int32_t kSparseModeLeftUp = 2;
+constexpr int32_t kSparseModeRightDown = 3;
+constexpr int32_t kSparseModeBand = 4;
+constexpr uint32_t kCompressMaskStride = 2048;
+constexpr uint32_t kSInnerSizeCompressCap = 1024;
+constexpr size_t kAttrIdxPreTokens = 5;
+constexpr size_t kAttrIdxNextTokens = 6;
+constexpr size_t kAttrIdxSparseMode = 7;
+constexpr size_t kInputIdxAttenMask = 6;
 
 inline uint32_t AlignUp(uint32_t a, uint32_t align)
 {
     return align == 0 ? a : ((a + align - 1) / align) * align;
+}
+
+inline int64_t ClampSparseToken(int64_t v)
+{
+    if (v > kSparseModeIntMax) {
+        return kSparseModeIntMax;
+    }
+    if (v < -kSparseModeIntMax) {
+        return -kSparseModeIntMax;
+    }
+    return v;
+}
+
+// Mirror FiaInfoParser::GetPreNextToken for causal / all-mask modes.
+void ApplySparsePreNextTokens(int32_t sparseMode, int64_t& preToken, int64_t& nextToken)
+{
+    if (sparseMode == kSparseModeAllMask) {
+        preToken = kSparseModeIntMax;
+        nextToken = kSparseModeIntMax;
+    } else if (sparseMode == kSparseModeLeftUp || sparseMode == kSparseModeRightDown) {
+        preToken = kSparseModeIntMax;
+        nextToken = 0;
+    }
+    preToken = ClampSparseToken(preToken);
+    nextToken = ClampSparseToken(nextToken);
+}
+
+// Mirror FiaInfoParser::GetAttenMaskInfo for stride / batchStride.
+void CalcAttenMaskStrides(const gert::Shape& maskShape, int64_t batchSize, uint32_t s1Size,
+                          int32_t sparseMode, uint32_t& batchStride, uint32_t& maskStride)
+{
+    const size_t dimNum = maskShape.GetDimNum();
+    batchStride = 0U;
+    if (dimNum == 2U && s1Size == 1U && maskShape.GetDim(0) != 1) {
+        batchStride = static_cast<uint32_t>(maskShape.GetDim(dimNum - 1));
+    } else if ((dimNum == 3U || dimNum == 4U) && maskShape.GetDim(0) == batchSize && batchSize != 1) {
+        batchStride = static_cast<uint32_t>(maskShape.GetDim(dimNum - 1) * maskShape.GetDim(dimNum - 2));
+    }
+
+    if (sparseMode == kSparseModeNoMask || sparseMode == kSparseModeAllMask) {
+        maskStride = static_cast<uint32_t>(maskShape.GetDim(dimNum - 1));
+    } else {
+        maskStride = kCompressMaskStride;  // compressed causal/band mask
+    }
+}
+
+void GetSafeActToken(SparseMode mode, int64_t actSeqQ, int64_t actSeqKv, int64_t& safePre,
+                     int64_t& safeNext)
+{
+    if (mode == SparseMode::DEFAULT_MASK) {
+        safePre = std::max(-actSeqKv, safePre);
+        safePre = std::min(safePre, actSeqQ);
+        safeNext = std::max(-actSeqQ, safeNext);
+        safeNext = std::min(safeNext, actSeqKv);
+    } else if (mode == SparseMode::BAND) {
+        safePre = std::max(-actSeqQ, safePre);
+        safePre = std::min(safePre, actSeqKv);
+        safeNext = std::max(-actSeqKv, safeNext);
+        safeNext = std::min(safeNext, actSeqQ);
+    }
+}
+
+// Mirror FiaTilingNonQuant::IsExistRowInvalid.
+bool IsExistRowInvalid(const BaseInfo& baseInfo)
+{
+    if (!baseInfo.attenMaskFlag) {
+        return false;
+    }
+    const auto mode = static_cast<SparseMode>(baseInfo.sparseMode);
+    if (mode == SparseMode::LEFT_UP_CAUSAL) {
+        return false;
+    }
+    if (mode == SparseMode::ALL_MASK) {
+        return true;
+    }
+    for (uint32_t bIdx = 0; bIdx < baseInfo.bSize; ++bIdx) {
+        const int32_t s1 = static_cast<int32_t>(GetS1SeqSize(bIdx, baseInfo));
+        const int32_t s2 = static_cast<int32_t>(GetS2SeqSize(bIdx, baseInfo));
+        if (s1 == 0 || s2 == 0) {
+            continue;
+        }
+        int64_t safePre = baseInfo.preToken;
+        int64_t safeNext = baseInfo.nextToken;
+        GetSafeActToken(mode, s1, s2, safePre, safeNext);
+        int64_t preLeftUp = 0;
+        int64_t nextLeftUp = 0;
+        if (mode == SparseMode::BAND) {
+            preLeftUp = safePre;
+            nextLeftUp = static_cast<int64_t>(s2) - static_cast<int64_t>(s1) + safeNext;
+        } else if (mode == SparseMode::DEFAULT_MASK) {
+            preLeftUp = static_cast<int64_t>(s2) - static_cast<int64_t>(s1) + safePre;
+            nextLeftUp = safeNext;
+        } else {
+            preLeftUp = 0;
+            nextLeftUp = static_cast<int64_t>(s2) - static_cast<int64_t>(s1);
+        }
+        if (preLeftUp < 0 || nextLeftUp < 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ApplySplitResult(TurboquantFiaMse8bitTilingData& tiling, const SplitResult& res,
@@ -131,6 +245,19 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
         return ge::GRAPH_FAILED;
     }
 
+    // Optional FIA-compatible sparse attrs (defaults match OpDef).
+    const int64_t* preTokensPtr = attrs->GetAttrPointer<int64_t>(kAttrIdxPreTokens);
+    const int64_t* nextTokensPtr = attrs->GetAttrPointer<int64_t>(kAttrIdxNextTokens);
+    const int64_t* sparseModePtr = attrs->GetAttrPointer<int64_t>(kAttrIdxSparseMode);
+    int64_t preToken = preTokensPtr != nullptr ? *preTokensPtr : kSparseModeIntMax;
+    int64_t nextToken = nextTokensPtr != nullptr ? *nextTokensPtr : kSparseModeIntMax;
+    const int32_t sparseMode =
+        sparseModePtr != nullptr ? static_cast<int32_t>(*sparseModePtr) : kSparseModeNoMask;
+    if (sparseMode < kSparseModeNoMask || sparseMode > kSparseModeBand) {
+        OPS_LOG_E(nodeName, "invalid sparse_mode=%d (expect 0..4)", sparseMode);
+        return ge::GRAPH_FAILED;
+    }
+
     const int64_t numHeads = *numHeadsPtr;
     const int64_t numKvHeads = *numKvHeadsPtr;
     const int64_t headSize = *headSizePtr;
@@ -169,6 +296,16 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
         return ge::GRAPH_FAILED;
     }
 
+    // atten_mask is OPTIONAL; present + non-empty enables mask path (FIA GetMaskFlag).
+    const gert::StorageShape* maskShapePtr = context->GetOptionalInputShape(kInputIdxAttenMask);
+    const bool attenMaskFlag =
+        (maskShapePtr != nullptr) && (maskShapePtr->GetStorageShape().GetShapeSize() != 0);
+    if (!attenMaskFlag && sparseMode != kSparseModeNoMask) {
+        OPS_LOG_E(nodeName, "sparse_mode=%d requires non-empty atten_mask", sparseMode);
+        return ge::GRAPH_FAILED;
+    }
+    ApplySparsePreNextTokens(sparseMode, preToken, nextToken);
+
     const int64_t* seqQHost = seqQTensor->GetData<int64_t>();
     const int64_t* seqKvHost = seqKvTensor->GetData<int64_t>();
     if (seqQHost == nullptr || seqKvHost == nullptr) {
@@ -189,7 +326,25 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
     // SplitCore uses per-batch S1 via actualSeqS1Size; s1Size is the max / fallback.
     const uint32_t s1Size = accumQ ? 1U : static_cast<uint32_t>(numTokens);
     const uint32_t s2Size = static_cast<uint32_t>(maxKvSeq);
-    const uint32_t s2BaseSize = kS2BaseSize;
+    uint32_t attenMaskBatchStride = 0;
+    uint32_t attenMaskStride = 0;
+    if (attenMaskFlag && maskShapePtr != nullptr) {
+        CalcAttenMaskStrides(maskShapePtr->GetStorageShape(), batchSize, s1Size, sparseMode,
+                             attenMaskBatchStride, attenMaskStride);
+    }
+
+    uint32_t s2BaseSize = kS2BaseSize;
+    // FIA: compress mask (sparse 2/3/4) caps sInner at 1024; TND base is already 512.
+    if (attenMaskFlag && (sparseMode == kSparseModeLeftUp || sparseMode == kSparseModeRightDown ||
+                          sparseMode == kSparseModeBand)) {
+        s2BaseSize = std::min(s2BaseSize, kSInnerSizeCompressCap);
+    }
+    // PA: keep s2Base a multiple of blockSize when possible.
+    if (blockSize > 0 && s2BaseSize > static_cast<uint32_t>(blockSize) &&
+        (s2BaseSize % static_cast<uint32_t>(blockSize) != 0U)) {
+        s2BaseSize = (s2BaseSize / static_cast<uint32_t>(blockSize)) *
+                     static_cast<uint32_t>(blockSize);
+    }
     const uint32_t sInnerSizeAlign = AlignUp(std::min(s2Size, s2BaseSize), 16U);
     const uint32_t headDimAlign = AlignUp(static_cast<uint32_t>(headSize), 16U);
 
@@ -205,10 +360,10 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
     baseInfo.isAccumSeqS2 = false;
     baseInfo.actualLenQDims = static_cast<uint32_t>(batchSize);
     baseInfo.actualLenKvDims = static_cast<uint32_t>(batchSize);
-    baseInfo.attenMaskFlag = false;
-    baseInfo.sparseMode = 0;
-    baseInfo.preToken = 2147483647;
-    baseInfo.nextToken = 2147483647;
+    baseInfo.attenMaskFlag = attenMaskFlag;
+    baseInfo.sparseMode = sparseMode;
+    baseInfo.preToken = preToken;
+    baseInfo.nextToken = nextToken;
     baseInfo.actualSeqS1Size.assign(seqQHost, seqQHost + batchSize);
     baseInfo.actualSeqS2Size.assign(seqKvHost, seqKvHost + batchSize);
 
@@ -232,6 +387,7 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
 
     const uint32_t usedCoreNum = splitRes.usedCoreNum;
     const bool enableFd = (splitRes.numOfFdHead > 0U);
+    const bool existRowInvalid = IsExistRowInvalid(baseInfo);
 
     TurboquantFiaMse8bitTilingData tiling {};
     auto& base = tiling.baseParams;
@@ -259,14 +415,14 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
     tiling.pageAttenParams.set_blockSize(static_cast<uint32_t>(blockSize));
     tiling.pageAttenParams.set_maxBlockNumPerBatch(static_cast<uint32_t>(maxBlocksPerSeq));
 
-    tiling.maskParams.set_attenMaskFlag(0U);
-    tiling.maskParams.set_attenMaskBatchStride(0U);
-    tiling.maskParams.set_attenMaskStride(0U);
-    tiling.maskParams.set_preToken(2147483647);
-    tiling.maskParams.set_nextToken(2147483647);
-    tiling.maskParams.set_isRowInvalid(0U);
-    tiling.maskParams.set_isExistRowInvalid(0U);
-    tiling.maskParams.set_sparseMode(0U);
+    tiling.maskParams.set_attenMaskFlag(attenMaskFlag ? 1U : 0U);
+    tiling.maskParams.set_attenMaskBatchStride(attenMaskBatchStride);
+    tiling.maskParams.set_attenMaskStride(attenMaskStride);
+    tiling.maskParams.set_preToken(static_cast<int32_t>(preToken));
+    tiling.maskParams.set_nextToken(static_cast<int32_t>(nextToken));
+    tiling.maskParams.set_isRowInvalid(0U);  // no inner_precise attr yet (FIA: innerPrecise>>1)
+    tiling.maskParams.set_isExistRowInvalid(existRowInvalid ? 1U : 0U);
+    tiling.maskParams.set_sparseMode(static_cast<uint32_t>(sparseMode));
 
     const uint32_t mm1ResSize = kMBaseSize * sInnerSizeAlign;
     const uint32_t mm2ResSize = kMBaseSize * headDimAlign;
@@ -337,9 +493,10 @@ static ge::graphStatus TurboquantFiaMse8bitTilingFunc(gert::TilingContext* conte
 
     OPS_LOG_I(nodeName,
               "TQ-FIA tiling: B=%ld N2=%ld G=%u S1=%u S2=%u cores=%u fd=%d fdHeads=%u "
-              "maxS2Split=%u ws=%zu key=%lu",
+              "maxS2Split=%u mask=%d sparse=%d pre=%ld next=%ld ws=%zu key=%lu",
               batchSize, numKvHeads, gSize, s1Size, s2Size, usedCoreNum, enableFd ? 1 : 0,
-              splitRes.numOfFdHead, splitRes.maxS2SplitNum, workspaces[0],
+              splitRes.numOfFdHead, splitRes.maxS2SplitNum, attenMaskFlag ? 1 : 0, sparseMode,
+              preToken, nextToken, workspaces[0],
               static_cast<unsigned long>(enableFd ? kTilingKeyFd : kTilingKeyNoFd));
     return ge::GRAPH_SUCCESS;
 }
