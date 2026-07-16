@@ -312,10 +312,19 @@ def _run_attention_op(
     )
 
 
-def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+def _assert_close(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float | None = None,
+    rtol: float | None = None,
+) -> None:
     actual_cpu = actual.float().cpu()
-    atol = 1e-3 if actual.dtype == torch.float16 else 4e-2
-    rtol = 1e-3 if actual.dtype == torch.float16 else 4e-2
+    if atol is None:
+        atol = 1e-3 if actual.dtype == torch.float16 else 4e-2
+    if rtol is None:
+        rtol = 1e-3 if actual.dtype == torch.float16 else 4e-2
     torch.testing.assert_close(actual_cpu, expected.float(), atol=atol, rtol=rtol)
     print(f"PASS {name}: dtype={actual.dtype}, maxdiff={(actual_cpu - expected).abs().max().item():.6f}")
 
@@ -646,6 +655,85 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
     _assert_min_cosine("pack_attention_vs_fp", actual, fp_expected, 0.990)
 
 
+def _run_pack_attention_qtile(dtype: torch.dtype, device: torch.device) -> None:
+    """Multi-token Q (num_q > usedCoreNum) exercises SplitBN qTile path."""
+    torch.manual_seed(SEED + 1)
+    num_kv_tokens = 48
+    num_query_tokens = 48
+    num_kv_heads = 8
+    num_heads = 2 * num_kv_heads
+    scale = HEAD_SIZE**-0.5
+    block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+    key = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    value = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    query = torch.randn(
+        (num_query_tokens, num_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    rotation_t = _dense_rotation(dtype, device)
+    rotation = rotation_t.transpose(0, 1).contiguous()
+    slot_mapping = torch.arange(num_kv_tokens, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, num_kv_tokens], dtype=torch.int32, device=device)
+    key_cache = torch.zeros(
+        num_blocks, num_kv_heads, KEY_BLOCK_STRIDE, dtype=torch.uint8, device=device
+    )
+    value_cache = torch.zeros(
+        num_blocks, num_kv_heads, VALUE_BLOCK_STRIDE, dtype=torch.uint8, device=device
+    )
+    torch.ops._C_ascend.bit_residual_pack_k8v4(
+        key,
+        value,
+        slot_mapping,
+        query_start_loc,
+        rotation_t,
+        key_cache,
+        value_cache,
+        1,
+        BLOCK_SIZE,
+    )
+    torch.npu.synchronize()
+    actual_seq_lens_q = [num_query_tokens]
+    actual_seq_lens_kv = [num_kv_tokens]
+    actual = _run_attention_op(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation_t,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+    torch.npu.synchronize()
+    expected = _golden_attention(
+        query=query.cpu(),
+        key_cache=key_cache.cpu(),
+        value_cache=value_cache.cpu(),
+        block_table=block_table_cpu,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation_t.cpu(),
+        rotation_value=rotation.cpu(),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=scale,
+    )
+    # Cube QK casts Q/K to fp16 for matmul; allow slightly looser than Vector QK.
+    _assert_close(
+        "pack_attention_qtile",
+        actual,
+        expected,
+        atol=2e-3 if dtype == torch.float16 else 5e-2,
+        rtol=2e-3 if dtype == torch.float16 else 5e-2,
+    )
+
+
 def main() -> None:
     _require_ops()
     device = torch.device("npu:0")
@@ -653,6 +741,7 @@ def main() -> None:
         _run_manual_single_kv(dtype, device)
         _run_zero_kv(dtype, device)
         _run_pack_attention_chain(dtype, device)
+        _run_pack_attention_qtile(dtype, device)
     print("bit residual k8v4 smoke output: all cases passed")
 
 

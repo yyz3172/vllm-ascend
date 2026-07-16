@@ -1589,9 +1589,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_kv_heads=self.num_kv_heads,
                         block_size=block_size,
                         scale=self.scale,
+                        out=output[:num_tokens],
                     )
                     if attn_output is not None:
-                        output[:num_tokens] = attn_output[:num_tokens]
                         return output
 
             slab_block_size = turboquant_slab_block_size_or_none(
@@ -1857,9 +1857,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_kv_heads=self.num_kv_heads,
                     block_size=block_size,
                     scale=self.scale,
+                    out=output,
                 )
                 if attn_output is not None:
-                    output.copy_(attn_output)
                     return output
             key_cache, value_cache, block_table = turboquant_decode_kv_cache_compact(
                 key_cache=key_cache,
