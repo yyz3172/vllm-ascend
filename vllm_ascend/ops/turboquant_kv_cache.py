@@ -2371,3 +2371,97 @@ def bit_residual_attention_paged_k8v4(
         float(scale),
     )
     return out.view(query.shape[0], num_heads, head_size)
+
+
+def bit_residual_fia_paged_k8v4(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    actual_seq_lengths_q: list[int],
+    actual_seq_lengths_kv: list[int],
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    scale: float,
+    atten_mask: torch.Tensor | None = None,
+    pre_tokens: int = 2147483647,
+    next_tokens: int = 2147483647,
+    sparse_mode: int = 3,
+) -> torch.Tensor | None:
+    """Call BitResidual FIA Paged K8V4 for Prefill / long-KV (FD-capable) path.
+
+    P0 kernel accepts fp16 query only. Returns ``None`` when conditions are not
+    met so callers can fall through to vector attn or stock FIA.
+    """
+    if (
+        head_size != 128
+        or block_size % BIT_RESIDUAL_K8V4_BLOCK_ROWS != 0
+        or query.dtype != torch.float16
+        or block_tables.numel() == 0
+        or num_kv_heads <= 0
+        or num_heads % num_kv_heads != 0
+    ):
+        return None
+
+    key_last_dim = key_cache.shape[-1]
+    value_last_dim = value_cache.shape[-1]
+    expected_key_width = bit_residual_k8v4_key_packed_width(block_size)
+    expected_value_width = bit_residual_k8v4_value_packed_width(block_size)
+    if key_last_dim != expected_key_width or value_last_dim != expected_value_width:
+        return None
+
+    if not _c_ascend_turboquant_op_available("bit_residual_fia_paged_k8v4"):
+        return None
+
+    actual_seq_lengths_q = [int(length) for length in actual_seq_lengths_q]
+    actual_seq_lengths_kv = [int(length) for length in actual_seq_lengths_kv]
+    if (
+        not actual_seq_lengths_q
+        or len(actual_seq_lengths_q) != len(actual_seq_lengths_kv)
+        or actual_seq_lengths_q[-1] != query.shape[0]
+    ):
+        return None
+    if any(length < 0 for length in actual_seq_lengths_kv):
+        return None
+    if max(actual_seq_lengths_kv) <= 0:
+        return None
+
+    # Prefill / causal: sparse_mode 2/3/4 need a non-empty compress mask.
+    if sparse_mode != 0 and (atten_mask is None or atten_mask.numel() == 0):
+        return None
+
+    # OpDef accepts int8 only (0=keep, 1=discard). Serving AttentionMaskBuilder
+    # may hand bool / fp16 masks used by stock FIA.
+    mask_arg: torch.Tensor | None = atten_mask
+    if mask_arg is not None and mask_arg.dtype != torch.int8:
+        if mask_arg.dtype == torch.bool:
+            mask_arg = mask_arg.to(torch.int8)
+        else:
+            mask_arg = (mask_arg != 0).to(torch.int8)
+
+    rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
+    rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
+
+    out = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
+        _contiguous_if_needed(query),
+        _contiguous_if_needed(_uint8_storage_view(key_cache)),
+        _contiguous_if_needed(_uint8_storage_view(value_cache)),
+        _int32_contiguous_if_needed(block_tables),
+        actual_seq_lengths_q,
+        actual_seq_lengths_kv,
+        None if mask_arg is None else _contiguous_if_needed(mask_arg),
+        _contiguous_if_needed(rotation_key),
+        _contiguous_if_needed(rotation_value),
+        int(num_heads),
+        int(num_kv_heads),
+        int(head_size),
+        int(block_size),
+        float(scale),
+        int(pre_tokens),
+        int(next_tokens),
+        int(sparse_mode),
+    )
+    return out.view(query.shape[0], num_heads, head_size)
