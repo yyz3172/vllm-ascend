@@ -18,11 +18,16 @@ from pathlib import Path
 
 SOURCE_HINTS = (
     b"csrc/turboquant",
+    b"csrc/bit_residual",
     b"op_kernel",
     b"/src/turboquant",
+    b"/src/bit_residual",
     b"turboquant_pack_kv_for_cache4bit.cpp",
     b"turboquant_attention_paged4bit.cpp",
+    b"bit_residual_pack_k8v4.cpp",
+    b"bit_residual_attention_paged_k8v4.cpp",
     b"decode_device.h",
+    b"attention_device.h",
 )
 
 
@@ -83,7 +88,7 @@ def has_source_hint(path: Path) -> bool:
 
 
 def candidate_runtime_debug_elf(root: Path, op: str, soc_dir: str) -> Path | None:
-    hash_name = op.removesuffix("_0_mix_aic")
+    hash_name = re.sub(r"_\d+_mix_(?:aic|aiv)$", "", op)
     if not hash_name:
         return None
 
@@ -91,6 +96,10 @@ def candidate_runtime_debug_elf(root: Path, op: str, soc_dir: str) -> Path | Non
         subdir = "turboquant_pack_kv_for_cache4bit"
     elif hash_name.startswith("TurboquantAttentionPaged4bit_"):
         subdir = "turboquant_attention_paged4bit"
+    elif hash_name.startswith("BitResidualPackK8v4_"):
+        subdir = "bit_residual_pack_k8v4"
+    elif hash_name.startswith("BitResidualAttentionPagedK8v4_"):
+        subdir = "bit_residual_attention_paged_k8v4"
     else:
         return None
 
