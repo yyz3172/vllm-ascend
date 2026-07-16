@@ -111,6 +111,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # is head_size / 2 + 2 bytes. Not sensitive.
     "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE":
     lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE", "0"))),
+    # BitResidual k8v4 Prefill path (default OFF). When ON, attention_v1 routes
+    # PrefillCacheHit / ChunkedPrefill to ``bit_residual_fia_paged_k8v4``.
+    # PrefillNoCache always uses float key/value (block_table=None), never this op.
+    # DecodeOnly is controlled by ``VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA``.
+    "VLLM_ASCEND_BIT_RESIDUAL_FIA":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_FIA", "0"))),
+    # BitResidual k8v4 Decode A/B (default OFF). When ON, DecodeOnly uses
+    # ``bit_residual_fia_paged_k8v4`` instead of ``bit_residual_attention_paged_k8v4``
+    # so FIA vs vector paged attn latency can be compared. Falls back to vector
+    # attn if FIA returns None.
+    "VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA", "0"))),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),

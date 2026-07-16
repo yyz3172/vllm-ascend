@@ -60,6 +60,7 @@ from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.turboquant_kv_cache import (
     _try_8bit_decode_paged,
     bit_residual_attention_paged_k8v4,
+    bit_residual_fia_paged_k8v4,
     bit_residual_k8v4_key_packed_width,
     turboquant_4bit_slab_cache_enabled,
     turboquant_attention_paged4bit,
@@ -75,6 +76,7 @@ from vllm_ascend.ops.turboquant_kv_cache import (
     warm_up_turboquant_4bit_tables,
 )
 from vllm_ascend.ascend_config import get_ascend_config
+import vllm_ascend.envs as envs_ascend
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -998,32 +1000,79 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
 
-            # BitResidual k8v4 paged attention: 8-bit key + 4-bit value.
+            # BitResidual k8v4:
+            # - PrefillNoCache: not here (block_table is None) → float key/value FIA
+            # - PrefillCacheHit / ChunkedPrefill: FIA when VLLM_ASCEND_BIT_RESIDUAL_FIA
+            # - DecodeOnly: FIA when VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA (A/B vs vector)
+            # - else / fallback: bit_residual_attention_paged_k8v4
             if (
                 self.turboquant_kv_bits_key == 8
                 and self.turboquant_kv_bits_value == 4
                 and self.head_size == 128
-                and attn_metadata.attn_state in (
+            ):
+                use_br_fia = (
+                    block_table.numel() > 0
+                    and (
+                        (
+                            envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_FIA
+                            and attn_metadata.attn_state
+                            in (
+                                AscendAttentionState.PrefillCacheHit,
+                                AscendAttentionState.ChunkedPrefill,
+                            )
+                        )
+                        or (
+                            envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA
+                            and attn_metadata.attn_state
+                            == AscendAttentionState.DecodeOnly
+                        )
+                    )
+                )
+                if use_br_fia:
+                    is_decode = (
+                        attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                    )
+                    attn_output = bit_residual_fia_paged_k8v4(
+                        query=query,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        block_tables=block_table,
+                        actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        head_size=self.head_size,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        block_size=block_size,
+                        scale=self.scale,
+                        atten_mask=None if is_decode else attn_metadata.attn_mask,
+                        pre_tokens=SWA_INT_MAX,
+                        next_tokens=SWA_INT_MAX,
+                        sparse_mode=0 if is_decode else 3,
+                    )
+                    if attn_output is not None:
+                        output[:num_tokens] = attn_output[:num_tokens]
+                        return output
+                if attn_metadata.attn_state in (
                     AscendAttentionState.DecodeOnly,
                     AscendAttentionState.ChunkedPrefill,
-                )
-            ):
-                attn_output = bit_residual_attention_paged_k8v4(
-                    query=query,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    block_tables=block_table,
-                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    head_size=self.head_size,
-                    num_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    block_size=block_size,
-                    scale=self.scale,
-                )
-                if attn_output is not None:
-                    output[:num_tokens] = attn_output[:num_tokens]
-                    return output
+                    AscendAttentionState.PrefillCacheHit,
+                ):
+                    attn_output = bit_residual_attention_paged_k8v4(
+                        query=query,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        block_tables=block_table,
+                        actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        head_size=self.head_size,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        block_size=block_size,
+                        scale=self.scale,
+                    )
+                    if attn_output is not None:
+                        output[:num_tokens] = attn_output[:num_tokens]
+                        return output
 
             slab_block_size = turboquant_slab_block_size_or_none(
                 self.key_cache,
@@ -1209,12 +1258,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value_cache = self.value_cache
         if self.kv_cache_dtype == "turboquant":
             assert key_cache is not None and value_cache is not None
-            # BitResidual k8v4: use its own paged attention op.
+            # BitResidual k8v4 Decode: default vector paged attn; optional FIA A/B.
             if (
                 self.turboquant_kv_bits_key == 8
                 and self.turboquant_kv_bits_value == 4
                 and self.head_size == 128
             ):
+                block_size = self.vllm_config.cache_config.block_size
+                if envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA:
+                    attn_output = bit_residual_fia_paged_k8v4(
+                        query=query,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        block_tables=block_table,
+                        actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                        head_size=self.head_size,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        block_size=block_size,
+                        scale=self.scale,
+                        atten_mask=None,
+                        pre_tokens=SWA_INT_MAX,
+                        next_tokens=SWA_INT_MAX,
+                        sparse_mode=0,
+                    )
+                    if attn_output is not None:
+                        output.copy_(attn_output)
+                        return output
                 attn_output = bit_residual_attention_paged_k8v4(
                     query=query,
                     key_cache=key_cache,
@@ -1225,7 +1296,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     head_size=self.head_size,
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
-                    block_size=self.vllm_config.cache_config.block_size,
+                    block_size=block_size,
                     scale=self.scale,
                 )
                 if attn_output is not None:
