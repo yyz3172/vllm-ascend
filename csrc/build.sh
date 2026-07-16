@@ -42,6 +42,8 @@ function help_info() {
     echo "-c|--compute-unit    Specifies the chip type. If there are multiple values, separate them with semicolons and use quotation marks. The default is ascend910b."
     echo "                     For example: -c \"ascend910b\" or -c \"ascend910b;ascend310p\""
     echo
+    echo "--op-debug-config    Op debug config passed to cmake OP_DEBUG_CONFIG (e.g. ccec_g for Source)."
+    echo
     echo "--cov                Compiles with cov."
     echo
     echo "--verbose            Displays more compilation information."
@@ -140,6 +142,10 @@ while [[ $# -gt 0 ]]; do
         ascend_compute_unit="$2"
         shift 2
         ;;
+    --op-debug-config)
+        op_debug_config="$2"
+        shift 2
+        ;;
     *)
         help_info
         exit 1
@@ -153,6 +159,11 @@ fi
 
 if [ -n "${ascend_op_name}" ];then
     CUSTOM_OPTION="${CUSTOM_OPTION} -DASCEND_OP_NAME=${ascend_op_name}"
+fi
+
+if [ -n "${op_debug_config:-}" ];then
+    CUSTOM_OPTION="${CUSTOM_OPTION} -DOP_DEBUG_CONFIG=${op_debug_config}"
+    log "Info: OP_DEBUG_CONFIG=${op_debug_config}"
 fi
 
 if [ -n "${ASCEND_HOME_PATH}" ];then
