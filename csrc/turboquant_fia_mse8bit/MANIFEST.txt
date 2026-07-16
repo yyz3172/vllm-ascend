@@ -1,0 +1,19 @@
+# turboquant_fia_mse8bit — new standalone op (NOT based on turboquant_fused_infer_attention_score8bit)
+
+Vendored from ops-transformer attention/common + FIA TQ P0:
+  op_kernel/vendored/arch32/fia_kernel_turboquant_p0.h
+  op_kernel/vendored/arch32/fia_block_cube_turboquant_p0.h
+  op_kernel/vendored/arch32/fia_block_vec_turboquant_p0.h
+  op_kernel/vendored/arch32/fia_block_vec_flashdecode.h
+  op_kernel/vendored/*.h (FIA common)
+
+Host (new):
+  op_host/turboquant_fia_mse8bit_def.cpp
+  op_host/turboquant_fia_mse8bit_tiling.{h,cpp}
+  op_host/turboquant_fia_tiling_data.h
+  op_host/aclnn_turboquant_fia_mse8bit.h
+
+Op names:
+  GE:    TurboquantFiaMse8bit
+  aclnn: aclnnTurboquantFiaMse8bit
+  kernel entry: turboquant_fia_mse8bit
