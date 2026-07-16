@@ -92,6 +92,11 @@ using TqRotateMatmulOp =
     AscendC::Matmul<TqRotateAT<T>, TqRotateBT<T>, TqRotateCT<T>,
                     TqRotateBiasT<T>, TQ_BR_ROTATE_MATMUL_TILING<T>>;
 
+// Prefill qTile Cube QK reuses TqRotateMatmulOp (same KFC object as rotation):
+//   C[M,N] = A[M,K] @ B[K,N] with B = physical K^T in GM (SetTensorB false).
+static constexpr uint32_t TQ_BR_QK_CUBE_MAX_M = 16;
+static constexpr uint32_t TQ_BR_QK_CUBE_MAX_N = 64;
+
 // Pipe sync helper (reuses TPipe for event ID, matching the pack kernel pattern).
 template <AscendC::HardEvent EVT>
 __aicore__ inline void TqBrSync() {

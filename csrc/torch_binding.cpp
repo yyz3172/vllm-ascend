@@ -86,6 +86,10 @@ TurboquantPackTableEntry &GetTurboquantPackTables(const at::Tensor &ref) {
     return g_turboquant_pack_tables[ref.device().index()];
 }
 
+at::Tensor MaybeContiguous(const at::Tensor &tensor) {
+    return tensor.is_contiguous() ? tensor : tensor.contiguous();
+}
+
 }  // namespace
 
 void turboquant_pack_register_tables(
@@ -645,7 +649,9 @@ void bit_residual_pack_k8v4(
 
     uint32_t vec_per_core = 128;
     if (n_vec < 128) {
-        vec_per_core = static_cast<uint32_t>(((n_vec + 15) / 16) * 16);
+        // Decode/chunked-prefill paths usually pack a handful of KV rows per
+        // step; vecPerCore=2 matches the ori TurboQuant tuning (~41 us vs ~44).
+        vec_per_core = static_cast<uint32_t>(n_vec <= 16 ? 2 : ((n_vec + 15) / 16) * 16);
         if (vec_per_core == 0) {
             vec_per_core = 16;
         }
@@ -707,7 +713,8 @@ at::Tensor bit_residual_attention_paged_k8v4(
     int64_t head_size,
     int64_t block_size,
     int64_t max_actual_seq_len,
-    double scale_value)
+    double scale_value,
+    c10::optional<at::Tensor> out_opt)
 {
     constexpr int64_t kHeadSize = 128;
     constexpr int64_t kBlockRows = 16;
@@ -752,14 +759,24 @@ at::Tensor bit_residual_attention_paged_k8v4(
     TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(),
                 "actual_seq_len_q and actual_seq_len_kv must have the same length");
 
-    const at::Tensor query_c = query.contiguous();
-    const at::Tensor key_cache_c = key_cache.contiguous();
-    const at::Tensor value_cache_c = value_cache.contiguous();
-    const at::Tensor block_table_c = block_table.contiguous();
-    const at::Tensor rotation_key_c = rotation_key.contiguous();
-    const at::Tensor rotation_value_c = rotation_value.contiguous();
+    const at::Tensor query_c = MaybeContiguous(query);
+    const at::Tensor key_cache_c = MaybeContiguous(key_cache);
+    const at::Tensor value_cache_c = MaybeContiguous(value_cache);
+    const at::Tensor block_table_c = MaybeContiguous(block_table);
+    const at::Tensor rotation_key_c = MaybeContiguous(rotation_key);
+    const at::Tensor rotation_value_c = MaybeContiguous(rotation_value);
 
-    at::Tensor out = at::empty(query_c.sizes(), query_c.options());
+    at::Tensor out;
+    if (out_opt.has_value() && out_opt->defined()) {
+        TORCH_CHECK(out_opt->is_privateuseone(), "out must be on NPU");
+        TORCH_CHECK(out_opt->sizes().equals(query_c.sizes()), "out shape must match query");
+        TORCH_CHECK(out_opt->scalar_type() == query_c.scalar_type(), "out dtype must match query");
+        TORCH_CHECK(out_opt->device() == query_c.device(), "out device must match query");
+        TORCH_CHECK(out_opt->is_contiguous(), "out must be contiguous for in-place write");
+        out = *out_opt;
+    } else {
+        out = at::empty(query_c.sizes(), query_c.options());
+    }
 
     const c10_npu::OptionalNPUGuard npuGuard(query_c.device());
     EXEC_NPU_CMD(
@@ -2463,7 +2480,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "int[] actual_seq_len_q, int[] actual_seq_len_kv, "
         "Tensor rotation_key, Tensor rotation_value, "
         "int num_heads, int num_kv_heads, int head_size, int block_size, "
-        "int max_actual_seq_len, float scale_value"
+        "int max_actual_seq_len, float scale_value, Tensor? out=None"
         ") -> Tensor");
     ops.impl(
         "bit_residual_attention_paged_k8v4",
