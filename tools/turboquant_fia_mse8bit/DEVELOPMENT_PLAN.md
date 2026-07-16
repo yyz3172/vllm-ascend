@@ -2,7 +2,9 @@
 
 > 基线：ops-transformer `verify_pi_ortho.sh`（QT+O golden）  
 > 源实现：`fia_kernel_turboquant_p0.h` + cube/vec block  
-> 目标仓：vllm-ascend `csrc/` 独立 custom op，先 C++ 验收，再 Python 集成
+> 目标仓：vllm-ascend `csrc/` 独立 custom op，先 C++ 验收，再 Python 集成  
+> 设计文档：[docs/turboquant_fia_mse8bit_design.md](docs/turboquant_fia_mse8bit_design.md)  
+> **迁移差异（最新）**：[docs/MIGRATION_DELTA.md](docs/MIGRATION_DELTA.md)
 
 ---
 
@@ -56,6 +58,7 @@ Output
 
 Attrs
   num_heads, num_kv_heads, head_size, block_size, scale_value
+  pre_tokens, next_tokens, sparse_mode   # FIA-compatible mask/sparse（可选）
 ```
 
 算子名（**新建目录，不改原 baseline op**）：
@@ -275,6 +278,6 @@ script/lcy/tq_fia_mse8bit/
 ## 10. 参考
 
 - ops-transformer：`.cursor/rules/fia-turboquant.mdc`
-- 设计：`attention/fused_infer_attention_score/docs/fia_turboquant_design.md`
+- 设计（本仓）：`docs/turboquant_fia_mse8bit_design.md`（源自 ops-transformer `fia_turboquant_design.md`）
 - 主测 tiling key（原 FIA）：`103000000016300303`（HP+FD+TQ）；本仓简化为 key `0/1`
 - 现有工程模板：`script/lcy/tq4bit/`、`test_tq4bit.cpp`

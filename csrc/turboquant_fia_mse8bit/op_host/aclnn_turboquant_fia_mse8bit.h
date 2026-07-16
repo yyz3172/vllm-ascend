@@ -13,6 +13,9 @@ extern "C" {
  * key/value_cache : int8 [BN, BS, KV*D]
  * key/value_scale : fp16 gamma [phys_tokens, KV]
  * rotation        : fp16 Pi [D, D]
+ * atten_mask      : optional int8/fp16 mask (nullptr when sparse_mode=0)
+ * pre_tokens / next_tokens / sparse_mode : FIA-compatible sparse attrs
+ *   sparse_mode: 0=none, 1=all, 2=left-up causal, 3=right-down causal, 4=band
  */
 __attribute__((visibility("default")))
 aclnnStatus aclnnTurboquantFiaMse8bitGetWorkspaceSize(
@@ -31,6 +34,9 @@ aclnnStatus aclnnTurboquantFiaMse8bitGetWorkspaceSize(
     int64_t headSize,
     int64_t blockSize,
     double scaleValue,
+    int64_t preTokens,
+    int64_t nextTokens,
+    int64_t sparseMode,
     const aclTensor* attentionOut,
     uint64_t* workspaceSize,
     aclOpExecutor** executor);

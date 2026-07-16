@@ -51,7 +51,7 @@ public:
             .ValueDepend(REQUIRED)
             .AutoContiguous();
         this->Input("atten_mask")
-            .ParamType(REQUIRED)
+            .ParamType(OPTIONAL)
             .DataType({ge::DT_INT8})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND})
@@ -87,6 +87,10 @@ public:
         this->Attr("head_size").Int();
         this->Attr("block_size").Int();
         this->Attr("scale_value").Float();
+        // Mirror FIA: pre_tokens / next_tokens / sparse_mode (0=none,1=all,2=left-up,3=right-down,4=band)
+        this->Attr("pre_tokens").AttrType(OPTIONAL).Int(2147483647);
+        this->Attr("next_tokens").AttrType(OPTIONAL).Int(2147483647);
+        this->Attr("sparse_mode").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)
