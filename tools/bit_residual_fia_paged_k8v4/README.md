@@ -60,6 +60,28 @@ bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1
 输出目录：`tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/op/OPPROF_*`  
 对照 TQ：`tools/turboquant_fia_mse8bit/prof_tnd_pa_turboquant.sh msprof --kv=1000`
 
+### 解读指标（固化脚本）
+
+```bash
+# 最新 OPPROF，或显式传目录
+python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --latest \
+  tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/op
+
+# 指标含义全文
+python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --explain
+```
+
+关注点摘要：
+
+| 指标 | 含义 | 用途 |
+|------|------|------|
+| `Task Duration` | 单次 kernel 墙钟时延 | P2/P3 主 KPI；P3：`BR ≤ TQ×1.15` |
+| `Pipe bound` (AIC vs AIV) | Cube / Vector 谁更慢 | AIV-bound → 值得做 P2 批量 dequant |
+| `aiv_mte2_ratio` / `aiv_vec_ratio` | AIV 搬数 vs 向量算 | mte2>vec 常指向 dequant 趟数 |
+| `aic_cube_ratio` / `aic_mte2_ratio` | Cube MAC vs 载入 | AIC-bound 时看 tiling/FD |
+
+`prof_tnd_pa_bit_residual.sh msprof|analyze` 结束后会自动调用该脚本。
+
 ## Serving（attention_v1）
 
 `cache_dtype=turboquant` + `turboquant_kv_bits=[8,4]`：

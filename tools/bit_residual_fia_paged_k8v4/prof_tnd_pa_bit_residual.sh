@@ -5,7 +5,7 @@
 #   build       Rebuild custom op + compile C++ test
 #   run         Run test binary (requires prior build)
 #   msprof      msprof op profiling (+ CSV summarize)
-#   analyze     Summarize latest OPPROF dump
+#   analyze     Summarize latest OPPROF dump via analyze_opprof.py
 #   all         build + run
 #
 # Usage:
@@ -13,6 +13,9 @@
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh run --kv=1000
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1000 --skip-build
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1000 --source
+#   python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --explain
+#   python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --latest \\
+#       tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/op
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -187,12 +190,15 @@ latest_opprof_dump() {
 
 summarize_msprof_csv() {
     local opprof_dir="$1"
-    python3 - <<'PY' "${opprof_dir}"
+    local analyzer="${TOOLS}/analyze_opprof.py"
+    if [[ -f "${analyzer}" ]]; then
+        python3 "${analyzer}" "${opprof_dir}"
+    else
+        echo "WARN: ${analyzer} missing; inline fallback summarize"
+        python3 - <<'PY' "${opprof_dir}"
 import csv, os, sys
-
 d = sys.argv[1]
-print(f"\n=== Op metrics summary: {d} ===")
-
+print(f"\n=== Op metrics summary (fallback): {d} ===")
 obi = os.path.join(d, "OpBasicInfo.csv")
 if os.path.isfile(obi):
     with open(obi) as f:
@@ -201,58 +207,8 @@ if os.path.isfile(obi):
         r = rows[0]
         print(f"Op Name       : {r.get('Op Name','')}")
         print(f"Task Duration : {r.get('Task Duration(us)','')} us")
-        print(f"Block Dim     : {r.get('Block Dim','')}  Mix Block Dim: {r.get('Mix Block Dim','')}")
-        print(f"Freq          : {r.get('Current Freq','')} / rated {r.get('Rated Freq','')} MHz")
-
-pu = os.path.join(d, "PipeUtilization.csv")
-if os.path.isfile(pu):
-    with open(pu) as f:
-        rows = list(csv.DictReader(f))
-    aic = [r for r in rows if r.get("sub_block_id","").startswith("cube")]
-    aiv = [r for r in rows if r.get("sub_block_id","").startswith("vector")]
-    def fnum(x):
-        try: return float(x)
-        except: return None
-    def avg(vals):
-        vals = [v for v in vals if v is not None]
-        return (sum(vals)/len(vals)) if vals else None
-    def fmt(v, s=""):
-        return f"{v:.3f}{s}" if v is not None else "NA"
-    aic_t = avg([fnum(r.get("aic_time(us)")) for r in aic])
-    aic_c = avg([fnum(r.get("aic_total_cycles")) for r in aic])
-    aiv_t = avg([fnum(r.get("aiv_time(us)")) for r in aiv])
-    aiv_c = avg([fnum(r.get("aiv_total_cycles")) for r in aiv])
-    aiv_vec = avg([fnum(r.get("aiv_vec_ratio")) for r in aiv])
-    aiv_mte2 = avg([fnum(r.get("aiv_mte2_ratio")) for r in aiv])
-    aiv_mte3 = avg([fnum(r.get("aiv_mte3_ratio")) for r in aiv])
-    aic_cube = avg([fnum(r.get("aic_cube_ratio")) for r in aic])
-    aic_mte2 = avg([fnum(r.get("aic_mte2_ratio")) for r in aic])
-    print(f"AIC cores     : {len(aic)}  avg time={fmt(aic_t,' us')}  avg cycles={fmt(aic_c,'')}")
-    print(f"  cube_ratio  : {fmt(aic_cube)}  mte2_ratio={fmt(aic_mte2)}")
-    print(f"AIV cores     : {len(aiv)}  avg time={fmt(aiv_t,' us')}  avg cycles={fmt(aiv_c,'')}")
-    print(f"  vec_ratio   : {fmt(aiv_vec)}  mte2_ratio={fmt(aiv_mte2)}  mte3_ratio={fmt(aiv_mte3)}")
-    if aic_t and aiv_t:
-        print(f"Pipe bound    : {'AIV' if aiv_t > aic_t else 'AIC'} (max avg {max(aic_t,aiv_t):.3f} us)")
-
-au = os.path.join(d, "ArithmeticUtilization.csv")
-if os.path.isfile(au):
-    with open(au) as f:
-        rows = list(csv.DictReader(f))
-    aic = [r for r in rows if r.get("sub_block_id","").startswith("cube")]
-    aiv = [r for r in rows if r.get("sub_block_id","").startswith("vector")]
-    def fnum(x):
-        try: return float(x)
-        except: return None
-    def avg(vals):
-        vals = [v for v in vals if v is not None]
-        return (sum(vals)/len(vals)) if vals else None
-    cube_instr = avg([fnum(r.get("aic_cube_total_instr_number")) for r in aic])
-    cube_fops = avg([fnum(r.get("aic_cube_fops")) for r in aic])
-    vec_fops = avg([fnum(r.get("aiv_vec_fops")) for r in aiv])
-    print(f"Cube instr#   : avg={cube_instr}")
-    print(f"Cube FOPS     : avg={cube_fops}")
-    print(f"Vec FOPS      : avg={vec_fops}")
 PY
+    fi
 }
 
 do_analyze() {
