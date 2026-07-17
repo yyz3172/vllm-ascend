@@ -24,6 +24,9 @@ static constexpr uint32_t BR_META0_UB_OFF = BR_HEAD_SIZE;
 static constexpr uint32_t BR_META1_UB_OFF = BR_HEAD_SIZE + 32U;
 static constexpr uint32_t BR_DEQUANT_UB_BYTES = BR_HEAD_SIZE + 64U;
 
+// Pack stores base/step/vmin/vstep as 2-byte floats matching the pack input
+// dtype (half or bfloat16). FIA must decode with the same type — reading bf16
+// metadata as half (or vice versa) produces catastrophic dequant values.
 __aicore__ inline float BrReadFp16FromUb(LocalTensor<uint8_t> ub, LocalTensor<float> scratch,
     uint32_t byteOffset)
 {
@@ -35,9 +38,32 @@ __aicore__ inline float BrReadFp16FromUb(LocalTensor<uint8_t> ub, LocalTensor<fl
     return scratch.GetValue(0);
 }
 
+__aicore__ inline float BrReadBf16FromUb(LocalTensor<uint8_t> ub, LocalTensor<float> scratch,
+    uint32_t byteOffset)
+{
+    auto asBf16 = ub.template ReinterpretCast<bfloat16_t>();
+    Cast(scratch, asBf16[byteOffset / sizeof(bfloat16_t)], RoundMode::CAST_NONE, 1);
+    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+    SetFlag<HardEvent::V_S>(e);
+    WaitFlag<HardEvent::V_S>(e);
+    return scratch.GetValue(0);
+}
+
+template <typename MetaT>
+__aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<float> scratch,
+    uint32_t byteOffset)
+{
+    if constexpr (IsSameType<MetaT, bfloat16_t>::value) {
+        return BrReadBf16FromUb(ub, scratch, byteOffset);
+    } else {
+        return BrReadFp16FromUb(ub, scratch, byteOffset);
+    }
+}
+
 __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<uint8_t> ub,
     uint64_t meta0Off, uint64_t meta1Off)
 {
+    // Both half and bfloat16 metadata are 2 bytes.
     DataCopyExtParams metaParams{1, sizeof(half), 0, 0, 0};
     DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
     DataCopyPad(ub[BR_META0_UB_OFF], srcGm[meta0Off], metaParams, padParams);
@@ -46,12 +72,15 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
 
 // Key: y = sign * (base + q7 * step), code = q7 | (sign << 7)
 // scratchA/scratchB/outFp32 each hold headDim floats.
+// halfScratch: temp for uint8→half widen (AscendC lacks uint8→float cast).
+template <typename OutT>
 __aicore__ inline void BrDecodeKeyRow(
     LocalTensor<uint8_t> codeUb,
-    LocalTensor<half> fp16Out,
+    LocalTensor<half> halfScratch,
     LocalTensor<float> scratchA,
     LocalTensor<float> scratchB,
     LocalTensor<float> outFp32,
+    LocalTensor<OutT> outUb,
     float base,
     float step,
     uint32_t headDim)
@@ -59,9 +88,9 @@ __aicore__ inline void BrDecodeKeyRow(
     const uint32_t n = headDim;
 
     // uint8 [0,255] → half → float (supported cast chain).
-    Cast(fp16Out, codeUb, RoundMode::CAST_NONE, n);
+    Cast(halfScratch, codeUb, RoundMode::CAST_NONE, n);
     PipeBarrier<PIPE_V>();
-    Cast(scratchA, fp16Out, RoundMode::CAST_NONE, n);  // code_f
+    Cast(scratchA, halfScratch, RoundMode::CAST_NONE, n);  // code_f
     PipeBarrier<PIPE_V>();
 
     // sign_bit = floor(code / 128) ∈ {0,1}
@@ -94,32 +123,34 @@ __aicore__ inline void BrDecodeKeyRow(
     // decoded = err * sign_val
     Mul(outFp32, outFp32, scratchB, n);
     PipeBarrier<PIPE_V>();
-    Cast(fp16Out, outFp32, RoundMode::CAST_RINT, n);
+    Cast(outUb, outFp32, RoundMode::CAST_RINT, n);
     PipeBarrier<PIPE_V>();
 }
 
 // Value: V = vmin + idx4 * vstep (nibble-packed codes)
+template <typename OutT>
 __aicore__ inline void BrDecodeValueRow(
     LocalTensor<uint8_t> nibbleUb,
-    LocalTensor<half> fp16Out,
+    LocalTensor<half> halfScratch,
     LocalTensor<float> idx4F32,
     LocalTensor<float> outFp32,
+    LocalTensor<OutT> outUb,
     float vmin,
     float vstep,
     uint32_t headDim)
 {
     // int4 → half unpack (same pattern as bit_residual_attention_paged_k8v4).
-    Cast(fp16Out, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, headDim);
+    Cast(halfScratch, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, headDim);
     PipeBarrier<PIPE_V>();
-    Adds(fp16Out, fp16Out, static_cast<half>(8.0f), headDim);
+    Adds(halfScratch, halfScratch, static_cast<half>(8.0f), headDim);
     PipeBarrier<PIPE_V>();
-    Cast(idx4F32, fp16Out, RoundMode::CAST_NONE, headDim);
+    Cast(idx4F32, halfScratch, RoundMode::CAST_NONE, headDim);
     PipeBarrier<PIPE_V>();
     Muls(outFp32, idx4F32, vstep, headDim);
     PipeBarrier<PIPE_V>();
     Adds(outFp32, outFp32, vmin, headDim);
     PipeBarrier<PIPE_V>();
-    Cast(fp16Out, outFp32, RoundMode::CAST_RINT, headDim);
+    Cast(outUb, outFp32, RoundMode::CAST_RINT, headDim);
     PipeBarrier<PIPE_V>();
 }
 

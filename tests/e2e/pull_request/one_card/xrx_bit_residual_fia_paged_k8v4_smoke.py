@@ -9,6 +9,7 @@
 # 3. decode / GQA / non-identity rotation / pack chain
 # 4. Prefill: multi-Q + sparse_mode=3 compress causal mask
 # 5. FlashDecode: long KV (kv>~s2Base=512) tiling key 1 path
+# 6. bf16: pack meta + query/rotation (serving dtype for Qwen bf16)
 #
 # Run on NPU after building custom ops:
 #   bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh
@@ -53,6 +54,9 @@ from tests.e2e.singlecard.xrx_bit_residual_k8v4_golden import (
 SCALE = HEAD_SIZE**-0.5
 FIA_VS_ATTN_ATOL = 2e-3
 FIA_VS_GOLDEN_ATOL = 2e-3
+# bf16: pack/dequant + FIA accumulate; measured max ~7.8e-3 on smoke shapes.
+FIA_VS_ATTN_ATOL_BF16 = 1.5e-2
+FIA_VS_GOLDEN_ATOL_BF16 = 1.5e-2
 # FIA compress causal/band mask (sparse_mode 2/3/4): 2048x2048, 0=keep.
 COMPRESS_MASK_SIZE = 2048
 SPARSE_MODE_RIGHT_DOWN = 3
@@ -194,8 +198,19 @@ def _compare_tria(
     out_fia: torch.Tensor,
     out_attn: torch.Tensor,
     expected: torch.Tensor,
+    *,
+    atol_golden: float | None = None,
+    atol_attn: float | None = None,
 ) -> None:
     """Compare FIA vs golden and FIA vs attn (CPU tensors for golden)."""
+    if atol_golden is None or atol_attn is None:
+        if out_fia.dtype == torch.bfloat16:
+            atol_golden = FIA_VS_GOLDEN_ATOL_BF16 if atol_golden is None else atol_golden
+            atol_attn = FIA_VS_ATTN_ATOL_BF16 if atol_attn is None else atol_attn
+        else:
+            atol_golden = FIA_VS_GOLDEN_ATOL if atol_golden is None else atol_golden
+            atol_attn = FIA_VS_ATTN_ATOL if atol_attn is None else atol_attn
+
     fia_cpu = out_fia.float().cpu()
     attn_cpu = out_attn.float().cpu()
     exp_cpu = expected.float().cpu()
@@ -205,13 +220,13 @@ def _compare_tria(
     print(
         f"{name}: fia_vs_golden={diff_golden:.6f}, fia_vs_attn={diff_attn:.6f}"
     )
-    if diff_golden > FIA_VS_GOLDEN_ATOL:
+    if diff_golden > atol_golden:
         raise AssertionError(
-            f"{name}: FIA vs golden max_diff {diff_golden} exceeds {FIA_VS_GOLDEN_ATOL}"
+            f"{name}: FIA vs golden max_diff {diff_golden} exceeds {atol_golden}"
         )
-    if diff_attn > FIA_VS_ATTN_ATOL:
+    if diff_attn > atol_attn:
         raise AssertionError(
-            f"{name}: FIA vs attn max_diff {diff_attn} exceeds {FIA_VS_ATTN_ATOL}"
+            f"{name}: FIA vs attn max_diff {diff_attn} exceeds {atol_attn}"
         )
     print(f"PASS {name}")
 
@@ -750,6 +765,217 @@ def test_flash_decode_multibatch_vs_attn(device: torch.device) -> None:
     print("PASS flash_decode_multibatch_vs_attn")
 
 
+def test_bf16_decode_multi_kv_gqa(device: torch.device) -> None:
+    """bf16 decode: pack meta is bf16; FIA must read bf16 (not half) metadata."""
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    num_kv_tokens = 32
+    num_kv_heads = 2
+    num_heads = 8
+    block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+
+    key = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    value = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    query = torch.randn((1, num_heads, HEAD_SIZE), dtype=dtype, device=device).contiguous()
+    rotation = _identity(dtype, device)
+    key_cache, value_cache = _pack_kv_cache(
+        key=key,
+        value=value,
+        rotation_t=rotation,
+        num_blocks=num_blocks,
+        num_kv_heads=num_kv_heads,
+    )
+
+    actual_seq_lens_q = [1]
+    actual_seq_lens_kv = [num_kv_tokens]
+    out_attn = _run_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    out_fia = _run_fia(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    expected = _golden_attention(
+        query=query.cpu(),
+        key_cache=key_cache.cpu(),
+        value_cache=value_cache.cpu(),
+        block_table=block_table_cpu,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation.cpu(),
+        rotation_value=rotation.cpu(),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=SCALE,
+    )
+    _compare_tria("bf16_decode_multi_kv_gqa", out_fia, out_attn, expected)
+
+
+def test_bf16_pack_fia_dense_rotation(device: torch.device) -> None:
+    """bf16 pack → FIA/attn with dense orthogonal R (serving-like Haar path)."""
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    num_kv_tokens = 9
+    num_query_tokens = 1
+    num_kv_heads = 4
+    num_heads = 8
+    block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+
+    key = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    value = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    query = torch.randn(
+        (num_query_tokens, num_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    rotation_t = _dense_rotation(dtype, device)
+    rotation = rotation_t.transpose(0, 1).contiguous()
+    key_cache, value_cache = _pack_kv_cache(
+        key=key,
+        value=value,
+        rotation_t=rotation_t,
+        num_blocks=num_blocks,
+        num_kv_heads=num_kv_heads,
+    )
+
+    actual_seq_lens_q = [num_query_tokens]
+    actual_seq_lens_kv = [num_kv_tokens]
+    out_attn = _run_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation_t,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    out_fia = _run_fia(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation_t,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    expected = _golden_attention(
+        query=query.cpu(),
+        key_cache=key_cache.cpu(),
+        value_cache=value_cache.cpu(),
+        block_table=block_table_cpu,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation_t.cpu(),
+        rotation_value=rotation.cpu(),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=SCALE,
+    )
+    _compare_tria("bf16_pack_fia_dense_rotation", out_fia, out_attn, expected)
+
+
+def test_bf16_prefill_causal_gqa(device: torch.device) -> None:
+    """bf16 prefill: multi-Q + sparse_mode=3 vs attn/golden."""
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    num_kv_tokens = 32
+    num_query_tokens = 8
+    num_kv_heads = 2
+    num_heads = 8
+    block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+
+    key = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    value = torch.randn(
+        (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    query = torch.randn(
+        (num_query_tokens, num_heads, HEAD_SIZE), dtype=dtype, device=device
+    ).contiguous()
+    rotation = _identity(dtype, device)
+    key_cache, value_cache = _pack_kv_cache(
+        key=key,
+        value=value,
+        rotation_t=rotation,
+        num_blocks=num_blocks,
+        num_kv_heads=num_kv_heads,
+    )
+    atten_mask = _compress_causal_mask(device)
+
+    actual_seq_lens_q = [num_query_tokens]
+    actual_seq_lens_kv = [num_kv_tokens]
+    out_attn = _run_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    out_fia = _run_fia(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table_cpu.to(device),
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation,
+        rotation_value=rotation,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        atten_mask=atten_mask,
+        sparse_mode=SPARSE_MODE_RIGHT_DOWN,
+    )
+    expected = _golden_attention(
+        query=query.cpu(),
+        key_cache=key_cache.cpu(),
+        value_cache=value_cache.cpu(),
+        block_table=block_table_cpu,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        rotation_key=rotation.cpu(),
+        rotation_value=rotation.cpu(),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        scale=SCALE,
+    )
+    _compare_tria("bf16_prefill_causal_gqa", out_fia, out_attn, expected)
+
+
 def main() -> None:
     device = _require_npu()
     test_manual_single_kv(device)
@@ -759,6 +985,9 @@ def main() -> None:
     test_prefill_full_seq_dense_rotation(device)
     test_flash_decode_long_kv(device)
     test_flash_decode_multibatch_vs_attn(device)
+    test_bf16_decode_multi_kv_gqa(device)
+    test_bf16_pack_fia_dense_rotation(device)
+    test_bf16_prefill_causal_gqa(device)
     print("All BitResidual FIA Prefill/FD correctness smoke tests passed.")
 
 

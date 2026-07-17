@@ -8,6 +8,9 @@
  * Tiling keys:
  *   0 = TND+PA, no FlashDecode
  *   1 = TND+PA, FlashDecode
+ *
+ * Dtype: query / rotation / out are half or bfloat16 (ORIG_DTYPE_QUERY).
+ * Pack metadata (base/step/vmin/vstep) must match query dtype.
  */
 
 #include "kernel_operator.h"
@@ -23,14 +26,23 @@
 using namespace AscendC;
 using namespace AttentionCommon;
 
+#if defined(ORIG_DTYPE_QUERY) && (ORIG_DTYPE_QUERY == DT_BF16)
+using BrFiaQT = bfloat16_t;
+#elif defined(DTYPE_QUERY) && (DTYPE_QUERY == DT_BF16)
+using BrFiaQT = bfloat16_t;
+#else
+using BrFiaQT = half;
+#endif
+
 #define BR_FIA_COPY_TILING(tiling)                                                                 \
     GET_TILING_DATA(tiling_data_gen, tiling);                                                      \
     const FusedInferAttentionScoreTilingData *__restrict tiling_data =                             \
         reinterpret_cast<const FusedInferAttentionScoreTilingData *>(&tiling_data_gen)
 
+// Q/OUT/ORIGIN = BrFiaQT; KV typed half for WS path (uint8 cache is dequanted to half WS).
 #define INVOKE_BR_FIA(FLASH_DECODE)                                                                \
     do {                                                                                           \
-        using FIAT = FIAType<half, half, half, half, true, FLASH_DECODE, FIA_LAYOUT::TND,          \
+        using FIAT = FIAType<BrFiaQT, half, BrFiaQT, BrFiaQT, true, FLASH_DECODE, FIA_LAYOUT::TND, \
                              FIA_TQ_MSE_8BIT_MODE, false, FIA_LAYOUT::BSH, false>;                 \
         using CubeT = FiaBlockCubeTurboQuantP0<FIAT>;                                               \
         using VecT = FiaBlockVecTurboQuantP0<FIAT>;                                                 \

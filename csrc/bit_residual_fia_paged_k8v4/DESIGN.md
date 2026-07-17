@@ -21,16 +21,18 @@ query → Q@R_key → Cube MM1 ← dequantKWs (BR K8 dequant)
 
 **Inputs**
 
-- `query` fp16 `[T,H,D]` TND
-- `key_cache` / `value_cache` **uint8**（pack 布局）
+- `query` / `attention_out`：fp16 **或 bf16** TND `[T,H,D]`
+- `key_cache` / `value_cache`：**uint8**（pack 布局）
 - `block_table` int32
 - `actual_seq_len_q` / `actual_seq_len_kv` int64（ValueDepend）
 - `atten_mask` optional
-- `rotation_key` / `rotation_value` `[D,D]` fp16
+- `rotation_key` / `rotation_value` `[D,D]`，**与 query 同 dtype**
 
 **去掉**：`key_scale` / `value_scale` / 单一 `rotation`
 
 **Attrs**：`num_heads`, `num_kv_heads`, `head_size(=128)`, `block_size(%16==0)`, `scale_value`, `pre_tokens`, `next_tokens`, `sparse_mode`
+
+**dtype 契约**：pack 写入的 base/step/vmin/vstep 是 2 字节浮点，dtype 跟 pack 输入一致。FIA dequant **必须**按 query dtype 解读 metadata；bf16 pack + 按 half 读 meta 会导致数值炸裂（serving 乱码根因）。
 
 ## 3. Cache 布局（pack 真源）
 
@@ -139,6 +141,8 @@ AscendAttentionBackendImpl.forward()
 
 FIA 框架内 **无法** 全面快于 TQ FIA；decode 默认走 vector attn，用 `DECODE_FIA` 做 A/B。
 
+**bf16 serving**：kernel / OpDef / wrapper 原生支持 bf16（query、rotation、pack meta 同 dtype）；勿再对 bf16 做 `→fp16` 边界 cast。
+
 ## 9. 实现分期
 
 | 阶段 | 内容 | 状态 |
@@ -147,12 +151,32 @@ FIA 框架内 **无法** 全面快于 TQ FIA；decode 默认走 vector attn，�
 | P1 | E2E vs attn/golden：identity×GQA；dense×GQA；meta/WS/`Q@Π` | 完成 |
 | P1.5 | Prefill/FD 正确性 + L6 aclnn/msprof 基线 | 完成 |
 | Serving | Prefill→FIA / Decode→attn（可配 Decode FIA A/B） | 完成 |
+| bf16 | 原生 bf16 query/rotation + meta dequant；smoke golden | 完成 |
 | P2 | tmpBuff1 时分复用 + s2_sub 批量 dequant | **未做（性能）** |
 | P3 | Queue 合并 + msprof ≤ TQ FIA +15% | **未做（性能）** |
 
 ## 10. 构建
 
+整仓（推荐，会进 `vllm_ascend/_cann_ops_custom`）：
+
+```bash
+# build_so.sh → COMPILE_CUSTOM_KERNELS=1 → setup.py build_ext
+#   → build_aclnn.sh（CUSTOM_OPS 须含 bit_residual_fia_paged_k8v4）
+bash build_so.sh
+```
+
+仅本算子（调试）：
+
 ```bash
 bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh
 pytest -sv tests/ut/ops/test_bit_residual_fia_dequant.py
 ```
+
+确认安装成功：
+
+```bash
+nm -D vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/op_api/lib/libcust_opapi.so \
+  | grep aclnnBitResidualFiaPagedK8v4
+```
+
+**注意**：`turboquant_fia_mse8bit` 与本算子都 vendored 了 `split_core.cpp`（同名 `optiling::SplitCore`），不可同时进 `build_aclnn.sh` 的 CUSTOM_OPS；TQ FIA 请单独 `rebuild_op.sh`。
