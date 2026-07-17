@@ -2502,17 +2502,19 @@ def bit_residual_fia_paged_k8v4(
 ) -> torch.Tensor | None:
     """Call BitResidual FIA Paged K8V4 for Prefill / long-KV (FD-capable) path.
 
-    P0 kernel accepts fp16 query only. Returns ``None`` when conditions are not
-    met so callers can fall through to vector attn or stock FIA.
+    Supports fp16 and bf16. Query / rotation dtype must match the pack metadata
+    dtype (serving pack uses the model dtype). Returns ``None`` when conditions
+    are not met so callers can fall through to vector attn / stock FIA.
     """
-    if (
-        head_size != 128
-        or block_size % BIT_RESIDUAL_K8V4_BLOCK_ROWS != 0
-        or query.dtype != torch.float16
-        or block_tables.numel() == 0
-        or num_kv_heads <= 0
-        or num_heads % num_kv_heads != 0
-    ):
+    if head_size != 128:
+        return None
+    if block_size % BIT_RESIDUAL_K8V4_BLOCK_ROWS != 0:
+        return None
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if block_tables.numel() == 0:
+        return None
+    if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         return None
 
     key_last_dim = key_cache.shape[-1]
@@ -2551,6 +2553,7 @@ def bit_residual_fia_paged_k8v4(
         else:
             mask_arg = (mask_arg != 0).to(torch.int8)
 
+    # Rotation dtype must match query (= pack metadata dtype).
     rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
     rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
 

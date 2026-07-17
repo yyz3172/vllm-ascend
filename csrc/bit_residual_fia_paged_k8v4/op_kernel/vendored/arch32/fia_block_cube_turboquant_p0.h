@@ -189,7 +189,8 @@ class FiaBlockCubeTurboQuantP0 {
     using CFG = DefaultCfg;
     using Q_T = typename FIAT::queryType;
     using KV_T = typename FIAT::kvType;
-    using WS_KV_T = half;
+    // Dequant workspace / L1 K,V,P must match Q dtype: Cube Mmad rejects bf16×half.
+    using WS_KV_T = Q_T;
 
     static constexpr bool PAGE_ATTENTION = FIAT::pageAttention;
     static constexpr FIA_LAYOUT PA_LAYOUT = FIAT::kvLayout;
@@ -369,10 +370,9 @@ private:
     FaGmTensor<KV_T, KV_FORMAT> valueGmTensor;
     CopyKvGmToL1<KV_T, KV_FORMAT> copyKvGmToL1;
 
-    // TurboQuant 旋转矩阵 Π = antiquantScale [headDim, headDim] fp16。
-    // BitResidual: MM1 前 Q_rot = Q @ Π（与 attn/golden 的 Q @ rotation_key 一致）。
-    // piApplyEnabled_=false(未传 antiquantScale)时 ApplyPiToQL1 直接 return,等价 Π=I,零回归。
-    GlobalTensor<half> piGm_;
+    // BitResidual: Π = rotation_key, same dtype as query (half / bf16).
+    // MM1 前 Q_rot = Q @ Π。未传则 Π=I。
+    GlobalTensor<Q_T> piGm_;
     bool piApplyEnabled_ = false;
 
     ConstInfo constInfo{};
@@ -405,20 +405,22 @@ private:
     static constexpr IsResetLoad3dConfig LOAD3DV2_CONFIG = {false, false};
     uint32_t load3DL1SizeCfg = 0;
     LoadData3DParamsV2<Q_T> loadData3DParams;
+    // MM2 loads P (always half WS) into L0A; needs half-typed 3D params when Q_T is bf16.
+    LoadData3DParamsV2<half> loadData3DParamsHalf;
     LoadData2DParams mm1LoadDataBTransposeToL0Params;
     LoadData2DParams mm2LoadDataBToL0Params;
 
-    // TurboQuant: AIV writes fp16 dequant workspace, AIC reads it for MM1/MM2
-    GlobalTensor<half> dequantKeyWsGm_;
-    GlobalTensor<half> dequantValueWsGm_;
+    // TurboQuant: AIV writes Q_T dequant workspace, AIC reads it for MM1/MM2
+    GlobalTensor<WS_KV_T> dequantKeyWsGm_;
+    GlobalTensor<WS_KV_T> dequantValueWsGm_;
     uint64_t dequantKeyWsOffset_ = 0;
     uint64_t dequantValueWsOffset_ = 0;
 
 public:
     __aicore__ inline void InitDequantWorkspace(__gm__ uint8_t *dequantKeyWsBase, __gm__ uint8_t *dequantValueWsBase)
     {
-        dequantKeyWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(dequantKeyWsBase));
-        dequantValueWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(dequantValueWsBase));
+        dequantKeyWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ WS_KV_T *>(dequantKeyWsBase));
+        dequantValueWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ WS_KV_T *>(dequantValueWsBase));
     }
 
     __aicore__ inline void SetDequantWsTaskOffset(const RunInfo &info)
@@ -462,6 +464,25 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::InitParams(const ConstInf
     loadData3DParams.dilationFilterH = 1;
     loadData3DParams.enTranspose = 0;
     loadData3DParams.fMatrixCtrl = 0;
+
+    // Mirror for MM2 P(half) loads when Q_T is bf16.
+    loadData3DParamsHalf.l1W = GetC0Num<half>();
+    loadData3DParamsHalf.padList[0] = 0;
+    loadData3DParamsHalf.padList[1] = 0;
+    loadData3DParamsHalf.padList[2] = 0;
+    loadData3DParamsHalf.padList[3] = 255;
+    loadData3DParamsHalf.mStartPt = 0;
+    loadData3DParamsHalf.kStartPt = 0;
+    loadData3DParamsHalf.strideW = 1;
+    loadData3DParamsHalf.strideH = 1;
+    loadData3DParamsHalf.filterW = 1;
+    loadData3DParamsHalf.filterSizeW = 0;
+    loadData3DParamsHalf.filterH = 1;
+    loadData3DParamsHalf.filterSizeH = 0;
+    loadData3DParamsHalf.dilationFilterW = 1;
+    loadData3DParamsHalf.dilationFilterH = 1;
+    loadData3DParamsHalf.enTranspose = 0;
+    loadData3DParamsHalf.fMatrixCtrl = 0;
 
     mm1LoadDataBTransposeToL0Params.startIndex = 0;
     mm1LoadDataBTransposeToL0Params.srcStride = 1;
@@ -576,9 +597,9 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::Init(
         }
     }
 
-    // TurboQuant 旋转矩阵 Π:antiquantScale 复用为 Π [headDim, headDim] fp16。未传则 Π=I 快路径。
+    // BitResidual: Π dtype matches query (half / bf16).
     if (antiquantScale != nullptr) {
-        piGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(antiquantScale));
+        piGm_.SetGlobalBuffer(reinterpret_cast<__gm__ Q_T *>(antiquantScale));
         piApplyEnabled_ = true;
     }
 
@@ -792,9 +813,8 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ApplyPiToQL1(
     uint32_t qBufId, const RunInfo &info, uint32_t subMStart, uint32_t subMSize, uint32_t subMSizeAlign)
 {
     // BitResidual: Q_rot = Q @ rotation_key (= Q @ Π), matching attn/golden.
-    // (TQ MSE used Q @ Π^T via LoadBTranspose; BR pack/attn contract is right-multiply.)
-    // Π 暂存 kpL1（随后 CopyK 盖掉）。Q_rot：L0C float --F322F16 Fixpipe CFG_NZ--> L1 Q。
-    // F322F16 会污染后续 MM1 float Fixpipe，须立刻 NoQuant 复位；Fixpipe mSize 用 mAct 勿用 pad。
+    // Π 暂存 kpL1（随后 CopyK 盖掉）。Q_rot：L0C float --Fixpipe--> L1 Q。
+    // F322F16/F322BF16 会污染后续 MM1 float Fixpipe，须立刻 NoQuant 复位。
     if (!piApplyEnabled_ || (TQ_PI_BISECT_CUBE == 0)) {
         SetFlag<HardEvent::MTE1_MTE2>(KP_EVENT0 + this->kpL1BufId);
         return;
@@ -830,7 +850,7 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ApplyPiToQL1(
         uint32_t mAlign = Align<uint32_t>(mAct, static_cast<uint32_t>(BLOCK_CUBE));
 
         LoadAToL0<M_L1_SPLIT>(piAbId, qL1, subMSizeAlign, mOff, mAlign, 0U, headDim);
-        // LoadB (not Transpose): Mmad(A,B) => Q @ Π
+        // LoadB (not Transpose): Mmad(A,B) => Q @ Π  (WS_KV_T == Q_T)
         LoadBToL0(piAbId, piStageL1, headDim, 0U, headDim, 0U, headDim);
 
         SetFlag<HardEvent::MTE1_M>(L0_READY_EVENT);
@@ -854,7 +874,11 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ApplyPiToQL1(
         fixParams.srcStride = mAlign;
         fixParams.dstStride = subMSizeAlign * BLOCK_CUBE * sizeof(Q_T) / ONE_BLK_SIZE;
         fixParams.ndNum = 1;
-        fixParams.quantPre = QuantMode_t::F322F16;
+        if constexpr (IsSameType<Q_T, bfloat16_t>::value) {
+            fixParams.quantPre = QuantMode_t::F322BF16;
+        } else {
+            fixParams.quantPre = QuantMode_t::F322F16;
+        }
         auto dstL1 = qL1[subMSizeAlign * 0U][GetC0Num<Q_T>() * mOff];
         Fixpipe<Q_T, T, CFG_NZ>(dstL1, cL0Tensor[piCId], fixParams);
 

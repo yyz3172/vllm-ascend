@@ -126,7 +126,8 @@ protected:
 
     // ===========================Workspace Global Tensor===========================
     GlobalTensor<MM1_OUT_T> mm1ResGm;
-    GlobalTensor<half> vec1ResGm;
+    // Softmax P / MM2-A: same dtype as query (half or bf16).
+    GlobalTensor<Q_T> vec1ResGm;
     GlobalTensor<MM2_OUT_T> mm2ResGm;
     GlobalTensor<UPDATE_T> vec2ResGm;
     GlobalTensor<T> accumOutGm;
@@ -371,7 +372,7 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
     offset += layoutCoreNum * dbWorkspaceRatio * constInfo.mmResUbSize * MM1_LAYOUT_ELEM_SIZE;
 
     vec1ResGm.SetGlobalBuffer(
-        (__gm__ half *)(workspace + offset + aiCoreIdx * dbWorkspaceRatio * constInfo.mmResUbSize * V1_LAYOUT_ELEM_SIZE));
+        (__gm__ Q_T *)(workspace + offset + aiCoreIdx * dbWorkspaceRatio * constInfo.mmResUbSize * V1_LAYOUT_ELEM_SIZE));
     offset += layoutCoreNum * dbWorkspaceRatio * constInfo.mmResUbSize * V1_LAYOUT_ELEM_SIZE;
 
     // mm2Res

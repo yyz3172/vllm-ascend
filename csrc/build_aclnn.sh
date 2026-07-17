@@ -25,7 +25,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
     export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
 
 
-    CUSTOM_OPS="moe_grouped_matmul;grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer_vllm;sparse_flash_attention;matmul_allreduce_add_rmsnorm;moe_init_routing_custom;moe_gating_top_k;add_rms_norm_bias;apply_top_k_top_p_custom;transpose_kv_cache_by_block;copy_and_expand_eagle_inputs;causal_conv1d;lightning_indexer_quant;turboquant_rotate_matmul_probe;turboquant_pack_kv_for_cache_fused;turboquant_pack_kv_for_cache_v2;turboquant_pack_kv_for_cache_v2_to_cache;turboquant_pack_kv_for_cache_v3;turboquant_pack_kv_for_cache_v3_to_cache;turboquant_pack_kv_for_cache_to_cache;turboquant_pack_kv_for_cache4bit;bit_residual_pack_k8v4;turboquant_fused_infer_attention_score8bit;turboquant_decode_paged8bit;turboquant_attention_paged8bit;turboquant_attention_paged4bit;bit_residual_attention_paged_k8v4;"
+    # bit_residual_fia_paged_k8v4 is included; do NOT also list turboquant_fia_mse8bit
+    # (duplicate vendored split_core.cpp → multiple definition at link).
+    CUSTOM_OPS="moe_grouped_matmul;grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer_vllm;sparse_flash_attention;matmul_allreduce_add_rmsnorm;moe_init_routing_custom;moe_gating_top_k;add_rms_norm_bias;apply_top_k_top_p_custom;transpose_kv_cache_by_block;copy_and_expand_eagle_inputs;causal_conv1d;lightning_indexer_quant;turboquant_rotate_matmul_probe;turboquant_pack_kv_for_cache_fused;turboquant_pack_kv_for_cache_v2;turboquant_pack_kv_for_cache_v2_to_cache;turboquant_pack_kv_for_cache_v3;turboquant_pack_kv_for_cache_v3_to_cache;turboquant_pack_kv_for_cache_to_cache;turboquant_pack_kv_for_cache4bit;bit_residual_pack_k8v4;turboquant_fused_infer_attention_score8bit;turboquant_decode_paged8bit;turboquant_attention_paged8bit;turboquant_attention_paged4bit;bit_residual_attention_paged_k8v4;bit_residual_fia_paged_k8v4;"
     SOC_ARG="ascend910b"
 elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     # ASCEND910C (A3) series
@@ -75,6 +77,12 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "turboquant_decode_paged8bit"
         "turboquant_attention_paged8bit"
         "turboquant_attention_paged4bit"
+        "bit_residual_attention_paged_k8v4"
+        "bit_residual_fia_paged_k8v4"
+        # NOTE: turboquant_fia_mse8bit must NOT be co-built with
+        # bit_residual_fia_paged_k8v4 — both vendor optiling::SplitCore in
+        # vendored/split_core.cpp and cause multiple-definition link errors.
+        # Build TQ FIA alone via script/lcy/turboquant_fia_mse8bit/rebuild_op.sh
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"

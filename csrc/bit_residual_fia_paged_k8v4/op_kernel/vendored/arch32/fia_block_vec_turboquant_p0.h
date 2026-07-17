@@ -57,11 +57,12 @@ public:
     static constexpr bool SOFTMAX_WITH_BRC = FIAT::softmaxWithBrc;
     static constexpr GmFormat KV_FORMAT = GetKVFormat<KV_LAYOUT_T, PAGE_ATTENTION>();
 
-    using WS_T = half;
+    // Dequant WS / vec1Res must match Cube Q dtype (Mmad rejects bf16×half).
+    using WS_T = Q_T;
     using UPDATE_T = T;
     using TMP_T = T;
-    using COMPUTE_T =  T;
-    using SOFTMAX_TYPE =  T;
+    using COMPUTE_T = T;
+    using SOFTMAX_TYPE = T;
     using MM1_OUT_T = T;
     using MM2_OUT_T = T;
     using SINK_T = bfloat16_t;
@@ -157,16 +158,16 @@ private:
     __gm__ uint8_t *valueListPtr_ = nullptr;
     GlobalTensor<uint8_t> keyCacheGm_;
     GlobalTensor<uint8_t> valueCacheGm_;
-    // TurboQuant 旋转矩阵 Π = antiquantScale [headDim, headDim] fp16。Vec2 末做 O = Π^T@acc (= acc@Π)。
-    // piApplyEnabled_=false(未传 antiquantScale)时 ApplyPiTransposeToRows 直接 return,等价 Π=I,零回归。
-    GlobalTensor<half> piGm_;
+    // BitResidual: Π = rotation_value, same dtype as query (half / bf16).
+    // Vec2 末做 O = Π^T@acc (= acc@Π)。未传则 Π=I。
+    GlobalTensor<Q_T> piGm_;
     bool piApplyEnabled_ = false;
     GlobalTensor<int32_t> blockTableGm_;
-    GlobalTensor<half> dequantKeyWsGm_;
-    GlobalTensor<half> dequantValueWsGm_;
+    GlobalTensor<WS_T> dequantKeyWsGm_;
+    GlobalTensor<WS_T> dequantValueWsGm_;
     TBuf<> dequantInt8Buf_;
     TBuf<> dequantFp32Buf_;
-    TBuf<> dequantFp16Buf_;
+    TBuf<> dequantFp16Buf_;  // half scratch + Q_T out (same 2B stride)
 
 protected:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
@@ -284,7 +285,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::Init(
         sinkGm.SetGlobalBuffer((__gm__ SINK_T *)learnableSink);
     }
     if (valueAntiquantScale != nullptr) {
-        piGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(valueAntiquantScale));
+        piGm_.SetGlobalBuffer(reinterpret_cast<__gm__ Q_T *>(valueAntiquantScale));
         piApplyEnabled_ = true;
     }
     qActSeqLensParser.Init(this->actualSeqLengthsGmQ, constInfo.actualLenQDims, constInfo.qSeqSize);
@@ -759,13 +760,13 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ApplyPiTransposeToRows(
     }
 
     constexpr uint32_t PI_COL_TILE = 32U;
-    // Layout (bytes): accRow | outRow | piHalf[32] | piFp32[32] | mulTmp[32]
+    // Layout (bytes): accRow | outRow | piQ[tile] | piFp32[tile] | mulTmp | tileUb
     LocalTensor<COMPUTE_T> accRowCopy = tmpBuff1.Get<COMPUTE_T>();
     LocalTensor<COMPUTE_T> outRow =
         tmpBuff1.GetWithOffset<COMPUTE_T>(headDimAlign, headDimAlign * sizeof(COMPUTE_T));
-    const uint32_t piHalfOffset = 2U * headDimAlign * sizeof(COMPUTE_T);
-    LocalTensor<half> piHalfUb = tmpBuff1.GetWithOffset<half>(PI_COL_TILE, piHalfOffset);
-    const uint32_t piFp32Offset = piHalfOffset + PI_COL_TILE * static_cast<uint32_t>(sizeof(half));
+    const uint32_t piQOffset = 2U * headDimAlign * sizeof(COMPUTE_T);
+    LocalTensor<Q_T> piQUb = tmpBuff1.GetWithOffset<Q_T>(PI_COL_TILE, piQOffset);
+    const uint32_t piFp32Offset = piQOffset + PI_COL_TILE * static_cast<uint32_t>(sizeof(Q_T));
     LocalTensor<COMPUTE_T> piFp32Ub = tmpBuff1.GetWithOffset<COMPUTE_T>(PI_COL_TILE, piFp32Offset);
     LocalTensor<COMPUTE_T> mulTmp = tmpBuff1.GetWithOffset<COMPUTE_T>(
         PI_COL_TILE, piFp32Offset + PI_COL_TILE * static_cast<uint32_t>(sizeof(COMPUTE_T)));
@@ -790,10 +791,10 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ApplyPiTransposeToRows(
 
             for (uint32_t k = 0U; k < headDim; ++k) {
                 // Π[k, dBlock:dBlock+tile] is contiguous in row-major [D,D].
-                DataCopy(piHalfUb, piGm_[k * headDim + dBlock], PI_COL_TILE);
+                DataCopy(piQUb, piGm_[k * headDim + dBlock], PI_COL_TILE);
                 SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
                 WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                Cast(piFp32Ub, piHalfUb, AscendC::RoundMode::CAST_NONE, PI_COL_TILE);
+                Cast(piFp32Ub, piQUb, AscendC::RoundMode::CAST_NONE, PI_COL_TILE);
                 AscendC::PipeBarrier<PIPE_V>();
 
                 SetFlag<HardEvent::V_S>(eventIdSWaitV);
@@ -1172,8 +1173,8 @@ template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::InitDequantWorkspace(__gm__ uint8_t *dequantKeyWsBase,
     __gm__ uint8_t *dequantValueWsBase)
 {
-    dequantKeyWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(dequantKeyWsBase));
-    dequantValueWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(dequantValueWsBase));
+    dequantKeyWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ WS_T *>(dequantKeyWsBase));
+    dequantValueWsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ WS_T *>(dequantValueWsBase));
 }
 
 template <typename FIAT>
@@ -1255,10 +1256,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     LocalTensor<float> fp32UbA = dequantFp32Buf_.Get<float>();
     LocalTensor<float> fp32UbB = dequantFp32Buf_.Get<float>()[headDimAlign];
     LocalTensor<float> outFp32 = dequantFp32Buf_.Get<float>()[headDimAlign * 2U];
-    LocalTensor<half> fp16Ub = dequantFp16Buf_.Get<half>();
+    LocalTensor<half> halfScratch = dequantFp16Buf_.Get<half>();
+    LocalTensor<WS_T> outUb = dequantFp16Buf_.Get<WS_T>();
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
-    GlobalTensor<half> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
+    GlobalTensor<WS_T> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
 
     event_t eventIdVWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
     event_t eventIdVWaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
@@ -1294,11 +1296,13 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
             WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
 
-            float base = br_dequant::BrReadFp16FromUb(
+            // Metadata dtype matches query/pack dtype (half or bf16).
+            float base = br_dequant::BrReadMeta16FromUb<Q_T>(
                 codeUb, fp32UbA, br_dequant::BR_META0_UB_OFF);
-            float step = br_dequant::BrReadFp16FromUb(
+            float step = br_dequant::BrReadMeta16FromUb<Q_T>(
                 codeUb, fp32UbA, br_dequant::BR_META1_UB_OFF);
-            br_dequant::BrDecodeKeyRow(codeUb, fp16Ub, fp32UbA, fp32UbB, outFp32, base, step, headDim);
+            br_dequant::BrDecodeKeyRow(codeUb, halfScratch, fp32UbA, fp32UbB, outFp32, outUb,
+                                       base, step, headDim);
         } else {
             uint64_t codeOff = br_pack::BrValCodeOffset(headBase, posInBlock);
             DataCopy(codeUb, srcGm[codeOff], br_pack::BR_VAL_CODE_BYTES);
@@ -1308,16 +1312,17 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
             WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
 
-            float vmin = br_dequant::BrReadFp16FromUb(
+            float vmin = br_dequant::BrReadMeta16FromUb<Q_T>(
                 codeUb, fp32UbA, br_dequant::BR_META0_UB_OFF);
-            float vstep = br_dequant::BrReadFp16FromUb(
+            float vstep = br_dequant::BrReadMeta16FromUb<Q_T>(
                 codeUb, fp32UbA, br_dequant::BR_META1_UB_OFF);
-            br_dequant::BrDecodeValueRow(codeUb, fp16Ub, fp32UbA, outFp32, vmin, vstep, headDim);
+            br_dequant::BrDecodeValueRow(codeUb, halfScratch, fp32UbA, outFp32, outUb,
+                                         vmin, vstep, headDim);
         }
 
         SetFlag<HardEvent::V_MTE3>(eventIdVWaitMte3);
         WaitFlag<HardEvent::V_MTE3>(eventIdVWaitMte3);
-        DataCopy(dstWsGm[dstWsElemIdx], fp16Ub, headDimAlign);
+        DataCopy(dstWsGm[dstWsElemIdx], outUb, headDimAlign);
         event_t curEv = (si % 2U == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
         SetFlag<HardEvent::MTE3_V>(curEv);
     }
