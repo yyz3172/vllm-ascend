@@ -152,7 +152,7 @@ FIA 框架内 **无法** 全面快于 TQ FIA；decode 默认走 vector attn，�
 | P1.5 | Prefill/FD 正确性 + L6 aclnn/msprof 基线 | 完成 |
 | Serving | Prefill→FIA / Decode→attn（可配 Decode FIA A/B） | 完成 |
 | bf16 | 原生 bf16 query/rotation + meta dequant；smoke golden | 完成 |
-| P2 | tmpBuff1 时分复用 + s2_sub 批量 dequant | **未做（性能）** |
+| P2 | tmpBuff1 时分复用 + s2_sub 批量 dequant | **未做（性能）**；L6 msprof Step1：见 `analyze_opprof.py` |
 | P3 | Queue 合并 + msprof ≤ TQ FIA +15% | **未做（性能）** |
 
 ## 10. 构建
