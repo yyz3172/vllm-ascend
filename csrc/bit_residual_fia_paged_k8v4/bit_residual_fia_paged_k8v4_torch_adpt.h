@@ -11,7 +11,7 @@ namespace vllm_ascend {
  * Torch adapter for BitResidual FIA Paged K8V4.
  *
  * key/value_cache : uint8 pack layout [num_blocks, num_kv_heads, packed_bytes]
- * rotation_key/value : fp16 [D, D]
+ * query / rotation_key / rotation_value : fp16 or bf16 (must match pack meta dtype)
  */
 at::Tensor bit_residual_fia_paged_k8v4(
     const at::Tensor& query,
@@ -35,12 +35,18 @@ at::Tensor bit_residual_fia_paged_k8v4(
     TORCH_CHECK(query.is_privateuseone(), "query must be on NPU");
     TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
     TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
-    TORCH_CHECK(query.scalar_type() == at::kHalf, "fp16 query only in P0");
+    TORCH_CHECK(
+        query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16,
+        "query must be fp16 or bf16");
+    TORCH_CHECK(rotation_key.scalar_type() == query.scalar_type(),
+                "rotation_key dtype must match query");
+    TORCH_CHECK(rotation_value.scalar_type() == query.scalar_type(),
+                "rotation_value dtype must match query");
     TORCH_CHECK(key_cache.scalar_type() == at::kByte, "uint8 key_cache");
     TORCH_CHECK(value_cache.scalar_type() == at::kByte, "uint8 value_cache");
-    TORCH_CHECK(head_size == 128, "head_size=128 only in P0");
+    TORCH_CHECK(head_size == 128, "head_size=128 only");
 
-    at::Tensor out = at::empty(query.sizes(), query.options().dtype(at::kHalf));
+    at::Tensor out = at::empty(query.sizes(), query.options());
     at::Tensor mask = atten_mask.has_value() && atten_mask->defined()
                           ? atten_mask.value()
                           : at::empty({0}, query.options().dtype(at::kChar));

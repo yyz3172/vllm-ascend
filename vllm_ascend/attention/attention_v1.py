@@ -1010,23 +1010,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and self.turboquant_kv_bits_value == 4
                 and self.head_size == 128
             ):
+                bt_numel = int(block_table.numel())
+                fia_env = envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_FIA
+                decode_fia_env = envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA
+                state = attn_metadata.attn_state
+                prefill_ok = state in (
+                    AscendAttentionState.PrefillCacheHit,
+                    AscendAttentionState.ChunkedPrefill,
+                )
+                decode_ok = state == AscendAttentionState.DecodeOnly
                 use_br_fia = (
-                    block_table.numel() > 0
-                    and (
-                        (
-                            envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_FIA
-                            and attn_metadata.attn_state
-                            in (
-                                AscendAttentionState.PrefillCacheHit,
-                                AscendAttentionState.ChunkedPrefill,
-                            )
-                        )
-                        or (
-                            envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA
-                            and attn_metadata.attn_state
-                            == AscendAttentionState.DecodeOnly
-                        )
-                    )
+                    bt_numel > 0
+                    and ((fia_env and prefill_ok) or (decode_fia_env and decode_ok))
                 )
                 if use_br_fia:
                     is_decode = (
@@ -1265,7 +1260,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 and self.head_size == 128
             ):
                 block_size = self.vllm_config.cache_config.block_size
-                if envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA:
+                decode_fia_env = envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA
+                if decode_fia_env:
                     attn_output = bit_residual_fia_paged_k8v4(
                         query=query,
                         key_cache=key_cache,

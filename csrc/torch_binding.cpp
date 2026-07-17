@@ -828,7 +828,9 @@ at::Tensor bit_residual_fia_paged_k8v4(
     TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
     TORCH_CHECK(rotation_key.is_privateuseone(), "rotation_key must be on NPU");
     TORCH_CHECK(rotation_value.is_privateuseone(), "rotation_value must be on NPU");
-    TORCH_CHECK(query.scalar_type() == at::kHalf, "BitResidual FIA accepts fp16 query in P0");
+    TORCH_CHECK(
+        query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16,
+        "BitResidual FIA accepts fp16 or bf16 query");
     TORCH_CHECK(head_size == kHeadSize, "BitResidual FIA only supports head_size=128");
     TORCH_CHECK(block_size > 0, "block_size must be > 0");
     TORCH_CHECK(block_size % kBlockRows == 0,
@@ -838,14 +840,14 @@ at::Tensor bit_residual_fia_paged_k8v4(
     TORCH_CHECK(key_cache.scalar_type() == at::kByte, "key_cache must be uint8");
     TORCH_CHECK(value_cache.scalar_type() == at::kByte, "value_cache must be uint8");
     TORCH_CHECK(block_table.scalar_type() == at::kInt, "block_table must be int32");
-    TORCH_CHECK(rotation_key.scalar_type() == at::kHalf &&
+    TORCH_CHECK(rotation_key.scalar_type() == query.scalar_type() &&
                 rotation_key.dim() == 2 && rotation_key.size(0) == kHeadSize &&
                 rotation_key.size(1) == kHeadSize,
-                "rotation_key must be [128,128] fp16");
-    TORCH_CHECK(rotation_value.scalar_type() == at::kHalf &&
+                "rotation_key must be [128,128] matching query dtype");
+    TORCH_CHECK(rotation_value.scalar_type() == query.scalar_type() &&
                 rotation_value.dim() == 2 && rotation_value.size(0) == kHeadSize &&
                 rotation_value.size(1) == kHeadSize,
-                "rotation_value must be [128,128] fp16");
+                "rotation_value must be [128,128] matching query dtype");
     TORCH_CHECK(key_cache.dim() == 3 && value_cache.dim() == 3,
                 "BitResidual caches must be [num_blocks, num_kv_heads, packed_bytes]");
     TORCH_CHECK(key_cache.size(1) == num_kv_heads && value_cache.size(1) == num_kv_heads,

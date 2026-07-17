@@ -20,8 +20,14 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 pytest -sv tests/ut/ops/test_bit_residual_fia_de
 ## NPU 验收
 
 ```bash
+# 仅本算子（调试）
 bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh
 python tests/e2e/singlecard/xrx_bit_residual_fia_paged_k8v4_smoke.py
+
+# 正式进包（build_so.sh → build_aclnn.sh，CUSTOM_OPS 含 bit_residual_fia_paged_k8v4）
+bash build_so.sh
+nm -D vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/op_api/lib/libcust_opapi.so \
+  | grep aclnnBitResidualFiaPagedK8v4
 ```
 
 P1.5 smoke 覆盖：
