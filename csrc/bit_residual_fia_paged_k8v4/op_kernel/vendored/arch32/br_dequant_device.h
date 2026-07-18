@@ -1,9 +1,12 @@
 /**
- * BitResidual K8/V4 AIV dequant helpers (single-row, head_size=128).
+ * BitResidual K8/V4 AIV dequant helpers (head_size=128).
  *
  * AscendC on 910B does not support Cast<int16, uint8>; widen via half/float.
  * Metadata (base/step/vmin/vstep) must be brought into UB via DataCopyPad —
  * raw scalar GM half reads are unreliable on AIV.
+ *
+ * P2: batch copy contiguous same-PA-block rows (codes + meta runs), then
+ * per-row decode into a staged out tile (see DequantKvImpl).
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -68,6 +71,28 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
     DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
     DataCopyPad(ub[BR_META0_UB_OFF], srcGm[meta0Off], metaParams, padParams);
     DataCopyPad(ub[BR_META1_UB_OFF], srcGm[meta1Off], metaParams, padParams);
+}
+
+// Copy a contiguous GM meta run into UB with one 32B-aligned slot per row.
+// VEC Cast of half/bf16 requires 32B-aligned UB addresses (packed 2B stride faults).
+static constexpr uint32_t BR_META_SLOT_BYTES = 32U;
+
+__aicore__ inline void BrCopyMetaRun(GlobalTensor<uint8_t> srcGm, LocalTensor<uint8_t> ubDst,
+    uint64_t metaGmOff, uint32_t numRows)
+{
+    DataCopyExtParams metaParams{1, sizeof(half), 0, 0, 0};
+    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+    for (uint32_t j = 0U; j < numRows; ++j) {
+        DataCopyPad(ubDst[j * BR_META_SLOT_BYTES], srcGm[metaGmOff + j * sizeof(half)],
+            metaParams, padParams);
+    }
+}
+
+static constexpr uint32_t BR_S2_SUB_MAX = 32U;
+
+__aicore__ inline uint32_t BrAlignUp32(uint32_t x)
+{
+    return (x + 31U) & ~31U;
 }
 
 // Key: y = sign * (base + q7 * step), code = q7 | (sign << 7)
