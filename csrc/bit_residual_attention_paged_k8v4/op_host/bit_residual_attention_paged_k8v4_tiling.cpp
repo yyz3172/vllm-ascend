@@ -495,12 +495,12 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
         }
     }
 
-    // qTile Cube QK reuses rotate Matmul; GM holds physical K^T [HEAD, 64] half.
+    // qTile Cube QK: physical K^T [HEAD, KV_TILE] half per AIV slot
+    // (mixCore*2+subIdx). Dual-AIV Prefill needs 2 slots per MIX group.
     uint32_t qkWorkspaceStride = 0;
     uint64_t qkWorkspaceOffset = 0;
     if (qTileMode) {
         qkPvMode = TQ_BR_ATTN_QKPV_CUBE;
-        // Physical K^T [HEAD, KV_TILE] half elements per data core.
         qkWorkspaceStride =
             optiling::TQ_BR_HEAD_SIZE * optiling::TQ_BR_ATTN_KV_TILE_CAP;
     }
@@ -543,8 +543,10 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
     }
     if (qkPvMode == TQ_BR_ATTN_QKPV_CUBE && qkWorkspaceStride > 0) {
         qkWorkspaceOffset = workspaceBytes;
-        workspaceBytes += static_cast<size_t>(parallelCoreNum) * qkWorkspaceStride *
-                          sizeof(uint16_t);
+        // One KT staging buffer per AIV (2 per MIX group).
+        constexpr uint32_t kAivPerMix = 2U;
+        workspaceBytes += static_cast<size_t>(parallelCoreNum) * kAivPerMix *
+                          qkWorkspaceStride * sizeof(uint16_t);
     }
     tiling.set_qkWorkspaceOffset(qkWorkspaceOffset);
     tiling.set_qkWorkspaceStride(qkWorkspaceStride);

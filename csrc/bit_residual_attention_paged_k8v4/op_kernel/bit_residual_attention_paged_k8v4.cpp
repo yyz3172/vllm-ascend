@@ -127,21 +127,22 @@ constexpr uint32_t TQ_BR_UB_VAL_MASK_BYTES = TQ_BR_HEAD_SIZE * sizeof(uint16_t);
 constexpr uint32_t TQ_BR_UB_ROTATE_WORK_OFFSET = TQ_BR_UB_VAL_MASK_OFFSET + TQ_BR_UB_VAL_MASK_BYTES;
 constexpr uint32_t TQ_BR_UB_ROTATE_WORK_BYTES = TQ_BR_HEAD_SIZE * TQ_BR_HEAD_SIZE * TQ_BR_DTYPE_BYTES;  // 32768
 
-// Prefill qTile buffers (GQA<=2): Cap=8 tokens × GqaCap=2 heads
-constexpr uint32_t TQ_BR_UB_QTILE_CAP = 8;
+// Prefill qTile buffers (GQA<=2): Cap=16 tokens × GqaCap=2 heads
+// (Cube QK MAX_M=32 covers compactRows = qRows * gqa ≤ 32).
+constexpr uint32_t TQ_BR_UB_QTILE_CAP = 16;
 constexpr uint32_t TQ_BR_UB_QTILE_GQA_CAP = 2;
 constexpr uint32_t TQ_BR_UB_QTILE_Q_OFFSET =
     TQ_BR_UB_ROTATE_WORK_OFFSET + TQ_BR_UB_ROTATE_WORK_BYTES;
 constexpr uint32_t TQ_BR_UB_QTILE_Q_BYTES =
-    TQ_BR_UB_QTILE_CAP * TQ_BR_UB_QTILE_GQA_CAP * TQ_BR_HEAD_SIZE * sizeof(float);  // 8192
+    TQ_BR_UB_QTILE_CAP * TQ_BR_UB_QTILE_GQA_CAP * TQ_BR_HEAD_SIZE * sizeof(float);  // 16384
 constexpr uint32_t TQ_BR_UB_QTILE_SCORE_OFFSET =
     TQ_BR_UB_QTILE_Q_OFFSET + TQ_BR_UB_QTILE_Q_BYTES;
 constexpr uint32_t TQ_BR_UB_QTILE_SCORE_BYTES =
-    TQ_BR_UB_QTILE_CAP * TQ_BR_UB_QTILE_GQA_CAP * TQ_BR_UB_KV_TILE_CAP * sizeof(float);  // 4096
+    TQ_BR_UB_QTILE_CAP * TQ_BR_UB_QTILE_GQA_CAP * TQ_BR_UB_KV_TILE_CAP * sizeof(float);  // 8192
 constexpr uint32_t TQ_BR_UB_QTILE_OUTACC_OFFSET =
     TQ_BR_UB_QTILE_SCORE_OFFSET + TQ_BR_UB_QTILE_SCORE_BYTES;
 constexpr uint32_t TQ_BR_UB_QTILE_OUTACC_BYTES =
-    TQ_BR_UB_QTILE_CAP * TQ_BR_UB_QTILE_GQA_CAP * TQ_BR_HEAD_SIZE * sizeof(float);  // 8192
+    TQ_BR_UB_QTILE_CAP * TQ_BR_UB_QTILE_GQA_CAP * TQ_BR_HEAD_SIZE * sizeof(float);  // 16384
 
 // A1: dedicated V raw staging so LoadV MTE2 can overlap Vector QK without
 // aliasing CodeFloat/CodeI16 (previous cheap staging into CodeFloat regressed).
@@ -229,6 +230,14 @@ private:
         event_t mte2VEvent);
     __aicore__ inline void PrefetchPackedValueTileRowsFinalize(
         uint32_t mRows, float* vminArr, float* vstepArr, event_t mte2VEvent);
+    // M3: issue next-tile Key code plane MTE2 into CodeFloat (idle during Softmax);
+    // Finalize widens to CodeI16 + loads meta. Overlaps Softmax Vector with MTE2.
+    __aicore__ inline void PrefetchPackedKeyCodesIssue(
+        uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
+        event_t mte2VEvent);
+    __aicore__ inline void PrefetchPackedKeyCodesFinalize(
+        uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
+        float* kBaseArr, float* kStepArr, event_t mte2VEvent);
 
     // ---- Decode ----
     __aicore__ inline void DecodeKeyTileToFloat(uint32_t mRows,
@@ -473,9 +482,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Ini
             wsBase = reinterpret_cast<__gm__ uint8_t*>(workspace);
         }
         if (wsBase != nullptr) {
+            // Host allocates usedCoreNum(=parallel) MIX * 2 AIV slots.
+            const uint64_t qkSlots =
+                static_cast<uint64_t>(usedCoreNum_) * TQ_BR_MIX_AIV_SUB;
             qkKGm_.SetGlobalBuffer(
                 reinterpret_cast<__gm__ QueryT*>(wsBase + tiling_.qkWorkspaceOffset),
-                static_cast<uint64_t>(20) * qkWorkspaceStride_);
+                qkSlots * qkWorkspaceStride_);
             qkGmReady_ = true;
         }
     }
@@ -577,26 +589,35 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
     float* kBaseArr, float* kStepArr)
 {
-    // Independent-row key cache layout:
-    //   codes: blockSize * 128 uint8
-    //   base / step: blockSize * sizeof(QueryT) each
-    // Per row: load code + base + step, then widen uint8→int16 for decode.
+    // Plane layout: [blockSize*128 codes][blockSize*2 base][blockSize*2 step].
+    // Bulk-load CODE plane in <=16-row chunks (1 MTE2); keep meta per-row
+    // (historical bulk-meta MTE2 triggered AICORE). After Cast, must V_MTE2
+    // before reusing PackedRaw for meta (prior code-bulk omitted this → corruption).
 
     const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
     auto packedRaw = PackedRawBuf();
     auto codeI16 = CodeI16Buf();
     auto floatScratch = FloatScratchBuf();
-
     const uint32_t D = TQ_BR_HEAD_SIZE;
+    const uint32_t headStride = blockSize_ * (D + 2 * sizeof(QueryT));
+    constexpr uint32_t kChunkRows = TQ_BR_BLOCK_ROWS;  // 16; PackedRaw fits 16*128 codes
 
-    // Cache block_table lookups: consecutive rows in the same page share blockId.
     int32_t cachedBlockId = -1;
     uint32_t cachedBlockOffset = 0xFFFFFFFFu;
+    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
 
-    for (uint32_t row = 0; row < mRows; ++row) {
+    uint32_t row = 0;
+    while (row < mRows) {
         const uint32_t absPos = absStart + row;
         const uint32_t blockOffset = absPos / blockSize_;
         const uint32_t posInBlock = absPos % blockSize_;
+        uint32_t n = mRows - row;
+        if (n > kChunkRows) {
+            n = kChunkRows;
+        }
+        if (n > blockSize_ - posInBlock) {
+            n = blockSize_ - posInBlock;
+        }
 
         if (blockOffset != cachedBlockOffset) {
             TqBrSync<HardEvent::S_MTE2>();
@@ -604,38 +625,156 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
             TqBrSync<HardEvent::MTE2_S>();
             cachedBlockOffset = blockOffset;
         }
-        const int32_t blockId = cachedBlockId;
-
-        const uint32_t headStride = blockSize_ * (TQ_BR_HEAD_SIZE + 2 * sizeof(QueryT));
         const uint64_t headBase =
-            (static_cast<uint64_t>(blockId) * numKvHeads_ + kvHead) * headStride;
-        DataCopyExtParams copyParams{1, TQ_BR_HEAD_SIZE, 0, 0, 0};
-        DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
-        DataCopyPad(packedRaw, keyCacheGm_[headBase + posInBlock * TQ_BR_HEAD_SIZE], copyParams, padParams);
+            (static_cast<uint64_t>(cachedBlockId) * numKvHeads_ + kvHead) * headStride;
+        const uint32_t codeBytes = n * D;
+
+        DataCopyExtParams codeParams{1, codeBytes, 0, 0, 0};
+        DataCopyPad(packedRaw, keyCacheGm_[headBase + posInBlock * D], codeParams, padParams);
+        TqBrSync<HardEvent::MTE2_V>();
+
+        // Widen per-row (same Cast path as before); codes already contiguous in UB.
+        auto tmpHalf = floatScratch.template ReinterpretCast<half>();
+        for (uint32_t i = 0; i < n; ++i) {
+            AscendC::Cast(tmpHalf, packedRaw[i * D], AscendC::RoundMode::CAST_NONE, D);
+            PipeBarrier<PIPE_V>();
+            AscendC::Cast(codeI16[(row + i) * D], tmpHalf, AscendC::RoundMode::CAST_RINT, D);
+            PipeBarrier<PIPE_V>();
+        }
+
+        // Vector finished with PackedRaw codes; reclaim for meta staging.
+        TqBrSync<HardEvent::V_MTE2>();
         DataCopyExtParams metaParams{1, sizeof(QueryT), 0, 0, 0};
-        DataCopyPad(packedRaw[TQ_BR_HEAD_SIZE],
-            keyCacheGm_[headBase + blockSize_ * TQ_BR_HEAD_SIZE + posInBlock * sizeof(QueryT)],
-            metaParams, padParams);
-        DataCopyPad(packedRaw[TQ_BR_HEAD_SIZE + 32],
-            keyCacheGm_[headBase + blockSize_ * (TQ_BR_HEAD_SIZE + sizeof(QueryT)) +
-                        posInBlock * sizeof(QueryT)], metaParams, padParams);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t p = posInBlock + i;
+            DataCopyPad(packedRaw[D],
+                        keyCacheGm_[headBase + blockSize_ * D + p * sizeof(QueryT)],
+                        metaParams, padParams);
+            DataCopyPad(packedRaw[D + 32],
+                        keyCacheGm_[headBase + blockSize_ * (D + sizeof(QueryT)) +
+                                    p * sizeof(QueryT)],
+                        metaParams, padParams);
+            TqBrSync<HardEvent::MTE2_V>();
+            TqBrSync<HardEvent::MTE2_S>();
+            kBaseArr[row + i] =
+                TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, D);
+            kStepArr[row + i] =
+                TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, D + 32);
+            if (i + 1 < n) {
+                TqBrSync<HardEvent::V_MTE2>();
+            }
+        }
+        row += n;
+    }
+    TqBrSync<HardEvent::V_S>();
+}
+
+// ---------------------------------------------------------------
+// PrefetchPackedKeyCodesIssue() — M3: MTE2 codes into CodeFloat staging
+// ---------------------------------------------------------------
+template <typename TilingT, typename QueryT>
+__aicore__ inline void
+BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::PrefetchPackedKeyCodesIssue(
+    uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
+    event_t mte2VEvent)
+{
+    // Softmax does not touch CodeFloat/PackedRaw; stage next-tile codes here.
+    const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
+    auto codeStage = CodeFloatBuf().template ReinterpretCast<uint8_t>();
+    const uint32_t D = TQ_BR_HEAD_SIZE;
+    const uint32_t headStride = blockSize_ * (D + 2 * sizeof(QueryT));
+    constexpr uint32_t kChunkRows = TQ_BR_BLOCK_ROWS;
+
+    int32_t cachedBlockId = -1;
+    uint32_t cachedBlockOffset = 0xFFFFFFFFu;
+    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+
+    uint32_t row = 0;
+    while (row < mRows) {
+        const uint32_t absPos = absStart + row;
+        const uint32_t blockOffset = absPos / blockSize_;
+        const uint32_t posInBlock = absPos % blockSize_;
+        uint32_t n = mRows - row;
+        if (n > kChunkRows) {
+            n = kChunkRows;
+        }
+        if (n > blockSize_ - posInBlock) {
+            n = blockSize_ - posInBlock;
+        }
+        if (blockOffset != cachedBlockOffset) {
+            TqBrSync<HardEvent::S_MTE2>();
+            cachedBlockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
+            TqBrSync<HardEvent::MTE2_S>();
+            cachedBlockOffset = blockOffset;
+        }
+        const uint64_t headBase =
+            (static_cast<uint64_t>(cachedBlockId) * numKvHeads_ + kvHead) * headStride;
+        DataCopyExtParams codeParams{1, n * D, 0, 0, 0};
+        DataCopyPad(codeStage[row * D], keyCacheGm_[headBase + posInBlock * D], codeParams,
+                    padParams);
+        row += n;
+    }
+    AscendC::SetFlag<HardEvent::MTE2_V>(mte2VEvent);
+}
+
+// ---------------------------------------------------------------
+// PrefetchPackedKeyCodesFinalize() — wait + widen + meta (after Softmax)
+// ---------------------------------------------------------------
+template <typename TilingT, typename QueryT>
+__aicore__ inline void
+BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::PrefetchPackedKeyCodesFinalize(
+    uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
+    float* kBaseArr, float* kStepArr, event_t mte2VEvent)
+{
+    AscendC::WaitFlag<HardEvent::MTE2_V>(mte2VEvent);
+
+    const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
+    auto codeStage = CodeFloatBuf().template ReinterpretCast<uint8_t>();
+    auto codeI16 = CodeI16Buf();
+    auto packedRaw = PackedRawBuf();
+    auto floatScratch = FloatScratchBuf();
+    const uint32_t D = TQ_BR_HEAD_SIZE;
+    const uint32_t headStride = blockSize_ * (D + 2 * sizeof(QueryT));
+
+    auto tmpHalf = floatScratch.template ReinterpretCast<half>();
+    for (uint32_t i = 0; i < mRows; ++i) {
+        AscendC::Cast(tmpHalf, codeStage[i * D], AscendC::RoundMode::CAST_NONE, D);
+        PipeBarrier<PIPE_V>();
+        AscendC::Cast(codeI16[i * D], tmpHalf, AscendC::RoundMode::CAST_RINT, D);
+        PipeBarrier<PIPE_V>();
+    }
+
+    int32_t cachedBlockId = -1;
+    uint32_t cachedBlockOffset = 0xFFFFFFFFu;
+    DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+    DataCopyExtParams metaParams{1, sizeof(QueryT), 0, 0, 0};
+    TqBrSync<HardEvent::V_MTE2>();
+    for (uint32_t i = 0; i < mRows; ++i) {
+        const uint32_t absPos = absStart + i;
+        const uint32_t blockOffset = absPos / blockSize_;
+        const uint32_t posInBlock = absPos % blockSize_;
+        if (blockOffset != cachedBlockOffset) {
+            TqBrSync<HardEvent::S_MTE2>();
+            cachedBlockId = blockTableGm_.GetValue(seqBlockBase + blockOffset);
+            TqBrSync<HardEvent::MTE2_S>();
+            cachedBlockOffset = blockOffset;
+        }
+        const uint64_t headBase =
+            (static_cast<uint64_t>(cachedBlockId) * numKvHeads_ + kvHead) * headStride;
+        DataCopyPad(packedRaw[D],
+                    keyCacheGm_[headBase + blockSize_ * D + posInBlock * sizeof(QueryT)],
+                    metaParams, padParams);
+        DataCopyPad(packedRaw[D + 32],
+                    keyCacheGm_[headBase + blockSize_ * (D + sizeof(QueryT)) +
+                                posInBlock * sizeof(QueryT)],
+                    metaParams, padParams);
         TqBrSync<HardEvent::MTE2_V>();
         TqBrSync<HardEvent::MTE2_S>();
-
-        // Vectorized uint8→int16 zero-extend (mirrors V's Cast path).
-        // Intermediate half keeps 0..255 exact; then cast to int16.
-        auto extractI16 = codeI16[row * D];
-        auto tmpHalf = floatScratch.template ReinterpretCast<half>();
-        AscendC::Cast(tmpHalf, packedRaw, AscendC::RoundMode::CAST_NONE, D);
-        PipeBarrier<PIPE_V>();
-        AscendC::Cast(extractI16, tmpHalf, AscendC::RoundMode::CAST_RINT, D);
-        PipeBarrier<PIPE_V>();
-
-        const float base = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, TQ_BR_HEAD_SIZE);
-        kBaseArr[row] = base;
-
-        const float step = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, TQ_BR_HEAD_SIZE + 32);
-        kStepArr[row] = step;
+        kBaseArr[i] = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, D);
+        kStepArr[i] = TqBrRead16FromU8<QueryT>(packedRaw, floatScratch, D + 32);
+        if (i + 1 < mRows) {
+            TqBrSync<HardEvent::V_MTE2>();
+        }
     }
     TqBrSync<HardEvent::V_S>();
 }
@@ -1042,25 +1181,32 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
     float vminArr[TQ_BR_UB_KV_TILE_CAP];
     float vstepArr[TQ_BR_UB_KV_TILE_CAP];
 
-    // Main KV tile loop. A1: prefetch V MTE2 into VStage while DecodeK+QK run.
+    // A1: V MTE2 ∥ DecodeK+QK. M3: next Key codes MTE2 ∥ Softmax.
+    // Decode keeps Vector QK (Cube at small M regressed ~+13%).
     event_t vPrefetchEvt =
         static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+    event_t kPrefetchEvt =
+        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+    bool keyReadyFromPrefetch = false;
+
     for (uint32_t pos = kvStart; pos < kvEnd; pos += kvTileRows_) {
         const uint32_t remainRows = kvEnd - pos;
         const uint32_t mRows = (kvTileRows_ < remainRows) ? kvTileRows_ : remainRows;
 
-        // Load K tile, then issue V MTE2 (staging) before Vector decode/QK.
-        LoadPackedKeyTileRows(seqIdx, kvHead, pos, mRows, kBaseArr, kStepArr);
+        if (keyReadyFromPrefetch) {
+            keyReadyFromPrefetch = false;
+        } else {
+            LoadPackedKeyTileRows(seqIdx, kvHead, pos, mRows, kBaseArr, kStepArr);
+        }
         PrefetchPackedValueTileRowsIssue(seqIdx, kvHead, pos, mRows, vPrefetchEvt);
         DecodeKeyTileToFloat(mRows, kBaseArr, kStepArr);
 
         auto decodedK = DecodedBuf();  // decoded K in float
 
-        // QK scores: score[g][m] = sum_d Q[g][d] * K[m][d] * scale
         auto scoreBuf = ScoreBuf();
         auto reduceTmp = FloatScratchBuf();
         auto mulTmp = reduceTmp[TQ_BR_HEAD_SIZE];
-        auto reduceScalar = KStepBuf();  // reuse KStep buffer as ReduceSum scalar temp
+        auto reduceScalar = KStepBuf();
         if (gqaCount == 2) {
             turboquant_attn::VectorQkFloatPreScaledGqa2(
                 qGroupFloat, decodedK, scoreBuf, reduceTmp, mulTmp, mRows);
@@ -1070,15 +1216,23 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
                 gqaCount, mRows);
         }
 
-        // Wait V MTE2 + extract (same semantics as LoadPackedValueTileRows).
         PrefetchPackedValueTileRowsFinalize(mRows, vminArr, vstepArr, vPrefetchEvt);
         DecodeValueTileToFloat(mRows, vminArr, vstepArr);
 
-        auto decodedV = DecodedBuf();  // decoded V in float
-
+        auto decodedV = DecodedBuf();
         auto expBuf = FloatScratchBuf();
         auto softmaxReduceTmp = expBuf[TQ_BR_HEAD_SIZE];
         auto weightedValue = mulTmp;
+
+        const uint32_t nextPos = pos + mRows;
+        const bool hasNext = (nextPos < kvEnd);
+        uint32_t nextRows = 0;
+        if (hasNext) {
+            const uint32_t nextRemain = kvEnd - nextPos;
+            nextRows = (kvTileRows_ < nextRemain) ? kvTileRows_ : nextRemain;
+            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
+        }
+
         if (gqaCount == 2) {
             turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar(
                 scoreBuf, decodedV, mStateScalar, sStateScalar, outAcc, expBuf,
@@ -1088,6 +1242,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
                 scoreBuf, decodedV, mStateScalar, sStateScalar, outAcc, expBuf,
                 softmaxReduceTmp, weightedValue,
                 gqaCount, mRows);
+        }
+
+        if (hasNext) {
+            PrefetchPackedKeyCodesFinalize(seqIdx, kvHead, nextPos, nextRows, kBaseArr,
+                                           kStepArr, kPrefetchEvt);
+            keyReadyFromPrefetch = true;
         }
     }
 
@@ -1229,8 +1389,11 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
     const uint32_t mPad = TqBrAlignUp16(compactRows);
     const uint32_t nPad = TQ_BR_QK_CUBE_MAX_N;  // 64
     constexpr uint32_t kTile = 16;
-    const uint32_t coreIdx = GetBlockIdx();
-    if (coreIdx >= usedCoreNum_ || qkWorkspaceStride_ < D * nPad) {
+    // Per-AIV slot (not raw GetBlockIdx): dual AIV in one MIX must not share KT GM.
+    const uint32_t mixCoreIdx = GetBlockIdx() / TQ_BR_MIX_AIV_SUB;
+    const uint32_t subIdx = GetSubBlockIdx() % TQ_BR_MIX_AIV_SUB;
+    const uint32_t aivSlot = mixCoreIdx * TQ_BR_MIX_AIV_SUB + subIdx;
+    if (mixCoreIdx >= usedCoreNum_ || qkWorkspaceStride_ < D * nPad) {
         return false;
     }
 
@@ -1261,7 +1424,7 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
         }
     }
     TqBrSync<HardEvent::V_MTE3>();
-    DataCopy(qkKGm_[static_cast<uint64_t>(coreIdx) * qkWorkspaceStride_], ktHalf, D * nPad);
+    DataCopy(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], ktHalf, D * nPad);
     TqBrSync<HardEvent::MTE3_V>();
     TqBrSync<HardEvent::MTE3_MTE2>();
 
@@ -1279,7 +1442,7 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
     rotateMm_->SetOrgShape(mPad, nPad, D);
     rotateMm_->SetSingleShape(compactRows, mRows, D);
     rotateMm_->SetTensorA(qHalf, false);
-    rotateMm_->SetTensorB(qkKGm_[static_cast<uint64_t>(coreIdx) * qkWorkspaceStride_], false);
+    rotateMm_->SetTensorB(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], false);
     rotateMm_->SetLocalWorkspace(RotateWorkBuf());
     rotateMm_->IterateAll(scoreHalf);
     rotateMm_->End();
@@ -1359,15 +1522,22 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         causalEnds[q] = GetCausalKvEnd(tokenStartIdx + q, seqIdx);
     }
 
-    // Reuse A1's independent V staging in qTile mode: issue V MTE2 before
-    // DecodeK/CubeQK, then finalize only when decoded V is needed.
+    // A1: V MTE2 ∥ DecodeK/QK. M3: next-tile Key codes MTE2 ∥ Softmax.
     event_t vPrefetchEvt =
         static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+    event_t kPrefetchEvt =
+        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+    bool keyReadyFromPrefetch = false;
+
     for (uint32_t pos = 0; pos < maxCausalKvEnd; pos += kvTileRows_) {
         const uint32_t remainRows = maxCausalKvEnd - pos;
         const uint32_t mRows = (kvTileRows_ < remainRows) ? kvTileRows_ : remainRows;
 
-        LoadPackedKeyTileRows(seqIdx, kvHead, pos, mRows, kBaseArr, kStepArr);
+        if (keyReadyFromPrefetch) {
+            keyReadyFromPrefetch = false;
+        } else {
+            LoadPackedKeyTileRows(seqIdx, kvHead, pos, mRows, kBaseArr, kStepArr);
+        }
         PrefetchPackedValueTileRowsIssue(seqIdx, kvHead, pos, mRows, vPrefetchEvt);
         DecodeKeyTileToFloat(mRows, kBaseArr, kStepArr);
         auto decodedK = DecodedBuf();
@@ -1405,6 +1575,16 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         auto softmaxReduceTmp = expBuf[TQ_BR_HEAD_SIZE];
         auto weightedValue = mulTmp;
 
+        const uint32_t nextPos = pos + mRows;
+        const bool hasNext = (nextPos < maxCausalKvEnd);
+        uint32_t nextRows = 0;
+        if (hasNext) {
+            const uint32_t nextRemain = maxCausalKvEnd - nextPos;
+            nextRows = (kvTileRows_ < nextRemain) ? kvTileRows_ : nextRemain;
+            // CodeFloat idle after DecodeV; Softmax only needs DecodedBuf/scores.
+            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
+        }
+
         for (uint32_t q = 0; q < qRows; ++q) {
             const uint32_t causalKvEnd = causalEnds[q];
             if (pos >= causalKvEnd) {
@@ -1424,6 +1604,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
                     outAccTile[q * gqaCount * D], expBuf, softmaxReduceTmp, weightedValue,
                     gqaCount, activeRows);
             }
+        }
+
+        if (hasNext) {
+            PrefetchPackedKeyCodesFinalize(seqIdx, kvHead, nextPos, nextRows, kBaseArr,
+                                           kStepArr, kPrefetchEvt);
+            keyReadyFromPrefetch = true;
         }
     }
 
@@ -1466,20 +1652,23 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Pro
         return;
     }
 
-    // Prefill qTile: host tiling partitions contiguous token ranges by causal
-    // KV work so consecutive Q rows still share one KV decode stream without
-    // leaving late, longer-context rows concentrated on the tail core.
+    // Prefill qTile: host gives each MIX group a causal-balanced token range.
+    // Split work across the two AIVs by kvHead (not token mid) so they do not
+    // double-fetch the same long KV prefix for overlapping causal windows.
+    // Cube QK/rotate stays primary-AIV-only inside ComputeAttentionQTile.
     (void)headChunkScale;
     const uint32_t rangeStart = tiling_.qTileTokenStart[mixCoreIdx];
     const uint32_t rangeEnd = tiling_.qTileTokenEnd[mixCoreIdx];
-    const uint32_t rangeMid = rangeStart + (rangeEnd - rangeStart + 1U) / 2U;
-    const uint32_t tokenStart = (subIdx == 0U) ? rangeStart : rangeMid;
-    const uint32_t tokenEnd = (subIdx == 0U) ? rangeMid : rangeEnd;
-    if (tokenStart >= tokenEnd || tokenStart >= numTokens_) {
+    if (rangeStart >= rangeEnd || rangeStart >= numTokens_) {
         return;
     }
+    const uint32_t tokenStart = rangeStart;
+    const uint32_t tokenEnd = rangeEnd;
 
     for (uint32_t kvHead = 0; kvHead < numKvHeads_; ++kvHead) {
+        if ((kvHead % TQ_BR_MIX_AIV_SUB) != subIdx) {
+            continue;
+        }
         for (uint32_t gqaChunk = 0; gqaChunk < gqaChunkCount; ++gqaChunk) {
             const uint32_t gqaStart = gqaChunk * TQ_BR_UB_GQA_CAP;
             const uint32_t gqaTileEnd = gqaStart + TQ_BR_UB_GQA_CAP;
