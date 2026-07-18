@@ -88,7 +88,7 @@ __aicore__ inline void BrCopyMetaRun(GlobalTensor<uint8_t> srcGm, LocalTensor<ui
     }
 }
 
-static constexpr uint32_t BR_S2_SUB_MAX = 32U;
+static constexpr uint32_t BR_S2_SUB_MAX = 64U;
 
 __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
 {

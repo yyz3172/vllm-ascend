@@ -89,7 +89,7 @@ d0: code=127 → +0.80; d1: q7=18,sign=1 → -0.20; ...
 
 **P1 Dequant 约束**：`s2_sub=1`（对齐 TQ），dequant TBuf ≤3KB；禁止 16-row float **常驻** TBuf。
 
-**P2**：Dequant 时分借 `tmpBuff1(32KB)`，同 PA block 连续 run 批量 GM→UB（codes+meta），`s2_sub` 上限由 UB 动态决定（≤32）；decode 仍按行复用 fp32 scratch。
+**P2**：Dequant 时分借 `tmpBuff1(32KB)`，同 PA block 连续 run 批量 GM→UB（codes+meta），`s2_sub` 上限由 UB 动态决定（`BR_S2_SUB_MAX=64`，Key 实际 ≈min(64, byUb≈72)）；decode 仍按行复用 fp32 scratch。
 
 ## 6. UB 账本（AIV ~192KB）
 
