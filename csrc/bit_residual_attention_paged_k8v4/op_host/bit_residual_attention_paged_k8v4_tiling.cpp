@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -440,6 +441,60 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
                            usedCoreNum > 0 &&
                            numTokens > usedCoreNum;
 
+    uint32_t qTileTokenStart[TQ_BR_ATTN_MAX_PARALLEL_CORES] = {0};
+    uint32_t qTileTokenEnd[TQ_BR_ATTN_MAX_PARALLEL_CORES] = {0};
+    for (uint32_t core = 0; core < usedCoreNum; ++core) {
+        qTileTokenStart[core] =
+            static_cast<uint32_t>((static_cast<uint64_t>(numTokens) * core) / usedCoreNum);
+        qTileTokenEnd[core] =
+            static_cast<uint32_t>((static_cast<uint64_t>(numTokens) * (core + 1U)) / usedCoreNum);
+    }
+
+    // Equal token counts can leave late causal rows much heavier than early
+    // rows. When ValueDepend sequence data is available, partition contiguous
+    // token ranges by estimated QK/PV work (causal KV rows) instead.
+    if (qTileMode && actualSeqLenQTensor != nullptr && actualSeqLenKvTensor != nullptr) {
+        const int64_t* seqQ = actualSeqLenQTensor->GetData<int64_t>();
+        const int64_t* seqKv = actualSeqLenKvTensor->GetData<int64_t>();
+        if (seqQ != nullptr && seqKv != nullptr && batchSize > 0) {
+            std::vector<uint64_t> prefixWork(static_cast<size_t>(numTokens) + 1U, 0U);
+            uint32_t seqIdx = 0;
+            for (uint32_t token = 0; token < numTokens; ++token) {
+                while (seqIdx + 1U < batchSize &&
+                       static_cast<int64_t>(token) >= seqQ[seqIdx]) {
+                    ++seqIdx;
+                }
+                const int64_t qStart = (seqIdx == 0U) ? 0 : seqQ[seqIdx - 1U];
+                const int64_t qCount = seqQ[seqIdx] - qStart;
+                const int64_t qPos = static_cast<int64_t>(token) - qStart;
+                int64_t causalEnd = seqKv[seqIdx] - qCount + qPos + 1;
+                causalEnd = std::max<int64_t>(0, std::min(causalEnd, seqKv[seqIdx]));
+                prefixWork[token + 1U] =
+                    prefixWork[token] + static_cast<uint64_t>(std::max<int64_t>(causalEnd, 1));
+            }
+
+            const uint64_t totalWork = prefixWork[numTokens];
+            uint32_t tokenStart = 0;
+            for (uint32_t core = 0; core < usedCoreNum; ++core) {
+                qTileTokenStart[core] = tokenStart;
+                if (core + 1U == usedCoreNum) {
+                    qTileTokenEnd[core] = numTokens;
+                    break;
+                }
+                const uint64_t target =
+                    (totalWork * static_cast<uint64_t>(core + 1U)) / usedCoreNum;
+                uint32_t tokenEnd = tokenStart + 1U;
+                while (tokenEnd < numTokens && prefixWork[tokenEnd] < target) {
+                    ++tokenEnd;
+                }
+                const uint32_t maxEnd = numTokens - (usedCoreNum - core - 1U);
+                tokenEnd = std::min(tokenEnd, maxEnd);
+                qTileTokenEnd[core] = tokenEnd;
+                tokenStart = tokenEnd;
+            }
+        }
+    }
+
     // qTile Cube QK reuses rotate Matmul; GM holds physical K^T [HEAD, 64] half.
     uint32_t qkWorkspaceStride = 0;
     uint64_t qkWorkspaceOffset = 0;
@@ -466,6 +521,8 @@ static ge::graphStatus BitResidualAttentionPagedK8v4TilingFunc(gert::TilingConte
     tiling.set_splitMode(splitMode);
     tiling.set_qkPvMode(qkPvMode);
     tiling.set_qTileMode(qTileMode ? 1U : 0U);
+    tiling.set_qTileTokenStart(qTileTokenStart);
+    tiling.set_qTileTokenEnd(qTileTokenEnd);
     tiling.set_kvSegmentLen(kvSegmentLen);
     tiling.set_kvSplitPart(kvSplitPart);
     const size_t systemWs = CalcSystemWorkspaceSize(ascendcPlatform);

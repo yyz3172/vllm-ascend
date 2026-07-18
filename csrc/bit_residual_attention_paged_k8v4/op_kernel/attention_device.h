@@ -191,6 +191,30 @@ __aicore__ inline void VectorQkFloatPreScaled(
     }
 }
 
+// GQA=2 PreScaled QK: reuse each K row for both Q heads (Qwen3-style GQA).
+__aicore__ inline void VectorQkFloatPreScaledGqa2(
+    AscendC::LocalTensor<float> qGroup,
+    AscendC::LocalTensor<float> kTileFloat,
+    AscendC::LocalTensor<float> scoreOut,
+    AscendC::LocalTensor<float> reduceTmp,
+    AscendC::LocalTensor<float> mulTmp,
+    uint32_t mRows)
+{
+    auto score0 = scoreOut;
+    auto score1 = scoreOut[TQ_ATTN_TILE_STRIDE];
+    auto q0 = qGroup;
+    auto q1 = qGroup[TQ_ATTN_HEAD];
+    for (uint32_t m = 0; m < mRows; ++m) {
+        const uint32_t kBase = m * TQ_ATTN_HEAD;
+        AscendC::Mul(mulTmp, q0, kTileFloat[kBase], TQ_ATTN_HEAD);
+        AscendC::ReduceSum<float>(score0[m], mulTmp, reduceTmp, TQ_ATTN_HEAD);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(mulTmp, q1, kTileFloat[kBase], TQ_ATTN_HEAD);
+        AscendC::ReduceSum<float>(score1[m], mulTmp, reduceTmp, TQ_ATTN_HEAD);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+}
+
 // Vector PV: prob[G,M] dot V_tile[M,128] -> out[G,128]
 template <typename KvT>
 __aicore__ inline void VectorPv(
@@ -522,6 +546,81 @@ __aicore__ inline void OnlineSoftmaxUpdateTileFloatPreScaledScalar(
         sState[g] = oldS * alpha + tileS;
         mState[g] = mNew;
     }
+}
+
+// GQA=2 PreScaled Softmax+PV: softmax both heads, then share each V row.
+__aicore__ inline void OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar(
+    AscendC::LocalTensor<float> scoreTile,
+    AscendC::LocalTensor<float> vTileFloat,
+    float* mState,
+    float* sState,
+    AscendC::LocalTensor<float> outAcc,
+    AscendC::LocalTensor<float>& expBuf,
+    AscendC::LocalTensor<float> reduceTmp,
+    uint32_t mRows)
+{
+    auto score0 = scoreTile;
+    auto score1 = scoreTile[TQ_ATTN_TILE_STRIDE];
+
+    AscendC::ReduceMax<float>(expBuf, score0, reduceTmp, mRows, false);
+    AscendC::PipeBarrier<PIPE_V>();
+    AttnSync<AscendC::HardEvent::V_S>();
+    const float oldM0 = mState[0];
+    const float oldS0 = sState[0];
+    const float tileM0 = expBuf.GetValue(0);
+    const float mNew0 = (tileM0 > oldM0) ? tileM0 : oldM0;
+    const float alpha0 = (oldS0 <= 0.f) ? 0.f :
+                         ((mNew0 > oldM0) ? ExpScalar(expBuf, oldM0 - mNew0) : 1.f);
+    AscendC::Adds(score0, score0, -mNew0, mRows);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Exp(score0, score0, mRows);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::ReduceSum<float>(expBuf, score0, reduceTmp, mRows);
+    AscendC::PipeBarrier<PIPE_V>();
+    AttnSync<AscendC::HardEvent::V_S>();
+    const float tileS0 = expBuf.GetValue(0);
+
+    AscendC::ReduceMax<float>(expBuf, score1, reduceTmp, mRows, false);
+    AscendC::PipeBarrier<PIPE_V>();
+    AttnSync<AscendC::HardEvent::V_S>();
+    const float oldM1 = mState[1];
+    const float oldS1 = sState[1];
+    const float tileM1 = expBuf.GetValue(0);
+    const float mNew1 = (tileM1 > oldM1) ? tileM1 : oldM1;
+    const float alpha1 = (oldS1 <= 0.f) ? 0.f :
+                         ((mNew1 > oldM1) ? ExpScalar(expBuf, oldM1 - mNew1) : 1.f);
+    AscendC::Adds(score1, score1, -mNew1, mRows);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Exp(score1, score1, mRows);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::ReduceSum<float>(expBuf, score1, reduceTmp, mRows);
+    AscendC::PipeBarrier<PIPE_V>();
+    AttnSync<AscendC::HardEvent::V_S>();
+    const float tileS1 = expBuf.GetValue(0);
+
+    if (oldS0 > 0.f) {
+        AscendC::Muls(outAcc, outAcc, alpha0, TQ_ATTN_HEAD);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    if (oldS1 > 0.f) {
+        AscendC::Muls(outAcc[TQ_ATTN_HEAD], outAcc[TQ_ATTN_HEAD], alpha1,
+                      TQ_ATTN_HEAD);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    for (uint32_t m = 0; m < mRows; ++m) {
+        const uint32_t vBase = m * TQ_ATTN_HEAD;
+        const float beta0 = score0.GetValue(m);
+        AscendC::Axpy(outAcc, vTileFloat[vBase], beta0, TQ_ATTN_HEAD);
+        AscendC::PipeBarrier<PIPE_V>();
+        const float beta1 = score1.GetValue(m);
+        AscendC::Axpy(outAcc[TQ_ATTN_HEAD], vTileFloat[vBase], beta1,
+                      TQ_ATTN_HEAD);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    sState[0] = oldS0 * alpha0 + tileS0;
+    mState[0] = mNew0;
+    sState[1] = oldS1 * alpha1 + tileS1;
+    mState[1] = mNew1;
 }
 
 // Online softmax update with fp32 V tile and vNorm (Scalar m/s).

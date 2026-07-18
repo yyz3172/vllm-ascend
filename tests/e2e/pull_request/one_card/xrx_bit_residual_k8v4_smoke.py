@@ -35,7 +35,10 @@ from vllm import LLM, SamplingParams
 from vllm_ascend.ascend_config import clear_ascend_config
 
 MODEL_PATH = "/root/yyz/models/Qwen3-0.6B"
-PROFILE_DIR = "/root/yyz/pytorch_profiler/BitResidualSmoke/260716/k8v4_Qwen3-0.6B"
+PROFILE_DIR = os.getenv(
+    "XRX_K8V4_PROFILE_DIR",
+    "/root/yyz/pytorch_profiler/BitResidualSmoke/260716/k8v4_Qwen3-0.6B",
+)
 PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_WARMUP_ITERATIONS", "2"))
 PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_ACTIVE_ITERATIONS", "2"))
 
