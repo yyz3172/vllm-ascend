@@ -1068,6 +1068,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
                     if attn_output is not None:
                         return output
+                    # k8v4 layout is incompatible with MSE/slab decode+FIA; fail
+                    # fast instead of silently producing wrong attention.
+                    raise RuntimeError(
+                        "BitResidual k8v4 attention returned None for "
+                        "turboquant_kv_bits=[8,4]; refusing silent fallback to "
+                        "MSE/paged paths."
+                    )
 
             slab_block_size = turboquant_slab_block_size_or_none(
                 self.key_cache,
@@ -1298,6 +1305,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
                 if attn_output is not None:
                     return output
+                raise RuntimeError(
+                    "BitResidual k8v4 paged attention returned None for "
+                    "turboquant_kv_bits=[8,4]; refusing silent fallback to "
+                    "MSE decode + stock paged attention."
+                )
             key_cache, value_cache, block_table = turboquant_decode_kv_cache_compact(
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -1492,7 +1504,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
-        output[:num_tokens] = attn_output[:num_tokens]
+        # All eager Ascend attention paths accept and return the caller-provided
+        # output buffer. Avoid dispatching an in-place copy when that exact
+        # buffer is returned; preserve the copy for any future allocating path.
+        if attn_output is not output:
+            output[:num_tokens] = attn_output[:num_tokens]
         return output
 
 
