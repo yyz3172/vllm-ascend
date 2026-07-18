@@ -94,7 +94,8 @@ using TqRotateMatmulOp =
 
 // Prefill qTile Cube QK reuses TqRotateMatmulOp (same KFC object as rotation):
 //   C[M,N] = A[M,K] @ B[K,N] with B = physical K^T in GM (SetTensorB false).
-static constexpr uint32_t TQ_BR_QK_CUBE_MAX_M = 16;
+// M covers qTile*GQA (16*2); rotate MatmulConfig singleM max is 64.
+static constexpr uint32_t TQ_BR_QK_CUBE_MAX_M = 32;
 static constexpr uint32_t TQ_BR_QK_CUBE_MAX_N = 64;
 
 // Pipe sync helper (reuses TPipe for event ID, matching the pack kernel pattern).
