@@ -21,26 +21,28 @@ paged attention path inside the vLLM inference pipeline.
 Run on an NPU machine after building custom ops:
 
     python tests/e2e/singlecard/xrx_bit_residual_k8v4_smoke.py
+
+Env:
+    XRX_K8V4_MODEL_PATH   model path (default: /root/l00856060/model/Qwen3-0.6B)
+    XRX_K8V4_PROFILE_DIR  torch profiler dump dir (default: /root/l00856060/perflog2)
+    XRX_K8V4_PROFILE      set to 1 to enable torch profiler
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
-import time
 
 import torch
 from vllm import LLM, SamplingParams
 
 from vllm_ascend.ascend_config import clear_ascend_config
 
-MODEL_PATH = "/root/yyz/models/Qwen3-0.6B"
+MODEL_PATH = os.getenv("XRX_K8V4_MODEL_PATH", "/root/l00856060/model/Qwen3-0.6B")
 PROFILE_DIR = os.getenv(
     "XRX_K8V4_PROFILE_DIR",
-    "/root/yyz/pytorch_profiler/BitResidualSmoke/260716/k8v4_Qwen3-0.6B",
+    "/root/l00856060/perflog2",
 )
-PROFILE_WARMUP_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_WARMUP_ITERATIONS", "2"))
-PROFILE_ACTIVE_ITERATIONS = int(os.getenv("XRX_K8V4_PROFILE_ACTIVE_ITERATIONS", "2"))
 
 
 @contextlib.contextmanager
@@ -66,17 +68,16 @@ def main() -> None:
         # BitResidual k8v4 reuses the turboquant MSE v1 rotation matrix.
         "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
     }
+    enable_profile = os.getenv("XRX_K8V4_PROFILE", "0") == "1"
     with _patched_env(env):
         clear_ascend_config()
-        enable_profile = os.getenv("XRX_K8V4_PROFILE", "0") == "1"
         profiler_config = None
         if enable_profile:
+            os.makedirs(PROFILE_DIR, exist_ok=True)
             profiler_config = {
                 "profiler": "torch",
                 "torch_profiler_dir": PROFILE_DIR,
                 "torch_profiler_with_stack": True,
-                "warmup_iterations": PROFILE_WARMUP_ITERATIONS,
-                "active_iterations": PROFILE_ACTIVE_ITERATIONS,
             }
         seed_cur = 0
         print("llm seed is ", seed_cur)
@@ -107,6 +108,8 @@ def main() -> None:
             if enable_profile:
                 llm.stop_profile()
     print("k8v4 smoke output:", [out.outputs[0].text for out in outs])
+    if enable_profile:
+        print("k8v4 smoke profile_dir:", PROFILE_DIR)
 
 
 if __name__ == "__main__":
