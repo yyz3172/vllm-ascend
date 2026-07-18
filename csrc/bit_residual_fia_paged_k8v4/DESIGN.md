@@ -87,9 +87,9 @@ d0: code=127 → +0.80; d1: q7=18,sign=1 → -0.20; ...
 | `DequantKvImpl` + flat int8 offset + γ | **BR Dequant** + pack layout 寻址 |
 | `rotation` / γ GM | `rotation_key` / `rotation_value` |
 
-**P1 Dequant 约束**：`s2_sub=1`（对齐 TQ），dequant TBuf ≤3KB；禁止 16-row float 常驻。
+**P1 Dequant 约束**：`s2_sub=1`（对齐 TQ），dequant TBuf ≤3KB；禁止 16-row float **常驻** TBuf。
 
-**P2**：Dequant 时分借 `tmpBuff1(32KB)`，`s2_sub=8~16`。
+**P2**：Dequant 时分借 `tmpBuff1(32KB)`，同 PA block 连续 run 批量 GM→UB（codes+meta），`s2_sub` 上限由 UB 动态决定（≤32）；decode 仍按行复用 fp32 scratch。
 
 ## 6. UB 账本（AIV ~192KB）
 
@@ -152,7 +152,7 @@ FIA 框架内 **无法** 全面快于 TQ FIA；decode 默认走 vector attn，�
 | P1.5 | Prefill/FD 正确性 + L6 aclnn/msprof 基线 | 完成 |
 | Serving | Prefill→FIA / Decode→attn（可配 Decode FIA A/B） | 完成 |
 | bf16 | 原生 bf16 query/rotation + meta dequant；smoke golden | 完成 |
-| P2 | tmpBuff1 时分复用 + s2_sub 批量 dequant | **未做（性能）**；L6 msprof Step1：见 `analyze_opprof.py` |
+| P2 | tmpBuff1 时分复用 + s2_sub 批量 dequant（同 PA block run） | **已做**；L6 用 `analyze_opprof.py` 对比 |
 | P3 | Queue 合并 + msprof ≤ TQ FIA +15% | **未做（性能）** |
 
 ## 10. 构建
