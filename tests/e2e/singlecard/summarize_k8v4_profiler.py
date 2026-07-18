@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Summarize K8V4 BitResidual / TurboQuant metrics from Ascend profiler output.
+"""Summarize K8V4 BitResidual / BitResidual-FIA / TurboQuant Ascend profiler dumps.
 
 Reads ``ASCEND_PROFILER_OUTPUT/operator_details.csv`` and
 ``ASCEND_PROFILER_OUTPUT/kernel_details.csv`` under one or more
-``rank0_*_ascend_pt`` directories produced by ``xrx_bit_residual_k8v4_smoke.py``
-(with ``XRX_K8V4_PROFILE=1``) or similar torch-profiler runs.
+``rank0_*_ascend_pt`` directories (torch / NPU profiler).
 
-Attention kernels are also split into decode vs prefill using the query token
-count from ``Input Shapes`` (first dim of the first tensor). Default rule for
-long-query profiles: ``Q <= --decode-q-max`` → decode, else prefill
+Supports BitResidual vector attn (``BitResidualAttentionPagedK8v4``), FIA
+(``BitResidualFiaPagedK8v4``), and TurboQuant. Attention kernels are split into
+decode vs prefill using the query token count from ``Input Shapes`` (first dim).
+Default: ``Q <= --decode-q-max`` → decode, else prefill
 (typical: decode Q=num_prompts, chunked-prefill Q≈241).
 
 Example::
 
     python tests/e2e/singlecard/summarize_k8v4_profiler.py \\
-        /root/yyz/pytorch_profiler/BitResidual/260713/k8v4_0.6B/rank0_565817_20260713062511278_ascend_pt
+        /root/l00856060/perflog2/BitResidualFiaPagedK8v4/latest
 
-    python tests/e2e/singlecard/summarize_k8v4_profiler.py \\
-        --compare --labels baseline optimized \\
-        profile_a/ profile_b/
+    # Vector attn vs FIA A/B (labels: space-separated or comma-separated)
+    python tests/e2e/singlecard/summarize_k8v4_profiler.py --compare \\
+        --labels attn,fia --latest \\
+        /path/to/attn/ /path/to/fia/
 
     python tests/e2e/singlecard/summarize_k8v4_profiler.py \\
         --compare -v baseline/ optimized/
@@ -82,6 +83,15 @@ ATTN_PHASE_KERNELS = {
     "BitResidualAttentionPagedK8v4",
     "BitResidualFiaPagedK8v4",
     "TurboquantFusedInferAttentionScoreK8v4",
+}
+
+# Canonical roles for cross-flavor compare (AttentionPaged vs FiaPaged).
+KERNEL_ROLE: dict[str, str] = {
+    "BitResidualPackK8v4": "pack",
+    "BitResidualAttentionPagedK8v4": "attn",
+    "BitResidualFiaPagedK8v4": "attn",
+    "TurboquantPackKvForCacheK8v4": "pack",
+    "TurboquantFusedInferAttentionScoreK8v4": "attn",
 }
 
 _SHAPE_FIRST_DIM_RE = re.compile(r'["\s]*(\d+)\s*,')
@@ -161,11 +171,16 @@ class DurationStats:
 @dataclass
 class KernelStats:
     duration: DurationStats = field(default_factory=DurationStats)
+    aic_time_mean: float = 0.0
+    aiv_time_mean: float = 0.0
     aic_mac_mean: float = 0.0
     aic_scalar_mean: float = 0.0
     aiv_scalar_mean: float = 0.0
     aiv_vec_mean: float = 0.0
+    aiv_mte2_mean: float = 0.0
+    aiv_mte3_mean: float = 0.0
     cube_util_mean: float = 0.0
+    wait_time_mean: float = 0.0
 
 
 @dataclass
@@ -273,12 +288,22 @@ def _pack_kernel_names(summary: ProfileSummary) -> list[str]:
 
 
 def _fmt_hw(stats: KernelStats) -> str:
-    return (
-        f"aic_mac={stats.aic_mac_mean:.2f} "
-        f"aic_scalar={stats.aic_scalar_mean:.2f} "
-        f"aiv_scalar={stats.aiv_scalar_mean:.1f} "
-        f"aiv_vec={stats.aiv_vec_mean:.1f}"
-    )
+    parts = [
+        f"aic={stats.aic_time_mean:.1f}",
+        f"aiv={stats.aiv_time_mean:.1f}",
+        f"aic_mac={stats.aic_mac_mean:.2f}",
+        f"aiv_vec={stats.aiv_vec_mean:.1f}",
+        f"aiv_mte2={stats.aiv_mte2_mean:.1f}",
+        f"aiv_mte3={stats.aiv_mte3_mean:.1f}",
+    ]
+    if stats.aiv_time_mean > 0:
+        parts.append(
+            f"share(vec/mte2/mte3)="
+            f"{100 * stats.aiv_vec_mean / stats.aiv_time_mean:.0f}/"
+            f"{100 * stats.aiv_mte2_mean / stats.aiv_time_mean:.0f}/"
+            f"{100 * stats.aiv_mte3_mean / stats.aiv_time_mean:.0f}%"
+        )
+    return " ".join(parts)
 
 
 def _f(row: dict[str, str], key: str) -> float:
@@ -291,19 +316,38 @@ def _f(row: dict[str, str], key: str) -> float:
         return 0.0
 
 
-def _resolve_profile_dir(path: Path) -> Path:
+def _resolve_profile_dir(path: Path, latest: bool = False) -> Path:
     path = path.expanduser().resolve()
     if (path / "ASCEND_PROFILER_OUTPUT" / "operator_details.csv").exists():
         return path
-    candidates = sorted(path.glob("rank0_*_ascend_pt"))
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        raise FileNotFoundError(
-            f"{path} contains multiple rank0_* dirs; pass one explicitly: "
-            + ", ".join(p.name for p in candidates[:5])
+    # Follow "latest" symlink dirs used by run_serving_profile_ab.sh.
+    if path.is_symlink() or (path / "latest").exists():
+        latest_link = path / "latest" if (path / "latest").exists() else path
+        if latest_link.is_dir():
+            resolved = latest_link.resolve()
+            if resolved != path:
+                return _resolve_profile_dir(resolved, latest=latest)
+    candidates = sorted(
+        path.glob("rank0_*_ascend_pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        # stamp dir may nest one level: OpName/<stamp>/rank0_*
+        nested = sorted(
+            path.glob("*/rank0_*_ascend_pt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
         )
-    raise FileNotFoundError(f"profiler output not found under {path}")
+        candidates = nested
+    if not candidates:
+        raise FileNotFoundError(f"profiler output not found under {path}")
+    if latest or len(candidates) == 1:
+        return candidates[0]
+    raise FileNotFoundError(
+        f"{path} contains multiple rank0_* dirs; pass one explicitly or use "
+        f"--latest. Candidates: " + ", ".join(p.name for p in candidates[:5])
+    )
 
 
 def _detect_flavor(operator_rows: list[dict[str, str]]) -> str:
@@ -415,14 +459,23 @@ def _phase_for_q(q_tokens: int | None, decode_q_max: int) -> str:
     return "prefill"
 
 
+def _mean(vals: list[float]) -> float:
+    return statistics.mean(vals) if vals else 0.0
+
+
 def _kernel_stats_from_rows(rows: list[dict[str, float]]) -> KernelStats:
     return KernelStats(
         duration=DurationStats.from_values(r["duration_us"] for r in rows),
-        aic_mac_mean=statistics.mean(r["aic_mac_us"] for r in rows),
-        aic_scalar_mean=statistics.mean(r["aic_scalar_us"] for r in rows),
-        aiv_scalar_mean=statistics.mean(r["aiv_scalar_us"] for r in rows),
-        aiv_vec_mean=statistics.mean(r["aiv_vec_us"] for r in rows),
-        cube_util_mean=statistics.mean(r["cube_util"] for r in rows),
+        aic_time_mean=_mean([r["aic_time_us"] for r in rows]),
+        aiv_time_mean=_mean([r["aiv_time_us"] for r in rows]),
+        aic_mac_mean=_mean([r["aic_mac_us"] for r in rows]),
+        aic_scalar_mean=_mean([r["aic_scalar_us"] for r in rows]),
+        aiv_scalar_mean=_mean([r["aiv_scalar_us"] for r in rows]),
+        aiv_vec_mean=_mean([r["aiv_vec_us"] for r in rows]),
+        aiv_mte2_mean=_mean([r["aiv_mte2_us"] for r in rows]),
+        aiv_mte3_mean=_mean([r["aiv_mte3_us"] for r in rows]),
+        cube_util_mean=_mean([r["cube_util"] for r in rows]),
+        wait_time_mean=_mean([r["wait_time_us"] for r in rows]),
     )
 
 
@@ -436,6 +489,9 @@ def _summarize_kernels(
         return {}, {}
 
     targets = set(KERNEL_TARGETS.get(flavor, ()))
+    # Always scan known BR/TQ kernels so mixed / mis-detected dumps still report.
+    for names in KERNEL_TARGETS.values():
+        targets.update(names)
     buckets: dict[str, list[dict[str, float]]] = {name: [] for name in targets}
     phase_buckets: dict[str, list[dict[str, float]]] = {}
 
@@ -447,11 +503,16 @@ def _summarize_kernels(
                 continue
             metrics = {
                 "duration_us": _f(row, "Duration(us)"),
+                "aic_time_us": _f(row, "aicore_time(us)"),
+                "aiv_time_us": _f(row, "aiv_time(us)"),
                 "aic_mac_us": _f(row, "aic_mac_time(us)"),
                 "aic_scalar_us": _f(row, "aic_scalar_time(us)"),
                 "aiv_scalar_us": _f(row, "aiv_scalar_time(us)"),
                 "aiv_vec_us": _f(row, "aiv_vec_time(us)"),
+                "aiv_mte2_us": _f(row, "aiv_mte2_time(us)"),
+                "aiv_mte3_us": _f(row, "aiv_mte3_time(us)"),
                 "cube_util": _f(row, "cube_utilization(%)"),
+                "wait_time_us": _f(row, "Wait Time(us)"),
             }
             buckets[name].append(metrics)
             if name in ATTN_PHASE_KERNELS:
@@ -479,8 +540,9 @@ def summarize_profile(
     skip_warmup: int = 1,
     skip_tail: int = 1,
     decode_q_max: int = 32,
+    latest: bool = False,
 ) -> ProfileSummary:
-    profile_dir = _resolve_profile_dir(profile_dir)
+    profile_dir = _resolve_profile_dir(profile_dir, latest=latest)
     rows = _read_operator_rows(profile_dir)
     flavor = _detect_flavor(rows)
     layer_blocks = _split_attention_layers(rows)
@@ -766,7 +828,8 @@ def _print_compare(
             force=key == "unified_attention_device",
         )
 
-    # Kernels: attn all + phases, then pack
+    # Kernels: same-name first; then role-aligned attn (AttentionPaged <-> FiaPaged)
+    compared_names: set[str] = set()
     for name in attn_names:
         bs = base.kernel_stats.get(name)
         os_ = other.kernel_stats.get(name)
@@ -778,6 +841,7 @@ def _print_compare(
                 col_w=col_w,
                 force=True,
             )
+            compared_names.add(name)
 
         phase_keys = [
             k
@@ -805,6 +869,22 @@ def _print_compare(
                 f"  {phase}",
                 bks.duration.value(stat),
                 oks.duration.value(stat),
+                col_w=col_w,
+                force=True,
+            )
+
+    # Cross-flavor attn role when kernel names differ (vector vs FIA dumps).
+    base_attn = [n for n in _attn_kernel_names(base) if n not in compared_names]
+    other_attn = [n for n in _attn_kernel_names(other) if n not in compared_names]
+    if base_attn and other_attn:
+        bn, on = base_attn[0], other_attn[0]
+        bs = base.kernel_stats.get(bn)
+        os_ = other.kernel_stats.get(on)
+        if bs and os_ and bs.duration.count and os_.duration.count:
+            _print_compare_dur_row(
+                f"attn ({bn} -> {on})",
+                bs.duration.value(stat),
+                os_.duration.value(stat),
                 col_w=col_w,
                 force=True,
             )
@@ -848,14 +928,20 @@ def _to_json(summary: ProfileSummary) -> dict:
             "sum": stats.sum,
         }
 
-    def kernel_dict(stats: KernelStats) -> dict:
+    def kernel_dict(name: str, stats: KernelStats) -> dict:
         return {
             "duration": stats_dict(stats.duration),
+            "aic_time_mean": stats.aic_time_mean,
+            "aiv_time_mean": stats.aiv_time_mean,
             "aic_mac_mean": stats.aic_mac_mean,
             "aic_scalar_mean": stats.aic_scalar_mean,
             "aiv_scalar_mean": stats.aiv_scalar_mean,
             "aiv_vec_mean": stats.aiv_vec_mean,
+            "aiv_mte2_mean": stats.aiv_mte2_mean,
+            "aiv_mte3_mean": stats.aiv_mte3_mean,
             "cube_util_mean": stats.cube_util_mean,
+            "wait_time_mean": stats.wait_time_mean,
+            "role": KERNEL_ROLE.get(name.split("[", 1)[0], "other"),
         }
 
     return {
@@ -867,10 +953,10 @@ def _to_json(summary: ProfileSummary) -> dict:
         "operator_stats": {k: stats_dict(v) for k, v in summary.operator_stats.items()},
         "host_overhead": {k: stats_dict(v) for k, v in summary.host_overhead.items()},
         "kernel_stats": {
-            name: kernel_dict(stats) for name, stats in summary.kernel_stats.items()
+            name: kernel_dict(name, stats) for name, stats in summary.kernel_stats.items()
         },
         "kernel_phase_stats": {
-            name: kernel_dict(stats)
+            name: kernel_dict(name, stats)
             for name, stats in summary.kernel_phase_stats.items()
         },
     }
@@ -883,13 +969,16 @@ def main() -> None:
     parser.add_argument(
         "profile_dirs",
         nargs="+",
-        help="rank0_*_ascend_pt dir, or parent dir containing exactly one such subdir",
+        help="rank0_*_ascend_pt dir, or parent dir (use --latest if multiple)",
     )
     parser.add_argument(
         "--labels",
         nargs="*",
         default=[],
-        help="display labels for each profile dir (default: directory basename)",
+        help=(
+            "display labels for each profile dir (default: directory basename). "
+            "Space-separated, or a single comma-separated string: attn,fia"
+        ),
     )
     parser.add_argument(
         "--skip-warmup",
@@ -902,6 +991,11 @@ def main() -> None:
         type=int,
         default=1,
         help="skip last N unified_attention layers when computing steady-state (default: 1)",
+    )
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="when a parent dir has multiple rank0_* dumps, pick the newest",
     )
     parser.add_argument(
         "--json",
@@ -919,7 +1013,7 @@ def main() -> None:
         action="store_true",
         help=(
             "show host wrappers, host overhead inside attention blocks, "
-            "and HW counters (aic/aiv)"
+            "and HW counters (aic/aiv/mte)"
         ),
     )
     parser.add_argument(
@@ -934,9 +1028,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    labels = args.labels or [Path(p).name for p in args.profile_dirs]
+    if args.labels:
+        labels: list[str] = []
+        for item in args.labels:
+            labels.extend(x.strip() for x in item.split(",") if x.strip())
+    else:
+        labels = [Path(p).name for p in args.profile_dirs]
     if len(labels) != len(args.profile_dirs):
-        raise SystemExit("labels count must match profile_dirs")
+        raise SystemExit(
+            f"labels count ({len(labels)}) must match profile_dirs "
+            f"({len(args.profile_dirs)}); use --labels a b  or  --labels a,b"
+        )
 
     summaries = [
         summarize_profile(
@@ -944,6 +1046,7 @@ def main() -> None:
             skip_warmup=args.skip_warmup,
             skip_tail=args.skip_tail,
             decode_q_max=args.decode_q_max,
+            latest=args.latest,
         )
         for path in args.profile_dirs
     ]
