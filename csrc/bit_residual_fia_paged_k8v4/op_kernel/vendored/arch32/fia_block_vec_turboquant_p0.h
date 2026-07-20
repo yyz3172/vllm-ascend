@@ -361,13 +361,11 @@ template <typename FIAT> __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::I
     Duplicate(softmaxSumDefaultUb, (COMPUTE_T)0.0, SOFTMAX_TMP_BUFFER_SIZE / sizeof(COMPUTE_T));
 
     uint32_t elemCount = constInfo.headDimAlign;
-    // codes + 64B meta staging (base/step or vmin/vstep via DataCopyPad)
+    // codes + 64B meta staging (legacy; Key/Value runs stage in tmpBuff1).
     uint32_t int8Bytes = ((br_dequant::BR_DEQUANT_UB_BYTES + 31U) / 32U) * 32U;
-    // Run-level Key tile: 3×(tile*128) fp32 + tile*128 half (see BrDecodeKeyTile).
-    uint32_t fp32Bytes =
-        ((br_dequant::BR_DECODE_TILE_ELEMS * 3U * static_cast<uint32_t>(sizeof(COMPUTE_T)) + 31U) / 32U) * 32U;
-    uint32_t fp16Bytes =
-        ((br_dequant::BR_DECODE_TILE_ELEMS * static_cast<uint32_t>(sizeof(half)) + 31U) / 32U) * 32U;
+    // 1-row dedicated scratch only. Tile=8 Key decode scratch overlays tmpBuff1 tail.
+    uint32_t fp32Bytes = ((elemCount * 3U * static_cast<uint32_t>(sizeof(COMPUTE_T)) + 31U) / 32U) * 32U;
+    uint32_t fp16Bytes = ((elemCount * static_cast<uint32_t>(sizeof(half)) + 31U) / 32U) * 32U;
     pipe->InitBuffer(dequantInt8Buf_, int8Bytes);
     pipe->InitBuffer(dequantFp32Buf_, fp32Bytes);
     pipe->InitBuffer(dequantFp16Buf_, fp16Bytes);
@@ -1249,16 +1247,27 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint64_t wsStride = static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(headDimAlign);
     uint64_t wsOffset = static_cast<uint64_t>(info.loop % 2) * wsStride;
 
-    // A1: dual-buffer tmpBuff1 so MTE2 load of run r+1 overlaps MTE3 store of run r.
-    // Each half is 16KB; Vec1/Vec2 still own the full 32KB after dequant returns.
+    // A1 dual-buffer staging in tmpBuff1 front; tile=8 decode scratch in the tail
+    // (shared). Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
-    constexpr uint32_t kHalfBytes = kTmp1Bytes / 2U;
     constexpr uint32_t kTileMax = br_dequant::BR_DECODE_TILE_MAX;
     constexpr uint32_t kScratchElems = br_dequant::BR_DECODE_TILE_ELEMS;
-    LocalTensor<float> fp32UbA = dequantFp32Buf_.Get<float>();
-    LocalTensor<float> fp32UbB = dequantFp32Buf_.Get<float>()[kScratchElems];
-    LocalTensor<float> fp32UbC = dequantFp32Buf_.Get<float>()[kScratchElems * 2U];
-    LocalTensor<half> halfScratch = dequantFp16Buf_.Get<half>();
+    constexpr uint32_t kFp32ScratchBytes =
+        kScratchElems * 3U * static_cast<uint32_t>(sizeof(float));
+    constexpr uint32_t kFp16ScratchBytes =
+        kScratchElems * static_cast<uint32_t>(sizeof(half));
+    constexpr uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes; // 14336
+    constexpr uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;              // 18432
+    constexpr uint32_t kHalfBytes = kStageBytes / 2U;                         // 9216
+
+    LocalTensor<float> fp32UbA =
+        tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
+    LocalTensor<float> fp32UbB =
+        tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes + kScratchElems * sizeof(float));
+    LocalTensor<float> fp32UbC = tmpBuff1.GetWithOffset<float>(
+        kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float));
+    LocalTensor<half> halfScratch =
+        tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
     // Scalar meta reads reuse fp32UbA[0] before each Key tile clobbers scratch.
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
