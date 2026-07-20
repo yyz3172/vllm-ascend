@@ -7,9 +7,10 @@
  *
  * P2: batch copy contiguous same-PA-block rows (codes + meta runs), then
  * per-row / tile decode into a staged out tile (see DequantKvImpl).
- * A1: DequantKvImpl dual-buffers tmpBuff1 (2x16KB) so MTE2/MTE3 overlap.
+ * A1: DequantKvImpl dual-buffers tmpBuff1 so MTE2/MTE3 overlap.
  * Key/Value decode: run-level BrDecodeKeyTile / BrDecodeValueTile;
  * tile=8 scratch overlays tmpBuff1 tail (dedicated dequantFp* stays 1-row).
+ * Dual-AIV S2 split: both subcores dequant disjoint [0,half)/[half,s2) WS rows.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
