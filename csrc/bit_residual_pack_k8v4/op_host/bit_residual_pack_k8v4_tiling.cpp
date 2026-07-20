@@ -8,7 +8,19 @@ namespace {
 constexpr uint32_t TQ_PACK_M_ALIGN = 16;
 constexpr uint32_t TQ_PACK_N = 128;
 constexpr uint32_t TQ_PACK_K = 128;
-constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
+// Manual C-bridge workspace, mirroring the kernel-side constants in
+// op_kernel/bit_residual_pack_k8v4_common.h:
+//   TQ_MANUAL_WORKSPACE_BYTE_OFFSET (512 KiB) +
+//   dataCores * (BUFFER_COUNT(2) * ROT_TILE_M(32) * ROT_N(128) * sizeof(float))
+// Each data core ping-pongs two 32x128 FP32 C tiles; the 512 KiB headroom is
+// reserved before the per-core region (kernel indexes manualWorkspace_ + offset).
+constexpr uint64_t TQ_MANUAL_WORKSPACE_BYTE_OFFSET_HOST = 512 * 1024;
+constexpr uint64_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT_HOST = 2;
+constexpr uint64_t TQ_MANUAL_ROT_TILE_M_HOST = 32;
+constexpr uint64_t TQ_MANUAL_ROT_N_HOST = TQ_PACK_N;
+// Fallback for the system/libapi workspace when the platform reports 0, matching
+// the bit_residual_fia_paged_k8v4 convention (kLibApiWorkspaceFallback).
+constexpr size_t TQ_LIBAPI_WORKSPACE_FALLBACK = 16 * 1024 * 1024;
 constexpr uint32_t TQ_PACK_TILING_KEY_DEFAULT = 0;
 constexpr uint32_t TQ_PACK_TILING_KEY_LARGE_CONTIG = 1;
 constexpr int32_t TQ_PACK_MAX_BASEM = 32;
@@ -269,12 +281,31 @@ static ge::graphStatus BitResidualPackK8v4TilingFunc(gert::TilingContext* contex
         OPS_LOG_E(nodeName, "workspace size buffer is null");
         return ge::GRAPH_FAILED;
     }
-    // 512 KiB is reserved before the manual C bridge workspace. Each data
-    // group needs two 32x128 FP32 ping-pong buffers; the system workspace is
-    // sufficient for all current 910B/C MIX 1C2V groups.
-    workspaces[0] = SYSTEM_NEED_WORKSPACE;
+    // Workspace = system/libapi workspace (platform-provided, NOT hardcoded) +
+    // this op's own manual C-bridge region. The libapi size backs SetSysWorkspace
+    // /GetSysWorkSpacePtr; the manual region backs cWorkGm (kernel indexes
+    // rawWorkspace + TQ_MANUAL_WORKSPACE_BYTE_OFFSET). Under-allocating the
+    // manual region makes the AIC Fixpipe / AIV DataCopy walk off the end of
+    // cWorkGm into unallocated GM (the BATCH_M=64 aicore exception).
+    size_t libapiSize = ascendcPlatform.GetLibApiWorkSpaceSize();
+    if (libapiSize == 0) {
+        libapiSize = TQ_LIBAPI_WORKSPACE_FALLBACK;
+    }
+    const uint64_t manualBytesPerCore =
+        TQ_MANUAL_WORKSPACE_BUFFER_COUNT_HOST *
+        (TQ_MANUAL_ROT_TILE_M_HOST * TQ_MANUAL_ROT_N_HOST) * sizeof(float);
+    const uint64_t manualWorkspaceBytes =
+        TQ_MANUAL_WORKSPACE_BYTE_OFFSET_HOST +
+        static_cast<uint64_t>(dataCores) * manualBytesPerCore;
+    workspaces[0] = static_cast<size_t>(libapiSize + manualWorkspaceBytes);
     context->SetBlockDim(blockDim);
     context->SetTilingKey(tilingKey);
+    OPS_LOG_I(nodeName,
+              "BR-pack-k8v4 tiling: nVec=%u vecPerCore=%u heads=%u blockSize=%u "
+              "blocks=%u reqs=%u dataCores=%u libapi=%zu manual=%lu ws=%zu key=%u",
+              nVec, vecPerCore, numHeads, blockSize, numBlocks, numReqs,
+              dataCores, libapiSize, static_cast<unsigned long>(manualWorkspaceBytes),
+              workspaces[0], tilingKey);
     return ge::GRAPH_SUCCESS;
 }
 
