@@ -12,10 +12,11 @@
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh build
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh run --kv=1000
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1000 --skip-build
-#   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1000 --source
+#   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=2000 --source
+#   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=2000 --workload=prefill --source
 #   python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --explain
 #   python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --latest \\
-#       tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/op
+#       tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/decode/op
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,11 +36,13 @@ LAUNCH_COUNT="${LAUNCH_COUNT:-1}"
 WARM_UP="${WARM_UP:-0}"
 OP_AIC_METRICS="${OP_AIC_METRICS:-PipeUtilization,ArithmeticUtilization,Memory,MemoryUB,ResourceConflictRatio}"
 KV_SEQ_LEN="${KV_SEQ_LEN:-1000}"
+BR_FIA_WORKLOAD="${BR_FIA_WORKLOAD:-decode}"
+Q_TOKENS_PER_BATCH="${Q_TOKENS_PER_BATCH:-}"
 ASCEND_DEVICE_ID="${ASCEND_DEVICE_ID:-1}"
 OP_DEBUG_CONFIG="${OP_DEBUG_CONFIG:-}"
 
 usage() {
-    sed -n '2,18p' "$0"
+    sed -n '2,20p' "$0"
     exit 1
 }
 
@@ -54,6 +57,8 @@ for arg in "$@"; do
         --launch-count=*) LAUNCH_COUNT="${arg#*=}" ;;
         --warm-up=*) WARM_UP="${arg#*=}" ;;
         --kv=*) KV_SEQ_LEN="${arg#*=}" ;;
+        --workload=*) BR_FIA_WORKLOAD="${arg#*=}" ;;
+        --q-per-batch=*) Q_TOKENS_PER_BATCH="${arg#*=}" ;;
         --device=*) ASCEND_DEVICE_ID="${arg#*=}" ;;
         --source) WANT_SOURCE=true ;;
         --no-analyze) WANT_ANALYZE=false ;;
@@ -66,6 +71,11 @@ for arg in "$@"; do
     esac
 done
 
+if [[ "${BR_FIA_WORKLOAD}" != "decode" && "${BR_FIA_WORKLOAD}" != "prefill" ]]; then
+    echo "Error: --workload must be decode or prefill (got: ${BR_FIA_WORKLOAD})"
+    exit 1
+fi
+
 if [[ "${WANT_SOURCE}" == "true" ]]; then
     if [[ "${OP_AIC_METRICS}" != *"Source"* ]]; then
         OP_AIC_METRICS="${OP_AIC_METRICS},Source"
@@ -75,7 +85,7 @@ if [[ "${WANT_SOURCE}" == "true" ]]; then
     fi
 fi
 
-PROF_ROOT="${PROF_ROOT}/kv${KV_SEQ_LEN}"
+PROF_ROOT="${PROF_ROOT}/kv${KV_SEQ_LEN}/${BR_FIA_WORKLOAD}"
 
 source_cann_env() {
     if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -105,11 +115,18 @@ setup_runtime_env() {
     export LD_LIBRARY_PATH="${CUSTOM_OPP_PATH}/op_api/lib:${LD_LIBRARY_PATH:-}"
     export ASCEND_DEVICE_ID
     export KV_SEQ_LEN
+    export BR_FIA_WORKLOAD
+    if [[ -n "${Q_TOKENS_PER_BATCH}" ]]; then
+        export Q_TOKENS_PER_BATCH
+    fi
     if [[ -f "${CUSTOM_OPP_PATH}/bin/set_env.bash" ]]; then
         # shellcheck disable=SC1090
         source "${CUSTOM_OPP_PATH}/bin/set_env.bash"
     fi
-    echo "KV_SEQ_LEN=${KV_SEQ_LEN} ASCEND_DEVICE_ID=${ASCEND_DEVICE_ID}"
+    echo "KV_SEQ_LEN=${KV_SEQ_LEN} BR_FIA_WORKLOAD=${BR_FIA_WORKLOAD} ASCEND_DEVICE_ID=${ASCEND_DEVICE_ID}"
+    if [[ -n "${Q_TOKENS_PER_BATCH:-}" ]]; then
+        echo "Q_TOKENS_PER_BATCH=${Q_TOKENS_PER_BATCH}"
+    fi
     echo "ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH}"
 }
 
@@ -123,7 +140,11 @@ export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}"
 export LD_LIBRARY_PATH="${CUSTOM_OPP_PATH}/op_api/lib:\${LD_LIBRARY_PATH}"
 export ASCEND_DEVICE_ID="${ASCEND_DEVICE_ID}"
 export KV_SEQ_LEN="${KV_SEQ_LEN}"
+export BR_FIA_WORKLOAD="${BR_FIA_WORKLOAD}"
 EOF
+    if [[ -n "${Q_TOKENS_PER_BATCH}" ]]; then
+        printf 'export Q_TOKENS_PER_BATCH=%q\n' "${Q_TOKENS_PER_BATCH}" >> "${run_wrapper}"
+    fi
     for v in Q_PATH PI_PATH GOLDEN_OUT_PATH WS_DUMP_PATH; do
         if [[ -n "${!v:-}" ]]; then
             printf 'export %s=%q\n' "${v}" "${!v}" >> "${run_wrapper}"
@@ -255,6 +276,7 @@ do_msprof_op() {
     cd "${out_dir}"
     echo "Output     : ${out_dir}"
     echo "KV_SEQ_LEN : ${KV_SEQ_LEN}"
+    echo "Workload   : ${BR_FIA_WORKLOAD}"
     echo "Kernel     : ${KERNEL_NAME}"
     echo "aic-metrics: ${OP_AIC_METRICS}"
     echo "OP_DEBUG   : ${OP_DEBUG_CONFIG:-<none>}"
@@ -271,7 +293,7 @@ do_msprof_op() {
     fi
 }
 
-echo "=== BitResidualFiaPagedK8v4 mode=${PROF_MODE} kv=${KV_SEQ_LEN} ==="
+echo "=== BitResidualFiaPagedK8v4 mode=${PROF_MODE} kv=${KV_SEQ_LEN} workload=${BR_FIA_WORKLOAD} ==="
 case "${PROF_MODE}" in
     build) do_build ;;
     run) do_run ;;
