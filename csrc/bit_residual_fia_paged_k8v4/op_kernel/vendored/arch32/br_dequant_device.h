@@ -8,7 +8,8 @@
  * P2: batch copy contiguous same-PA-block rows (codes + meta runs), then
  * per-row / tile decode into a staged out tile (see DequantKvImpl).
  * A1: DequantKvImpl dual-buffers tmpBuff1 (2x16KB) so MTE2/MTE3 overlap.
- * Key decode: run-level BrDecodeKeyTile (And/ShiftRight, mask once per tile).
+ * Key decode: run-level BrDecodeKeyTile (And/ShiftRight, mask once per tile);
+ * tile=8 scratch overlays tmpBuff1 tail (dedicated dequantFp* stays 1-row).
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -92,8 +93,9 @@ __aicore__ inline void BrCopyMetaRun(GlobalTensor<uint8_t> srcGm, LocalTensor<ui
 
 static constexpr uint32_t BR_S2_SUB_MAX = 64U;
 // Run-level Key decode tile: mask Duplicate amortized across this many rows.
-// Keep small (4) to stay within AIV UB budget alongside TQue pingpong.
-static constexpr uint32_t BR_DECODE_TILE_MAX = 4U;
+// tile=8 scratch (~14KB) overlays tmpBuff1 tail (see DequantKvImpl); dedicated
+// dequantFp* stays 1-row so total AIV UB remains within ~192KB.
+static constexpr uint32_t BR_DECODE_TILE_MAX = 8U;
 static constexpr uint32_t BR_DECODE_TILE_ELEMS = BR_DECODE_TILE_MAX * BR_HEAD_SIZE;
 
 __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
