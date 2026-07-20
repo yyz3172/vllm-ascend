@@ -1,13 +1,14 @@
 /**
  * BitResidual K8/V4 AIV dequant helpers (head_size=128).
  *
- * AscendC on 910B does not support Cast<int16, uint8>; widen via half/float.
+ * AscendC on 910B does not support Cast<int16, uint8>; widen via half then int16.
  * Metadata (base/step/vmin/vstep) must be brought into UB via DataCopyPad —
  * raw scalar GM half reads are unreliable on AIV.
  *
  * P2: batch copy contiguous same-PA-block rows (codes + meta runs), then
- * per-row decode into a staged out tile (see DequantKvImpl).
+ * per-row / tile decode into a staged out tile (see DequantKvImpl).
  * A1: DequantKvImpl dual-buffers tmpBuff1 (2x16KB) so MTE2/MTE3 overlap.
+ * Key decode: run-level BrDecodeKeyTile (And/ShiftRight, mask once per tile).
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -90,15 +91,93 @@ __aicore__ inline void BrCopyMetaRun(GlobalTensor<uint8_t> srcGm, LocalTensor<ui
 }
 
 static constexpr uint32_t BR_S2_SUB_MAX = 64U;
+// Run-level Key decode tile: mask Duplicate amortized across this many rows.
+// Keep small (4) to stay within AIV UB budget alongside TQue pingpong.
+static constexpr uint32_t BR_DECODE_TILE_MAX = 4U;
+static constexpr uint32_t BR_DECODE_TILE_ELEMS = BR_DECODE_TILE_MAX * BR_HEAD_SIZE;
 
 __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
 {
     return (x + 31U) & ~31U;
 }
 
-// Key: y = sign * (base + q7 * step), code = q7 | (sign << 7)
-// scratchA/scratchB/outFp32 each hold headDim floats.
-// halfScratch: temp for uint8→half widen (AscendC lacks uint8→float cast).
+// Key tile: y = sign * (base + q7 * step), code = q7 | (sign << 7).
+// codesUb: contiguous numRows * headDim uint8.
+// halfScratch / scratchA/B/C: each numRows * headDim elements.
+// outUb: numRows * headDimAlign (CAST writes headDim elems per row).
+// bases/steps: length numRows.
+template <typename OutT>
+__aicore__ inline void BrDecodeKeyTile(
+    LocalTensor<uint8_t> codesUb,
+    LocalTensor<half> halfScratch,
+    LocalTensor<float> scratchA,
+    LocalTensor<float> scratchB,
+    LocalTensor<float> scratchC,
+    LocalTensor<OutT> outUb,
+    const float *bases,
+    const float *steps,
+    uint32_t numRows,
+    uint32_t headDim,
+    uint32_t headDimAlign)
+{
+    const uint32_t N = numRows * headDim;
+
+    Cast(halfScratch, codesUb, RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+    auto codeI16 = scratchA.template ReinterpretCast<int16_t>();
+    Cast(codeI16, halfScratch, RoundMode::CAST_RINT, N);
+    PipeBarrier<PIPE_V>();
+
+    auto codeU16 = codeI16.template ReinterpretCast<uint16_t>();
+    auto signStorage = scratchC.template ReinterpretCast<int16_t>();
+    auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
+
+    // One mask build for the whole tile.
+    Duplicate(signStorageU16, static_cast<uint16_t>(0x80), N);
+    PipeBarrier<PIPE_V>();
+    And(signStorageU16, codeU16, signStorageU16, N);
+    PipeBarrier<PIPE_V>();
+
+    auto q7MaskU16 = halfScratch.template ReinterpretCast<uint16_t>();
+    Duplicate(q7MaskU16, static_cast<uint16_t>(0x7f), N);
+    PipeBarrier<PIPE_V>();
+    And(codeU16, codeU16, q7MaskU16, N);
+    PipeBarrier<PIPE_V>();
+
+    ShiftRight(signStorage, signStorage, static_cast<int16_t>(7), N);
+    PipeBarrier<PIPE_V>();
+    Cast(scratchB, signStorage, RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+    Muls(scratchB, scratchB, -2.0f, N);
+    PipeBarrier<PIPE_V>();
+    Adds(scratchB, scratchB, 1.0f, N);
+    PipeBarrier<PIPE_V>();
+
+    // q7 → scratchC; err = base + q7*step → scratchA (overwrites codeI16).
+    Cast(scratchC, codeI16, RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+    for (uint32_t row = 0U; row < numRows; ++row) {
+        const uint32_t off = row * headDim;
+        Duplicate(scratchA[off], bases[row], headDim);
+        PipeBarrier<PIPE_V>();
+        Axpy(scratchA[off], scratchC[off], steps[row], headDim);
+        PipeBarrier<PIPE_V>();
+    }
+
+    Mul(scratchA, scratchA, scratchB, N);
+    PipeBarrier<PIPE_V>();
+    if (headDimAlign == headDim) {
+        Cast(outUb, scratchA, RoundMode::CAST_RINT, N);
+        PipeBarrier<PIPE_V>();
+    } else {
+        for (uint32_t row = 0U; row < numRows; ++row) {
+            Cast(outUb[row * headDimAlign], scratchA[row * headDim], RoundMode::CAST_RINT, headDim);
+            PipeBarrier<PIPE_V>();
+        }
+    }
+}
+
+// Single-row wrapper.
 template <typename OutT>
 __aicore__ inline void BrDecodeKeyRow(
     LocalTensor<uint8_t> codeUb,
@@ -111,46 +190,12 @@ __aicore__ inline void BrDecodeKeyRow(
     float step,
     uint32_t headDim)
 {
-    const uint32_t n = headDim;
-
-    // uint8 [0,255] → half → float (supported cast chain).
-    Cast(halfScratch, codeUb, RoundMode::CAST_NONE, n);
-    PipeBarrier<PIPE_V>();
-    Cast(scratchA, halfScratch, RoundMode::CAST_NONE, n);  // code_f
-    PipeBarrier<PIPE_V>();
-
-    // sign_bit = floor(code / 128) ∈ {0,1}
-    Muls(scratchB, scratchA, 1.0f / 128.0f, n);
-    PipeBarrier<PIPE_V>();
-    auto signI16 = outFp32.template ReinterpretCast<int16_t>();
-    Cast(signI16, scratchB, RoundMode::CAST_FLOOR, n);
-    PipeBarrier<PIPE_V>();
-    Cast(scratchB, signI16, RoundMode::CAST_NONE, n);  // sign_f
-    PipeBarrier<PIPE_V>();
-
-    // q7 = code - sign * 128
-    Muls(outFp32, scratchB, 128.0f, n);
-    PipeBarrier<PIPE_V>();
-    Sub(outFp32, scratchA, outFp32, n);  // q7_f
-    PipeBarrier<PIPE_V>();
-
-    // sign_val = 1 - 2 * sign
-    Muls(scratchB, scratchB, -2.0f, n);
-    PipeBarrier<PIPE_V>();
-    Adds(scratchB, scratchB, 1.0f, n);
-    PipeBarrier<PIPE_V>();
-
-    // err = base + q7 * step
-    Muls(outFp32, outFp32, step, n);
-    PipeBarrier<PIPE_V>();
-    Adds(outFp32, outFp32, base, n);
-    PipeBarrier<PIPE_V>();
-
-    // decoded = err * sign_val
-    Mul(outFp32, outFp32, scratchB, n);
-    PipeBarrier<PIPE_V>();
-    Cast(outUb, outFp32, RoundMode::CAST_RINT, n);
-    PipeBarrier<PIPE_V>();
+    float bases[1];
+    float steps[1];
+    bases[0] = base;
+    steps[0] = step;
+    BrDecodeKeyTile(codeUb, halfScratch, scratchA, scratchB, outFp32, outUb, bases, steps, 1U, headDim,
+        headDim);
 }
 
 // Value: V = vmin + idx4 * vstep (nibble-packed codes)

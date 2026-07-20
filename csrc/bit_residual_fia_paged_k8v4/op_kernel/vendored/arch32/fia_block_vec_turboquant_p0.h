@@ -363,8 +363,11 @@ template <typename FIAT> __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::I
     uint32_t elemCount = constInfo.headDimAlign;
     // codes + 64B meta staging (base/step or vmin/vstep via DataCopyPad)
     uint32_t int8Bytes = ((br_dequant::BR_DEQUANT_UB_BYTES + 31U) / 32U) * 32U;
-    uint32_t fp32Bytes = ((elemCount * 3U * static_cast<uint32_t>(sizeof(COMPUTE_T)) + 31U) / 32U) * 32U;
-    uint32_t fp16Bytes = ((elemCount * static_cast<uint32_t>(sizeof(half)) + 31U) / 32U) * 32U;
+    // Run-level Key tile: 3×(tile*128) fp32 + tile*128 half (see BrDecodeKeyTile).
+    uint32_t fp32Bytes =
+        ((br_dequant::BR_DECODE_TILE_ELEMS * 3U * static_cast<uint32_t>(sizeof(COMPUTE_T)) + 31U) / 32U) * 32U;
+    uint32_t fp16Bytes =
+        ((br_dequant::BR_DECODE_TILE_ELEMS * static_cast<uint32_t>(sizeof(half)) + 31U) / 32U) * 32U;
     pipe->InitBuffer(dequantInt8Buf_, int8Bytes);
     pipe->InitBuffer(dequantFp32Buf_, fp32Bytes);
     pipe->InitBuffer(dequantFp16Buf_, fp16Bytes);
@@ -1250,10 +1253,13 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     // Each half is 16KB; Vec1/Vec2 still own the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
     constexpr uint32_t kHalfBytes = kTmp1Bytes / 2U;
+    constexpr uint32_t kTileMax = br_dequant::BR_DECODE_TILE_MAX;
+    constexpr uint32_t kScratchElems = br_dequant::BR_DECODE_TILE_ELEMS;
     LocalTensor<float> fp32UbA = dequantFp32Buf_.Get<float>();
-    LocalTensor<float> fp32UbB = dequantFp32Buf_.Get<float>()[headDimAlign];
-    LocalTensor<float> outFp32 = dequantFp32Buf_.Get<float>()[headDimAlign * 2U];
+    LocalTensor<float> fp32UbB = dequantFp32Buf_.Get<float>()[kScratchElems];
+    LocalTensor<float> fp32UbC = dequantFp32Buf_.Get<float>()[kScratchElems * 2U];
     LocalTensor<half> halfScratch = dequantFp16Buf_.Get<half>();
+    // Scalar meta reads reuse fp32UbA[0] before each Key tile clobbers scratch.
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
     GlobalTensor<WS_T> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
@@ -1343,22 +1349,34 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         LocalTensor<WS_T> outBatch =
             batchUb[outOff].template ReinterpretCast<WS_T>();
 
-        for (uint32_t j = 0U; j < n; ++j) {
-            LocalTensor<uint8_t> codeRow = batchUb[j * codeRowBytes];
-            LocalTensor<WS_T> outRow = outBatch[j * headDimAlign];
-            if (isKey) {
-                float base = br_dequant::BrReadMeta16FromUb<Q_T>(
-                    batchUb, fp32UbA, meta0Off + j * kMetaSlot);
-                float step = br_dequant::BrReadMeta16FromUb<Q_T>(
-                    batchUb, fp32UbA, meta1Off + j * kMetaSlot);
-                br_dequant::BrDecodeKeyRow(codeRow, halfScratch, fp32UbA, fp32UbB, outFp32, outRow,
-                                           base, step, headDim);
-            } else {
+        if (isKey) {
+            for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
+                uint32_t nb = n - j0;
+                if (nb > kTileMax) {
+                    nb = kTileMax;
+                }
+                float bases[kTileMax];
+                float steps[kTileMax];
+                for (uint32_t jj = 0U; jj < nb; ++jj) {
+                    const uint32_t j = j0 + jj;
+                    bases[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
+                        batchUb, fp32UbA, meta0Off + j * kMetaSlot);
+                    steps[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
+                        batchUb, fp32UbA, meta1Off + j * kMetaSlot);
+                }
+                br_dequant::BrDecodeKeyTile(
+                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
+                    outBatch[j0 * headDimAlign], bases, steps, nb, headDim, headDimAlign);
+            }
+        } else {
+            for (uint32_t j = 0U; j < n; ++j) {
+                LocalTensor<uint8_t> codeRow = batchUb[j * codeRowBytes];
+                LocalTensor<WS_T> outRow = outBatch[j * headDimAlign];
                 float vmin = br_dequant::BrReadMeta16FromUb<Q_T>(
                     batchUb, fp32UbA, meta0Off + j * kMetaSlot);
                 float vstep = br_dequant::BrReadMeta16FromUb<Q_T>(
                     batchUb, fp32UbA, meta1Off + j * kMetaSlot);
-                br_dequant::BrDecodeValueRow(codeRow, halfScratch, fp32UbA, outFp32, outRow,
+                br_dequant::BrDecodeValueRow(codeRow, halfScratch, fp32UbA, fp32UbC, outRow,
                                              vmin, vstep, headDim);
             }
         }
