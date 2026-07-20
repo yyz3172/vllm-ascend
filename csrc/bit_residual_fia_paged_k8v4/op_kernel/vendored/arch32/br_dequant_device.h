@@ -8,7 +8,7 @@
  * P2: batch copy contiguous same-PA-block rows (codes + meta runs), then
  * per-row / tile decode into a staged out tile (see DequantKvImpl).
  * A1: DequantKvImpl dual-buffers tmpBuff1 (2x16KB) so MTE2/MTE3 overlap.
- * Key decode: run-level BrDecodeKeyTile (And/ShiftRight, mask once per tile);
+ * Key/Value decode: run-level BrDecodeKeyTile / BrDecodeValueTile;
  * tile=8 scratch overlays tmpBuff1 tail (dedicated dequantFp* stays 1-row).
  */
 #ifndef BR_DEQUANT_DEVICE_H
@@ -200,7 +200,51 @@ __aicore__ inline void BrDecodeKeyRow(
         headDim);
 }
 
-// Value: V = vmin + idx4 * vstep (nibble-packed codes)
+// Value tile: y = vmin + idx4 * vstep (nibble-packed codes).
+// nibbleUb: contiguous numRows * (headDim/2) uint8 (int4 packed).
+// halfScratch / scratchA/B: each numRows * headDim elements.
+template <typename OutT>
+__aicore__ inline void BrDecodeValueTile(
+    LocalTensor<uint8_t> nibbleUb,
+    LocalTensor<half> halfScratch,
+    LocalTensor<float> scratchA,
+    LocalTensor<float> scratchB,
+    LocalTensor<OutT> outUb,
+    const float *vmins,
+    const float *vsteps,
+    uint32_t numRows,
+    uint32_t headDim,
+    uint32_t headDimAlign)
+{
+    const uint32_t N = numRows * headDim;
+
+    Cast(halfScratch, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+    Adds(halfScratch, halfScratch, static_cast<half>(8.0f), N);
+    PipeBarrier<PIPE_V>();
+    Cast(scratchA, halfScratch, RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+
+    for (uint32_t row = 0U; row < numRows; ++row) {
+        const uint32_t off = row * headDim;
+        Duplicate(scratchB[off], vmins[row], headDim);
+        PipeBarrier<PIPE_V>();
+        Axpy(scratchB[off], scratchA[off], vsteps[row], headDim);
+        PipeBarrier<PIPE_V>();
+    }
+
+    if (headDimAlign == headDim) {
+        Cast(outUb, scratchB, RoundMode::CAST_RINT, N);
+        PipeBarrier<PIPE_V>();
+    } else {
+        for (uint32_t row = 0U; row < numRows; ++row) {
+            Cast(outUb[row * headDimAlign], scratchB[row * headDim], RoundMode::CAST_RINT, headDim);
+            PipeBarrier<PIPE_V>();
+        }
+    }
+}
+
+// Single-row wrapper.
 template <typename OutT>
 __aicore__ inline void BrDecodeValueRow(
     LocalTensor<uint8_t> nibbleUb,
@@ -212,19 +256,12 @@ __aicore__ inline void BrDecodeValueRow(
     float vstep,
     uint32_t headDim)
 {
-    // int4 → half unpack (same pattern as bit_residual_attention_paged_k8v4).
-    Cast(halfScratch, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, headDim);
-    PipeBarrier<PIPE_V>();
-    Adds(halfScratch, halfScratch, static_cast<half>(8.0f), headDim);
-    PipeBarrier<PIPE_V>();
-    Cast(idx4F32, halfScratch, RoundMode::CAST_NONE, headDim);
-    PipeBarrier<PIPE_V>();
-    Muls(outFp32, idx4F32, vstep, headDim);
-    PipeBarrier<PIPE_V>();
-    Adds(outFp32, outFp32, vmin, headDim);
-    PipeBarrier<PIPE_V>();
-    Cast(outUb, outFp32, RoundMode::CAST_RINT, headDim);
-    PipeBarrier<PIPE_V>();
+    float vmins[1];
+    float vsteps[1];
+    vmins[0] = vmin;
+    vsteps[0] = vstep;
+    BrDecodeValueTile(nibbleUb, halfScratch, idx4F32, outFp32, outUb, vmins, vsteps, 1U, headDim,
+        headDim);
 }
 
 }  // namespace br_dequant
