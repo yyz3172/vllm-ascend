@@ -1,14 +1,18 @@
 /**
  * C++ perf/correctness harness for BitResidualFiaPagedK8v4.
  *
- * Same workload scale as tools/turboquant_fia_mse8bit/test_aclnn_tq_fia_mse8bit.cpp:
- *   B=16, T=16 (1 Q token / batch), H=16, NKV=8, D=128, BS=128,
- *   blockNum=120, maxBlockPerSeq=16, kvSeq=1000 (override via KV_SEQ_LEN),
- *   sparseMode=3 + 2048x2048 compress mask.
+ * Workloads (env BR_FIA_WORKLOAD):
+ *   decode  (default): B=16, T=16 (1 Q / seq) — TQ FIA L6 scale
+ *   prefill: B=16, T=B*Q_TOKENS_PER_BATCH (default 15 → T=240 ≈ serving Q=241)
  *
- * Cache layout differs (uint8 BR pack [num_blocks, nkv, packed_bytes]).
+ * Shared: H=16, NKV=8, D=128, BS=128, blockNum=120, maxBlockPerSeq=16,
+ *   kvSeq=1000 (override via KV_SEQ_LEN), sparseMode=3 + 2048x2048 compress mask.
+ *
+ * Cache layout: uint8 BR pack [num_blocks, nkv, packed_bytes].
  *
  * Env:
+ *   BR_FIA_WORKLOAD=decode|prefill
+ *   Q_TOKENS_PER_BATCH (prefill only, default 15)
  *   ASCEND_DEVICE_ID, KV_SEQ_LEN, ASCEND_CUSTOM_OPP_PATH
  *   Q_PATH, PI_PATH (optional fp16 bins; PI used for both rotation_key/value)
  *   GOLDEN_OUT_PATH, WS_DUMP_PATH
@@ -42,9 +46,8 @@ namespace {
         fflush(stdout);                  \
     } while (0)
 
-// Match TQ FIA L6 scale exactly (decode-style multi-batch long KV).
+// Geometry shared by decode / prefill (Qwen3-0.6B-like GQA).
 constexpr int64_t kBatch = 16;
-constexpr int64_t kTotalTokens = 16;
 constexpr int64_t kNumHeads = 16;
 constexpr int64_t kNumKvHeads = 8;
 constexpr int64_t kHeadDim = 128;
@@ -53,6 +56,7 @@ constexpr int64_t kBlockSize = 128;
 constexpr int64_t kMaxBlockNumPerSeq = 16;
 constexpr int64_t kKvSeqLenPerBatch = 1000;
 constexpr int64_t kMaskSize = 2048;
+constexpr int64_t kDefaultPrefillQPerBatch = 15;  // T=240 ≈ serving chunked Q=241
 constexpr uint32_t kBrBlockRows = 16;
 constexpr uint32_t kBrKeyTileBytes = 2112;  // 16 rows
 constexpr uint32_t kBrValTileBytes = 1088;
@@ -62,6 +66,33 @@ constexpr int64_t kValPackedBytes =
     static_cast<int64_t>((kBlockSize / kBrBlockRows) * kBrValTileBytes);  // 8704
 constexpr uint16_t kFp16Zero = 0x0000;
 constexpr uint16_t kFp16One = 0x3C00;
+
+struct WorkloadConfig {
+    const char *name;
+    int64_t qTokensPerBatch;
+    int64_t totalTokens;
+};
+
+WorkloadConfig ResolveWorkload()
+{
+    const char *mode = getenv("BR_FIA_WORKLOAD");
+    if (mode == nullptr || mode[0] == '\0' || strcmp(mode, "decode") == 0) {
+        return WorkloadConfig{"decode", 1, kBatch};
+    }
+    if (strcmp(mode, "prefill") != 0) {
+        LOG_PRINT("[workload] WARN: unknown BR_FIA_WORKLOAD=%s, using decode\n", mode);
+        return WorkloadConfig{"decode", 1, kBatch};
+    }
+    int64_t qPer = kDefaultPrefillQPerBatch;
+    if (const char *env = getenv("Q_TOKENS_PER_BATCH")) {
+        char *end = nullptr;
+        long long v = strtoll(env, &end, 10);
+        if (end != env && v > 0) {
+            qPer = static_cast<int64_t>(v);
+        }
+    }
+    return WorkloadConfig{"prefill", qPer, kBatch * qPer};
+}
 
 #ifndef VLLM_ASCEND_CUSTOM_OPP_PATH
 #define VLLM_ASCEND_CUSTOM_OPP_PATH "vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
@@ -338,6 +369,9 @@ int main()
     setenv("ASCEND_SLOG_PRINT_TO_STDOUT", "1", 1);
     setenv("ASCEND_GLOBAL_LOG_LEVEL", "3", 1);
 
+    const WorkloadConfig wl = ResolveWorkload();
+    const int64_t kvSeqLen = ResolveKvSeqLenPerBatch();
+
     int32_t deviceId = 0;
     if (const char *devEnv = getenv("ASCEND_DEVICE_ID")) {
         deviceId = static_cast<int32_t>(strtol(devEnv, nullptr, 10));
@@ -349,8 +383,8 @@ int main()
         return ret;
     }
 
-    vector<int64_t> queryShape = {kTotalTokens, kNumHeads, kHeadDim};
-    vector<int64_t> outShape = {kTotalTokens, kNumHeads, kHeadDim};
+    vector<int64_t> queryShape = {wl.totalTokens, kNumHeads, kHeadDim};
+    vector<int64_t> outShape = {wl.totalTokens, kNumHeads, kHeadDim};
     vector<int64_t> keyCacheShape = {kBlockNum, kNumKvHeads, kKeyPackedBytes};
     vector<int64_t> valueCacheShape = {kBlockNum, kNumKvHeads, kValPackedBytes};
     vector<int64_t> rotShape = {kHeadDim, kHeadDim};
@@ -381,13 +415,13 @@ int main()
     vector<uint8_t> keyHostData = BuildKeyCacheHost();
     vector<uint8_t> valueHostData = BuildValueCacheHost();
     vector<uint16_t> rotHostData = LoadPiOrIdentity();
-    // Match TQ L6: all-zero compress mask (q=1 → sparse causal is a no-op vs full).
+    // Compress mask: zeros keep sparseMode=3 path active; for perf we care about
+    // dequant + mm1/mm2 traffic more than exact causal masking.
     vector<int8_t> attenMaskHostData(static_cast<size_t>(GetShapeSize(attenMaskShape)), 0);
     vector<int32_t> blockTableHostData = BuildBlockTable(kBatch, kMaxBlockNumPerSeq);
     vector<uint16_t> outHostData(static_cast<size_t>(GetShapeSize(outShape)), kFp16Zero);
 
-    vector<int64_t> actualSeqQ = BuildCumulativeActualSeqLengths(kBatch, 1);
-    const int64_t kvSeqLen = ResolveKvSeqLenPerBatch();
+    vector<int64_t> actualSeqQ = BuildCumulativeActualSeqLengths(kBatch, wl.qTokensPerBatch);
     vector<int64_t> actualSeqKv(static_cast<size_t>(kBatch), kvSeqLen);
 
     ret = CreateAclTensor(queryHostData, queryShape, &queryDeviceAddr, aclDataType::ACL_FLOAT16, &queryTensor);
@@ -421,15 +455,22 @@ int main()
     constexpr int64_t kNextTokens = 2147483647;
     constexpr int64_t kSparseMode = 3;
     LOG_PRINT(
-        "BitResidualFiaPagedK8v4 TND+PA: rot=[%ld,%ld] keyPack=[%ld,%ld,%ld] "
-        "valPack=[%ld,%ld,%ld] kvSeq=%ld sparseMode=%ld\n",
-        kHeadDim, kHeadDim, kBlockNum, kNumKvHeads, kKeyPackedBytes, kBlockNum, kNumKvHeads, kValPackedBytes,
-        kvSeqLen, kSparseMode);
+        "BitResidualFiaPagedK8v4 TND+PA workload=%s: Q=%ld (q/seq=%ld) B=%ld "
+        "rot=[%ld,%ld] keyPack=[%ld,%ld,%ld] valPack=[%ld,%ld,%ld] kvSeq=%ld sparseMode=%ld\n",
+        wl.name, wl.totalTokens, wl.qTokensPerBatch, kBatch, kHeadDim, kHeadDim, kBlockNum, kNumKvHeads,
+        kKeyPackedBytes, kBlockNum, kNumKvHeads, kValPackedBytes, kvSeqLen, kSparseMode);
     if (kvSeqLen > 512 && kBatch >= 8) {
         LOG_PRINT(
             "[FD] Workload B=%ld kv=%ld > s2Base=512: expect tiling key=1 when "
             "SplitCore records numOfFdHead>0 (aligned with TQ FIA L6).\n",
             static_cast<long>(kBatch), static_cast<long>(kvSeqLen));
+    }
+    if (strcmp(wl.name, "prefill") == 0) {
+        const int64_t gS1 = wl.qTokensPerBatch * (kNumHeads / kNumKvHeads);
+        LOG_PRINT(
+            "[prefill] gSize*S1/seq=%ld mBase=512 → M-tiles/seq=%ld (serving Q=241 "
+            "proxy for mm1/mm2 workspace MTE2)\n",
+            static_cast<long>(gS1), static_cast<long>((gS1 + 511) / 512));
     }
 
     uint64_t workspaceSize = 0;

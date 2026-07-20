@@ -55,9 +55,15 @@ bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh run --kv=1000
 
 # msprof：时延 + Pipe/Arithmetic（指令开销）
 bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1000 --device=1 --skip-build
+
+# Decode / Prefill + Source（ccec_g；勿与 --skip-build 同用首次）
+bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof \
+  --kv=2000 --workload=decode --source
+bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof \
+  --kv=2000 --workload=prefill --source   # T=240 (16×15), ≈ serving Q=241
 ```
 
-输出目录：`tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/op/OPPROF_*`  
+输出目录：`tools/.../prof_output/tnd_pa_bit_residual/kv<KV>/<decode|prefill>/op/OPPROF_*`  
 对照 TQ：`tools/turboquant_fia_mse8bit/prof_tnd_pa_turboquant.sh msprof --kv=1000`
 
 ### 解读指标（固化脚本）
@@ -65,7 +71,7 @@ bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1
 ```bash
 # 最新 OPPROF，或显式传目录
 python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --latest \
-  tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/op
+  tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/decode/op
 
 # 指标含义全文
 python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --explain
