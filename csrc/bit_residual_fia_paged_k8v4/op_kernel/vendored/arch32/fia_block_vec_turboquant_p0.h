@@ -1246,8 +1246,10 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint64_t wsStride = static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(headDimAlign);
     uint64_t wsOffset = static_cast<uint64_t>(info.loop % 2) * wsStride;
 
-    // P2: time-multiplex tmpBuff1 for batched codes/meta/out (Vec1/Vec2 run later).
-    LocalTensor<uint8_t> batchUb = tmpBuff1.Get<uint8_t>();
+    // A1: dual-buffer tmpBuff1 so MTE2 load of run r+1 overlaps MTE3 store of run r.
+    // Each half is 16KB; Vec1/Vec2 still own the full 32KB after dequant returns.
+    constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
+    constexpr uint32_t kHalfBytes = kTmp1Bytes / 2U;
     LocalTensor<float> fp32UbA = dequantFp32Buf_.Get<float>();
     LocalTensor<float> fp32UbB = dequantFp32Buf_.Get<float>()[headDimAlign];
     LocalTensor<float> outFp32 = dequantFp32Buf_.Get<float>()[headDimAlign * 2U];
@@ -1266,13 +1268,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     const uint32_t codeRowBytes =
         isKey ? br_pack::BR_KEY_CODE_BYTES : br_pack::BR_VAL_CODE_BYTES;
     const uint32_t outRowBytes = headDimAlign * static_cast<uint32_t>(sizeof(WS_T));
-    // codes[n] + meta0[n*32] + meta1[n*32] + outs[n] <= 32KB
-    constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
     constexpr uint32_t kMetaSlot = br_dequant::BR_META_SLOT_BYTES;
     uint32_t maxSub = br_dequant::BR_S2_SUB_MAX;
     {
         uint32_t perRow = codeRowBytes + outRowBytes + 2U * kMetaSlot;
-        uint32_t byUb = (kTmp1Bytes > 128U) ? ((kTmp1Bytes - 128U) / perRow) : 1U;
+        uint32_t byUb = (kHalfBytes > 128U) ? ((kHalfBytes - 128U) / perRow) : 1U;
         if (byUb < maxSub) {
             maxSub = byUb;
         }
@@ -1306,10 +1306,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             ++n;
         }
 
-        if (runId > 0U) {
-            event_t prevEv = ((runId - 1U) % 2U == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
-            WaitFlag<HardEvent::MTE3_V>(prevEv);
+        const uint32_t bufIdx = runId % 2U;
+        // Reuse this half only after its previous MTE3 store finished (runId >= 2).
+        if (runId >= 2U) {
+            event_t reuseEv = (bufIdx == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
+            WaitFlag<HardEvent::MTE3_V>(reuseEv);
         }
+
+        LocalTensor<uint8_t> batchUb =
+            tmpBuff1.GetWithOffset<uint8_t>(kHalfBytes, bufIdx * kHalfBytes);
 
         const uint32_t codesBytes = n * codeRowBytes;
         const uint32_t meta0Off = br_dequant::BrAlignUp32(codesBytes);
@@ -1362,16 +1367,19 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         WaitFlag<HardEvent::V_MTE3>(eventIdVWaitMte3);
         uint64_t dstWsElemIdx = wsOffset + static_cast<uint64_t>(si) * headDimAlign;
         DataCopy(dstWsGm[dstWsElemIdx], outBatch, n * headDimAlign);
-        event_t curEv = (runId % 2U == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
+        event_t curEv = (bufIdx == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
         SetFlag<HardEvent::MTE3_V>(curEv);
 
         si += n;
         ++runId;
     }
 
-    if (runId > 0U) {
-        event_t lastEv = ((runId - 1U) % 2U == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
-        WaitFlag<HardEvent::MTE3_V>(lastEv);
+    // Drain both ping-pong store halves.
+    if (runId == 1U) {
+        WaitFlag<HardEvent::MTE3_V>(eventIdMte3WaitV0);
+    } else if (runId >= 2U) {
+        WaitFlag<HardEvent::MTE3_V>(eventIdMte3WaitV0);
+        WaitFlag<HardEvent::MTE3_V>(eventIdMte3WaitV1);
     }
 }
 

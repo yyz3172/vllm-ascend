@@ -7,6 +7,7 @@
  *
  * P2: batch copy contiguous same-PA-block rows (codes + meta runs), then
  * per-row decode into a staged out tile (see DequantKvImpl).
+ * A1: DequantKvImpl dual-buffers tmpBuff1 (2x16KB) so MTE2/MTE3 overlap.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
