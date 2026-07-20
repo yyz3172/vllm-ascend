@@ -137,12 +137,18 @@ Cube QK 把物理 `K^T` 落在 per-core qk workspace。
 | A1 V prefetch | `PrefetchPackedValueTileRowsIssue` 把 V MTE2 叠在 DecodeK+QK 上；独立 `VStage` | kernel main / qTile loop |
 | B3 双 AIV FD | SplitBNS partial 双 AIV；Combine 仍 primary-only | `Process()` |
 | 双 AIV SplitBN | Decode / qTile 均映射 `workerNum = usedCoreNum*2` | `ProcessSplitBn` |
+| Prefill 按 kvHead 拆双 AIV | qTile 路径两 AIV 按 `kvHead % 2` 分工，避免 token 对半切导致的 KV 前缀双读（Prefill Q=241 约 −27%） | `ProcessSplitBn` qTile |
+| H1 Key code plane bulk | 同 page ≤16 行 codes 一次 MTE2；meta 仍逐行；Cast 后 `V_MTE2` 再复用 PackedRaw（Decode 约 −2%） | `LoadPackedKeyTileRows` |
+| M2 更大 qTile | Prefill `qTile` 8→16，`CubeQk MAX_M` 16→32（覆盖 GQA=2）；Prefill 约 −1.6% | `TQ_BR_UB_QTILE_CAP` |
+| Cube QK 按 AIV slot | KT GM 用 `mixCore*2+subIdx`，每 MIX 分配 2 槽；双 AIV Prefill 可并行 Cube（约 −29%） | `CubeQkQTile` / tiling ws |
+| M3 Softmax∥LoadK | Softmax 期间 MTE2 预取下一 tile Key codes（暂存 CodeFloat）；Decode 约 −1% | `PrefetchPackedKeyCodes*` |
 | qTile 负载均衡 | host 按 causal work 切 token 区间 | tiling.cpp |
 | GQA=2 特化 | `VectorQkFloatPreScaledGqa2` / `OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar`：K/V 行复用两 Q head | `attention_device.h` |
 | 原地输出 | binding `out=`；eager 路径若返回同一 buffer 则跳过 self-copy | `torch_binding.cpp`, `attention_v1.py` |
 
-**刻意不做 / 已回退**：bulk MTE2 metadata batch（曾触发 AICORE）；盲目抬高
-`TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新 FD cost model）。
+**刻意不做 / 已回退**：bulk MTE2 metadata batch（曾触发 AICORE）；`SetTensorB(true)`
+消 K^T 手工转置（相对 H2 持平）；Decode 路径开 Cube QK（小 M 的 K^T 税使
+Q=16 约 +13%）；盲目抬高 `TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新 FD cost model）。
 
 ## 6. Workspace
 

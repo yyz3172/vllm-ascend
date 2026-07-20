@@ -20,7 +20,7 @@ constexpr uint32_t TQ_BR_ATTN_GQA_CAP = 8;
 constexpr uint32_t TQ_BR_ATTN_MAX_PARALLEL_CORES = 20;
 constexpr uint32_t TQ_BR_ATTN_CUBE_MIN_G = 8;
 constexpr uint32_t TQ_BR_ATTN_CUBE_MIN_TILE = 32;
-constexpr uint32_t TQ_BR_ATTN_QTILE_CAP = 8;
+constexpr uint32_t TQ_BR_ATTN_QTILE_CAP = 16;
 constexpr uint32_t TQ_BR_ATTN_QTILE_GQA_CAP = 2;
 
 // Split mode constants.
