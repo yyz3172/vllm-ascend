@@ -1378,15 +1378,23 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                     outBatch[j0 * headDimAlign], bases, steps, nb, headDim, headDimAlign);
             }
         } else {
-            for (uint32_t j = 0U; j < n; ++j) {
-                LocalTensor<uint8_t> codeRow = batchUb[j * codeRowBytes];
-                LocalTensor<WS_T> outRow = outBatch[j * headDimAlign];
-                float vmin = br_dequant::BrReadMeta16FromUb<Q_T>(
-                    batchUb, fp32UbA, meta0Off + j * kMetaSlot);
-                float vstep = br_dequant::BrReadMeta16FromUb<Q_T>(
-                    batchUb, fp32UbA, meta1Off + j * kMetaSlot);
-                br_dequant::BrDecodeValueRow(codeRow, halfScratch, fp32UbA, fp32UbC, outRow,
-                                             vmin, vstep, headDim);
+            for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
+                uint32_t nb = n - j0;
+                if (nb > kTileMax) {
+                    nb = kTileMax;
+                }
+                float vmins[kTileMax];
+                float vsteps[kTileMax];
+                for (uint32_t jj = 0U; jj < nb; ++jj) {
+                    const uint32_t j = j0 + jj;
+                    vmins[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
+                        batchUb, fp32UbA, meta0Off + j * kMetaSlot);
+                    vsteps[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
+                        batchUb, fp32UbA, meta1Off + j * kMetaSlot);
+                }
+                br_dequant::BrDecodeValueTile(
+                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
+                    outBatch[j0 * headDimAlign], vmins, vsteps, nb, headDim, headDimAlign);
             }
         }
 
