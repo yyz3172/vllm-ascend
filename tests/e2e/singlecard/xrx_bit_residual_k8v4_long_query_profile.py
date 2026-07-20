@@ -22,9 +22,9 @@ import time
 
 import torch
 
-MODEL_PATH = os.getenv("XRX_K8V4_MODEL_PATH", "/root/yyz/models/Qwen3-0.6B")
+MODEL_PATH = os.getenv("MODEL_PATH", "/root/yyz/models/Qwen3-0.6B")
 PROFILE_DIR = os.getenv(
-    "XRX_K8V4_PROFILE_DIR",
+    "PROFILE_DIR",
     "/root/yyz/pytorch_profiler/BitResidualLong/260716/k8v4_Qwen3-0.6B",
 )
 

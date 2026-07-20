@@ -38,9 +38,9 @@ from vllm import LLM, SamplingParams
 
 from vllm_ascend.ascend_config import clear_ascend_config
 
-MODEL_PATH = os.getenv("XRX_K8V4_MODEL_PATH", "/root/l00856060/model/Qwen3-0.6B")
+MODEL_PATH = os.getenv("MODEL_PATH", "/root/l00856060/model/Qwen3-0.6B")
 PROFILE_DIR = os.getenv(
-    "XRX_K8V4_PROFILE_DIR",
+    "PROFILE_DIR",
     "/root/l00856060/perflog2",
 )
 
