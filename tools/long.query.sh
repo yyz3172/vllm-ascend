@@ -12,5 +12,4 @@ XRX_K8V4_PROFILE=1 \
 XRX_TQ4BIT_PROFILE=1 \
 MODEL_PATH="/root/x00827378/model/Qwen3-0.6B" \
 PROFILE_DIR="/root/x00827378/vllm-ascend/ztmp/perflog" \
-python tests/e2e/singlecard/xrx_bit_residual_k8v4_smoke.py
-#python tests/e2e/singlecard/xrx_turboquant4bit_smoke.py
+python tests/e2e/singlecard/xrx_bit_residual_k8v4_long_query_profile.py
