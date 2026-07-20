@@ -154,12 +154,16 @@ Device（`ProcessSplitBn` qTile 分支）：
 | M3 Softmax∥LoadK | Softmax 期间 MTE2 预取下一 tile Key codes（暂存 CodeFloat）；Finalize 同样整块 meta+Cast | `PrefetchPackedKeyCodes*` |
 | qTile 负载均衡 | host 按 causal work 切 token 区间 | tiling.cpp |
 | GQA=2 特化 | `VectorQkFloatPreScaledGqa2` / `OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar`：K/V 行复用两 Q head | `attention_device.h` |
+| Prefill Cube PV | Softmax 留 AIV；`P@V` 走 KFC（`CubePvQTile`）；门槛 `qRows≥4`、`mRows≥32`、无部分因果（Prefill 约 −27%） | `ComputeAttentionQTile` |
 | 原地输出 | binding `out=`；eager 路径若返回同一 buffer 则跳过 self-copy | `torch_binding.cpp`, `attention_v1.py` |
 
 **刻意不做 / 已回退**：codes+meta **融合**成一次 MTE2 / 错误对齐 dst（曾触发 AICORE；现改为同 page **分平面**整块 meta，安全）；
 `SetTensorB(true)` 消 K^T 手工转置（相对 H2 持平）；Decode 路径开 Cube QK（小 M 的 K^T 税使
 Q=16 约 +13%）；盲目抬高 `TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新 FD cost model）；
-Softmax/PV 改 Brcb+BinaryRepeat（Prefill +14%）；Prefill KV-outer lite（+1.3%）。
+Softmax/PV 改 Brcb+BinaryRepeat（Prefill +14%）；Prefill KV-outer lite（+1.3%）；
+qTile Cap 16→24（Prefill 持平，已回退）；Prefill 真 KV-outer GM spill（Q/outAcc/m/s 驻 GM +
+K tile 暂存、chunk 内 Vector QK；相对 Cube PV Prefill +0.8%，已回退——跨 tile 单扫的 GM/标量税
+抵消了少扫 KV 的收益）。
 
 ## 6. Workspace
 
