@@ -72,38 +72,43 @@ V: idx4 ∈ [0,15]            → V = vmin + idx4*vstep
 
 | Key | 模式 | 典型场景 |
 |-----|------|----------|
-| `0` | SplitBN + Vector QK/PV | 短 KV Decode；非 qTile Prefill |
-| `1` | SplitBNS + Vector QK/PV（FlashDecode） | 长 KV、小 Q（`numTokens ≤ 32`） |
-| `2` | SplitBN + qTile + Cube QK / Vector PV | Prefill / ChunkedPrefill（`GQA≤2`） |
+| `0` | SplitBN + Vector QK/PV | 短 KV Decode；未进 qTile 的 Prefill（如 `GQA>2` 或 `numTokens ≤ usedCoreNum`） |
+| `1` | SplitBNS + Vector QK/PV（FlashDecode） | 长 KV、小 Q（`1 ≤ numTokens ≤ 32` 且代价模型选 `P>1`） |
+| `2` | SplitBN + qTile + Cube QK / Vector PV | Prefill / ChunkedPrefill（`GQA≤2` 且 `numTokens > usedCoreNum`） |
 
-硬件：`KERNEL_TYPE_MIX_AIC_1_2`（每 MIX 组 1 AIC + 2 AIV）。
+硬件：`KERNEL_TYPE_MIX_AIC_1_2`（每 MIX 组 1 AIC + 2 AIV）。  
+Host 启动 `blockDim = parallelCoreNum * mixBlockDim`（`parallelCoreNum = min(aicNum, 20)`）；闲置 MIX 在 device 侧 `mixCoreIdx >= usedCoreNum` 后直接 return。
 
-### 4.1 SplitBN（key 0 / 2）
+选择顺序（host `GetTiling`）：先判 FD → 否则 SplitBN；再在 SplitBN 上叠加 `qTileMode`（成功则 tilingKey=2，并把 `qkPvMode` 置 Cube）。
 
-- 任务粒度：`(token, kvHead, gqaChunk)`
-- Host 按 task 均分到 `usedCoreNum` 个 MIX 组
-- Device：**两个 AIV subcore 都参与**（`workerIdx = mixCoreIdx*2 + subIdx`）
-- AIC：Decode / FD 路径下直接 return；qTile Cube QK 时 primary AIV 经 KFC 发 Matmul
+### 4.1 SplitBN（key 0；key 2 的非 qTile 回落也走同一 worker 映射）
+
+- 任务粒度：`(token, kvHead, gqaChunk)`，`taskCount = numTokens * numKvHeads * ceil(gqaGroup / GQA_CAP)`
+- Host：`SplitBn` 决定 `usedCoreNum = min(taskCount, parallelCoreNum)`（另写 former/tail range，**device 当前未用**）
+- Device（key 0 / `qTileMode==0`）：双 AIV 都参与，`workerIdx = mixCoreIdx*2 + subIdx`，`workerNum = usedCoreNum*2`，按 `taskIdx % workerNum` **round-robin** 认领 task
+- AIC：SplitBN / FD partial 路径直接 return；qTile Cube QK 时两 AIV 均可经共享 KFC 发 Matmul（`K^T` 按 AIV slot 隔离，见 §4.3）
 
 ### 4.2 SplitBNS / FlashDecode（key 1）
 
 开启条件（`IsFlashDecodeK8v4`）：
 
 1. `1 ≤ numTokens ≤ TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（32）
-2. `PickFlashDecodeKvSplitPart(taskCount, maxKvLen, coreNum) > 1`
+2. `PickFlashDecodeKvSplitPart(taskCount, maxKvLen, parallelCoreNum) > 1`
 
 分段代价模型（host）：
 
 ```text
 cost(P) = ceil(taskCount / (coreNum/P)) * ceil(maxKvLen / P)
-约束：maxKvLen ≥ 1024，segment ≥ 512，P ≤ coreNum
+约束：maxKvLen ≥ 1024，segment ≥ 512，P ≤ coreNum（且受 maxKvLen/512 限制）
 ```
+
+`SplitBns`：`usedCoreNum = min(coreNum, (coreNum/P) * P)`，`kvSegmentLen` 按 `blockSize` 对齐。
 
 流程：
 
-1. 双 AIV 写 FD partial（`accumOut` / LSE）到 workspace
+1. 双 AIV 写 FD partial（`accumOut` / LSE）到 workspace（round-robin 含 `segIdx`）
 2. `SyncAll`
-3. **仅 primary AIV** 做 `CombineFlashDecode`（Rotate 共用每组一个 KFC）
+3. **仅 primary AIV**（`subIdx==0`）做 `CombineFlashDecode`（Rotate 共用每组一个 KFC）
 
 调试：编译期 `TQ_BR_FORCE_DISABLE_FLASH_DECODE=1` 可强制关 FD。  
 Host 探针：`tests/e2e/singlecard/xrx_k8v4_fd_cost_model.py`。
@@ -114,7 +119,8 @@ Host 探针：`tests/e2e/singlecard/xrx_k8v4_fd_cost_model.py`。
 
 ```text
 splitMode == SplitBN
-&& gqaGroup ≤ 2
+&& gqaGroup ≤ TQ_BR_ATTN_QTILE_GQA_CAP（2）
+&& usedCoreNum > 0
 && numTokens > usedCoreNum
 ```
 
@@ -123,8 +129,12 @@ Host 为每个 MIX 组写 `[qTileTokenStart, qTileTokenEnd)`：
 - 默认按 token 数均分
 - 有 ValueDepend seq 时，按 **causal KV 工作量前缀和** 再平衡（避免尾部长 causal 偏重）
 
-Device：每个 MIX 组的两个 AIV 再把该区间对半切，同组共享已 decode 的 K/V tile；
-Cube QK 把物理 `K^T` 落在 per-core qk workspace。
+Device（`ProcessSplitBn` qTile 分支）：
+
+- 两 AIV **共享同一 token 区间**，按 `kvHead % 2 == subIdx` 分工（**不对半切 token**；避免因果前缀双读）
+- 各自独立 DecodeK/V，**不**跨 AIV 共享已 decode 的 K/V tile
+- 同 seq 内连续 token 聚成 `qRows ≤ TQ_BR_UB_QTILE_CAP(16)` 的 qTile；`qRows>1` 走 `ComputeAttentionQTile`（Cube QK），否则回落单 token Vector 路径
+- Cube QK：物理 `K^T` 落在 **per-AIV-slot** qk workspace（`aivSlot = mixCore*2+subIdx`，每 MIX 2 槽）
 
 ## 5. 热路径优化（摘要）
 
@@ -134,21 +144,22 @@ Cube QK 把物理 `K^T` 落在 per-core qk workspace。
 |------|------|----------|
 | AIV 解包 | 向量化 K/V 解包；`Duplicate+Axpy`；栈上 scalar base/step | `DecodePacked*`, `decode_device.h` |
 | 寻址缓存 | 同 page 连续行复用 `blockId`；qTile 预取 `causalEnds` | `GetBlockId` / qTile loop |
-| A1 V prefetch | `PrefetchPackedValueTileRowsIssue` 把 V MTE2 叠在 DecodeK+QK 上；独立 `VStage` | kernel main / qTile loop |
+| A1 V prefetch | `PrefetchPackedValueTileRowsIssue` 把 V MTE2 叠在 DecodeK+QK 上；`VStage` 为 codes/vmin/vstep 连续平面，同 page 各一次 `DataCopyPad`，Finalize 整块 Cast | kernel main / qTile loop |
 | B3 双 AIV FD | SplitBNS partial 双 AIV；Combine 仍 primary-only | `Process()` |
 | 双 AIV SplitBN | Decode / qTile 均映射 `workerNum = usedCoreNum*2` | `ProcessSplitBn` |
 | Prefill 按 kvHead 拆双 AIV | qTile 路径两 AIV 按 `kvHead % 2` 分工，避免 token 对半切导致的 KV 前缀双读（Prefill Q=241 约 −27%） | `ProcessSplitBn` qTile |
-| H1 Key code plane bulk | 同 page ≤16 行 codes 一次 MTE2；meta 仍逐行；Cast 后 `V_MTE2` 再复用 PackedRaw（Decode 约 −2%） | `LoadPackedKeyTileRows` |
+| H1 Key code + meta bulk | 同 page ≤16 行：codes 一次 MTE2；base/step 各一次 `DataCopyPad`；subblock 整块 Cast；`V_MTE2` 后再复用 PackedRaw（相对 M3：Decode 约 −58%、Prefill 约 −44%，含 Value plane） | `LoadPackedKeyTileRows` / `PrefetchPackedKeyCodesFinalize` |
 | M2 更大 qTile | Prefill `qTile` 8→16，`CubeQk MAX_M` 16→32（覆盖 GQA=2）；Prefill 约 −1.6% | `TQ_BR_UB_QTILE_CAP` |
 | Cube QK 按 AIV slot | KT GM 用 `mixCore*2+subIdx`，每 MIX 分配 2 槽；双 AIV Prefill 可并行 Cube（约 −29%） | `CubeQkQTile` / tiling ws |
-| M3 Softmax∥LoadK | Softmax 期间 MTE2 预取下一 tile Key codes（暂存 CodeFloat）；Decode 约 −1% | `PrefetchPackedKeyCodes*` |
+| M3 Softmax∥LoadK | Softmax 期间 MTE2 预取下一 tile Key codes（暂存 CodeFloat）；Finalize 同样整块 meta+Cast | `PrefetchPackedKeyCodes*` |
 | qTile 负载均衡 | host 按 causal work 切 token 区间 | tiling.cpp |
 | GQA=2 特化 | `VectorQkFloatPreScaledGqa2` / `OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar`：K/V 行复用两 Q head | `attention_device.h` |
 | 原地输出 | binding `out=`；eager 路径若返回同一 buffer 则跳过 self-copy | `torch_binding.cpp`, `attention_v1.py` |
 
-**刻意不做 / 已回退**：bulk MTE2 metadata batch（曾触发 AICORE）；`SetTensorB(true)`
-消 K^T 手工转置（相对 H2 持平）；Decode 路径开 Cube QK（小 M 的 K^T 税使
-Q=16 约 +13%）；盲目抬高 `TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新 FD cost model）。
+**刻意不做 / 已回退**：codes+meta **融合**成一次 MTE2 / 错误对齐 dst（曾触发 AICORE；现改为同 page **分平面**整块 meta，安全）；
+`SetTensorB(true)` 消 K^T 手工转置（相对 H2 持平）；Decode 路径开 Cube QK（小 M 的 K^T 税使
+Q=16 约 +13%）；盲目抬高 `TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新 FD cost model）；
+Softmax/PV 改 Brcb+BinaryRepeat（Prefill +14%）；Prefill KV-outer lite（+1.3%）。
 
 ## 6. Workspace
 
@@ -160,7 +171,7 @@ Q=16 约 +13%）；盲目抬高 `TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新
 
 - FD partial：`accumOutSize = T * H * kvSplitPart * D`（fp32）  
   `logSumExpSize = T * H * kvSplitPart * 2`（fp32）
-- qTile：`qkWorkspaceStride = D * KV_TILE_CAP` half 元素 / core
+- qTile：`qkWorkspaceStride = D * KV_TILE_CAP` half 元素 / **AIV slot**（每 MIX 2 槽 × `parallelCoreNum`）
 
 ## 7. Serving 接入（attention_v1）
 
