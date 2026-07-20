@@ -143,11 +143,6 @@ public:
     __aicore__ inline void SinkInvalidRow(const RunInfo &info, LocalTensor<COMPUTE_T> &tmpSinkResUbBrcb,
                                             int64_t s1Idx, int64_t row);
 private:
-    __aicore__ inline bool IsDequantSubCore()
-    {
-        // Mix AIC/AIV: two AIV subcores share one aiCoreIdx/dequant workspace; only subcore-0 dequants.
-        return (GetBlockIdx() % 2U) == 0U;
-    }
     __aicore__ inline uint64_t GetKvCacheTokenIdx(uint32_t bIdx, uint32_t globalS2);
     __aicore__ inline uint64_t GetBrPackHeadBase(int32_t physBlock, uint32_t n2Idx, bool isKey);
     __aicore__ inline void BindKvCacheGm(uint32_t bIdx);
@@ -1181,21 +1176,16 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::InitDequantWorkspace(__gm_
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantK(const RunInfo &info)
 {
-    // BR dequant is heavier than TQ MSE. Dual-subcore both writing the full (or split)
-    // dequant workspace was numerically wrong for GQA×multi-token. Only subcore-0 dequants;
-    // both subcores still set FIA_SYNC_MODE2 so the cube wait completes.
-    if (IsDequantSubCore()) {
-        DequantKvImpl(info, true);
-    }
+    // Dual-AIV S2 split: both subcores run DequantKvImpl on disjoint token halves of the
+    // shared WS (si is a global index → no GM race). FIA_SYNC_MODE2 still needs both flags.
+    DequantKvImpl(info, true);
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(TQ_VEC_DEQ_K0_READY_VEC + (info.loop % 2));
 }
 
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantV(const RunInfo &info)
 {
-    if (IsDequantSubCore()) {
-        DequantKvImpl(info, false);
-    }
+    DequantKvImpl(info, false);
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(TQ_VEC_DEQ_V0_READY_VEC + (info.loop % 2));
 }
 
@@ -1247,6 +1237,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint64_t wsStride = static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(headDimAlign);
     uint64_t wsOffset = static_cast<uint64_t>(info.loop % 2) * wsStride;
 
+    // Dual-AIV S2 split (ops-transformer TQ pattern): sub0=[0,half), sub1=[half,s2Count).
+    // Each writes disjoint WS rows via global si → no race; slot size unchanged.
+    uint32_t subCoreId = GetBlockIdx() % 2U;
+    uint32_t siStart = (s2Count * subCoreId) / 2U;
+    uint32_t siEnd = (s2Count * (subCoreId + 1U)) / 2U;
+    if (siStart >= siEnd) {
+        return;
+    }
+
     // A1 dual-buffer staging in tmpBuff1 front; tile=8 decode scratch in the tail
     // (shared). Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
@@ -1296,9 +1295,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         }
     }
 
-    uint32_t si = 0U;
+    uint32_t si = siStart;
     uint32_t runId = 0U;
-    while (si < s2Count) {
+    while (si < siEnd) {
         uint32_t globalS2 = info.s2Idx * constInfo.s2BaseSize + si;
         uint32_t blockInBatch = globalS2 / bs;
         uint32_t pos0 = globalS2 % bs;
@@ -1309,11 +1308,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
         uint64_t headBase = GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
 
-        // Extend run while same PA block index and within s2_sub / block remainder.
+        // Extend run while same PA block and within this subcore's [si, siEnd).
         uint32_t n = 1U;
         uint32_t maxInBlock = bs - pos0;
         uint32_t nCap = maxSub < maxInBlock ? maxSub : maxInBlock;
-        while (si + n < s2Count && n < nCap) {
+        while (si + n < siEnd && n < nCap) {
             uint32_t gNext = info.s2Idx * constInfo.s2BaseSize + si + n;
             if ((gNext / bs) != blockInBatch) {
                 break;
