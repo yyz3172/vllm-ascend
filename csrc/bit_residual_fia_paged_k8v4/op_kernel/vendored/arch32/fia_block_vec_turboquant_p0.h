@@ -1262,8 +1262,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float));
     LocalTensor<half> halfScratch =
         tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
-    // P0: batch meta Cast into fp32UbC[0..2*tile), one V_S, then GetValue to
-    // stack before BrDecode*Tile reuses A/B/C scratch.
+    // P1: two packed 32B meta buffers live in the dedicated legacy staging
+    // buffer. P0 batch-Casts them into fp32UbC with one V_S per decode tile.
+    LocalTensor<uint8_t> packedMetaUb = dequantInt8Buf_.Get<uint8_t>();
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
     GlobalTensor<WS_T> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
@@ -1278,10 +1279,10 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     const uint32_t codeRowBytes =
         isKey ? br_pack::BR_KEY_CODE_BYTES : br_pack::BR_VAL_CODE_BYTES;
     const uint32_t outRowBytes = headDimAlign * static_cast<uint32_t>(sizeof(WS_T));
-    constexpr uint32_t kMetaSlot = br_dequant::BR_META_SLOT_BYTES;
     uint32_t maxSub = br_dequant::BR_S2_SUB_MAX;
     {
-        uint32_t perRow = codeRowBytes + outRowBytes + 2U * kMetaSlot;
+        // Meta uses a fixed 64B dedicated buffer instead of 64B per staged row.
+        uint32_t perRow = codeRowBytes + outRowBytes;
         uint32_t byUb = (kHalfBytes > 128U) ? ((kHalfBytes - 128U) / perRow) : 1U;
         if (byUb < maxSub) {
             maxSub = byUb;
@@ -1327,24 +1328,20 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             tmpBuff1.GetWithOffset<uint8_t>(kHalfBytes, bufIdx * kHalfBytes);
 
         const uint32_t codesBytes = n * codeRowBytes;
-        const uint32_t meta0Off = br_dequant::BrAlignUp32(codesBytes);
-        const uint32_t meta1Off = br_dequant::BrAlignUp32(meta0Off + n * kMetaSlot);
-        const uint32_t outOff = br_dequant::BrAlignUp32(meta1Off + n * kMetaSlot);
+        const uint32_t outOff = br_dequant::BrAlignUp32(codesBytes);
+        uint64_t meta0GmOff;
+        uint64_t meta1GmOff;
 
         if (isKey) {
             uint64_t codeOff = br_pack::BrKeyCodeOffset(headBase, pos0);
             DataCopy(batchUb, srcGm[codeOff], codesBytes);
-            br_dequant::BrCopyMetaRun(srcGm, batchUb[meta0Off],
-                br_pack::BrKeyBaseOffset(headBase, bs, pos0), n);
-            br_dequant::BrCopyMetaRun(srcGm, batchUb[meta1Off],
-                br_pack::BrKeyStepOffset(headBase, bs, pos0), n);
+            meta0GmOff = br_pack::BrKeyBaseOffset(headBase, bs, pos0);
+            meta1GmOff = br_pack::BrKeyStepOffset(headBase, bs, pos0);
         } else {
             uint64_t codeOff = br_pack::BrValCodeOffset(headBase, pos0);
             DataCopy(batchUb, srcGm[codeOff], codesBytes);
-            br_dequant::BrCopyMetaRun(srcGm, batchUb[meta0Off],
-                br_pack::BrValVminOffset(headBase, bs, pos0), n);
-            br_dequant::BrCopyMetaRun(srcGm, batchUb[meta1Off],
-                br_pack::BrValVstepOffset(headBase, bs, pos0), n);
+            meta0GmOff = br_pack::BrValVminOffset(headBase, bs, pos0);
+            meta1GmOff = br_pack::BrValVstepOffset(headBase, bs, pos0);
         }
 
         SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
@@ -1361,15 +1358,14 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 }
                 float bases[kTileMax];
                 float steps[kTileMax];
-                // Batch Cast both meta runs into 32B-strided slots on fp32UbC;
-                // single V_S then scalar pull. Need 2 * tile * 8 floats (=128).
-                br_dequant::BrCastMetaSlotsToFp32<Q_T>(
-                    batchUb, meta0Off + j0 * kMetaSlot, nb, fp32UbC, false);
-                br_dequant::BrCastMetaSlotsToFp32<Q_T>(batchUb, meta1Off + j0 * kMetaSlot, nb,
-                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], true);
+                br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
+                    meta0GmOff + j0 * sizeof(Q_T), meta1GmOff + j0 * sizeof(Q_T), nb);
+                SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+                WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+                br_dequant::BrCastPackedMetaToFp32<Q_T>(
+                    packedMetaUb, nb, fp32UbC, fp32UbC[kTileMax]);
                 br_dequant::BrLoadMetaFp32ToArray(fp32UbC, bases, nb);
-                br_dequant::BrLoadMetaFp32ToArray(
-                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], steps, nb);
+                br_dequant::BrLoadMetaFp32ToArray(fp32UbC[kTileMax], steps, nb);
                 br_dequant::BrDecodeKeyTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
                     outBatch[j0 * headDimAlign], bases, steps, nb, headDim, headDimAlign);
@@ -1382,13 +1378,14 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 }
                 float vmins[kTileMax];
                 float vsteps[kTileMax];
-                br_dequant::BrCastMetaSlotsToFp32<Q_T>(
-                    batchUb, meta0Off + j0 * kMetaSlot, nb, fp32UbC, false);
-                br_dequant::BrCastMetaSlotsToFp32<Q_T>(batchUb, meta1Off + j0 * kMetaSlot, nb,
-                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], true);
+                br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
+                    meta0GmOff + j0 * sizeof(Q_T), meta1GmOff + j0 * sizeof(Q_T), nb);
+                SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+                WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+                br_dequant::BrCastPackedMetaToFp32<Q_T>(
+                    packedMetaUb, nb, fp32UbC, fp32UbC[kTileMax]);
                 br_dequant::BrLoadMetaFp32ToArray(fp32UbC, vmins, nb);
-                br_dequant::BrLoadMetaFp32ToArray(
-                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], vsteps, nb);
+                br_dequant::BrLoadMetaFp32ToArray(fp32UbC[kTileMax], vsteps, nb);
                 br_dequant::BrDecodeValueTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
                     outBatch[j0 * headDimAlign], vmins, vsteps, nb, headDim, headDimAlign);
