@@ -79,7 +79,7 @@ __aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<
 // be 32B aligned on 910B.
 static constexpr uint32_t BR_PACKED_META_BYTES = 32U;
 static constexpr uint32_t BR_META_FP32_0_UB_OFF = 64U;
-static constexpr uint32_t BR_META_FP32_1_UB_OFF = 96U;
+static constexpr uint32_t BR_META_FP32_1_UB_OFF = 128U;
 
 // Copy packed meta0/meta1 runs. GM already uses SoA layout, so each run is
 // contiguous; DataCopyPad handles sub-32B tails and potentially unaligned GM.
@@ -171,11 +171,12 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
 }
 
 static constexpr uint32_t BR_S2_SUB_MAX = 64U;
-// Run-level Key decode tile: mask Duplicate amortized across this many rows.
-// tile=8 scratch (~14KB) overlays tmpBuff1 tail (see DequantKvImpl); dedicated
-// dequantFp* stays 1-row so total AIV UB remains within ~192KB.
-static constexpr uint32_t BR_DECODE_TILE_MAX = 8U;
-static constexpr uint32_t BR_DECODE_TILE_ELEMS = BR_DECODE_TILE_MAX * BR_HEAD_SIZE;
+// K8 needs three FP32 scratch tensors, while V4 needs two. Keep K at 8 rows
+// and use the released V4 scratch capacity for a 13-row tile. For a 128-row
+// PA block this reduces V4 meta/decode tiles from 18 to 11 per AIV half while
+// preserving enough front space for dual-buffer code/output staging.
+static constexpr uint32_t BR_KEY_DECODE_TILE_MAX = 8U;
+static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX = 13U;
 
 __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
 {
