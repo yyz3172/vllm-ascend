@@ -108,6 +108,9 @@ run_one_profile() {
 
     # Clear BR FIA gates then apply caller overrides (passed as env assignments).
     unset VLLM_ASCEND_BIT_RESIDUAL_FIA VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA || true
+    # long_query_profile.py reads MODEL_PATH / PROFILE_DIR directly.
+    export MODEL_PATH="${MODEL_PATH}"
+    export PROFILE_DIR="${out_dir}"
     export XRX_K8V4_MODEL_PATH="${MODEL_PATH}"
     export XRX_K8V4_PROFILE_DIR="${out_dir}"
     export XRX_K8V4_ENABLE_PROFILE=1

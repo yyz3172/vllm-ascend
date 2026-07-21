@@ -29,6 +29,8 @@
 
 constexpr uint32_t TQ_VEC_DEQ_K0_READY_VEC = 14U;
 constexpr uint32_t TQ_VEC_DEQ_V0_READY_VEC = 16U;
+constexpr uint32_t TQ_VEC_OUTPUT_PI_READY_VEC = 10U;
+constexpr uint32_t TQ_CUBE_OUTPUT_PI_DONE_VEC = 11U;
 constexpr float TQ_MSE_SCALE = 0.0026f;
 constexpr float TQ_MSE_CENTER = 127.5f;
 
@@ -107,9 +109,11 @@ public:
     __aicore__ inline void ComputeLogSumExpAndCopyToGm(const RunInfo &info, const MSplitInfo &mSplitInfo,
                                                        LocalTensor<COMPUTE_T> &softmaxSumUb, LocalTensor<COMPUTE_T> &softmaxMaxUb);
     // V2
-    __aicore__ inline void ProcessVec2SingleBuf(const RunInfo &info);
+    __aicore__ inline void ProcessVec2SingleBuf(const RunInfo &info, bool cubePiPrepare = false);
+    __aicore__ inline void CopyCubePiResult(const RunInfo &info);
     __aicore__ inline void DealBmm2ResBaseBlock(const RunInfo &info, uint32_t startRow, uint32_t dealRowCount,
-                                                uint32_t columnCount, uint32_t actualColumnCount);
+                                                uint32_t columnCount, uint32_t actualColumnCount,
+                                                bool cubePiPrepare = false);
     // TurboQuant: 在 DealBmm2ResBaseBlock 的 isLastS2Loop 分支,RowDivs 之后、Bmm2ResCopyOut 之前,
     // 对 acc 做 O = Π^T@acc (= acc@Π)。覆盖普通/FD-split/FD-nonsplit 三条出口(在统一分发口之前插)。
     // P0 stub:piApplyEnabled_=false(Π=I)时直接 return,零回归。真实现见 plan §3.2。
@@ -639,7 +643,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::SoftmaxFlashV2Compute(
     }
 }
 
-template <typename FIAT> __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ProcessVec2SingleBuf(const RunInfo &info)
+template <typename FIAT>
+__aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ProcessVec2SingleBuf(
+    const RunInfo &info, bool cubePiPrepare)
 {
     if (mSplitInfo.vecDealM == 0) {
         return;
@@ -659,13 +665,15 @@ template <typename FIAT> __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::P
         if (i == (loopCount - 1)) {
             dealSize = tailSplitSize;
         }
-        DealBmm2ResBaseBlock(info, i * mSplitSize, dealSize, constInfo.headDimAlign, constInfo.headDim);
+        DealBmm2ResBaseBlock(info, i * mSplitSize, dealSize,
+            constInfo.headDimAlign, constInfo.headDim, cubePiPrepare);
     }
 }
 
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DealBmm2ResBaseBlock(
-    const RunInfo &info, uint32_t startRow, uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount)
+    const RunInfo &info, uint32_t startRow, uint32_t dealRowCount,
+    uint32_t columnCount, uint32_t actualColumnCount, bool cubePiPrepare)
 {
     uint32_t vec2ComputeSize = dealRowCount * columnCount;
     uint32_t mStart = mSplitInfo.nBufferStartM + mSplitInfo.vecStartM + startRow;
@@ -727,9 +735,24 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DealBmm2ResBaseBlock(
         }
 
         AscendC::PipeBarrier<PIPE_V>();
-        ApplyPiTransposeToRows(bmm2ResUb, dealRowCount, actualColumnCount, columnCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        Bmm2ResCopyOut(info, bmm2ResUb, mStart, startRow, dealRowCount, columnCount, actualColumnCount);
+        if (cubePiPrepare) {
+            // Cube consumes Q_T Acc from vec1ResGm; each AIV writes its disjoint M rows.
+            LocalTensor<Q_T> cubePiIn = outputQue1.AllocTensor<Q_T>();
+            Cast(cubePiIn, bmm2ResUb, AscendC::RoundMode::CAST_RINT, vec2ComputeSize);
+            outputQue1.EnQue(cubePiIn);
+            outputQue1.DeQue<Q_T>();
+            uint64_t cubePiOffset =
+                (info.loop % constInfo.preLoadNum) * constInfo.vec1ResUbSize +
+                inOutBaseOffset;
+            DataCopy(vec1ResGm[cubePiOffset], cubePiIn, vec2ComputeSize);
+            outputQue1.FreeTensor(cubePiIn);
+        } else {
+            ApplyPiTransposeToRows(
+                bmm2ResUb, dealRowCount, actualColumnCount, columnCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            Bmm2ResCopyOut(info, bmm2ResUb, mStart, startRow,
+                dealRowCount, columnCount, actualColumnCount);
+        }
     } else {
         AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<COMPUTE_T> tmpBmm2Res = outputQue1.AllocTensor<COMPUTE_T>();
@@ -743,6 +766,42 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DealBmm2ResBaseBlock(
     }
 
     inputQue1.FreeTensor(bmm2ResUb);
+}
+
+template <typename FIAT>
+__aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::CopyCubePiResult(
+    const RunInfo &info)
+{
+    if (mSplitInfo.vecDealM == 0U) {
+        return;
+    }
+    uint32_t splitRows = BASE_BLOCK_MAX_ELEMENT_NUM / constInfo.headDimAlign;
+    if (splitRows > mSplitInfo.vecDealM) {
+        splitRows = mSplitInfo.vecDealM;
+    }
+    const uint32_t loops =
+        (mSplitInfo.vecDealM + splitRows - 1U) / splitRows;
+    for (uint32_t i = 0U; i < loops; ++i) {
+        const uint32_t startRow = i * splitRows;
+        uint32_t rows = mSplitInfo.vecDealM - startRow;
+        if (rows > splitRows) {
+            rows = splitRows;
+        }
+        const uint32_t mStart =
+            mSplitInfo.nBufferStartM + mSplitInfo.vecStartM + startRow;
+        const uint32_t elems = rows * constInfo.headDimAlign;
+        const uint64_t offset =
+            (info.loop % constInfo.preLoadNum) * constInfo.bmm2ResUbSize +
+            static_cast<uint64_t>(mStart) * constInfo.headDimAlign;
+
+        LocalTensor<MM2_OUT_T> result = inputQue1.AllocTensor<MM2_OUT_T>();
+        DataCopy(result, mm2ResGm[offset], elems);
+        inputQue1.EnQue(result);
+        inputQue1.DeQue<MM2_OUT_T>();
+        Bmm2ResCopyOut(info, result, mStart, startRow, rows,
+            constInfo.headDimAlign, constInfo.headDim);
+        inputQue1.FreeTensor(result);
+    }
 }
 
 template <typename FIAT>
@@ -1157,7 +1216,19 @@ template <typename FIAT> __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::C
 {
     SetMSplitInfo(info.actMBaseSize);
     CrossCoreWaitFlag(constInfo.syncC2V2);
-    ProcessVec2SingleBuf(info);
+    const bool useCubePi = piApplyEnabled_ &&
+        (TQ_PI_OUTPUT_CUBE != 0) && info.isLastS2Loop &&
+        info.actMBaseSize >= TQ_PI_OUTPUT_CUBE_MIN_M;
+    if (useCubePi) {
+        ProcessVec2SingleBuf(info, true);
+        // FIA_SYNC_MODE2 waits for both AIV subcores, so the full M tile is ready.
+        CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
+            TQ_VEC_OUTPUT_PI_READY_VEC);
+        CrossCoreWaitFlag(TQ_CUBE_OUTPUT_PI_DONE_VEC);
+        CopyCubePiResult(info);
+    } else {
+        ProcessVec2SingleBuf(info);
+    }
 }
 
 template <typename FIAT>
