@@ -11,13 +11,16 @@ constexpr uint32_t TQ_PACK_K = 128;
 // Manual C-bridge workspace, mirroring the kernel-side constants in
 // op_kernel/bit_residual_pack_k8v4_common.h:
 //   TQ_MANUAL_WORKSPACE_BYTE_OFFSET (512 KiB) +
-//   dataCores * (BUFFER_COUNT(2) * ROT_TILE_M(32) * ROT_N(128) * sizeof(float))
-// Each data core ping-pongs two 32x128 FP32 C tiles; the 512 KiB headroom is
-// reserved before the per-core region (kernel indexes manualWorkspace_ + offset).
+//   dataCores * (BUFFER_COUNT(2) * ROT_TILE_M(32) * ROT_N(128) * BRIDGE_BYTES)
+// Each data core ping-pongs two 32x128 half C tiles (AIC Fixpipe F322F16
+// output); the 512 KiB headroom is reserved before the per-core region
+// (kernel indexes manualWorkspace_ + offset).  BRIDGE_BYTES mirrors
+// sizeof(half) on the host (the kernel-side half type is not visible here).
 constexpr uint64_t TQ_MANUAL_WORKSPACE_BYTE_OFFSET_HOST = 512 * 1024;
 constexpr uint64_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT_HOST = 2;
 constexpr uint64_t TQ_MANUAL_ROT_TILE_M_HOST = 32;
 constexpr uint64_t TQ_MANUAL_ROT_N_HOST = TQ_PACK_N;
+constexpr uint64_t TQ_MANUAL_BRIDGE_BYTES = 2;  // sizeof(half) on the GM bridge
 // Fallback for the system/libapi workspace when the platform reports 0, matching
 // the bit_residual_fia_paged_k8v4 convention (kLibApiWorkspaceFallback).
 constexpr size_t TQ_LIBAPI_WORKSPACE_FALLBACK = 16 * 1024 * 1024;
@@ -293,7 +296,7 @@ static ge::graphStatus BitResidualPackK8v4TilingFunc(gert::TilingContext* contex
     }
     const uint64_t manualBytesPerCore =
         TQ_MANUAL_WORKSPACE_BUFFER_COUNT_HOST *
-        (TQ_MANUAL_ROT_TILE_M_HOST * TQ_MANUAL_ROT_N_HOST) * sizeof(float);
+        (TQ_MANUAL_ROT_TILE_M_HOST * TQ_MANUAL_ROT_N_HOST) * TQ_MANUAL_BRIDGE_BYTES;
     const uint64_t manualWorkspaceBytes =
         TQ_MANUAL_WORKSPACE_BYTE_OFFSET_HOST +
         static_cast<uint64_t>(dataCores) * manualBytesPerCore;
