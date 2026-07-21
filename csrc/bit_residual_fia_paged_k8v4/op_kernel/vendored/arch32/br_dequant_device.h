@@ -15,6 +15,8 @@
  * Meta: still per-row DataCopyPad(2B) into 32B slots (Cast align). A Prefill
  * trial of blockCount+rightPadding bulk Pad regressed vs Pi-opt baseline;
  * see tools/.../docs/prefill_pi_meta_opt_report.md Opt2.
+ * P0: BrCastMetaSlotsToFp32 batches slot Casts and one V_S sync (replaces
+ * per-row BrReadMeta16FromUb Cast+V_S+GetValue in DequantKvImpl).
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -71,6 +73,48 @@ __aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<
     }
 }
 
+// VEC Cast of half/bf16 requires 32B-aligned UB addresses (packed 2B stride faults).
+static constexpr uint32_t BR_META_SLOT_BYTES = 32U;
+
+// Cast numRows meta half/bf16 values from 32B-aligned UB slots into a float
+// staging buffer with 32B (8-float) stride per row — Cast dst must be 32B-aligned
+// on 910B. Optional single V_S sync so callers can GetValue without per-row barriers.
+static constexpr uint32_t BR_META_FP32_STRIDE = 8U; // 8*sizeof(float)=32B
+
+template <typename MetaT>
+__aicore__ inline void BrCastMetaSlotsToFp32(LocalTensor<uint8_t> ub, uint32_t metaByteOff,
+    uint32_t numRows, LocalTensor<float> dst, bool sync)
+{
+    if constexpr (IsSameType<MetaT, bfloat16_t>::value) {
+        auto asBf16 = ub.template ReinterpretCast<bfloat16_t>();
+        for (uint32_t j = 0U; j < numRows; ++j) {
+            const uint32_t srcIdx =
+                (metaByteOff + j * BR_META_SLOT_BYTES) / static_cast<uint32_t>(sizeof(bfloat16_t));
+            Cast(dst[j * BR_META_FP32_STRIDE], asBf16[srcIdx], RoundMode::CAST_NONE, 1);
+        }
+    } else {
+        auto asHalf = ub.template ReinterpretCast<half>();
+        for (uint32_t j = 0U; j < numRows; ++j) {
+            const uint32_t srcIdx =
+                (metaByteOff + j * BR_META_SLOT_BYTES) / static_cast<uint32_t>(sizeof(half));
+            Cast(dst[j * BR_META_FP32_STRIDE], asHalf[srcIdx], RoundMode::CAST_NONE, 1);
+        }
+    }
+    if (sync) {
+        PipeBarrier<PIPE_V>();
+        event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+        SetFlag<HardEvent::V_S>(e);
+        WaitFlag<HardEvent::V_S>(e);
+    }
+}
+
+__aicore__ inline void BrLoadMetaFp32ToArray(LocalTensor<float> src, float *dst, uint32_t numRows)
+{
+    for (uint32_t j = 0U; j < numRows; ++j) {
+        dst[j] = src.GetValue(j * BR_META_FP32_STRIDE);
+    }
+}
+
 __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<uint8_t> ub,
     uint64_t meta0Off, uint64_t meta1Off)
 {
@@ -82,9 +126,6 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
 }
 
 // Copy a contiguous GM meta run into UB with one 32B-aligned slot per row.
-// VEC Cast of half/bf16 requires 32B-aligned UB addresses (packed 2B stride faults).
-static constexpr uint32_t BR_META_SLOT_BYTES = 32U;
-
 __aicore__ inline void BrCopyMetaRun(GlobalTensor<uint8_t> srcGm, LocalTensor<uint8_t> ubDst,
     uint64_t metaGmOff, uint32_t numRows)
 {
