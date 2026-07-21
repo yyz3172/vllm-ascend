@@ -1312,25 +1312,31 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         return;
     }
 
-    // A1 dual-buffer staging in tmpBuff1 front; tile=8 decode scratch in the tail
-    // (shared). Vec1/Vec2 reclaim the full 32KB after dequant returns.
+    // A1 dual-buffer staging in tmpBuff1 front; decode scratch in the tail
+    // (shared). K8 uses 8 rows/3 FP32 tensors, while V4 uses 13 rows/2 FP32
+    // tensors. Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
-    constexpr uint32_t kTileMax = br_dequant::BR_DECODE_TILE_MAX;
-    constexpr uint32_t kScratchElems = br_dequant::BR_DECODE_TILE_ELEMS;
-    constexpr uint32_t kFp32ScratchBytes =
-        kScratchElems * 3U * static_cast<uint32_t>(sizeof(float));
-    constexpr uint32_t kFp16ScratchBytes =
+    const uint32_t kTileMax = isKey
+        ? br_dequant::BR_KEY_DECODE_TILE_MAX
+        : br_dequant::BR_VALUE_DECODE_TILE_MAX;
+    const uint32_t kScratchElems = kTileMax * br_pack::BR_HEAD_SIZE;
+    const uint32_t kFp32ScratchCount = isKey ? 3U : 2U;
+    const uint32_t kFp32ScratchBytes =
+        kScratchElems * kFp32ScratchCount * static_cast<uint32_t>(sizeof(float));
+    const uint32_t kFp16ScratchBytes =
         kScratchElems * static_cast<uint32_t>(sizeof(half));
-    constexpr uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes; // 14336
-    constexpr uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;              // 18432
-    constexpr uint32_t kHalfBytes = kStageBytes / 2U;                         // 9216
+    const uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes;
+    const uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;
+    const uint32_t kHalfBytes = kStageBytes / 2U;
 
     LocalTensor<float> fp32UbA =
         tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
     LocalTensor<float> fp32UbB =
         tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes + kScratchElems * sizeof(float));
-    LocalTensor<float> fp32UbC = tmpBuff1.GetWithOffset<float>(
-        kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float));
+    LocalTensor<float> fp32UbC = isKey
+        ? tmpBuff1.GetWithOffset<float>(
+            kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float))
+        : dequantFp32Buf_.Get<float>();
     LocalTensor<half> halfScratch =
         tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
     // P1/P4: packed meta and its FP32 form stay in the dedicated buffer.
