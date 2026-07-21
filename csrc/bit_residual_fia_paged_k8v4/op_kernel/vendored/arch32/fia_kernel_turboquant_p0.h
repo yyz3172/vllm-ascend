@@ -1072,6 +1072,10 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
         if ASCEND_IS_AIV {
             vectorService.ComputeVec2(extraInfo1);
         }
+        if ASCEND_IS_AIC {
+            // Prefill last-S2 only: wait for Vec2 normalized Acc, then run Acc@Pi.
+            matmulService.ComputeOutputPi(extraInfo1);
+        }
         extraInfo1.isValid = false;
     }
 }

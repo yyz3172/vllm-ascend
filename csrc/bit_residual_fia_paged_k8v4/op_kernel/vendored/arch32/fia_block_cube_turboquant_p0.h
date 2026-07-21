@@ -21,6 +21,7 @@
 #include "../vector_common.h"
 #include "../memory_copy.h"
 #include "fia_kernel_common.h"
+#include "fia_turboquant_pi_bisect.h"
 
 #include "../fia_public_define.h"
 
@@ -29,6 +30,8 @@ using AscendC::CrossCoreWaitFlag;
 
 constexpr uint32_t TQ_VEC_DEQ_K0_READY_CUBE = 14U;
 constexpr uint32_t TQ_VEC_DEQ_V0_READY_CUBE = 16U;
+constexpr uint32_t TQ_VEC_OUTPUT_PI_READY_CUBE = 10U;
+constexpr uint32_t TQ_CUBE_OUTPUT_PI_DONE_CUBE = 11U;
 
 
 /**
@@ -234,6 +237,9 @@ public:
     __aicore__ inline void ComputeMm1(const RunInfo &info);
     template <CubeFormat OutFormat=CubeFormat::ND, CubeFormat AFormat=CubeFormat::ND>
     __aicore__ inline void ComputeMm2(const RunInfo &info);
+    // Last-S2 output rotation: consume Q_T acc staged by both AIVs,
+    // compute O=acc@Π on Cube, and write float result back to mm2ResGm.
+    __aicore__ inline void ComputeOutputPi(const RunInfo &info);
 
 private:
     /**
@@ -374,6 +380,9 @@ private:
     // MM1 前 Q_rot = Q @ Π。未传则 Π=I。
     GlobalTensor<Q_T> piGm_;
     bool piApplyEnabled_ = false;
+    // Vec2 output uses rotation_value, which may differ from rotation_key.
+    GlobalTensor<Q_T> outputPiGm_;
+    bool outputPiApplyEnabled_ = false;
 
     ConstInfo constInfo{};
 
@@ -601,6 +610,11 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::Init(
     if (antiquantScale != nullptr) {
         piGm_.SetGlobalBuffer(reinterpret_cast<__gm__ Q_T *>(antiquantScale));
         piApplyEnabled_ = true;
+    }
+    if (valueAntiquantScale != nullptr) {
+        outputPiGm_.SetGlobalBuffer(
+            reinterpret_cast<__gm__ Q_T *>(valueAntiquantScale));
+        outputPiApplyEnabled_ = true;
     }
 
     if (constInfo.ropeSplitMode) {
@@ -1324,5 +1338,83 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ComputeMm2(const RunInfo 
     }
 #endif
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC2V2);
+}
+
+template <typename FIAT>
+__aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ComputeOutputPi(const RunInfo &info)
+{
+    const bool useCubePi = outputPiApplyEnabled_ &&
+        (TQ_PI_OUTPUT_CUBE != 0) && info.isLastS2Loop &&
+        info.actMBaseSize >= TQ_PI_OUTPUT_CUBE_MIN_M;
+    if (!useCubePi) {
+        return;
+    }
+
+    // Both AIV subcores finish staging their disjoint M rows before AIC reads.
+    CrossCoreWaitFlag(TQ_VEC_OUTPUT_PI_READY_CUBE);
+
+    constexpr uint32_t M_BASE = 128U;
+    const uint32_t headDim = constInfo.headDim;
+    auto accGm = this->vec1ResGm[info.loop % CFG::PRELOAD_NUM];
+    auto outGm = this->mm2ResGm[info.loop % CFG::PRELOAD_NUM];
+
+    const uint32_t vBufId = this->vL1BufId;
+    WaitFlag<HardEvent::MTE1_MTE2>(V_EVENT0 + vBufId);
+    CopySingleMatrixNDToNZ(
+        vL1Tensor[vBufId], outputPiGm_, headDim, headDim, headDim, headDim);
+    SetFlag<HardEvent::MTE2_MTE1>(V_EVENT0 + vBufId);
+    WaitFlag<HardEvent::MTE2_MTE1>(V_EVENT0 + vBufId);
+
+    for (uint32_t mStart = 0U; mStart < info.actMBaseSize; mStart += M_BASE) {
+        uint32_t mAct = info.actMBaseSize - mStart;
+        if (mAct > M_BASE) {
+            mAct = M_BASE;
+        }
+        const uint32_t mAlign = Align(mAct, static_cast<uint32_t>(BLOCK_CUBE));
+        const uint32_t kpBufId = this->kpL1BufId;
+
+        WaitFlag<HardEvent::MTE1_MTE2>(KP_EVENT0 + kpBufId);
+        CopySingleMatrixNDToNZ(kpL1Tensor[kpBufId],
+            accGm[static_cast<uint64_t>(mStart) * headDim],
+            mAct, headDim, headDim, mAlign);
+        SetFlag<HardEvent::MTE2_MTE1>(KP_EVENT0 + kpBufId);
+        WaitFlag<HardEvent::MTE2_MTE1>(KP_EVENT0 + kpBufId);
+
+        WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT0 + this->abL0BufId);
+        WaitFlag<HardEvent::FIX_M>(L0C_EVENT0 + this->cL0BufId);
+        LoadAToL0<M_BASE>(this->abL0BufId, kpL1Tensor[kpBufId],
+            mAlign, 0U, mAlign, 0U, headDim);
+        // Unlike Q rotation (Q@Π^T), output rotation is acc@Π.
+        LoadBToL0(this->abL0BufId, vL1Tensor[vBufId],
+            headDim, 0U, headDim, 0U, headDim);
+        SetFlag<HardEvent::MTE1_M>(L0_READY_EVENT);
+        WaitFlag<HardEvent::MTE1_M>(L0_READY_EVENT);
+
+        MmadParams params;
+        params.m = mAlign;
+        params.n = headDim;
+        params.k = headDim;
+        params.cmatrixInitVal = true;
+        params.cmatrixSource = false;
+        Mmad(cL0Tensor[this->cL0BufId], aL0Tensor[this->abL0BufId],
+            bL0Tensor[this->abL0BufId], params);
+
+        SetFlag<HardEvent::M_MTE1>(L0AB_EVENT0 + this->abL0BufId);
+        SetFlag<HardEvent::MTE1_MTE2>(KP_EVENT0 + kpBufId);
+        this->abL0BufId = (this->abL0BufId + 1U) % L0AB_BUFCNT;
+        this->kpL1BufId = (this->kpL1BufId + 1U) % L1_KP_BUFCNT;
+
+        SetFlag<HardEvent::M_FIX>(L0C_EVENT0 + this->cL0BufId);
+        WaitFlag<HardEvent::M_FIX>(L0C_EVENT0 + this->cL0BufId);
+        FixpipeCToGM<CubeFormat::ND>(
+            outGm, this->cL0BufId, headDim, mStart, mAct, 0U, headDim);
+        SetFlag<HardEvent::FIX_M>(L0C_EVENT0 + this->cL0BufId);
+        this->cL0BufId = (this->cL0BufId + 1U) % L0C_BUFCNT;
+    }
+
+    SetFlag<HardEvent::MTE1_MTE2>(V_EVENT0 + vBufId);
+    this->vL1BufId = (this->vL1BufId + 1U) % L1_V_BUFCNT;
+    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(
+        TQ_CUBE_OUTPUT_PI_DONE_CUBE);
 }
 #endif // FIA_BLOCK_CUBE_TURBOQUANT_P0_H
