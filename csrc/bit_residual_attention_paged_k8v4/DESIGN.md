@@ -1,8 +1,10 @@
 # BitResidualAttentionPagedK8v4 设计文档
 
-> Vector paged-attention 算子：在 BitResidual K8/V4 压缩 cache 上做 Decode / Prefill。
-> Cache 布局真源见 `../bit_residual_pack_k8v4/design.md`。FIA 流水线对照见
-> `../bit_residual_fia_paged_k8v4/DESIGN.md`。
+> AIV 主导的 paged-attention：在 BitResidual K8/V4 压缩 cache 上做 Decode / Prefill。
+> Prefill（GQA≤2）可经 KFC 做 Cube QK / 条件 Cube PV。
+>
+> Cache 布局真源见 `../bit_residual_pack_k8v4/design.md`。
+> FIA 流水线对照见 `../bit_residual_fia_paged_k8v4/DESIGN.md`。
 
 ## 1. 定位
 
@@ -22,100 +24,129 @@
 | PrefillCacheHit / ChunkedPrefill | **本算子** | `VLLM_ASCEND_BIT_RESIDUAL_FIA=1` 时先试 FIA |
 | PrefillNoCache | stock FIA（float K/V） | 不读 KV cache |
 
-FIA 与本算子均为可选 A/B；两开关默认均为 `0`。
+两开关默认均为 `0`（`vllm_ascend/envs.py`）。
 
 ```text
 pack_k8v4 → uint8 PA cache
-query → LoadQ → (optional Cube rotate Q@R)
+query → LoadQ → Cube rotate (Q @ R_key) → × scale
       → tile loop:
-           DecodeK (AIV) → QK (Vector / Cube)  ∥  Prefetch V (MTE2)
-           DecodeV finalize → Softmax+PV (Vector)
-      → WriteOut (optional Cube rotate @R_value)
+           Load/Prefetch K → DecodeK → QK (Vector | Cube)  ∥  Prefetch V (A1)
+           Finalize V → DecodeV
+           Softmax+PV (Vector)  |  SoftmaxOnly + Cube PV   ∥  M3 next-K（非 Cube PV）
+      → Normalize → Cube rotate (out @ R_value) → WriteOut
 ```
 
 ## 2. IO
 
 **Inputs**
 
-- `query`：fp16 / bf16，TND `[T, H, D]`，`D=128`
-- `key_cache` / `value_cache`：uint8 PA layout（见 §3）
-- `block_table`：int32
-- `actual_seq_len_q` / `actual_seq_len_kv`：int64（ValueDepend）
-- `rotation_key` / `rotation_value`：`[D,D]`，与 query 同 dtype
+| 名 | dtype | shape / 说明 |
+|----|-------|----------------|
+| `query` | fp16 / bf16 | TND `[T, H, D]`，`D=128` |
+| `key_cache` / `value_cache` | uint8 | `[num_blocks, num_kv_heads, packed_bytes]` |
+| `block_table` | int32 | `[batch, maxBlocksPerSeq]` |
+| `actual_seq_len_q` / `actual_seq_len_kv` | int64 | ValueDepend；前缀和风格 |
+| `rotation_key` / `rotation_value` | 同 query | `[D, D]`；Python 侧 key=`R^T`，value=`R` |
 
 **Output**
 
-- `attention_out`：与 query 同 shape / dtype；binding 支持可选 `out=` 原地写
+- `attention_out`：与 query 同 shape / dtype；Torch binding 支持可选 `out=` 原地写
 
-**Attrs**：`num_heads`, `num_kv_heads`, `head_size(=128)`, `block_size(%16==0)`,
+**Attrs**（顺序）：`num_heads`, `num_kv_heads`, `head_size`, `block_size`,
 `max_actual_seq_len`, `scale_value`
 
-**约束**：`num_heads % num_kv_heads == 0`；GQA 组大小 UB 上限 `TQ_BR_ATTN_GQA_CAP=8`（按 chunk 处理）。
+**硬约束**
+
+- `head_size == 128`；`block_size % 16 == 0`
+- `num_heads % num_kv_heads == 0`；GQA 按 `TQ_BR_ATTN_GQA_CAP=8` 分 chunk
+- query / `rotation_key` / `rotation_value` **同 dtype**
+- key last-dim = `(block_size/16)*2112`；value = `(block_size/16)*1088`
+- `max_actual_seq_len` ≥ observed `max(actual_seq_len_kv)`
+- Workspace：system ≥ 16MB；user 上限 128MB
 
 ## 3. Cache 布局
 
-与 pack 共用（每 16-row sub-block）：
+与 pack 共用——**整 block 独立行平面**（非「16-row 交错 sub-block 串」）：
 
 ```text
-Key:   [16*128 codes][16*2 base][16*2 step]     → 2112 B
-Value: [16*64 nibbles][16*2 vmin][16*2 vstep]   → 1088 B
+Key head:   [block_size × 128 codes]
+            [block_size × 2 base]
+            [block_size × 2 step]
+            headStride = block_size × (128 + 4)
+
+Value head: [block_size × 64 packed nibbles]
+            [block_size × 2 vmin]
+            [block_size × 2 vstep]
+            headStride = block_size × (64 + 4)
 ```
 
-反量化：
+每 16 行字节量：`TQ_BR_KEY_BLOCK_STRIDE=2112`、`TQ_BR_VAL_BLOCK_STRIDE=1088`
+（tiling / pack 真源；`decode_device.h` 注释中的 2176/1152 为历史笔误，常量值为 2112/1088）。
+
+反量化（kernel）：
 
 ```text
-K: q7=code&0x7F, sign=code>>7 → y = ±(base + q7*step)
-V: idx4 ∈ [0,15]            → V = vmin + idx4*vstep
+K: q7=code&0x7F, sign=code>>7
+   err = base + q7*step
+   decoded = err * (±1)
+
+V: signed idx4 ∈ [-8, 7]
+   Load/Finalize 将 +8*vstep 折入 vmin'
+   decoded = vmin' + idx4_s * vstep
 ```
+
+Load 路径：同 page 连续行复用 `blockId`；codes 按 ≤16 行一次 `DataCopyPad`；
+base/step（或 vmin/vstep）各一次平面 `DataCopyPad`，Cast 后 **GetValue→栈数组**
+再喂 Decode（meta 留 UB 曾乱码，已回退）。
 
 ## 4. Tiling Key 与调度
 
-| Key | 模式 | 典型场景 |
-|-----|------|----------|
-| `0` | SplitBN + Vector QK/PV | 短 KV Decode；未进 qTile 的 Prefill（如 `GQA>2` 或 `numTokens ≤ usedCoreNum`） |
-| `1` | SplitBNS + Vector QK/PV（FlashDecode） | 长 KV、小 Q（`1 ≤ numTokens ≤ 32` 且代价模型选 `P>1`） |
-| `2` | SplitBN + qTile + Cube QK / Vector PV | Prefill / ChunkedPrefill（`GQA≤2` 且 `numTokens > usedCoreNum`） |
+| Key | 常量 | 模式 | 典型场景 |
+|-----|------|------|----------|
+| `0` | `TQ_BR_ATTN_KEY_SPLITBN_VECTOR` | SplitBN + Vector QK/PV | 短 KV Decode；未进 qTile 的 Prefill |
+| `1` | `TQ_BR_ATTN_KEY_SPLITBNS_VECTOR` | SplitBNS + Vector（FlashDecode） | 长 KV、小 Q（`1≤T≤32` 且代价模型 `P>1`） |
+| `2` | `TQ_BR_ATTN_KEY_SPLITBN_QTILE` | SplitBN + qTile + Cube QK；**条件 Cube PV** | Prefill / ChunkedPrefill（`GQA≤2` 且 `T>usedCoreNum`） |
 
-硬件：`KERNEL_TYPE_MIX_AIC_1_2`（每 MIX 组 1 AIC + 2 AIV）。  
-Host 启动 `blockDim = parallelCoreNum * mixBlockDim`（`parallelCoreNum = min(aicNum, 20)`）；闲置 MIX 在 device 侧 `mixCoreIdx >= usedCoreNum` 后直接 return。
+硬件：`KERNEL_TYPE_MIX_AIC_1_2`（每 MIX：1 AIC + 2 AIV）。  
+Host：`parallelCoreNum = min(aicNum, 20)`，`blockDim = parallelCoreNum * mixBlockDim`；
+闲置 MIX 在 `mixCoreIdx >= usedCoreNum` 后 return。
 
-选择顺序（host `GetTiling`）：先判 FD → 否则 SplitBN；再在 SplitBN 上叠加 `qTileMode`（成功则 tilingKey=2，并把 `qkPvMode` 置 Cube）。
+选择顺序（`GetTiling`）：**先 FD → 否则 SplitBN → 再叠 qTile**。
+qTile 成功则 key=2，且 `qkPvMode = TQ_BR_ATTN_QKPV_CUBE`。
 
-### 4.1 SplitBN（key 0；key 2 的非 qTile 回落也走同一 worker 映射）
+> `TQ_BR_ATTN_CUBE_MIN_G` / `TQ_BR_ATTN_CUBE_MIN_TILE` 在 tiling.h 中**未被引用**；
+> 真门控见 §5。
 
-- 任务粒度：`(token, kvHead, gqaChunk)`，`taskCount = numTokens * numKvHeads * ceil(gqaGroup / GQA_CAP)`
-- Host：`SplitBn` 决定 `usedCoreNum = min(taskCount, parallelCoreNum)`（另写 former/tail range，**device 当前未用**）
-- Device（key 0 / `qTileMode==0`）：双 AIV 都参与，`workerIdx = mixCoreIdx*2 + subIdx`，`workerNum = usedCoreNum*2`，按 `taskIdx % workerNum` **round-robin** 认领 task
-- AIC：SplitBN / FD partial 路径直接 return；qTile Cube QK 时两 AIV 均可经共享 KFC 发 Matmul（`K^T` 按 AIV slot 隔离，见 §4.3）
+### 4.1 SplitBN（key 0）
 
-### 4.2 SplitBNS / FlashDecode（key 1）
+- 任务：`(token, kvHead, gqaChunk)`，`taskCount = T * numKvHeads * ceil(gqa/GQA_CAP)`
+- `usedCoreNum = min(taskCount, parallelCoreNum)`（`formerCoreNum` / range 字段 host 写入、**device 未用**）
+- Device：`workerIdx = mixCore*2+subIdx`，`workerNum = usedCoreNum*2`，task **round-robin**
+- AIC entry 在 SplitBN 上直接 return；Cube 由 AIV 经共享 KFC 驱动
 
-开启条件（`IsFlashDecodeK8v4`）：
+### 4.2 FlashDecode（key 1）
+
+`IsFlashDecodeK8v4`：
 
 1. `1 ≤ numTokens ≤ TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（32）
-2. `PickFlashDecodeKvSplitPart(taskCount, maxKvLen, parallelCoreNum) > 1`
+2. `PickFlashDecodeKvSplitPart(taskCount, maxActualSeqLen, parallelCoreNum) > 1`
+3. 编译期 `TQ_BR_FORCE_DISABLE_FLASH_DECODE=1` 可强制关
 
-分段代价模型（host）：
+代价模型：
 
 ```text
 cost(P) = ceil(taskCount / (coreNum/P)) * ceil(maxKvLen / P)
-约束：maxKvLen ≥ 1024，segment ≥ 512，P ≤ coreNum（且受 maxKvLen/512 限制）
+约束：maxKvLen ≥ 1024，segment ≥ 512，P ≤ min(coreNum, maxKvLen/512)
 ```
 
-`SplitBns`：`usedCoreNum = min(coreNum, (coreNum/P) * P)`，`kvSegmentLen` 按 `blockSize` 对齐。
+调用时传入的长度参数为 **`maxActualSeqLen`**（tiling 字段名 `maxActualSeqLen`）。
 
-流程：
+流程：双 AIV 写 partial（`accumOut` + LSE）→ `SyncAll` → **仅 primary AIV**
+（`subIdx==0`）`CombineFlashDecode`（Rotate 共用每 MIX 一个 KFC）。
 
-1. 双 AIV 写 FD partial（`accumOut` / LSE）到 workspace（round-robin 含 `segIdx`）
-2. `SyncAll`
-3. **仅 primary AIV**（`subIdx==0`）做 `CombineFlashDecode`（Rotate 共用每组一个 KFC）
-
-调试：编译期 `TQ_BR_FORCE_DISABLE_FLASH_DECODE=1` 可强制关 FD。  
-Host 探针：`tests/e2e/singlecard/xrx_k8v4_fd_cost_model.py`。
+探针：`tests/e2e/singlecard/xrx_k8v4_fd_cost_model.py`。
 
 ### 4.3 Prefill qTile（key 2）
-
-开启条件：
 
 ```text
 splitMode == SplitBN
@@ -124,119 +155,232 @@ splitMode == SplitBN
 && numTokens > usedCoreNum
 ```
 
-Host 为每个 MIX 组写 `[qTileTokenStart, qTileTokenEnd)`：
-
-- 默认按 token 数均分
-- 有 ValueDepend seq 时，按 **causal KV 工作量前缀和** 再平衡（避免尾部长 causal 偏重）
+Host 为每个 MIX 写 `[qTileTokenStart, qTileTokenEnd)`：默认按 token 均分；
+有 ValueDepend seq 时按 **causal KV 工作量前缀和** 再平衡。
 
 Device（`ProcessSplitBn` qTile 分支）：
 
-- 两 AIV **共享同一 token 区间**，按 `kvHead % 2 == subIdx` 分工（**不对半切 token**；避免因果前缀双读）
-- 各自独立 DecodeK/V，**不**跨 AIV 共享已 decode 的 K/V tile
-- 同 seq 内连续 token 聚成 `qRows ≤ TQ_BR_UB_QTILE_CAP(16)` 的 qTile；`qRows>1` 走 `ComputeAttentionQTile`（Cube QK），否则回落单 token Vector 路径
-- Cube QK：物理 `K^T` 落在 **per-AIV-slot** qk workspace（`aivSlot = mixCore*2+subIdx`，每 MIX 2 槽）
+- 两 AIV **共享同一 token 区间**，按 `kvHead % 2 == subIdx` 分工（不对半切 token）
+- 同 seq 内连续 token 聚成 `qRows ≤ TQ_BR_UB_QTILE_CAP(16)`；`qRows>1` →
+  `ComputeAttentionQTile`，否则回落单 token `ComputeAttention`
+- Cube QK/PV 的 GM staging 按 **AIV slot** 隔离：`aivSlot = mixCore*2+subIdx`
 
-## 5. 热路径优化（摘要）
+## 5. Cube QK / Cube PV 门控
 
-相对早期 vector 基线，当前实现的主要收益点：
+### 5.1 Cube QK
 
-| 主题 | 做法 | 代码锚点 |
-|------|------|----------|
-| AIV 解包 | 向量化 K/V 解包；`Duplicate+Axpy`；栈上 scalar base/step | `DecodePacked*`, `decode_device.h` |
-| 寻址缓存 | 同 page 连续行复用 `blockId`；qTile 预取 `causalEnds` | `GetBlockId` / qTile loop |
-| A1 V prefetch | `PrefetchPackedValueTileRowsIssue` 把 V MTE2 叠在 DecodeK+QK 上；`VStage` 为 codes/vmin/vstep 连续平面，同 page 各一次 `DataCopyPad`，Finalize 整块 Cast | kernel main / qTile loop |
-| B3 双 AIV FD | SplitBNS partial 双 AIV；Combine 仍 primary-only | `Process()` |
-| 双 AIV SplitBN | Decode / qTile 均映射 `workerNum = usedCoreNum*2` | `ProcessSplitBn` |
-| Prefill 按 kvHead 拆双 AIV | qTile 路径两 AIV 按 `kvHead % 2` 分工，避免 token 对半切导致的 KV 前缀双读（Prefill Q=241 约 −27%） | `ProcessSplitBn` qTile |
-| H1 Key code + meta bulk | 同 page ≤16 行：codes 一次 MTE2；base/step 各一次 `DataCopyPad`；subblock 整块 Cast；`V_MTE2` 后再复用 PackedRaw（相对 M3：Decode 约 −58%、Prefill 约 −44%，含 Value plane） | `LoadPackedKeyTileRows` / `PrefetchPackedKeyCodesFinalize` |
-| M2 更大 qTile | Prefill `qTile` 8→16，`CubeQk MAX_M` 16→32（覆盖 GQA=2）；Prefill 约 −1.6% | `TQ_BR_UB_QTILE_CAP` |
-| Cube QK 按 AIV slot | KT GM 用 `mixCore*2+subIdx`，每 MIX 分配 2 槽；双 AIV Prefill 可并行 Cube（约 −29%） | `CubeQkQTile` / tiling ws |
-| M3 Softmax∥LoadK | Softmax 期间 MTE2 预取下一 tile Key codes（暂存 CodeFloat）；Finalize 同样整块 meta+Cast | `PrefetchPackedKeyCodes*` |
-| qTile 负载均衡 | host 按 causal work 切 token 区间 | tiling.cpp |
-| GQA=2 特化 | `VectorQkFloatPreScaledGqa2` / `OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar`：K/V 行复用两 Q head | `attention_device.h` |
-| Prefill Cube PV | Softmax 留 AIV；`P@V` 走 KFC（`CubePvQTile`）；门槛 `qRows≥4`、`mRows≥32`、无部分因果（Prefill 约 −27%） | `ComputeAttentionQTile` |
-| 原地输出 | binding `out=`；eager 路径若返回同一 buffer 则跳过 self-copy | `torch_binding.cpp`, `attention_v1.py` |
+Host：qTileMode → `qkPvMode=1` + 分配 qk workspace。
 
-**刻意不做 / 已回退**：codes+meta **融合**成一次 MTE2 / 错误对齐 dst（曾触发 AICORE；现改为同 page **分平面**整块 meta，安全）；
-`SetTensorB(true)` 消 K^T 手工转置（相对 H2 持平）；Decode 路径开 Cube QK（小 M 的 K^T 税使
-Q=16 约 +13%）；盲目抬高 `TQ_BR_FLASH_DECODE_MAX_Q_TOKENS`（需先更新 FD cost model）；
-Softmax/PV 改 Brcb+BinaryRepeat（Prefill +14%）；Prefill KV-outer lite（+1.3%）；
-qTile Cap 16→24（Prefill 持平，已回退）；Prefill 真 KV-outer GM spill（Q/outAcc/m/s 驻 GM +
-K tile 暂存、chunk 内 Vector QK；相对 Cube PV Prefill +0.8%，已回退——跨 tile 单扫的 GM/标量税
-抵消了少扫 KV 的收益）。
-
-## 6. Workspace
+Device：
 
 ```text
-[0, systemWs)                              // libapi / system
-[systemWs, …)  partial accum + LSE         // 仅 SplitBNS
-[…, …)         qk K^T staging per core     // 仅 qTile Cube QK
+preferCubeQk = (qkPvMode_ == 1) && (qRows > 1)
 ```
 
-- FD partial：`accumOutSize = T * H * kvSplitPart * D`（fp32）  
-  `logSumExpSize = T * H * kvSplitPart * 2`（fp32）
-- qTile：`qkWorkspaceStride = D * KV_TILE_CAP` half 元素 / **AIV slot**（每 MIX 2 槽 × `parallelCoreNum`）
+`CubeQkQTile` 额外要求：`compactRows=qRows*gqa ≤ TQ_BR_QK_CUBE_MAX_M(32)`，
+`mRows ≤ TQ_BR_QK_CUBE_MAX_N(64)`，`qkGmReady_` / `matmulReady_`，
+workspace stride ≥ `D×64` half。
 
-## 7. Serving 接入（attention_v1）
+实现：K fp32→half → 16×16 vtranspose 得 `K^T` → 写入 per-slot GM →
+`SetTensorA(Q)` / `SetTensorB(KT, false)` → `IterateAll` → score half→float。
+失败回落 `VectorQkFloatPreScaled(Gqa2)`。
+
+**Decode 永不开 Cube QK**（小 M 的 K^T 税使 Q=16 约 +13%，已回退）。
+
+### 5.2 Cube PV（仅 Prefill qTile）
+
+```text
+tileFullForAllQ =
+  gqaCount==2 && qRows≥4 && mRows≥32
+  && compactRows≤32 && mRows≤64 && preferCubeQk
+  && ∀q: ¬(pos < causalEnds[q] < pos+mRows)   // 禁止部分因果 tile
+```
+
+通过后：`OnlineSoftmaxOnlyTileFloatPreScaledGqa2Scalar`（更新 m/s，留下 P）→
+`CubePvQTile`（P@V，V 行主序 staging，无转置）。失败则 GQA=2 双 head `Axpy` 回落。
+
+Cube PV 占用 `CodeFloat` 时 **延后 M3** Key-code prefetch（先 SoftmaxOnly+PV，再 Issue）。
+
+## 6. UB 账本（≤192 KiB）
+
+静态偏移布局（`bit_residual_attention_paged_k8v4.cpp`），合计约 **171 KiB**：
+
+| Buffer | 约 Bytes | 用途 |
+|--------|----------|------|
+| PackedRaw | 2112 | K/V 平面临时 staging |
+| CodeI16 | 16384 | codes / Cube P half |
+| CodeFloat | 32768 | decode scratch；M3 codes；Cube KT/V stage |
+| QGroupFloat | 4096 | Decode Q |
+| Score | 2048 | Decode scores（stride=`KV_TILE_CAP`） |
+| KBase/KStep/Vmin/Vstep | 256×4 | meta Cast 中转 |
+| MState/SState | 32×2 | UB 态（热路径多用栈 scalar） |
+| OutAcc | 4096 | Decode accum |
+| Decoded | 32768 | K/V float（时分复用） |
+| FloatScratch | 1024 | reduce / ExpScalar |
+| Mask / ValMask | 256×2 | 常量掩码 |
+| RotateWork | 32768 | KFC workspace；DecodeKey `signBits` |
+| QTileQ / Score / OutAcc | 16384+8192+16384 | Prefill qTile（Cap=16×GQA2） |
+| VStage | ≤8192（实约 4608） | A1：`[codes][vmin][vstep]` 连续平面 |
+
+常量：`TQ_BR_UB_KV_TILE_CAP=64`，`TQ_BR_UB_GQA_CAP=8`，
+`TQ_BR_UB_QTILE_CAP=16`，`TQ_BR_UB_QTILE_GQA_CAP=2`。
+
+## 7. 热路径流水
+
+### 7.1 Decode / 非 qTile（`ComputeAttention`）
+
+```text
+LoadQ → Cast → Rotate(Q@R_key) → ×scale
+for KV tile:
+  LoadK | M3-Finalize → PrefetchV Issue (A1)
+  DecodeK → Vector QK (Gqa2)
+  PrefetchV Finalize → DecodeV
+  M3 Issue next-K → Softmax+PV Scalar (Gqa2) → M3 Finalize
+Normalize → [FD WritePartial | Rotate(out@R_value) → WriteOut]
+```
+
+### 7.2 Prefill qTile（`ComputeAttentionQTile`）
+
+```text
+LoadQ tile → Rotate → ×scale；预取 causalEnds[]
+for KV tile (至 maxCausalKvEnd):
+  LoadK | M3-Finalize → PrefetchV Issue
+  DecodeK → Cube QK (prefer) | Vector QK
+  PrefetchV Finalize → DecodeV
+  if tileFullForAllQ:
+      SoftmaxOnly → CubePv | Axpy fallback
+      then M3 Issue          // CodeFloat 已释放
+  else:
+      M3 Issue → Softmax+PV Scalar → …
+  M3 Finalize
+WriteFinalOutputQTile（×1/s → Rotate → Cast → GM）
+```
+
+### 7.3 `attention_device.h` 热路径实际调用
+
+| 函数 | 场景 |
+|------|------|
+| `VectorQkFloatPreScaled` / `…Gqa2` | Decode；qTile Cube QK 失败回落 |
+| `OnlineSoftmaxUpdateTileFloatPreScaledScalar` / `…Gqa2Scalar` | Decode；qTile Vector PV |
+| `OnlineSoftmaxOnlyTileFloatPreScaledGqa2Scalar` | Prefill Cube PV 前 |
+
+其余 LocalTensor-m/s、带 vNorm、未接本 kernel 的变体视为遗留，勿当热路径文档。
+
+## 8. 已落地优化（摘要）
+
+| 主题 | 做法 | 锚点 |
+|------|------|------|
+| A1 V prefetch | V MTE2 ∥ DecodeK+QK；`VStage` 分平面 | `PrefetchPackedValueTileRows*` |
+| H1 Key/Value bulk | 同 page ≤16 行 codes 一次 + meta 分平面 | `LoadPackedKeyTileRows` 等 |
+| M3 Softmax∥LoadK | Softmax 期间预取下一 tile Key codes→`CodeFloat` | `PrefetchPackedKeyCodes*` |
+| B3 双 AIV FD | partial 双 AIV；Combine primary-only | `Process` / `CombineFlashDecode` |
+| Prefill kvHead 拆双 AIV | 共享 token 区间，避免因果前缀双读 | `ProcessSplitBn` qTile |
+| Cube QK per-AIV-slot | KT GM 隔离，双 AIV 可并行发 Matmul | `CubeQkQTile` |
+| Prefill Cube PV | SoftmaxOnly + `CubePvQTile`；门控见 §5.2 | `ComputeAttentionQTile` |
+| GQA=2 | K/V 行复用两 Q head | `attention_device.h` |
+| qTile 负载均衡 | host 按 causal work 切区间 | tiling.cpp |
+| 原地输出 | binding `out=`；同 buffer 跳过 copy | `torch_binding` / `attention_v1` |
+
+## 9. 刻意不做 / 已回退（勿重复试）
+
+对照基线：Prefill Cube PV 后 long_query（Decode Q=16 ≈2.23 ms，Prefill Q=241 ≈6.77 ms）。
+
+| 尝试 | 结果 | 结论 |
+|------|------|------|
+| codes+meta 融合单次 MTE2 / 错对齐 dst | AICORE | 分平面 bulk（已落地） |
+| Softmax/PV `Brcb`+`BinaryRepeat` | Prefill **+14%** / 乱码 | 禁止盲 Brcb |
+| Softmax 两 head 合 V↔S / Exp 批处理 | Prefill **+1.3%** | 无净收益 |
+| Softmax+PV：beta 先搬栈再 Axpy | Decode **+8.2%** | 禁止「只搬栈」 |
+| Decode SoftmaxOnly + Cube PV（`compactRows=2`） | Decode **+2.5%** | 小 M Cube PV 税＞收益 |
+| Prefill 部分因果仍走 Cube PV | Prefill **−0.1%** | 保持 `tileFullForAllQ` |
+| qTile Cap 16→24 | 持平 | 保持 Cap=16 |
+| Prefill KV-outer lite | Prefill **+1.3%** | 未少扫 KV |
+| Prefill 真 KV-outer GM spill | Prefill **+0.8%** | GM 税抵消少扫；需重设计 |
+| `SetTensorB(true)` 消手工 K^T | 持平 | 转置税不在此 |
+| Decode 开 Cube QK | Q=16 约 **+13%** | Decode 保持 Vector QK |
+| 盲目抬 `FLASH_DECODE_MAX_Q_TOKENS` | Q≥32 收益 ≤1% | 禁止盲目抬 cap |
+| DecodeK/V 合并 per-row barrier / 整 tile Mul+Add | **+1.8~1.9%** | 解压行向已非瓶颈 |
+| Decode M3 改 `RotateWork` 提前 Issue | Decode **+0.3%** | 无收益 |
+| Cube PV 期 M3 改 `VStage` | Prefill **−0.6%** | SoftmaxOnly 窗短 |
+| meta 留 UB（去 GetValue→栈） | 假加速 + smoke **乱码** | 禁止未验证 offset Cast |
+| Vector QK GQA2 减 barrier | **0.0%** | Prefill 主路径已是 Cube QK |
+| Prefill 再搬 QK ReduceSum 上 Cube | — | 已有 `CubeQkQTile` |
+| DecodeKey 迁 Cube / AIC MTE1 卸 MTE2 | — | 否决 |
+
+AIV 微优化在 Cube PV 基线上已榨干。结构性破局方向（未落地）：真 KV-outer、
+多 tile 合批 Cube、FIA 旁路——见会话设计页 / Todos，**勿**再重复上表路径。
+
+## 10. Workspace
+
+```text
+[0, systemWs)                         // libapi，≥16MB
+[systemWs, …)  FD partial（仅 SplitBNS）:
+               accumOut: T × H × kvSplitPart × D   fp32
+               LSE:      T × H × kvSplitPart × 2   fp32
+[…]  qk staging（仅 qkPvMode==CUBE）:
+     parallelCoreNum × 2 slots × (D × KV_TILE_CAP) × sizeof(uint16)
+     // Cube QK 存 K^T；Cube PV 复用槽位存 V（行主序）
+```
+
+Device Init：`qkSlots = usedCoreNum * 2`（host 按 `parallelCoreNum*2` 分配，更宽）。
+
+## 11. Serving 接入
 
 ```text
 AscendAttentionBackendImpl
   └─ reshape_and_cache → bit_residual_pack_k8v4
   └─ forward / paged path
-        ├─ (optional) bit_residual_fia_paged_k8v4   # env 打开时
+        ├─ (optional) bit_residual_fia_paged_k8v4   # env
         └─ bit_residual_attention_paged_k8v4(out=caller_buf)
               └─ None → RuntimeError（fail-fast，禁止静默落到 MSE/slab）
 ```
 
-要点：
+1. Wrapper 条件不满足返回 `None`；serving **直接报错**。
+2. 调用方传 `out=`；仅当 `attn_output is not output` 时 copy。
+3. bf16：query / rotation / pack meta 同 dtype，禁止边界 `→fp16` cast。
 
-1. Wrapper 条件不满足时返回 `None`；serving **直接报错**，不再 silent fallback。
-2. 调用方传入 `out=`，避免额外分配；`forward` 末尾仅在 `attn_output is not output` 时 copy。
-3. bf16 serving：query / rotation / pack meta 同 dtype，禁止边界 `→fp16` cast。
-
-## 8. 验证与 Profile
+## 12. 验证与 Profile
 
 | 工具 | 用途 |
 |------|------|
-| `tests/e2e/singlecard/xrx_bit_residual_k8v4_smoke.py` | 短序列正确性 + optional profiler（`XRX_K8V4_PROFILE_DIR`） |
-| `tests/e2e/singlecard/xrx_bit_residual_k8v4_long_query_profile.py` | 长 query / chunked prefill |
-| `tests/e2e/singlecard/xrx_bit_residual_k8v4_bs1_long_profile.py` | bs=1 长 KV 微基准 |
-| `tests/e2e/singlecard/xrx_bit_residual_k8v4_golden.py` | 数值对照 |
-| `tests/e2e/singlecard/summarize_k8v4_profiler.py` | 汇总 host/device；按 `Input Shapes` 首维 Q 分 decode / prefill（`--decode-q-max`，默认 32） |
-| `tests/e2e/singlecard/xrx_k8v4_fd_cost_model.py` | 打印 FD `PickFlashDecodeKvSplitPart` 代价 |
+| `xrx_bit_residual_k8v4_smoke.py` | 短序列 + optional profiler（`XRX_K8V4_PROFILE_DIR`） |
+| `xrx_bit_residual_k8v4_long_query_profile.py` | 长 query / chunked prefill |
+| `xrx_bit_residual_k8v4_bs1_long_profile.py` | bs=1 长 KV |
+| `xrx_bit_residual_k8v4_golden.py` | 数值对照 |
+| `summarize_k8v4_profiler.py` | host/device；按 Q 首维分 decode/prefill（`--decode-q-max` 默认 32） |
+| `xrx_k8v4_fd_cost_model.py` | FD `PickFlashDecodeKvSplitPart` |
 
-典型 long-query：decode `Q≈num_prompts`（如 16），chunked prefill `Q≈241`。
-
-改 C++ 后需重建扩展：
+典型 long-query：decode `Q≈16`，chunked prefill `Q≈241`。
 
 ```bash
 rm -rf build csrc/build
-python3 setup.py build_ext --inplace   # 或项目惯用 rebuild 脚本
+python3 setup.py build_ext
 ```
 
-## 9. 目录结构
+## 13. 目录结构
 
 ```text
 csrc/bit_residual_attention_paged_k8v4/
-  DESIGN.md                          # 本文档
+  DESIGN.md
   op_host/
     bit_residual_attention_paged_k8v4_def.cpp
     bit_residual_attention_paged_k8v4_tiling.{h,cpp}
     aclnn_bit_residual_attention_paged_k8v4.h
+    CMakeLists.txt
   op_kernel/
-    bit_residual_attention_paged_k8v4.cpp   # entry + Kernel
-    attention_device.h                      # Vector QK / Softmax+PV / GQA=2
-    decode_device.h                         # packed K/V decode helpers
+    bit_residual_attention_paged_k8v4.cpp   # entry + Kernel + UB
+    attention_device.h                      # Vector QK / Softmax / SoftmaxOnly
+    decode_device.h                         # 布局常量 + TqRotateMatmulOp
 ```
 
-## 10. 与 FIA 的边界
+## 14. 与 FIA 的边界
 
-| | Attention（本算子） | FIA (`bit_residual_fia_paged_k8v4`) |
-|--|---------------------|-------------------------------------|
-| 流水 | AIV decode + Vector/Cube QK/PV | vendor FIA Cube MM1/MM2 + BR dequant |
+| | 本算子 | FIA (`bit_residual_fia_paged_k8v4`) |
+|--|--------|-------------------------------------|
+| 流水 | AIV decode + Vector/Cube QK/PV | vendor Cube MM1/MM2 + BR dequant |
 | Decode 默认 | **是** | env A/B |
 | Prefill cache-hit 默认 | **是** | env A/B |
-| 长 Q Prefill | qTile + 工作量均衡 | FIA 自身 tiling / FD |
-| 失败策略（serving） | 返回 None → **抛错** | 返回 None → 再试本算子 |
+| 长 Q Prefill | qTile + 工作量均衡 + 条件 Cube PV | FIA 自身 tiling / FD |
+| 失败（serving） | 返回 None → **抛错** | 返回 None → 再试本算子 |
 
 优化本算子时**不要**改 FIA kernel / tiling；A/B 只通过 env 切换。
