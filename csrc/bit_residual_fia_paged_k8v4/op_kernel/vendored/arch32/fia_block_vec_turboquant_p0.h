@@ -1262,7 +1262,8 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float));
     LocalTensor<half> halfScratch =
         tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
-    // Scalar meta reads reuse fp32UbA[0] before each Key tile clobbers scratch.
+    // P0: batch meta Cast into fp32UbC[0..2*tile), one V_S, then GetValue to
+    // stack before BrDecode*Tile reuses A/B/C scratch.
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
     GlobalTensor<WS_T> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
@@ -1360,13 +1361,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 }
                 float bases[kTileMax];
                 float steps[kTileMax];
-                for (uint32_t jj = 0U; jj < nb; ++jj) {
-                    const uint32_t j = j0 + jj;
-                    bases[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
-                        batchUb, fp32UbA, meta0Off + j * kMetaSlot);
-                    steps[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
-                        batchUb, fp32UbA, meta1Off + j * kMetaSlot);
-                }
+                // Batch Cast both meta runs into 32B-strided slots on fp32UbC;
+                // single V_S then scalar pull. Need 2 * tile * 8 floats (=128).
+                br_dequant::BrCastMetaSlotsToFp32<Q_T>(
+                    batchUb, meta0Off + j0 * kMetaSlot, nb, fp32UbC, false);
+                br_dequant::BrCastMetaSlotsToFp32<Q_T>(batchUb, meta1Off + j0 * kMetaSlot, nb,
+                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], true);
+                br_dequant::BrLoadMetaFp32ToArray(fp32UbC, bases, nb);
+                br_dequant::BrLoadMetaFp32ToArray(
+                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], steps, nb);
                 br_dequant::BrDecodeKeyTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
                     outBatch[j0 * headDimAlign], bases, steps, nb, headDim, headDimAlign);
@@ -1379,13 +1382,13 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 }
                 float vmins[kTileMax];
                 float vsteps[kTileMax];
-                for (uint32_t jj = 0U; jj < nb; ++jj) {
-                    const uint32_t j = j0 + jj;
-                    vmins[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
-                        batchUb, fp32UbA, meta0Off + j * kMetaSlot);
-                    vsteps[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
-                        batchUb, fp32UbA, meta1Off + j * kMetaSlot);
-                }
+                br_dequant::BrCastMetaSlotsToFp32<Q_T>(
+                    batchUb, meta0Off + j0 * kMetaSlot, nb, fp32UbC, false);
+                br_dequant::BrCastMetaSlotsToFp32<Q_T>(batchUb, meta1Off + j0 * kMetaSlot, nb,
+                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], true);
+                br_dequant::BrLoadMetaFp32ToArray(fp32UbC, vmins, nb);
+                br_dequant::BrLoadMetaFp32ToArray(
+                    fp32UbC[kTileMax * br_dequant::BR_META_FP32_STRIDE], vsteps, nb);
                 br_dequant::BrDecodeValueTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
                     outBatch[j0 * headDimAlign], vmins, vsteps, nb, headDim, headDimAlign);
