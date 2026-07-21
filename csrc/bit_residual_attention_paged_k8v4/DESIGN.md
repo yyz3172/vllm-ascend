@@ -30,9 +30,9 @@
 pack_k8v4 → uint8 PA cache
 query → LoadQ → Cube rotate (Q @ R_key) → × scale
       → tile loop:
-           Load/Prefetch K → DecodeK → QK (Vector | Cube)  ∥  Prefetch V (A1)
+           Load/Prefetch K → DecodeK → QK (Vector | Cube)  ∥  Prefetch V
            Finalize V → DecodeV
-           Softmax+PV (Vector)  |  SoftmaxOnly + Cube PV   ∥  M3 next-K（非 Cube PV）
+           Softmax+PV (Vector)  |  SoftmaxOnly + Cube PV   ∥  预取下一 tile Key
       → Normalize → Cube rotate (out @ R_value) → WriteOut
 ```
 
@@ -199,7 +199,7 @@ tileFullForAllQ =
 通过后：`OnlineSoftmaxOnlyTileFloatPreScaledGqa2Scalar`（更新 m/s，留下 P）→
 `CubePvQTile`（P@V，V 行主序 staging，无转置）。失败则 GQA=2 双 head `Axpy` 回落。
 
-Cube PV 占用 `CodeFloat` 时 **延后 M3** Key-code prefetch（先 SoftmaxOnly+PV，再 Issue）。
+Cube PV 占用 `CodeFloat` 时 **延后**下一 tile 的 Key-code prefetch（先 SoftmaxOnly+PV，再 Issue）。
 
 ## 6. UB 账本（≤192 KiB）
 
@@ -209,7 +209,7 @@ Cube PV 占用 `CodeFloat` 时 **延后 M3** Key-code prefetch（先 SoftmaxOnly
 |--------|----------|------|
 | PackedRaw | 2112 | K/V 平面临时 staging |
 | CodeI16 | 16384 | codes / Cube P half |
-| CodeFloat | 32768 | decode scratch；M3 codes；Cube KT/V stage |
+| CodeFloat | 32768 | decode scratch；下一 tile Key codes；Cube KT/V stage |
 | QGroupFloat | 4096 | Decode Q |
 | Score | 2048 | Decode scores（stride=`KV_TILE_CAP`） |
 | KBase/KStep/Vmin/Vstep | 256×4 | meta Cast 中转 |
@@ -220,7 +220,7 @@ Cube PV 占用 `CodeFloat` 时 **延后 M3** Key-code prefetch（先 SoftmaxOnly
 | Mask / ValMask | 256×2 | 常量掩码 |
 | RotateWork | 32768 | KFC workspace；DecodeKey `signBits` |
 | QTileQ / Score / OutAcc | 16384+8192+16384 | Prefill qTile（Cap=16×GQA2） |
-| VStage | ≤8192（实约 4608） | A1：`[codes][vmin][vstep]` 连续平面 |
+| VStage | ≤8192（实约 4608） | V 预取：`[codes][vmin][vstep]` 连续平面 |
 
 常量：`TQ_BR_UB_KV_TILE_CAP=64`，`TQ_BR_UB_GQA_CAP=8`，
 `TQ_BR_UB_QTILE_CAP=16`，`TQ_BR_UB_QTILE_GQA_CAP=2`。
@@ -232,10 +232,10 @@ Cube PV 占用 `CodeFloat` 时 **延后 M3** Key-code prefetch（先 SoftmaxOnly
 ```text
 LoadQ → Cast → Rotate(Q@R_key) → ×scale
 for KV tile:
-  LoadK | M3-Finalize → PrefetchV Issue (A1)
+  LoadK | 上一轮 Key 预取 Finalize → Prefetch V Issue
   DecodeK → Vector QK (Gqa2)
-  PrefetchV Finalize → DecodeV
-  M3 Issue next-K → Softmax+PV Scalar (Gqa2) → M3 Finalize
+  Prefetch V Finalize → DecodeV
+  Issue 下一 tile Key → Softmax+PV Scalar (Gqa2) → Finalize 该 Key
 Normalize → [FD WritePartial | Rotate(out@R_value) → WriteOut]
 ```
 
@@ -244,15 +244,15 @@ Normalize → [FD WritePartial | Rotate(out@R_value) → WriteOut]
 ```text
 LoadQ tile → Rotate → ×scale；预取 causalEnds[]
 for KV tile (至 maxCausalKvEnd):
-  LoadK | M3-Finalize → PrefetchV Issue
+  LoadK | 上一轮 Key 预取 Finalize → Prefetch V Issue
   DecodeK → Cube QK (prefer) | Vector QK
-  PrefetchV Finalize → DecodeV
+  Prefetch V Finalize → DecodeV
   if tileFullForAllQ:
       SoftmaxOnly → CubePv | Axpy fallback
-      then M3 Issue          // CodeFloat 已释放
+      then Issue 下一 tile Key   // CodeFloat 已释放
   else:
-      M3 Issue → Softmax+PV Scalar → …
-  M3 Finalize
+      Issue 下一 tile Key → Softmax+PV Scalar → …
+  Finalize 该 Key
 WriteFinalOutputQTile（×1/s → Rotate → Cast → GM）
 ```
 
@@ -268,47 +268,82 @@ WriteFinalOutputQTile（×1/s → Rotate → Cast → GM）
 
 ## 8. 已落地优化（摘要）
 
-| 主题 | 做法 | 锚点 |
+| 做法 | 说明 | 锚点 |
 |------|------|------|
-| A1 V prefetch | V MTE2 ∥ DecodeK+QK；`VStage` 分平面 | `PrefetchPackedValueTileRows*` |
-| H1 Key/Value bulk | 同 page ≤16 行 codes 一次 + meta 分平面 | `LoadPackedKeyTileRows` 等 |
-| M3 Softmax∥LoadK | Softmax 期间预取下一 tile Key codes→`CodeFloat` | `PrefetchPackedKeyCodes*` |
-| B3 双 AIV FD | partial 双 AIV；Combine primary-only | `Process` / `CombineFlashDecode` |
-| Prefill kvHead 拆双 AIV | 共享 token 区间，避免因果前缀双读 | `ProcessSplitBn` qTile |
-| Cube QK per-AIV-slot | KT GM 隔离，双 AIV 可并行发 Matmul | `CubeQkQTile` |
-| Prefill Cube PV | SoftmaxOnly + `CubePvQTile`；门控见 §5.2 | `ComputeAttentionQTile` |
-| GQA=2 | K/V 行复用两 Q head | `attention_device.h` |
-| qTile 负载均衡 | host 按 causal work 切区间 | tiling.cpp |
-| 原地输出 | binding `out=`；同 buffer 跳过 copy | `torch_binding` / `attention_v1` |
+| V 预取与 DecodeK/QK 重叠 | V 的 MTE2 与当前 tile DecodeK+QK 并行；`VStage` 分平面 | `PrefetchPackedValueTileRows*` |
+| 同 page 批量 Load K/V | ≤16 行 codes 一次 `DataCopyPad`；meta 分平面拷贝 | `LoadPackedKeyTileRows` 等 |
+| Softmax 期间预取下一 tile Key | codes 先落到 `CodeFloat`，Softmax 后再 Finalize | `PrefetchPackedKeyCodes*` |
+| FlashDecode 双 AIV | partial 双写；Combine 仅 primary AIV | `Process` / `CombineFlashDecode` |
+| Prefill 按 kvHead 拆双 AIV | 两 AIV 共享同一 token 区间，避免因果前缀双读 | `ProcessSplitBn` qTile |
+| Cube QK 按 AIV slot 隔离 staging | 双 AIV 可并行发 Matmul | `CubeQkQTile` |
+| Prefill 条件 Cube PV | SoftmaxOnly + `CubePvQTile`；门控见 §5.2 | `ComputeAttentionQTile` |
+| GQA=2 复用 K/V 行 | 同一 KV 行服务两个 Q head | `attention_device.h` |
+| qTile 按 causal 工作量切核 | host 写 `[tokenStart, tokenEnd)` | tiling.cpp |
+| 原地写 output | binding `out=`；同 buffer 跳过 copy | `torch_binding` / `attention_v1` |
 
 ## 9. 刻意不做 / 已回退（勿重复试）
 
-对照基线：Prefill Cube PV 后 long_query（Decode Q=16 ≈2.23 ms，Prefill Q=241 ≈6.77 ms）。
+对照基线（Prefill 已开 Cube PV）：long_query 上 **Decode Q=16 ≈2.23 ms**，
+**Prefill Q=241 ≈6.77 ms**。下列尝试已实测或论证为负向/不可行。
 
-| 尝试 | 结果 | 结论 |
-|------|------|------|
-| codes+meta 融合单次 MTE2 / 错对齐 dst | AICORE | 分平面 bulk（已落地） |
-| Softmax/PV `Brcb`+`BinaryRepeat` | Prefill **+14%** / 乱码 | 禁止盲 Brcb |
-| Softmax 两 head 合 V↔S / Exp 批处理 | Prefill **+1.3%** | 无净收益 |
-| Softmax+PV：beta 先搬栈再 Axpy | Decode **+8.2%** | 禁止「只搬栈」 |
-| Decode SoftmaxOnly + Cube PV（`compactRows=2`） | Decode **+2.5%** | 小 M Cube PV 税＞收益 |
-| Prefill 部分因果仍走 Cube PV | Prefill **−0.1%** | 保持 `tileFullForAllQ` |
-| qTile Cap 16→24 | 持平 | 保持 Cap=16 |
-| Prefill KV-outer lite | Prefill **+1.3%** | 未少扫 KV |
-| Prefill 真 KV-outer GM spill | Prefill **+0.8%** | GM 税抵消少扫；需重设计 |
-| `SetTensorB(true)` 消手工 K^T | 持平 | 转置税不在此 |
+### 9.1 微优化回退表
+
+| 尝试了什么 | 结果 | 结论 |
+|------------|------|------|
+| codes+meta 合成一次 MTE2 / dst 对齐错误 | AICORE 异常 | 保持 codes / meta **分平面** bulk |
+| Softmax/PV 用 `Brcb`+`BinaryRepeat` 广播 | Prefill **+14%** / 乱码 | 禁止盲 Brcb |
+| Softmax 两 head 合并 V↔S、Exp 批处理 | Prefill **+1.3%** | 无净收益 |
+| Softmax+PV 把 beta 先搬到栈再 Axpy | Decode **+8.2%** | 禁止「只搬栈」 |
+| Decode 也走 SoftmaxOnly + Cube PV（`compactRows=2`） | Decode **+2.5%** | 小 M 上 Cube PV 税更大 |
+| Prefill 部分因果 tile 仍走 Cube PV | Prefill **−0.1%** | 保持 `tileFullForAllQ` 门控 |
+| qTile 容量 16→24 | 持平 | 保持 Cap=16 |
+| Prefill「KV 外环」轻量版（未改调度） | Prefill **+1.3%** | 关键路径未少扫 KV |
+| Prefill「KV 外环」+ 状态 GM spill | Prefill **+0.8%** | GM 税抵消少扫 |
+| `SetTensorB(true)` 省掉手工 Kᵀ | 持平 | 转置税不在此 API |
 | Decode 开 Cube QK | Q=16 约 **+13%** | Decode 保持 Vector QK |
-| 盲目抬 `FLASH_DECODE_MAX_Q_TOKENS` | Q≥32 收益 ≤1% | 禁止盲目抬 cap |
-| DecodeK/V 合并 per-row barrier / 整 tile Mul+Add | **+1.8~1.9%** | 解压行向已非瓶颈 |
-| Decode M3 改 `RotateWork` 提前 Issue | Decode **+0.3%** | 无收益 |
-| Cube PV 期 M3 改 `VStage` | Prefill **−0.6%** | SoftmaxOnly 窗短 |
-| meta 留 UB（去 GetValue→栈） | 假加速 + smoke **乱码** | 禁止未验证 offset Cast |
-| Vector QK GQA2 减 barrier | **0.0%** | Prefill 主路径已是 Cube QK |
-| Prefill 再搬 QK ReduceSum 上 Cube | — | 已有 `CubeQkQTile` |
-| DecodeKey 迁 Cube / AIC MTE1 卸 MTE2 | — | 否决 |
+| 盲目抬 FlashDecode 的 `MAX_Q_TOKENS` | Q≥32 收益 ≤1% | 禁止盲目抬 cap |
+| DecodeK/V 合并 per-row barrier / 整 tile Mul+Add | **+1.8~1.9%** | 行向解压已非瓶颈 |
+| Decode：Softmax 前用 `RotateWork` 提前 Issue Key | Decode **+0.3%** | 无收益 |
+| Cube PV 期间改用 `VStage` 做 Key 预取 | Prefill **−0.6%** | SoftmaxOnly 窗口太短 |
+| meta 留在 UB、去掉 GetValue→栈 | 假加速 + smoke **乱码** | 禁止未验证 offset Cast |
+| Vector QK GQA2 减 PipeBarrier | **0.0%** | Prefill 主路径已是 Cube QK |
+| Prefill 再把 QK ReduceSum 搬上 Cube | — | 已有 `CubeQkQTile` |
+| DecodeKey 改走 Cube / 用 AIC MTE1 卸 MTE2 | — | 否决 |
+| Softmax 按 W=2 分块 + 合批 Cube PV（K≤128） | Prefill **+0.6%** | 持平即停；勿再抬 W=4 |
+| 跨 page 批量读 `blockId` 进 UB 再拷栈 | Decode **+1.7%** / Prefill **+2.5%** | 批 MTE2+拷栈税更大 |
+| Prefill：Cube QK 的 `IterateAll` 期间并行 DecodeV | 不可落地 | `IterateAll` 占用 Decoded/CodeI16，无多余 UB |
+| 短 KV 动态抬高 `kvTileRows` | 否 | UB 已是 CAP=64；短序列已用尾 tile `mRows` |
+| 强制少核 `usedCoreNum=10`（仍按 qTile 内环扫 KV） | Prefill **+43.4%**（6.77→9.70 ms） | Softmax 串行；**永久关闭**少核线 |
+| GM/UB 改 32B meta 槽再 Brcb 解压 | 不单开 | 与上表「整 tile Mul+Add / Softmax Brcb」同构；FIA 的 32B 槽只为 Cast 对齐，仍 GetValue→Duplicate |
 
-AIV 微优化在 Cube PV 基线上已榨干。结构性破局方向（未落地）：真 KV-outer、
-多 tile 合批 Cube、FIA 旁路——见会话设计页 / Todos，**勿**再重复上表路径。
+### 9.2 为何不做「KV 外环」（先扫一遍 KV，内层滚多个 qTile）
+
+当前 Prefill 按 **causal 工作量** 把 Q 分到约 20 个 MIX；long-query（Q≈241、
+seqKv≈2k）下每个核大约只有 **1 个 qTile**。墙钟由「晚 token、causal 最长」的核
+决定，这些核上 **没有**「跨 qTile 重复扫同一段 KV」可省。
+
+若强行少核、拉大每核 token 区间，才会出现多 qTile 重扫——但 Softmax/Cube QK
+并行度从 ~20 降到更少，墙钟 Softmax 近似按核数放大。实测只减核、不改算法时
+Prefill **+43%**，说明 Softmax 税先到账，KV 外环回不来。旧轻量版 / GM spill
+亦为 **+0.8%~+1.3%**。本 KPI **不要**再试少核或 KV 外环。
+
+### 9.3 为何不做「改 meta 布局降 scalar」
+
+pack/attn 已是整 block SoA 平面 + 批量 Cast；profile 上 MTE2 只占墙钟一小部分，
+scalar 主要来自 Decode 的 `Duplicate`+`Axpy` 与 Softmax 侧 GetValue。FIA 的
+32B meta 槽是 half→float Cast 对齐用的，解码仍 GetValue + Duplicate。再做
+「UB 驻留 meta + Brcb 整 tile 解压」等于重做 §9.1 已回退项；只改 GM 宽度增
+HBM、不消主因。
+
+### 9.4 Serving / host（非本算子墙钟）
+
+`async_scheduling=True` 在本场景 e2e 约 **−7~−9%**（不是同事估的 +50~100%）。
+`_torch_cuda_wrapper` 在 `NPUModelRunner` 成功 init 后须保持 `cuda.Event→npu`
+别名，勿再打回 no-op Placeholder。更深 Preparing / IPC / lookahead 属
+runtime/scheduler，勿在本算子内冒充。
+
+**小结**：Cube PV 基线上，AIV 微优化与上述结构线均已停损；优化时请对照本表，
+勿重复已否决路径。
 
 ## 10. Workspace
 

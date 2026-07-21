@@ -3623,7 +3623,10 @@ def _torch_cuda_wrapper():
             pass
 
     try:
-        # replace cuda APIs with xpu APIs, this should work by default
+        # Keep cuda.* aliased to npu.* for the rest of the process so later
+        # torch.cuda.Event / Stream (e.g. async scheduling, draft events) work.
+        # Previously a finally block reset Event to a no-op Placeholder after
+        # successful init, which silently broke event-based overlap (P0).
         torch.Event = torch.npu.Event
         torch.cuda.Event = torch.npu.Event
         torch.cuda.Stream = torch.npu.Stream
@@ -3641,16 +3644,7 @@ def _torch_cuda_wrapper():
         torch.cuda.stream = _StreamPlaceholder
         torch.cuda.synchronize = _StreamPlaceholder
         torch.cuda.mem_get_info = _StreamPlaceholder
-        raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
-    finally:
-        # if anything goes wrong, just patch it with a placeholder
-        torch.cuda.Event = _EventPlaceholder
-        torch.cuda.Stream = torch.cuda.Stream
-        torch.cuda.default_stream = torch.npu.default_stream
-        torch.cuda.current_stream = torch.npu.current_stream
-        torch.cuda.stream = torch.npu.stream
-        torch.cuda.synchronize = torch.npu.synchronize
-        torch.cuda.mem_get_info = torch.npu.mem_get_info
+        raise RuntimeError(f"NPUModelRunner init failed, error is {e}") from e
 
 
 # TODO: This method will be removed subsequently and implemented in platform.
