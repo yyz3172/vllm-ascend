@@ -13,9 +13,12 @@
  * Dual-AIV S2 split: both subcores dequant disjoint [0,half)/[half,s2) WS rows.
  *
  * Meta P1: each decode tile copies contiguous GM meta0/meta1 runs into two
- * aligned 32B UB buffers, then P0 batch-Casts both runs with one V_S sync.
+ * aligned 32B UB buffers, then batch-Casts both runs.
  * This replaces 2*numRows 2B DataCopyPad transactions and 32B-per-row slots
  * with two bulk DataCopyPad transactions and 64B fixed UB staging per tile.
+ * Meta P4: metadata stays in UB after Cast. Brcb expands each row scalar to
+ * one FP32 block and row-broadcast Mul/Add consumes it directly, avoiding
+ * GetValue and all metadata V_S synchronization.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -75,6 +78,8 @@ __aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<
 // One packed meta tile buffer; source/destination bases for vector Cast must
 // be 32B aligned on 910B.
 static constexpr uint32_t BR_PACKED_META_BYTES = 32U;
+static constexpr uint32_t BR_META_FP32_0_UB_OFF = 64U;
+static constexpr uint32_t BR_META_FP32_1_UB_OFF = 96U;
 
 // Copy packed meta0/meta1 runs. GM already uses SoA layout, so each run is
 // contiguous; DataCopyPad handles sub-32B tails and potentially unaligned GM.
@@ -105,16 +110,54 @@ __aicore__ inline void BrCastPackedMetaToFp32(LocalTensor<uint8_t> src,
         Cast(dst1, src1, RoundMode::CAST_NONE, numRows);
     }
     PipeBarrier<PIPE_V>();
-    event_t e = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
-    SetFlag<HardEvent::V_S>(e);
-    WaitFlag<HardEvent::V_S>(e);
 }
 
-__aicore__ inline void BrLoadMetaFp32ToArray(LocalTensor<float> src, float *dst, uint32_t numRows)
+__aicore__ inline void BrApplyRowAffine(LocalTensor<float> dst,
+    LocalTensor<float> src, LocalTensor<float> offsets,
+    LocalTensor<float> scales, LocalTensor<float> broadcast,
+    uint32_t numRows, uint32_t headDim)
 {
-    for (uint32_t j = 0U; j < numRows; ++j) {
-        dst[j] = src.GetValue(j);
+    constexpr uint32_t FP32_BLOCK_ELEMS = 8U;
+    constexpr uint32_t FP32_REPEAT_ELEMS = 64U;
+    const uint32_t rowStrideBlocks = headDim / FP32_BLOCK_ELEMS;
+    const uint32_t columnLoops =
+        (headDim + FP32_REPEAT_ELEMS - 1U) / FP32_REPEAT_ELEMS;
+
+    BinaryRepeatParams repeatParams;
+    repeatParams.dstBlkStride = 1U;
+    repeatParams.src0BlkStride = 1U;
+    repeatParams.src1BlkStride = 0U;
+    repeatParams.dstRepStride = rowStrideBlocks;
+    repeatParams.src0RepStride = rowStrideBlocks;
+    repeatParams.src1RepStride = 1U;
+
+    Brcb(broadcast, scales, (numRows + FP32_BLOCK_ELEMS - 1U) /
+        FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
+    PipeBarrier<PIPE_V>();
+    for (uint32_t columnLoop = 0U; columnLoop < columnLoops; ++columnLoop) {
+        const uint32_t columnOffset = columnLoop * FP32_REPEAT_ELEMS;
+        uint32_t columnCount = headDim - columnOffset;
+        if (columnCount > FP32_REPEAT_ELEMS) {
+            columnCount = FP32_REPEAT_ELEMS;
+        }
+        Mul(dst[columnOffset], src[columnOffset], broadcast, columnCount,
+            numRows, repeatParams);
     }
+    PipeBarrier<PIPE_V>();
+
+    Brcb(broadcast, offsets, (numRows + FP32_BLOCK_ELEMS - 1U) /
+        FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
+    PipeBarrier<PIPE_V>();
+    for (uint32_t columnLoop = 0U; columnLoop < columnLoops; ++columnLoop) {
+        const uint32_t columnOffset = columnLoop * FP32_REPEAT_ELEMS;
+        uint32_t columnCount = headDim - columnOffset;
+        if (columnCount > FP32_REPEAT_ELEMS) {
+            columnCount = FP32_REPEAT_ELEMS;
+        }
+        Add(dst[columnOffset], dst[columnOffset], broadcast, columnCount,
+            numRows, repeatParams);
+    }
+    PipeBarrier<PIPE_V>();
 }
 
 __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<uint8_t> ub,
@@ -143,7 +186,7 @@ __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
 // codesUb: contiguous numRows * headDim uint8.
 // halfScratch / scratchA/B/C: each numRows * headDim elements.
 // outUb: numRows * headDimAlign (CAST writes headDim elems per row).
-// bases/steps: length numRows.
+// bases/steps: UB tensors containing numRows FP32 values.
 template <typename OutT>
 __aicore__ inline void BrDecodeKeyTile(
     LocalTensor<uint8_t> codesUb,
@@ -152,8 +195,8 @@ __aicore__ inline void BrDecodeKeyTile(
     LocalTensor<float> scratchB,
     LocalTensor<float> scratchC,
     LocalTensor<OutT> outUb,
-    const float *bases,
-    const float *steps,
+    LocalTensor<float> bases,
+    LocalTensor<float> steps,
     uint32_t numRows,
     uint32_t headDim,
     uint32_t headDimAlign)
@@ -194,13 +237,9 @@ __aicore__ inline void BrDecodeKeyTile(
     // q7 → scratchC; err = base + q7*step → scratchA (overwrites codeI16).
     Cast(scratchC, codeI16, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
-    for (uint32_t row = 0U; row < numRows; ++row) {
-        const uint32_t off = row * headDim;
-        Duplicate(scratchA[off], bases[row], headDim);
-        PipeBarrier<PIPE_V>();
-        Axpy(scratchA[off], scratchC[off], steps[row], headDim);
-        PipeBarrier<PIPE_V>();
-    }
+    auto metaBroadcast = halfScratch.template ReinterpretCast<float>();
+    BrApplyRowAffine(
+        scratchA, scratchC, bases, steps, metaBroadcast, numRows, headDim);
 
     Mul(scratchA, scratchA, scratchB, N);
     PipeBarrier<PIPE_V>();
@@ -215,27 +254,6 @@ __aicore__ inline void BrDecodeKeyTile(
     }
 }
 
-// Single-row wrapper.
-template <typename OutT>
-__aicore__ inline void BrDecodeKeyRow(
-    LocalTensor<uint8_t> codeUb,
-    LocalTensor<half> halfScratch,
-    LocalTensor<float> scratchA,
-    LocalTensor<float> scratchB,
-    LocalTensor<float> outFp32,
-    LocalTensor<OutT> outUb,
-    float base,
-    float step,
-    uint32_t headDim)
-{
-    float bases[1];
-    float steps[1];
-    bases[0] = base;
-    steps[0] = step;
-    BrDecodeKeyTile(codeUb, halfScratch, scratchA, scratchB, outFp32, outUb, bases, steps, 1U, headDim,
-        headDim);
-}
-
 // Value tile: y = vmin + idx4 * vstep (nibble-packed codes).
 // nibbleUb: contiguous numRows * (headDim/2) uint8 (int4 packed).
 // halfScratch / scratchA/B: each numRows * headDim elements.
@@ -246,8 +264,8 @@ __aicore__ inline void BrDecodeValueTile(
     LocalTensor<float> scratchA,
     LocalTensor<float> scratchB,
     LocalTensor<OutT> outUb,
-    const float *vmins,
-    const float *vsteps,
+    LocalTensor<float> vmins,
+    LocalTensor<float> vsteps,
     uint32_t numRows,
     uint32_t headDim,
     uint32_t headDimAlign)
@@ -261,13 +279,9 @@ __aicore__ inline void BrDecodeValueTile(
     Cast(scratchA, halfScratch, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
 
-    for (uint32_t row = 0U; row < numRows; ++row) {
-        const uint32_t off = row * headDim;
-        Duplicate(scratchB[off], vmins[row], headDim);
-        PipeBarrier<PIPE_V>();
-        Axpy(scratchB[off], scratchA[off], vsteps[row], headDim);
-        PipeBarrier<PIPE_V>();
-    }
+    auto metaBroadcast = halfScratch.template ReinterpretCast<float>();
+    BrApplyRowAffine(
+        scratchB, scratchA, vmins, vsteps, metaBroadcast, numRows, headDim);
 
     if (headDimAlign == headDim) {
         Cast(outUb, scratchB, RoundMode::CAST_RINT, N);
@@ -278,26 +292,6 @@ __aicore__ inline void BrDecodeValueTile(
             PipeBarrier<PIPE_V>();
         }
     }
-}
-
-// Single-row wrapper.
-template <typename OutT>
-__aicore__ inline void BrDecodeValueRow(
-    LocalTensor<uint8_t> nibbleUb,
-    LocalTensor<half> halfScratch,
-    LocalTensor<float> idx4F32,
-    LocalTensor<float> outFp32,
-    LocalTensor<OutT> outUb,
-    float vmin,
-    float vstep,
-    uint32_t headDim)
-{
-    float vmins[1];
-    float vsteps[1];
-    vmins[0] = vmin;
-    vsteps[0] = vstep;
-    BrDecodeValueTile(nibbleUb, halfScratch, idx4F32, outFp32, outUb, vmins, vsteps, 1U, headDim,
-        headDim);
 }
 
 }  // namespace br_dequant
