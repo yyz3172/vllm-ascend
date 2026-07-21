@@ -213,10 +213,9 @@ __aicore__ inline void BrDecodeKeyTile(
     auto signStorage = scratchC.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
 
-    // One mask build for the whole tile.
-    Duplicate(signStorageU16, static_cast<uint16_t>(0x80), N);
-    PipeBarrier<PIPE_V>();
-    And(signStorageU16, codeU16, signStorageU16, N);
+    // Codes are widened uint8 values in [0,255], so shifting directly
+    // extracts the encoded sign bit without constructing a 0x80 mask tile.
+    ShiftRight(signStorageU16, codeU16, static_cast<uint16_t>(7), N);
     PipeBarrier<PIPE_V>();
 
     auto q7MaskU16 = halfScratch.template ReinterpretCast<uint16_t>();
@@ -225,8 +224,6 @@ __aicore__ inline void BrDecodeKeyTile(
     And(codeU16, codeU16, q7MaskU16, N);
     PipeBarrier<PIPE_V>();
 
-    ShiftRight(signStorage, signStorage, static_cast<int16_t>(7), N);
-    PipeBarrier<PIPE_V>();
     Cast(scratchB, signStorage, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
     Muls(scratchB, scratchB, -2.0f, N);
