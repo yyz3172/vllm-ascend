@@ -143,11 +143,6 @@ public:
     __aicore__ inline void SinkInvalidRow(const RunInfo &info, LocalTensor<COMPUTE_T> &tmpSinkResUbBrcb,
                                             int64_t s1Idx, int64_t row);
 private:
-    __aicore__ inline bool IsDequantSubCore()
-    {
-        // Mix AIC/AIV: two AIV subcores share one aiCoreIdx/dequant workspace; only subcore-0 dequants.
-        return (GetBlockIdx() % 2U) == 0U;
-    }
     __aicore__ inline uint64_t GetKvCacheTokenIdx(uint32_t bIdx, uint32_t globalS2);
     __aicore__ inline uint64_t GetBrPackHeadBase(int32_t physBlock, uint32_t n2Idx, bool isKey);
     __aicore__ inline void BindKvCacheGm(uint32_t bIdx);
@@ -755,24 +750,24 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ApplyPiTransposeToRows(
     LocalTensor<MM2_OUT_T> &accUb, uint32_t dealRowCount, uint32_t headDim, uint32_t headDimAlign)
 {
     // TurboQuant: O = Π^T@acc → O[m,d] = Σ_k Π[k,d]*acc[m,k]。仅 last S2 出口。
-    // tmpBuff1(32KB): accRow + outRow + piHalf(tile) + piFp32(tile) + mulTmp。
+    // Row-prefetch: 每个 k 一次 GM→UB 整行 Π[k,:]（D elems），再按 dBlock tile 乘加。
+    // 相对旧实现 m*(D/tile)*D 次 32 元小 DataCopy，MTE2 事务数降为 m*D。
     if (!piApplyEnabled_ || (TQ_PI_BISECT_VEC == 0)) {
         return;
     }
 
     constexpr uint32_t PI_COL_TILE = 32U;
-    // Layout (bytes): accRow | outRow | piQ[tile] | piFp32[tile] | mulTmp | tileUb
+    // Layout (bytes): accRow | outRow | piRowHalf[D] | piRowFp32[D] | mulTmp[tile]
     LocalTensor<COMPUTE_T> accRowCopy = tmpBuff1.Get<COMPUTE_T>();
     LocalTensor<COMPUTE_T> outRow =
         tmpBuff1.GetWithOffset<COMPUTE_T>(headDimAlign, headDimAlign * sizeof(COMPUTE_T));
     const uint32_t piQOffset = 2U * headDimAlign * sizeof(COMPUTE_T);
-    LocalTensor<Q_T> piQUb = tmpBuff1.GetWithOffset<Q_T>(PI_COL_TILE, piQOffset);
-    const uint32_t piFp32Offset = piQOffset + PI_COL_TILE * static_cast<uint32_t>(sizeof(Q_T));
-    LocalTensor<COMPUTE_T> piFp32Ub = tmpBuff1.GetWithOffset<COMPUTE_T>(PI_COL_TILE, piFp32Offset);
+    LocalTensor<Q_T> piRowHalf = tmpBuff1.GetWithOffset<Q_T>(headDim, piQOffset);
+    const uint32_t piFp32Offset = piQOffset + headDim * static_cast<uint32_t>(sizeof(Q_T));
+    LocalTensor<COMPUTE_T> piRowFp32 =
+        tmpBuff1.GetWithOffset<COMPUTE_T>(headDim, piFp32Offset);
     LocalTensor<COMPUTE_T> mulTmp = tmpBuff1.GetWithOffset<COMPUTE_T>(
-        PI_COL_TILE, piFp32Offset + PI_COL_TILE * static_cast<uint32_t>(sizeof(COMPUTE_T)));
-    LocalTensor<COMPUTE_T> tileUb = tmpBuff1.GetWithOffset<COMPUTE_T>(
-        PI_COL_TILE, piFp32Offset + 2U * PI_COL_TILE * static_cast<uint32_t>(sizeof(COMPUTE_T)));
+        PI_COL_TILE, piFp32Offset + headDim * static_cast<uint32_t>(sizeof(COMPUTE_T)));
 
     event_t eventIdVWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
     event_t eventIdSWaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
@@ -786,31 +781,26 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ApplyPiTransposeToRows(
         Duplicate(outRow, static_cast<COMPUTE_T>(0.0f), headDimAlign);
         AscendC::PipeBarrier<PIPE_V>();
 
-        for (uint32_t dBlock = 0U; dBlock < headDim; dBlock += PI_COL_TILE) {
-            Duplicate(tileUb, static_cast<COMPUTE_T>(0.0f), PI_COL_TILE);
+        for (uint32_t k = 0U; k < headDim; ++k) {
+            // One contiguous GM load of Π row k (headDim elems).
+            DataCopy(piRowHalf, piGm_[k * headDim], headDim);
+            SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+            WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+            Cast(piRowFp32, piRowHalf, AscendC::RoundMode::CAST_NONE, headDim);
             AscendC::PipeBarrier<PIPE_V>();
 
-            for (uint32_t k = 0U; k < headDim; ++k) {
-                // Π[k, dBlock:dBlock+tile] is contiguous in row-major [D,D].
-                DataCopy(piQUb, piGm_[k * headDim + dBlock], PI_COL_TILE);
-                SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                Cast(piFp32Ub, piQUb, AscendC::RoundMode::CAST_NONE, PI_COL_TILE);
-                AscendC::PipeBarrier<PIPE_V>();
+            SetFlag<HardEvent::V_S>(eventIdSWaitV);
+            WaitFlag<HardEvent::V_S>(eventIdSWaitV);
+            const COMPUTE_T accMk = accRowCopy.GetValue(k);
+            SetFlag<HardEvent::S_V>(eventIdVWaitS);
+            WaitFlag<HardEvent::S_V>(eventIdVWaitS);
 
-                SetFlag<HardEvent::V_S>(eventIdSWaitV);
-                WaitFlag<HardEvent::V_S>(eventIdSWaitV);
-                const COMPUTE_T accMk = accRowCopy.GetValue(k);
-                SetFlag<HardEvent::S_V>(eventIdVWaitS);
-                WaitFlag<HardEvent::S_V>(eventIdVWaitS);
-
-                Muls(mulTmp, piFp32Ub, accMk, PI_COL_TILE);
+            for (uint32_t dBlock = 0U; dBlock < headDim; dBlock += PI_COL_TILE) {
+                Muls(mulTmp, piRowFp32[dBlock], accMk, PI_COL_TILE);
                 AscendC::PipeBarrier<PIPE_V>();
-                Add(tileUb, tileUb, mulTmp, PI_COL_TILE);
+                Add(outRow[dBlock], outRow[dBlock], mulTmp, PI_COL_TILE);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            DataCopy(outRow[dBlock], tileUb, PI_COL_TILE);
-            AscendC::PipeBarrier<PIPE_V>();
         }
 
         DataCopy(accUb[m * headDimAlign], outRow, headDimAlign);
@@ -1181,21 +1171,16 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::InitDequantWorkspace(__gm_
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantK(const RunInfo &info)
 {
-    // BR dequant is heavier than TQ MSE. Dual-subcore both writing the full (or split)
-    // dequant workspace was numerically wrong for GQA×multi-token. Only subcore-0 dequants;
-    // both subcores still set FIA_SYNC_MODE2 so the cube wait completes.
-    if (IsDequantSubCore()) {
-        DequantKvImpl(info, true);
-    }
+    // Dual-AIV S2 split: both subcores run DequantKvImpl on disjoint token halves of the
+    // shared WS (si is a global index → no GM race). FIA_SYNC_MODE2 still needs both flags.
+    DequantKvImpl(info, true);
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(TQ_VEC_DEQ_K0_READY_VEC + (info.loop % 2));
 }
 
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantV(const RunInfo &info)
 {
-    if (IsDequantSubCore()) {
-        DequantKvImpl(info, false);
-    }
+    DequantKvImpl(info, false);
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(TQ_VEC_DEQ_V0_READY_VEC + (info.loop % 2));
 }
 
@@ -1247,6 +1232,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint64_t wsStride = static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(headDimAlign);
     uint64_t wsOffset = static_cast<uint64_t>(info.loop % 2) * wsStride;
 
+    // Dual-AIV S2 split (ops-transformer TQ pattern): sub0=[0,half), sub1=[half,s2Count).
+    // Each writes disjoint WS rows via global si → no race; slot size unchanged.
+    uint32_t subCoreId = GetBlockIdx() % 2U;
+    uint32_t siStart = (s2Count * subCoreId) / 2U;
+    uint32_t siEnd = (s2Count * (subCoreId + 1U)) / 2U;
+    if (siStart >= siEnd) {
+        return;
+    }
+
     // A1 dual-buffer staging in tmpBuff1 front; tile=8 decode scratch in the tail
     // (shared). Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
@@ -1296,9 +1290,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         }
     }
 
-    uint32_t si = 0U;
+    uint32_t si = siStart;
     uint32_t runId = 0U;
-    while (si < s2Count) {
+    while (si < siEnd) {
         uint32_t globalS2 = info.s2Idx * constInfo.s2BaseSize + si;
         uint32_t blockInBatch = globalS2 / bs;
         uint32_t pos0 = globalS2 % bs;
@@ -1309,11 +1303,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
         uint64_t headBase = GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
 
-        // Extend run while same PA block index and within s2_sub / block remainder.
+        // Extend run while same PA block and within this subcore's [si, siEnd).
         uint32_t n = 1U;
         uint32_t maxInBlock = bs - pos0;
         uint32_t nCap = maxSub < maxInBlock ? maxSub : maxInBlock;
-        while (si + n < s2Count && n < nCap) {
+        while (si + n < siEnd && n < nCap) {
             uint32_t gNext = info.s2Idx * constInfo.s2BaseSize + si + n;
             if ((gNext / bs) != blockInBatch) {
                 break;
@@ -1378,15 +1372,23 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                     outBatch[j0 * headDimAlign], bases, steps, nb, headDim, headDimAlign);
             }
         } else {
-            for (uint32_t j = 0U; j < n; ++j) {
-                LocalTensor<uint8_t> codeRow = batchUb[j * codeRowBytes];
-                LocalTensor<WS_T> outRow = outBatch[j * headDimAlign];
-                float vmin = br_dequant::BrReadMeta16FromUb<Q_T>(
-                    batchUb, fp32UbA, meta0Off + j * kMetaSlot);
-                float vstep = br_dequant::BrReadMeta16FromUb<Q_T>(
-                    batchUb, fp32UbA, meta1Off + j * kMetaSlot);
-                br_dequant::BrDecodeValueRow(codeRow, halfScratch, fp32UbA, fp32UbC, outRow,
-                                             vmin, vstep, headDim);
+            for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
+                uint32_t nb = n - j0;
+                if (nb > kTileMax) {
+                    nb = kTileMax;
+                }
+                float vmins[kTileMax];
+                float vsteps[kTileMax];
+                for (uint32_t jj = 0U; jj < nb; ++jj) {
+                    const uint32_t j = j0 + jj;
+                    vmins[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
+                        batchUb, fp32UbA, meta0Off + j * kMetaSlot);
+                    vsteps[jj] = br_dequant::BrReadMeta16FromUb<Q_T>(
+                        batchUb, fp32UbA, meta1Off + j * kMetaSlot);
+                }
+                br_dequant::BrDecodeValueTile(
+                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
+                    outBatch[j0 * headDimAlign], vmins, vsteps, nb, headDim, headDimAlign);
             }
         }
 

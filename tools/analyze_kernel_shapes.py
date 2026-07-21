@@ -31,11 +31,22 @@ def find_kernel_details_csv(base_dir: str) -> Path:
 
 def parse_shape_field(shape_str: str) -> list[list[int]]:
     """Parse a kernel_details Input Shapes field like "1936,8,128;1936,8,128;128,128;1936;2"
-    into [[1936,8,128], [1936,8,128], [128,128], [1936], [2]]."""
+    into [[1936,8,128], [1936,8,128], [128,128], [1936], [2]].
+
+    Empty `;`-separated slots (optional / absent tensors, e.g. ``16;16;;128,128``)
+    are kept as ``[]`` so positional indices stay aligned.
+    """
     shape_str = shape_str.strip().strip('"')
     if not shape_str:
         return []
-    return [[int(x) for x in part.split(",")] for part in shape_str.split(";")]
+    shapes: list[list[int]] = []
+    for part in shape_str.split(";"):
+        part = part.strip()
+        if not part:
+            shapes.append([])
+            continue
+        shapes.append([int(x) for x in part.split(",") if x.strip()])
+    return shapes
 
 
 def compute_pct(value: float, total: float) -> float:

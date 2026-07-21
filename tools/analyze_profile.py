@@ -6,6 +6,7 @@ Extracts and calculates average execution time for:
 - vllm_ascend/ops/turboquant_kv_cache.py: turboquant_pack_kv_for_cache_to_cache
 - aten::contiguous
 - TurboquantPackKvForCacheFused (or TurboquantPackKvForCacheToCache)
+- BitResidualFiaPagedK8v4 / BitResidualAttentionPagedK8v4 / BitResidualPackK8v4
 """
 
 import json
@@ -171,6 +172,13 @@ def analyze_profile(base_dir: str) -> None:
         ),
         ("TurboquantPackKvForCacheV2", "TurboquantPackKvForCacheV2", None),
         ("TurboquantPackKvForCacheV3", "TurboquantPackKvForCacheV3", None),
+        ("BitResidualPackK8v4", "BitResidualPackK8v4", None),
+        (
+            "BitResidualAttentionPagedK8v4",
+            "BitResidualAttentionPagedK8v4",
+            None,
+        ),
+        ("BitResidualFiaPagedK8v4", "BitResidualFiaPagedK8v4", None),
     ]
 
     print(f"Analyzing profile data from: {trace_path}")
