@@ -750,24 +750,24 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ApplyPiTransposeToRows(
     LocalTensor<MM2_OUT_T> &accUb, uint32_t dealRowCount, uint32_t headDim, uint32_t headDimAlign)
 {
     // TurboQuant: O = Π^T@acc → O[m,d] = Σ_k Π[k,d]*acc[m,k]。仅 last S2 出口。
-    // tmpBuff1(32KB): accRow + outRow + piHalf(tile) + piFp32(tile) + mulTmp。
+    // Row-prefetch: 每个 k 一次 GM→UB 整行 Π[k,:]（D elems），再按 dBlock tile 乘加。
+    // 相对旧实现 m*(D/tile)*D 次 32 元小 DataCopy，MTE2 事务数降为 m*D。
     if (!piApplyEnabled_ || (TQ_PI_BISECT_VEC == 0)) {
         return;
     }
 
     constexpr uint32_t PI_COL_TILE = 32U;
-    // Layout (bytes): accRow | outRow | piQ[tile] | piFp32[tile] | mulTmp | tileUb
+    // Layout (bytes): accRow | outRow | piRowHalf[D] | piRowFp32[D] | mulTmp[tile]
     LocalTensor<COMPUTE_T> accRowCopy = tmpBuff1.Get<COMPUTE_T>();
     LocalTensor<COMPUTE_T> outRow =
         tmpBuff1.GetWithOffset<COMPUTE_T>(headDimAlign, headDimAlign * sizeof(COMPUTE_T));
     const uint32_t piQOffset = 2U * headDimAlign * sizeof(COMPUTE_T);
-    LocalTensor<Q_T> piQUb = tmpBuff1.GetWithOffset<Q_T>(PI_COL_TILE, piQOffset);
-    const uint32_t piFp32Offset = piQOffset + PI_COL_TILE * static_cast<uint32_t>(sizeof(Q_T));
-    LocalTensor<COMPUTE_T> piFp32Ub = tmpBuff1.GetWithOffset<COMPUTE_T>(PI_COL_TILE, piFp32Offset);
+    LocalTensor<Q_T> piRowHalf = tmpBuff1.GetWithOffset<Q_T>(headDim, piQOffset);
+    const uint32_t piFp32Offset = piQOffset + headDim * static_cast<uint32_t>(sizeof(Q_T));
+    LocalTensor<COMPUTE_T> piRowFp32 =
+        tmpBuff1.GetWithOffset<COMPUTE_T>(headDim, piFp32Offset);
     LocalTensor<COMPUTE_T> mulTmp = tmpBuff1.GetWithOffset<COMPUTE_T>(
-        PI_COL_TILE, piFp32Offset + PI_COL_TILE * static_cast<uint32_t>(sizeof(COMPUTE_T)));
-    LocalTensor<COMPUTE_T> tileUb = tmpBuff1.GetWithOffset<COMPUTE_T>(
-        PI_COL_TILE, piFp32Offset + 2U * PI_COL_TILE * static_cast<uint32_t>(sizeof(COMPUTE_T)));
+        PI_COL_TILE, piFp32Offset + headDim * static_cast<uint32_t>(sizeof(COMPUTE_T)));
 
     event_t eventIdVWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
     event_t eventIdSWaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
@@ -781,31 +781,26 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::ApplyPiTransposeToRows(
         Duplicate(outRow, static_cast<COMPUTE_T>(0.0f), headDimAlign);
         AscendC::PipeBarrier<PIPE_V>();
 
-        for (uint32_t dBlock = 0U; dBlock < headDim; dBlock += PI_COL_TILE) {
-            Duplicate(tileUb, static_cast<COMPUTE_T>(0.0f), PI_COL_TILE);
+        for (uint32_t k = 0U; k < headDim; ++k) {
+            // One contiguous GM load of Π row k (headDim elems).
+            DataCopy(piRowHalf, piGm_[k * headDim], headDim);
+            SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+            WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+            Cast(piRowFp32, piRowHalf, AscendC::RoundMode::CAST_NONE, headDim);
             AscendC::PipeBarrier<PIPE_V>();
 
-            for (uint32_t k = 0U; k < headDim; ++k) {
-                // Π[k, dBlock:dBlock+tile] is contiguous in row-major [D,D].
-                DataCopy(piQUb, piGm_[k * headDim + dBlock], PI_COL_TILE);
-                SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                Cast(piFp32Ub, piQUb, AscendC::RoundMode::CAST_NONE, PI_COL_TILE);
-                AscendC::PipeBarrier<PIPE_V>();
+            SetFlag<HardEvent::V_S>(eventIdSWaitV);
+            WaitFlag<HardEvent::V_S>(eventIdSWaitV);
+            const COMPUTE_T accMk = accRowCopy.GetValue(k);
+            SetFlag<HardEvent::S_V>(eventIdVWaitS);
+            WaitFlag<HardEvent::S_V>(eventIdVWaitS);
 
-                SetFlag<HardEvent::V_S>(eventIdSWaitV);
-                WaitFlag<HardEvent::V_S>(eventIdSWaitV);
-                const COMPUTE_T accMk = accRowCopy.GetValue(k);
-                SetFlag<HardEvent::S_V>(eventIdVWaitS);
-                WaitFlag<HardEvent::S_V>(eventIdVWaitS);
-
-                Muls(mulTmp, piFp32Ub, accMk, PI_COL_TILE);
+            for (uint32_t dBlock = 0U; dBlock < headDim; dBlock += PI_COL_TILE) {
+                Muls(mulTmp, piRowFp32[dBlock], accMk, PI_COL_TILE);
                 AscendC::PipeBarrier<PIPE_V>();
-                Add(tileUb, tileUb, mulTmp, PI_COL_TILE);
+                Add(outRow[dBlock], outRow[dBlock], mulTmp, PI_COL_TILE);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            DataCopy(outRow[dBlock], tileUb, PI_COL_TILE);
-            AscendC::PipeBarrier<PIPE_V>();
         }
 
         DataCopy(accUb[m * headDimAlign], outRow, headDimAlign);
