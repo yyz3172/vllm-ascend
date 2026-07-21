@@ -11,6 +11,10 @@
  * Key/Value decode: run-level BrDecodeKeyTile / BrDecodeValueTile;
  * tile=8 scratch overlays tmpBuff1 tail (dedicated dequantFp* stays 1-row).
  * Dual-AIV S2 split: both subcores dequant disjoint [0,half)/[half,s2) WS rows.
+ *
+ * Meta: still per-row DataCopyPad(2B) into 32B slots (Cast align). A Prefill
+ * trial of blockCount+rightPadding bulk Pad regressed vs Pi-opt baseline;
+ * see tools/.../docs/prefill_pi_meta_opt_report.md Opt2.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
