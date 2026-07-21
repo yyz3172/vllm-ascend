@@ -159,8 +159,16 @@ constexpr uint32_t TQ_BR_UB_V_VSTEP_OFFSET =
     TQ_BR_UB_V_VMIN_OFFSET + TQ_BR_UB_V_META_PLANE_BYTES;
 constexpr uint32_t TQ_BR_UB_V_STAGE_OFFSET =
     TQ_BR_UB_QTILE_OUTACC_OFFSET + TQ_BR_UB_QTILE_OUTACC_BYTES;
+// V plane needs ~4608B; pad to 8192 so Cube-PV path can stage next-tile Key
+// codes here while CodeFloat is occupied by CubePvQTile.
+constexpr uint32_t TQ_BR_UB_V_STAGE_PLANE_BYTES =
+    TQ_BR_UB_V_VSTEP_OFFSET + TQ_BR_UB_V_META_PLANE_BYTES;
+constexpr uint32_t TQ_BR_UB_V_STAGE_KEY_CODES_BYTES =
+    TQ_BR_UB_KV_TILE_CAP * TQ_BR_HEAD_SIZE;  // 8192
 constexpr uint32_t TQ_BR_UB_V_STAGE_BYTES =
-    TQ_BR_UB_V_VSTEP_OFFSET + TQ_BR_UB_V_META_PLANE_BYTES;  // ≤8192
+    (TQ_BR_UB_V_STAGE_PLANE_BYTES > TQ_BR_UB_V_STAGE_KEY_CODES_BYTES)
+        ? TQ_BR_UB_V_STAGE_PLANE_BYTES
+        : TQ_BR_UB_V_STAGE_KEY_CODES_BYTES;
 static_assert(TQ_BR_UB_V_STAGE_BYTES <= 8192, "VStage grew past prior budget");
 // Legacy name kept for call sites that only need the buffer base.
 constexpr uint32_t TQ_BR_UB_V_STAGE_STRIDE = 128;
@@ -241,14 +249,15 @@ private:
         event_t mte2VEvent);
     __aicore__ inline void PrefetchPackedValueTileRowsFinalize(
         uint32_t mRows, float* vminArr, float* vstepArr, event_t mte2VEvent);
-    // M3: issue next-tile Key code plane MTE2 into CodeFloat (idle during Softmax);
-    // Finalize widens to CodeI16 + loads meta. Overlaps Softmax Vector with MTE2.
+    // M3: issue next-tile Key code plane MTE2 into CodeFloat (idle during Softmax)
+    // or VStage (during SoftmaxOnly+Cube PV when CodeFloat is busy). Finalize
+    // widens to CodeI16 + loads meta.
     __aicore__ inline void PrefetchPackedKeyCodesIssue(
         uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
-        event_t mte2VEvent);
+        event_t mte2VEvent, bool stageInVStage);
     __aicore__ inline void PrefetchPackedKeyCodesFinalize(
         uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
-        float* kBaseArr, float* kStepArr, event_t mte2VEvent);
+        float* kBaseArr, float* kStepArr, event_t mte2VEvent, bool stageInVStage);
 
     // ---- Decode ----
     __aicore__ inline void DecodeKeyTileToFloat(uint32_t mRows,
@@ -688,17 +697,20 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Loa
 }
 
 // ---------------------------------------------------------------
-// PrefetchPackedKeyCodesIssue() — M3: MTE2 codes into CodeFloat staging
+// PrefetchPackedKeyCodesIssue() — M3: MTE2 codes into CodeFloat or VStage
 // ---------------------------------------------------------------
 template <typename TilingT, typename QueryT>
 __aicore__ inline void
 BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::PrefetchPackedKeyCodesIssue(
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
-    event_t mte2VEvent)
+    event_t mte2VEvent, bool stageInVStage)
 {
-    // Softmax does not touch CodeFloat/PackedRaw; stage next-tile codes here.
+    // Softmax (non-Cube-PV) does not touch CodeFloat; Cube-PV stages KT/V via
+    // CodeFloat so next-tile Key codes go into VStage instead.
     const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
-    auto codeStage = CodeFloatBuf().template ReinterpretCast<uint8_t>();
+    auto codeStage = stageInVStage
+                         ? VStageBuf()
+                         : CodeFloatBuf().template ReinterpretCast<uint8_t>();
     const uint32_t D = TQ_BR_HEAD_SIZE;
     const uint32_t headStride = blockSize_ * (D + 2 * sizeof(QueryT));
     constexpr uint32_t kChunkRows = TQ_BR_BLOCK_ROWS;
@@ -742,18 +754,20 @@ template <typename TilingT, typename QueryT>
 __aicore__ inline void
 BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::PrefetchPackedKeyCodesFinalize(
     uint32_t seqIdx, uint32_t kvHead, uint32_t absStart, uint32_t mRows,
-    float* kBaseArr, float* kStepArr, event_t mte2VEvent)
+    float* kBaseArr, float* kStepArr, event_t mte2VEvent, bool stageInVStage)
 {
     AscendC::WaitFlag<HardEvent::MTE2_V>(mte2VEvent);
 
     const uint32_t seqBlockBase = seqIdx * maxBlocksPerSeq_;
-    auto codeStage = CodeFloatBuf().template ReinterpretCast<uint8_t>();
+    auto codeStage = stageInVStage
+                         ? VStageBuf()
+                         : CodeFloatBuf().template ReinterpretCast<uint8_t>();
     auto codeI16 = CodeI16Buf();
     auto packedRaw = PackedRawBuf();
     const uint32_t D = TQ_BR_HEAD_SIZE;
     const uint32_t headStride = blockSize_ * (D + 2 * sizeof(QueryT));
 
-    // Bulk widen via RotateWork (CodeFloat holds codeStage). Chunk ≤16 rows.
+    // Bulk widen via RotateWork (codeStage may alias VStage or CodeFloat).
     auto widenHalf = RotateWorkBuf().template ReinterpretCast<half>();
     constexpr uint32_t kWidenChunk = TQ_BR_BLOCK_ROWS;
     for (uint32_t off = 0; off < mRows; off += kWidenChunk) {
@@ -1284,7 +1298,8 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         if (hasNext) {
             const uint32_t nextRemain = kvEnd - nextPos;
             nextRows = (kvTileRows_ < nextRemain) ? kvTileRows_ : nextRemain;
-            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
+            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt,
+                                        false);
         }
 
         if (gqaCount == 2) {
@@ -1300,7 +1315,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
 
         if (hasNext) {
             PrefetchPackedKeyCodesFinalize(seqIdx, kvHead, nextPos, nextRows, kBaseArr,
-                                           kStepArr, kPrefetchEvt);
+                                           kStepArr, kPrefetchEvt, false);
             keyReadyFromPrefetch = true;
         }
     }
@@ -1414,10 +1429,16 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Wri
                       gqaCount * D);
         PipeBarrier<PIPE_V>();
         TqBrSync<HardEvent::V_MTE3>();
-        for (uint32_t g = 0; g < gqaCount; ++g) {
-            const uint32_t headIdx = qBaseHead + g;
-            DataCopy(outGm_[(tokenStartIdx + q) * numHeads_ * D + headIdx * D],
-                     outLocal[g * D], D);
+        // GQA=2 heads are contiguous in TND [T,H,D] → one 256-elem DataCopy.
+        if (gqaCount == 2) {
+            DataCopy(outGm_[(tokenStartIdx + q) * numHeads_ * D + qBaseHead * D],
+                     outLocal, gqaCount * D);
+        } else {
+            for (uint32_t g = 0; g < gqaCount; ++g) {
+                const uint32_t headIdx = qBaseHead + g;
+                DataCopy(outGm_[(tokenStartIdx + q) * numHeads_ * D + headIdx * D],
+                         outLocal[g * D], D);
+            }
         }
         TqBrSync<HardEvent::MTE3_V>();
         TqBrSync<HardEvent::MTE3_MTE2>();
@@ -1429,8 +1450,8 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
     LocalTensor<float> qTile, LocalTensor<float> decodedK, LocalTensor<float> scoreTile,
     uint32_t compactRows, uint32_t mRows)
 {
-    // Reuse rotate KFC with physical K^T in GM (SetTensorB false):
-    //   C[M,N] = Q[M,128] @ KT[128,N], N<=64, score stride 64.
+    // C[M,N] = Q[M,128] @ K^T via SetTensorB(..., true): stage K as [N,128]
+    // row-major in GM (no AIV 16x16 vtranspose).
     if (!matmulReady_ || !qkGmReady_ || rotateMm_ == nullptr || qkWorkspaceStride_ == 0 ||
         compactRows == 0 || mRows == 0) {
         return false;
@@ -1441,44 +1462,22 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
     const uint32_t mPad = TqBrAlignUp16(compactRows);
-    const uint32_t nPad = TQ_BR_QK_CUBE_MAX_N;  // 64
-    constexpr uint32_t kTile = 16;
-    // Per-AIV slot (not raw GetBlockIdx): dual AIV in one MIX must not share KT GM.
+    const uint32_t nPad = TqBrAlignUp16(mRows);
     const uint32_t mixCoreIdx = GetBlockIdx() / TQ_BR_MIX_AIV_SUB;
     const uint32_t subIdx = GetSubBlockIdx() % TQ_BR_MIX_AIV_SUB;
     const uint32_t aivSlot = mixCoreIdx * TQ_BR_MIX_AIV_SUB + subIdx;
-    if (mixCoreIdx >= usedCoreNum_ || qkWorkspaceStride_ < D * nPad) {
+    if (mixCoreIdx >= usedCoreNum_ || qkWorkspaceStride_ < nPad * D) {
         return false;
     }
 
-    auto kHalf = CodeI16Buf().template ReinterpretCast<QueryT>();
+    // Stage K[N,128] half to GM (row-major); Cube loads with B transpose.
+    auto kHalf = CodeFloatBuf().template ReinterpretCast<QueryT>();
     Duplicate(kHalf, static_cast<QueryT>(0), nPad * D);
     PipeBarrier<PIPE_V>();
     Cast(kHalf, decodedK, RoundMode::CAST_RINT, mRows * D);
     PipeBarrier<PIPE_V>();
-
-    // 16x16 vtranspose: K[64,128] → KT[128,64] then stage to per-core GM.
-    auto ktHalf = CodeFloatBuf().template ReinterpretCast<QueryT>();
-    Duplicate(ktHalf, static_cast<QueryT>(0), D * nPad);
-    PipeBarrier<PIPE_V>();
-    auto tileSrc = RotateWorkBuf().template ReinterpretCast<QueryT>();
-    auto tileDst = tileSrc[kTile * kTile];
-    for (uint32_t r = 0; r < nPad; r += kTile) {
-        for (uint32_t c = 0; c < D; c += kTile) {
-            for (uint32_t i = 0; i < kTile; ++i) {
-                DataCopy(tileSrc[i * kTile], kHalf[(r + i) * D + c], kTile);
-            }
-            PipeBarrier<PIPE_V>();
-            Transpose(tileDst, tileSrc);
-            PipeBarrier<PIPE_V>();
-            for (uint32_t i = 0; i < kTile; ++i) {
-                DataCopy(ktHalf[(c + i) * nPad + r], tileDst[i * kTile], kTile);
-            }
-            PipeBarrier<PIPE_V>();
-        }
-    }
     TqBrSync<HardEvent::V_MTE3>();
-    DataCopy(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], ktHalf, D * nPad);
+    DataCopy(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], kHalf, nPad * D);
     TqBrSync<HardEvent::MTE3_V>();
     TqBrSync<HardEvent::MTE3_MTE2>();
 
@@ -1489,19 +1488,21 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
         TqBrDuplicateZero(qHalf[compactRows * D], (mPad - compactRows) * D);
     }
 
+    // Score half uses CodeI16; Softmax reads stride = KV_TILE_CAP.
     auto scoreHalf = CodeI16Buf().template ReinterpretCast<QueryT>();
-    Duplicate(scoreHalf, static_cast<QueryT>(0), mPad * nPad);
+    const uint32_t scoreStride = TQ_BR_UB_KV_TILE_CAP;
+    Duplicate(scoreHalf, static_cast<QueryT>(0), mPad * scoreStride);
     PipeBarrier<PIPE_V>();
 
-    rotateMm_->SetOrgShape(mPad, nPad, D);
+    rotateMm_->SetOrgShape(mPad, scoreStride, D);
     rotateMm_->SetSingleShape(compactRows, mRows, D);
     rotateMm_->SetTensorA(qHalf, false);
-    rotateMm_->SetTensorB(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], false);
+    rotateMm_->SetTensorB(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], true);
     rotateMm_->SetLocalWorkspace(RotateWorkBuf());
     rotateMm_->IterateAll(scoreHalf);
     rotateMm_->End();
 
-    Cast(scoreTile, scoreHalf, RoundMode::CAST_NONE, mPad * nPad);
+    Cast(scoreTile, scoreHalf, RoundMode::CAST_NONE, mPad * scoreStride);
     PipeBarrier<PIPE_V>();
     return true;
 }
@@ -1703,10 +1704,10 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
             nextRows = (kvTileRows_ < nextRemain) ? kvTileRows_ : nextRemain;
         }
 
-        // Cube PV gate: Prefill GQA=2, large enough M/K, and this KV tile fully
-        // visible to every active q (avoids partial-causal P packing bugs).
+        // Cube PV gate: Prefill GQA=2; relaxed qRows/mRows vs historical Cap to
+        // feed AIC more often. Keep full-causal-tile gate for P packing safety.
         const uint32_t compactRows = qRows * gqaCount;
-        bool tileFullForAllQ = (gqaCount == 2) && (qRows >= 4) && (mRows >= 32) &&
+        bool tileFullForAllQ = (gqaCount == 2) && (qRows >= 2) && (mRows >= 16) &&
                                (compactRows <= TQ_BR_QK_CUBE_MAX_M) &&
                                (mRows <= TQ_BR_QK_CUBE_MAX_N) && preferCubeQk;
         if (tileFullForAllQ) {
@@ -1718,10 +1719,15 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
             }
         }
 
-        // M3 Key-code prefetch overlaps Softmax only when CodeFloat is free
-        // (Cube PV also stages through CodeFloat).
+        // Non-Cube-PV: Key codes → CodeFloat ∥ Softmax.
+        // Cube-PV: Key codes → VStage ∥ SoftmaxOnly+CubePv (CodeFloat busy).
         if (hasNext && !tileFullForAllQ) {
-            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
+            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt,
+                                        false);
+        }
+        if (hasNext && tileFullForAllQ) {
+            PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt,
+                                        true);
         }
 
         if (tileFullForAllQ) {
@@ -1762,9 +1768,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
                     }
                 }
             }
-            if (hasNext) {
-                PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
-            }
         } else {
             for (uint32_t q = 0; q < qRows; ++q) {
                 const uint32_t causalKvEnd = causalEnds[q];
@@ -1791,7 +1794,7 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
 
         if (hasNext) {
             PrefetchPackedKeyCodesFinalize(seqIdx, kvHead, nextPos, nextRows, kBaseArr,
-                                           kStepArr, kPrefetchEvt);
+                                           kStepArr, kPrefetchEvt, tileFullForAllQ);
             keyReadyFromPrefetch = true;
         }
     }
@@ -2033,9 +2036,12 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Pro
             ProcessSplitBns(workerIdx, workerNum);
         }
         SyncAll();
-        const bool isPrimaryAiv = (subIdx == 0);
-        if (isPrimaryAiv && mixCoreIdx < usedCoreNum_) {
-            CombineFlashDecode(mixCoreIdx, usedCoreNum_);
+        // Both AIVs combine disjoint (token,head) rows; Rotate still uses one
+        // KFC per MIX so AIVs may serialize on IterateAll but double combine work.
+        const uint32_t workerIdx = mixCoreIdx * TQ_BR_MIX_AIV_SUB + subIdx;
+        const uint32_t workerNum = usedCoreNum_ * TQ_BR_MIX_AIV_SUB;
+        if (mixCoreIdx < usedCoreNum_) {
+            CombineFlashDecode(workerIdx, workerNum);
         }
         return;
     }

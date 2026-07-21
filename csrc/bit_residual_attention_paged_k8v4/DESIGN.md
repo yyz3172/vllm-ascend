@@ -181,11 +181,12 @@ preferCubeQk = (qkPvMode_ == 1) && (qRows > 1)
 `mRows ≤ TQ_BR_QK_CUBE_MAX_N(64)`，`qkGmReady_` / `matmulReady_`，
 workspace stride ≥ `D×64` half。
 
-实现：K fp32→half → 16×16 vtranspose 得 `K^T` → 写入 per-slot GM →
-`SetTensorA(Q)` / `SetTensorB(KT, false)` → `IterateAll` → score half→float。
-失败回落 `VectorQkFloatPreScaled(Gqa2)`。
+实现：K fp32→half → 行主序写入 per-slot GM →
+`SetTensorA(Q)` / `SetTensorB(K, true)`（Cube 侧转置）→ `IterateAll` →
+score half→float。失败回落 `VectorQkFloatPreScaled(Gqa2)`。
 
-**Decode 永不开 Cube QK**（小 M 的 K^T 税使 Q=16 约 +13%，已回退）。
+**Decode 永不开 Cube QK**（小 M 税使 Q=16 约 +13%，已回退）。
+手工 AIV 16×16 vtranspose 已由 `SetTensorB(true)` 替代（Prefill 约 −30%）。
 
 ### 5.2 Cube PV（仅 Prefill qTile）
 
@@ -299,7 +300,7 @@ WriteFinalOutputQTile（×1/s → Rotate → Cast → GM）
 | qTile 容量 16→24 | 持平 | 保持 Cap=16 |
 | Prefill「KV 外环」轻量版（未改调度） | Prefill **+1.3%** | 关键路径未少扫 KV |
 | Prefill「KV 外环」+ 状态 GM spill | Prefill **+0.8%** | GM 税抵消少扫 |
-| `SetTensorB(true)` 省掉手工 Kᵀ | 持平 | 转置税不在此 API |
+| `SetTensorB(true)` 省掉手工 Kᵀ | Prefill **约 −30%**（2026-07-21 复测） | **已落地**；旧「持平」结论作废 |
 | Decode 开 Cube QK | Q=16 约 **+13%** | Decode 保持 Vector QK |
 | 盲目抬 FlashDecode 的 `MAX_Q_TOKENS` | Q≥32 收益 ≤1% | 禁止盲目抬 cap |
 | DecodeK/V 合并 per-row barrier / 整 tile Mul+Add | **+1.8~1.9%** | 行向解压已非瓶颈 |

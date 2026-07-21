@@ -93,7 +93,7 @@ using TqRotateMatmulOp =
                     TqRotateBiasT<T>, TQ_BR_ROTATE_MATMUL_TILING<T>>;
 
 // Prefill qTile Cube QK reuses TqRotateMatmulOp (same KFC object as rotation):
-//   C[M,N] = A[M,K] @ B[K,N] with B = physical K^T in GM (SetTensorB false).
+//   C[M,N] = A[M,K] @ B[K,N] with B stored as [N,K] and SetTensorB(..., true).
 // M covers qTile*GQA (16*2); rotate MatmulConfig singleM max is 64.
 static constexpr uint32_t TQ_BR_QK_CUBE_MAX_M = 32;
 static constexpr uint32_t TQ_BR_QK_CUBE_MAX_N = 64;
