@@ -9,5 +9,9 @@
 
 #define TQ_PI_BISECT_CUBE 1
 #define TQ_PI_BISECT_VEC 1
+// Last-S2 output O=acc@Π: 1 routes through AIC Cube; 0 keeps Vec fallback.
+#define TQ_PI_OUTPUT_CUBE 1
+// Decode and prefill share the Cube path; raise this threshold only for A/B.
+#define TQ_PI_OUTPUT_CUBE_MIN_M 1U
 
 #endif // FIA_TURBOQUANT_PI_BISECT_H
