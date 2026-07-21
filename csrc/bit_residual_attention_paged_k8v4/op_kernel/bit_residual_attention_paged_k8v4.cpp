@@ -269,6 +269,10 @@ private:
     __aicore__ inline bool CubeQkQTile(LocalTensor<float> qTile, LocalTensor<float> decodedK,
                                        LocalTensor<float> scoreTile, uint32_t compactRows,
                                        uint32_t mRows);
+    // Prefill Cube PV: C[M,128] = P[M,K] @ V[K,128] via same KFC; V needs no transpose.
+    __aicore__ inline bool CubePvQTile(LocalTensor<float> scoreTile, LocalTensor<float> decodedV,
+                                       LocalTensor<float> pvOut, uint32_t compactRows,
+                                       uint32_t mRows);
     __aicore__ inline void WriteFinalOutputQTile(uint32_t tokenStartIdx, uint32_t qRows,
                                                  uint32_t kvHead, float* sStateScalar,
                                                  LocalTensor<float> outAcc, uint32_t gqaStart,
@@ -1503,6 +1507,72 @@ __aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Cub
 }
 
 template <typename TilingT, typename QueryT>
+__aicore__ inline bool BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::CubePvQTile(
+    LocalTensor<float> scoreTile, LocalTensor<float> decodedV, LocalTensor<float> pvOut,
+    uint32_t compactRows, uint32_t mRows)
+{
+    // C[M,128] = P[M,K] @ V[K,128]. Reuse qk GM slot for V (no transpose).
+    if (!matmulReady_ || !qkGmReady_ || rotateMm_ == nullptr || qkWorkspaceStride_ == 0 ||
+        compactRows == 0 || mRows == 0) {
+        return false;
+    }
+    if (compactRows > TQ_BR_QK_CUBE_MAX_M || mRows > TQ_BR_QK_CUBE_MAX_N) {
+        return false;
+    }
+
+    const uint32_t D = TQ_BR_HEAD_SIZE;
+    const uint32_t mPad = TqBrAlignUp16(compactRows);
+    const uint32_t kPad = TqBrAlignUp16(mRows);
+    const uint32_t mixCoreIdx = GetBlockIdx() / TQ_BR_MIX_AIV_SUB;
+    const uint32_t subIdx = GetSubBlockIdx() % TQ_BR_MIX_AIV_SUB;
+    const uint32_t aivSlot = mixCoreIdx * TQ_BR_MIX_AIV_SUB + subIdx;
+    if (mixCoreIdx >= usedCoreNum_ || qkWorkspaceStride_ < kPad * D) {
+        return false;
+    }
+
+    // Pack P rows (score stride = KV_TILE_CAP) into contiguous half [M,K].
+    auto pHalf = CodeI16Buf().template ReinterpretCast<QueryT>();
+    Duplicate(pHalf, static_cast<QueryT>(0), mPad * kPad);
+    PipeBarrier<PIPE_V>();
+    for (uint32_t r = 0; r < compactRows; ++r) {
+        Cast(pHalf[r * kPad], scoreTile[r * TQ_BR_UB_KV_TILE_CAP], RoundMode::CAST_RINT,
+             mRows);
+        PipeBarrier<PIPE_V>();
+    }
+
+    // Stage V[K,128] half to GM (row-major, no transpose).
+    auto vHalf = DecodedBuf().template ReinterpretCast<QueryT>();
+    // decodedV still holds fp32 V; cast into CodeFloat then copy — DecodedBuf alias
+    // conflict: use CodeFloat as cast dst then MTE3.
+    auto vHalfStage = CodeFloatBuf().template ReinterpretCast<QueryT>();
+    Duplicate(vHalfStage, static_cast<QueryT>(0), kPad * D);
+    PipeBarrier<PIPE_V>();
+    Cast(vHalfStage, decodedV, RoundMode::CAST_RINT, mRows * D);
+    PipeBarrier<PIPE_V>();
+    TqBrSync<HardEvent::V_MTE3>();
+    DataCopy(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], vHalfStage,
+             kPad * D);
+    TqBrSync<HardEvent::MTE3_V>();
+    TqBrSync<HardEvent::MTE3_MTE2>();
+
+    auto cHalf = vHalf;  // reuse DecodedBuf half view for C[M,128]
+    Duplicate(cHalf, static_cast<QueryT>(0), mPad * D);
+    PipeBarrier<PIPE_V>();
+
+    rotateMm_->SetOrgShape(mPad, D, kPad);
+    rotateMm_->SetSingleShape(compactRows, D, mRows);
+    rotateMm_->SetTensorA(pHalf, false);
+    rotateMm_->SetTensorB(qkKGm_[static_cast<uint64_t>(aivSlot) * qkWorkspaceStride_], false);
+    rotateMm_->SetLocalWorkspace(RotateWorkBuf());
+    rotateMm_->IterateAll(cHalf);
+    rotateMm_->End();
+
+    Cast(pvOut, cHalf, RoundMode::CAST_NONE, compactRows * D);
+    PipeBarrier<PIPE_V>();
+    return true;
+}
+
+template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::ComputeAttentionQTile(
     uint32_t tokenStartIdx, uint32_t qRows, uint32_t kvHead, uint32_t gqaStart,
     uint32_t gqaCount)
@@ -1631,28 +1701,91 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Com
         if (hasNext) {
             const uint32_t nextRemain = maxCausalKvEnd - nextPos;
             nextRows = (kvTileRows_ < nextRemain) ? kvTileRows_ : nextRemain;
-            // CodeFloat idle after DecodeV; Softmax only needs DecodedBuf/scores.
+        }
+
+        // Cube PV gate: Prefill GQA=2, large enough M/K, and this KV tile fully
+        // visible to every active q (avoids partial-causal P packing bugs).
+        const uint32_t compactRows = qRows * gqaCount;
+        bool tileFullForAllQ = (gqaCount == 2) && (qRows >= 4) && (mRows >= 32) &&
+                               (compactRows <= TQ_BR_QK_CUBE_MAX_M) &&
+                               (mRows <= TQ_BR_QK_CUBE_MAX_N) && preferCubeQk;
+        if (tileFullForAllQ) {
+            for (uint32_t q = 0; q < qRows; ++q) {
+                if (pos < causalEnds[q] && causalEnds[q] < pos + mRows) {
+                    tileFullForAllQ = false;
+                    break;
+                }
+            }
+        }
+
+        // M3 Key-code prefetch overlaps Softmax only when CodeFloat is free
+        // (Cube PV also stages through CodeFloat).
+        if (hasNext && !tileFullForAllQ) {
             PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
         }
 
-        for (uint32_t q = 0; q < qRows; ++q) {
-            const uint32_t causalKvEnd = causalEnds[q];
-            if (pos >= causalKvEnd) {
-                continue;
+        if (tileFullForAllQ) {
+            for (uint32_t q = 0; q < qRows; ++q) {
+                if (pos >= causalEnds[q]) {
+                    Duplicate(scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP], 0.f,
+                              gqaCount * TQ_BR_UB_KV_TILE_CAP);
+                    PipeBarrier<PIPE_V>();
+                    continue;
+                }
+                turboquant_attn::OnlineSoftmaxOnlyTileFloatPreScaledGqa2Scalar(
+                    scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP],
+                    mStateScalar + q * gqaCount, sStateScalar + q * gqaCount,
+                    outAccTile[q * gqaCount * D], expBuf, softmaxReduceTmp, mRows);
             }
-            const uint32_t activeRows =
-                (pos + mRows <= causalKvEnd) ? mRows : (causalKvEnd - pos);
-            if (gqaCount == 2) {
-                turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar(
-                    scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP], decodedV,
-                    mStateScalar + q * gqaCount, sStateScalar + q * gqaCount,
-                    outAccTile[q * gqaCount * D], expBuf, softmaxReduceTmp, activeRows);
+            auto pvTmp = CodeFloatBuf();
+            const bool usedCubePv =
+                CubePvQTile(scoreTile, decodedV, pvTmp, compactRows, mRows);
+            if (usedCubePv) {
+                Add(outAccTile, outAccTile, pvTmp, compactRows * D);
+                PipeBarrier<PIPE_V>();
             } else {
-                turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledScalar(
-                    scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP], decodedV,
-                    mStateScalar + q * gqaCount, sStateScalar + q * gqaCount,
-                    outAccTile[q * gqaCount * D], expBuf, softmaxReduceTmp, weightedValue,
-                    gqaCount, activeRows);
+                for (uint32_t q = 0; q < qRows; ++q) {
+                    if (pos >= causalEnds[q]) {
+                        continue;
+                    }
+                    auto score0 = scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP];
+                    auto score1 = scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP +
+                                            TQ_BR_UB_KV_TILE_CAP];
+                    auto out0 = outAccTile[q * gqaCount * D];
+                    auto out1 = outAccTile[q * gqaCount * D + D];
+                    for (uint32_t m = 0; m < mRows; ++m) {
+                        const uint32_t vBase = m * D;
+                        Axpy(out0, decodedV[vBase], score0.GetValue(m), D);
+                        PipeBarrier<PIPE_V>();
+                        Axpy(out1, decodedV[vBase], score1.GetValue(m), D);
+                        PipeBarrier<PIPE_V>();
+                    }
+                }
+            }
+            if (hasNext) {
+                PrefetchPackedKeyCodesIssue(seqIdx, kvHead, nextPos, nextRows, kPrefetchEvt);
+            }
+        } else {
+            for (uint32_t q = 0; q < qRows; ++q) {
+                const uint32_t causalKvEnd = causalEnds[q];
+                if (pos >= causalKvEnd) {
+                    continue;
+                }
+                const uint32_t activeRows =
+                    (pos + mRows <= causalKvEnd) ? mRows : (causalKvEnd - pos);
+                if (gqaCount == 2) {
+                    turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledGqa2Scalar(
+                        scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP], decodedV,
+                        mStateScalar + q * gqaCount, sStateScalar + q * gqaCount,
+                        outAccTile[q * gqaCount * D], expBuf, softmaxReduceTmp,
+                        activeRows);
+                } else {
+                    turboquant_attn::OnlineSoftmaxUpdateTileFloatPreScaledScalar(
+                        scoreTile[q * gqaCount * TQ_BR_UB_KV_TILE_CAP], decodedV,
+                        mStateScalar + q * gqaCount, sStateScalar + q * gqaCount,
+                        outAccTile[q * gqaCount * D], expBuf, softmaxReduceTmp,
+                        weightedValue, gqaCount, activeRows);
+                }
             }
         }
 
