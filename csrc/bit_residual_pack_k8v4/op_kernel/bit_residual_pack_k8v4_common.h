@@ -67,10 +67,14 @@ static constexpr uint32_t TQ_MANUAL_ROT_B_L1_OFFSET =
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_BUFFER_COUNT = 2;
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_STRIDE_ELEMS =
     TQ_MANUAL_ROT_TILE_M * TQ_ROT_N;
-static constexpr uint32_t TQ_MANUAL_C_WORKSPACE_FLOATS_PER_CORE =
+// cWorkGm carries the AIC Fixpipe F322F16 output (half), so the per-core
+// payload is measured in half elements, not float.
+static constexpr uint32_t TQ_MANUAL_C_WORKSPACE_HALVES_PER_CORE =
     TQ_MANUAL_WORKSPACE_BUFFER_COUNT * TQ_MANUAL_WORKSPACE_STRIDE_ELEMS;
+// manualWorkspace_ is __gm__ T* (T = half/bf16, both 2 B).  Index stride must
+// cover the same bytes as the per-core half payload.
 static constexpr uint32_t TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE =
-    TQ_MANUAL_C_WORKSPACE_FLOATS_PER_CORE * sizeof(float) / sizeof(uint16_t);
+    TQ_MANUAL_C_WORKSPACE_HALVES_PER_CORE * sizeof(half) / sizeof(uint16_t);
 static constexpr uint16_t TQ_MANUAL_SYNC_A_FREE = 0;
 static constexpr uint16_t TQ_MANUAL_SYNC_A_READY = 1;
 static constexpr uint16_t TQ_MANUAL_SYNC_C_FREE = 2;
@@ -304,9 +308,10 @@ __aicore__ inline void copy_packed_gm_to_ub(
 //
 // Hand-built LocalTensor buffer addresses live in one logical UB address space.
 // Do not reuse the same byte offsets across VECIN/VECOUT/VECCALC positions.
-// The rotated FP32 input uses two slots so MTE2 can prefetch stream N+1 while
-// the vector pipeline encodes stream N.  Encode scratch and encoded output stay
-// single-buffered because they are consumed in order by the cache RMW stage.
+// The rotated half input (AIC Fixpipe F322F16 output) uses two slots so MTE2
+// can prefetch stream N+1 while the vector pipeline encodes stream N.  Encode
+// scratch and encoded output stay single-buffered because they are consumed in
+// order by the cache RMW stage.
 // ── Base variable (offset = 0, no predecessor) ────────────────────────────────
 
 // ── A_ENCODED has a max-expression size; pre-compute before chaining ──────────
@@ -338,9 +343,15 @@ static constexpr uint32_t TQ_UB_ENCODE_SCALAR_BUF = TqAlignUp32(
     TQ_ENCODE_SCALAR_SLOTS * TQ_ENCODE_SCALAR_TILE_ELEMS * sizeof(half));
 
 // ── Chained layout via UB_VARIBALE_AND_OFF ────────────────────────────────────
-UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH,        TQ_BATCH_ELEMS * sizeof(float), TQ_UB_BASE)
-UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH1,       TQ_BATCH_ELEMS * sizeof(float), TQ_UB_XY_BATCH)
-UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_FAT,      TQ_UB_ENCODE_SMALL_BUF, TQ_UB_XY_BATCH1)       // fat: A/quant/final/pack_u8 + bf16 meta scratch
+// XY_BATCH/XY_BATCH1 hold the AIC Fixpipe F322F16 half output directly (no
+// fp32→half Cast on the AIV), so each slot is one 16×128 half tile = 4 KB.
+UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH,        TQ_BATCH_ELEMS * sizeof(half), TQ_UB_BASE)
+UB_VARIBALE_AND_OFF(TQ_UB_XY_BATCH1,       TQ_BATCH_ELEMS * sizeof(half), TQ_UB_XY_BATCH)
+// ENCODE_TMPB: the third 4 KB half slot freed by halving the two XY slots
+// (8 KB fp32 → 4 KB half each).  Home of signVec (key) / pack_half in the
+// half-input pipeline where fat is already busy as absVec/shiftedSign.
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_TMPB,     TQ_UB_ENCODE_SMALL_BUF, TQ_UB_XY_BATCH1)
+UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_FAT,      TQ_UB_ENCODE_SMALL_BUF, TQ_UB_ENCODE_TMPB)     // fat: absVec/quant/final/pack_u8 + bf16 meta scratch
 UB_VARIBALE_AND_OFF(TQ_UB_ENCODE_SCALAR,   TQ_UB_ENCODE_SCALAR_BUF, TQ_UB_ENCODE_FAT)    // scal: max→baseBlk, min, gap→step, stepBlk
 UB_VARIBALE_AND_OFF(TQ_UB_A_ENCODED_BATCH, TQ_UB_ENCODED_BATCH_BYTES, TQ_UB_ENCODE_SCALAR)
 UB_VARIBALE_AND_OFF(TQ_UB_PACKED_ROW,      TQ_PACKED_TILE_SCRATCH_BYTES, TQ_UB_A_ENCODED_BATCH)
@@ -358,12 +369,12 @@ public:
     //   Time-shared views: XY_BATCH and A_ENCODED_BATCH each hold multiple
     //   accessors with different element types/counts.  Use _SIZE for the full
     //   slot size; sub-view counts are derived from the raw constants.
-    __aicore__ inline AscendC::LocalTensor<float> YBatchFloat(
+    __aicore__ inline AscendC::LocalTensor<half> YBatchHalf(
         uint32_t bufferIndex = 0) {
         const uint32_t offset = bufferIndex == 0
             ? TQ_UB_XY_BATCH_OFFSET
             : TQ_UB_XY_BATCH1_OFFSET;
-        return local_.vecCalc.GetBufferByByte<float>(
+        return local_.vecCalc.GetBufferByByte<half>(
             offset,
             TQ_UB_XY_BATCH_SIZE);
     }
@@ -380,6 +391,13 @@ public:
     __aicore__ inline AscendC::LocalTensor<uint8_t> EncodeBuffer2() {
         return local_.vecCalc.GetBufferByByte<uint8_t>(
             TQ_UB_ENCODE_SCALAR_OFFSET, TQ_UB_ENCODE_SCALAR_SIZE);
+    }
+    // tmpB (4 KB): third half scratch slot — home of signVec (key encoder,
+    // Step 2) reused as pack_half (Step 13).  Carved from the 4 KB freed by
+    // halving each XY slot from 8 KB fp32 to 4 KB half.
+    __aicore__ inline AscendC::LocalTensor<uint8_t> EncodeTmpB() {
+        return local_.vecCalc.GetBufferByByte<uint8_t>(
+            TQ_UB_ENCODE_TMPB_OFFSET, TQ_UB_ENCODE_TMPB_SIZE);
     }
 
     __aicore__ inline AscendC::LocalTensor<uint16_t> KeyEncodedBatch() {
@@ -470,13 +488,13 @@ public:
 
     __aicore__ inline void InitManualWorkspaceTensors(
         uint32_t manualGroupId,
-        AscendC::GlobalTensor<float>& cWorkGm) const {
+        AscendC::GlobalTensor<half>& cWorkGm) const {
         __gm__ T* groupWork =
             manualWorkspace_ + static_cast<uint64_t>(manualGroupId) *
                                    TQ_MANUAL_WORKSPACE_ELEMS_PER_CORE;
         cWorkGm.SetGlobalBuffer(
-            reinterpret_cast<__gm__ float*>(groupWork),
-            TQ_MANUAL_C_WORKSPACE_FLOATS_PER_CORE);
+            reinterpret_cast<__gm__ half*>(groupWork),
+            TQ_MANUAL_C_WORKSPACE_HALVES_PER_CORE);
     }
 
     __aicore__ inline uint32_t ManualStreamBufferIndex(uint32_t streamOrdinal) const {

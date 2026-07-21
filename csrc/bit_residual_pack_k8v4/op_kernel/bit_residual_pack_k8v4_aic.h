@@ -49,7 +49,7 @@ public:
 
     __aicore__ inline void Process(uint32_t manualGroupId) {
         auto& op = context_;
-        AscendC::GlobalTensor<float> cWorkGm;
+        AscendC::GlobalTensor<half> cWorkGm;
         op.InitManualWorkspaceTensors(manualGroupId, cWorkGm);
         Init();
 
@@ -270,7 +270,7 @@ private:
 
     __aicore__ inline void ComputeSlice(
         TqManualMmadResource& resource,
-        AscendC::GlobalTensor<float>& cWorkGm,
+        AscendC::GlobalTensor<half>& cWorkGm,
         uint32_t streamOrdinal,
         uint32_t cOffset) {
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(eventListMte2Mte1);
@@ -323,9 +323,12 @@ private:
             rotFixParams.dstStride = TQ_ROT_N;
             rotFixParams.ndNum = 1;
             rotFixParams.unitFlag = unitFlag;
-            rotFixParams.quantPre = QuantMode_t::NoQuant;
+            // F322F16: cast L0C float → GM half in-place on the L0C→GM store.
+            // Required quantPre for Fixpipe<half, float> on dav_c220 (910B3),
+            // so the AIV reads cWorkGm as half directly (no fp32→half Cast).
+            rotFixParams.quantPre = QuantMode_t::F322F16;
             rotFixParams.reluEn = false;
-            AscendC::Fixpipe<float, float, AscendC::CFG_ROW_MAJOR>(
+            AscendC::Fixpipe<half, float, AscendC::CFG_ROW_MAJOR>(
                 cWorkGm[cOffset + slice * TQ_MANUAL_AIV_SLICE_M * TQ_ROT_N],
                 cL0_rot,
                 rotFixParams);
@@ -337,7 +340,7 @@ private:
 
     __aicore__ inline void ComputeStream(
         TqManualMmadResource& resource,
-        AscendC::GlobalTensor<float>& cWorkGm,
+        AscendC::GlobalTensor<half>& cWorkGm,
         const ManualKey1StreamDesc& desc) {
         const uint16_t flagBase = context_.ManualFlagBase(desc.streamOrdinal);
         const uint32_t bufferOffset =
