@@ -1388,16 +1388,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
         uint64_t headBase = GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
 
-        // Extend run while same PA block and within this subcore's [si, siEnd).
-        uint32_t n = 1U;
+        // P15: O(1) run length within same PA block and [si, siEnd).
         uint32_t maxInBlock = bs - pos0;
-        uint32_t nCap = maxSub < maxInBlock ? maxSub : maxInBlock;
-        while (si + n < siEnd && n < nCap) {
-            uint32_t gNext = info.s2Idx * constInfo.s2BaseSize + si + n;
-            if ((gNext / bs) != blockInBatch) {
-                break;
-            }
-            ++n;
+        uint32_t remainingInSub = siEnd - si;
+        uint32_t n = maxInBlock;
+        if (remainingInSub < n) {
+            n = remainingInSub;
+        }
+        if (maxSub < n) {
+            n = maxSub;
         }
 
         const uint32_t bufIdx = runId % 2U;

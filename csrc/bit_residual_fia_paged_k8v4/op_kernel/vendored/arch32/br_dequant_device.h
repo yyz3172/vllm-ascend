@@ -21,6 +21,8 @@
  * GetValue and all metadata V_S synchronization.
  * Meta P9b: dequantInt8Buf_ holds up to BR_S2_SUB_MAX packed meta rows so
  * each PA run does one meta DMA+cast, then tiles only decode.
+ * P14: BrApplyRowAffine — one column loop, fewer PipeBarriers.
+ * P13: BrDecodeKeyTile — merge safe Cast/Muls+Adds chains, fewer barriers.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -151,8 +153,6 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<float> dst,
         Mul(dst[columnOffset], src[columnOffset], broadcast, columnCount,
             numRows, repeatParams);
     }
-    PipeBarrier<PIPE_V>();
-
     Brcb(broadcast, offsets, (numRows + FP32_BLOCK_ELEMS - 1U) /
         FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
     PipeBarrier<PIPE_V>();
@@ -207,8 +207,8 @@ __aicore__ inline void BrDecodeKeyTile(
 {
     const uint32_t N = numRows * headDim;
 
+    // P13: merge back-to-back Cast; keep barriers on RAW deps only.
     Cast(halfScratch, codesUb, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
     auto codeI16 = scratchA.template ReinterpretCast<int16_t>();
     Cast(codeI16, halfScratch, RoundMode::CAST_RINT, N);
     PipeBarrier<PIPE_V>();
@@ -229,9 +229,7 @@ __aicore__ inline void BrDecodeKeyTile(
     PipeBarrier<PIPE_V>();
 
     Cast(scratchB, signStorage, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
     Muls(scratchB, scratchB, -2.0f, N);
-    PipeBarrier<PIPE_V>();
     Adds(scratchB, scratchB, 1.0f, N);
     PipeBarrier<PIPE_V>();
 
