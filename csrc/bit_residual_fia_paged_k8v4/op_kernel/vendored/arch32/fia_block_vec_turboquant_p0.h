@@ -1312,30 +1312,41 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         return;
     }
 
-    // A1 dual-buffer staging in tmpBuff1 front; tile=8 decode scratch in the tail
-    // (shared). Vec1/Vec2 reclaim the full 32KB after dequant returns.
+    // A1 dual-buffer staging in tmpBuff1 front; decode scratch in the tail
+    // (shared). K8 uses 8 rows/3 FP32 tensors, while V4 uses 13 rows/2 FP32
+    // tensors. Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
-    constexpr uint32_t kTileMax = br_dequant::BR_DECODE_TILE_MAX;
-    constexpr uint32_t kScratchElems = br_dequant::BR_DECODE_TILE_ELEMS;
-    constexpr uint32_t kFp32ScratchBytes =
-        kScratchElems * 3U * static_cast<uint32_t>(sizeof(float));
-    constexpr uint32_t kFp16ScratchBytes =
+    const uint32_t kTileMax = isKey
+        ? br_dequant::BR_KEY_DECODE_TILE_MAX
+        : br_dequant::BR_VALUE_DECODE_TILE_MAX;
+    const uint32_t kScratchElems = kTileMax * br_pack::BR_HEAD_SIZE;
+    const uint32_t kFp32ScratchCount = isKey ? 3U : 2U;
+    const uint32_t kFp32ScratchBytes =
+        kScratchElems * kFp32ScratchCount * static_cast<uint32_t>(sizeof(float));
+    const uint32_t kFp16ScratchBytes =
         kScratchElems * static_cast<uint32_t>(sizeof(half));
-    constexpr uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes; // 14336
-    constexpr uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;              // 18432
-    constexpr uint32_t kHalfBytes = kStageBytes / 2U;                         // 9216
+    const uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes;
+    const uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;
+    const uint32_t kHalfBytes = kStageBytes / 2U;
 
     LocalTensor<float> fp32UbA =
         tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
     LocalTensor<float> fp32UbB =
         tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes + kScratchElems * sizeof(float));
-    LocalTensor<float> fp32UbC = tmpBuff1.GetWithOffset<float>(
-        kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float));
+    LocalTensor<float> fp32UbC = isKey
+        ? tmpBuff1.GetWithOffset<float>(
+            kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float))
+        : dequantFp32Buf_.Get<float>();
     LocalTensor<half> halfScratch =
         tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
-    // P1: two packed 32B meta buffers live in the dedicated legacy staging
-    // buffer. P0 batch-Casts them into fp32UbC with one V_S per decode tile.
+    // P1/P4: packed meta and its FP32 form stay in the dedicated buffer.
+    // Decode consumes FP32 metadata through vector row broadcasts, without
+    // scalar GetValue or V_S synchronization.
     LocalTensor<uint8_t> packedMetaUb = dequantInt8Buf_.Get<uint8_t>();
+    LocalTensor<float> meta0Fp32 = packedMetaUb[
+        br_dequant::BR_META_FP32_0_UB_OFF].template ReinterpretCast<float>();
+    LocalTensor<float> meta1Fp32 = packedMetaUb[
+        br_dequant::BR_META_FP32_1_UB_OFF].template ReinterpretCast<float>();
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
     GlobalTensor<WS_T> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
@@ -1345,6 +1356,8 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     event_t eventIdMte3WaitV0 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
     event_t eventIdMte3WaitV1 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
     event_t eventIdMte2WaitS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE2));
+    event_t eventIdMte2WaitVMeta = static_cast<event_t>(
+        GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
 
     const uint32_t bs = constInfo.kvCacheBlockSize;
     const uint32_t codeRowBytes =
@@ -1427,19 +1440,18 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 if (nb > kTileMax) {
                     nb = kTileMax;
                 }
-                float bases[kTileMax];
-                float steps[kTileMax];
+                SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
+                WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
                 br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
                     meta0GmOff + j0 * sizeof(Q_T), meta1GmOff + j0 * sizeof(Q_T), nb);
                 SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
                 WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
                 br_dequant::BrCastPackedMetaToFp32<Q_T>(
-                    packedMetaUb, nb, fp32UbC, fp32UbC[kTileMax]);
-                br_dequant::BrLoadMetaFp32ToArray(fp32UbC, bases, nb);
-                br_dequant::BrLoadMetaFp32ToArray(fp32UbC[kTileMax], steps, nb);
+                    packedMetaUb, nb, meta0Fp32, meta1Fp32);
                 br_dequant::BrDecodeKeyTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
-                    outBatch[j0 * headDimAlign], bases, steps, nb, headDim, headDimAlign);
+                    outBatch[j0 * headDimAlign], meta0Fp32, meta1Fp32,
+                    nb, headDim, headDimAlign);
             }
         } else {
             for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
@@ -1447,19 +1459,18 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 if (nb > kTileMax) {
                     nb = kTileMax;
                 }
-                float vmins[kTileMax];
-                float vsteps[kTileMax];
+                SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
+                WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
                 br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
                     meta0GmOff + j0 * sizeof(Q_T), meta1GmOff + j0 * sizeof(Q_T), nb);
                 SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
                 WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
                 br_dequant::BrCastPackedMetaToFp32<Q_T>(
-                    packedMetaUb, nb, fp32UbC, fp32UbC[kTileMax]);
-                br_dequant::BrLoadMetaFp32ToArray(fp32UbC, vmins, nb);
-                br_dequant::BrLoadMetaFp32ToArray(fp32UbC[kTileMax], vsteps, nb);
+                    packedMetaUb, nb, meta0Fp32, meta1Fp32);
                 br_dequant::BrDecodeValueTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
-                    outBatch[j0 * headDimAlign], vmins, vsteps, nb, headDim, headDimAlign);
+                    outBatch[j0 * headDimAlign], meta0Fp32, meta1Fp32,
+                    nb, headDim, headDimAlign);
             }
         }
 
