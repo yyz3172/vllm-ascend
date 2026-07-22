@@ -507,10 +507,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DealBmm1ResBaseBlock(
     inputQue1.DeQue<MM1_OUT_T>();
 
     ElewiseCompute(info, mmResUb, tmpBuff1, startRow, dealRowCount, columnCount, actualColumnCount);
-    AscendC::PipeBarrier<PIPE_V>();
     LocalTensor<uint8_t> softmaxTmpUb = tmpBuff1.Get<uint8_t>();
     SoftmaxFlashV2Compute(info, mmResUb, softmaxTmpUb, startRow, dealRowCount, columnCount, actualColumnCount);
-    AscendC::PipeBarrier<PIPE_V>();
+    PipeBarrier<PIPE_V>();
     LocalTensor<WS_T> vec1ResUb = outputQue1.AllocTensor<WS_T>();
     Cast(vec1ResUb, mmResUb, AscendC::RoundMode::CAST_ROUND, computeSize);
     outputQue1.EnQue(vec1ResUb);
@@ -1434,7 +1433,46 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         LocalTensor<WS_T> outBatch =
             batchUb[outOff].template ReinterpretCast<WS_T>();
 
-        if (isKey) {
+        // P9: hoist meta DMA/cast when n fits the 16-row packed buffer.
+        // meta0Fp32[j0] must stay 32B-aligned for Brcb, so tile step is a
+        // multiple of 8 floats (even when V4 decode tile is 13).
+        constexpr uint32_t kMetaSliceAlign = 8U;
+        if (n <= br_dequant::BR_PACKED_META_TILE_ROWS) {
+            SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
+            WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
+            br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
+                meta0GmOff, meta1GmOff, n);
+            SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+            WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+            br_dequant::BrCastPackedMetaToFp32<Q_T>(
+                packedMetaUb, n, meta0Fp32, meta1Fp32);
+            const uint32_t hoistTile = (kTileMax < kMetaSliceAlign)
+                ? kTileMax
+                : (kTileMax / kMetaSliceAlign) * kMetaSliceAlign;
+            if (isKey) {
+                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
+                    uint32_t nb = n - j0;
+                    if (nb > hoistTile) {
+                        nb = hoistTile;
+                    }
+                    br_dequant::BrDecodeKeyTile(
+                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
+                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
+                        nb, headDim, headDimAlign);
+                }
+            } else {
+                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
+                    uint32_t nb = n - j0;
+                    if (nb > hoistTile) {
+                        nb = hoistTile;
+                    }
+                    br_dequant::BrDecodeValueTile(
+                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
+                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
+                        nb, headDim, headDimAlign);
+                }
+            }
+        } else if (isKey) {
             for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
                 uint32_t nb = n - j0;
                 if (nb > kTileMax) {
