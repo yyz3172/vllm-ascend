@@ -360,7 +360,7 @@ template <typename FIAT> __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::I
     Duplicate(softmaxSumDefaultUb, (COMPUTE_T)0.0, SOFTMAX_TMP_BUFFER_SIZE / sizeof(COMPUTE_T));
 
     uint32_t elemCount = constInfo.headDimAlign;
-    // codes + 64B meta staging (legacy; Key/Value runs stage in tmpBuff1).
+    // P9b: packed meta0/1 half + FP32 cast rows (up to BR_S2_SUB_MAX).
     uint32_t int8Bytes = ((br_dequant::BR_DEQUANT_UB_BYTES + 31U) / 32U) * 32U;
     // 1-row dedicated scratch only. Tile=8 Key decode scratch overlays tmpBuff1 tail.
     uint32_t fp32Bytes = ((elemCount * 3U * static_cast<uint32_t>(sizeof(COMPUTE_T)) + 31U) / 32U) * 32U;
@@ -1364,7 +1364,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     const uint32_t outRowBytes = headDimAlign * static_cast<uint32_t>(sizeof(WS_T));
     uint32_t maxSub = br_dequant::BR_S2_SUB_MAX;
     {
-        // Meta uses a fixed 64B dedicated buffer instead of 64B per staged row.
+        // Meta uses dedicated dequantInt8Buf_ (P9b: up to BR_S2_SUB_MAX rows).
         uint32_t perRow = codeRowBytes + outRowBytes;
         uint32_t byUb = (kHalfBytes > 128U) ? ((kHalfBytes - 128U) / perRow) : 1U;
         if (byUb < maxSub) {
@@ -1433,81 +1433,41 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         LocalTensor<WS_T> outBatch =
             batchUb[outOff].template ReinterpretCast<WS_T>();
 
-        // P9: hoist meta DMA/cast when n fits the 16-row packed buffer.
-        // meta0Fp32[j0] must stay 32B-aligned for Brcb, so tile step is a
-        // multiple of 8 floats (even when V4 decode tile is 13).
+        // P9b: one meta DMA+cast per run (n <= BR_S2_SUB_MAX = packed capacity).
+        // meta0Fp32[j0] must stay 32B-aligned for Brcb, so decode tile step is
+        // a multiple of 8 floats (V4 tile-13 becomes hoistTile=8).
         constexpr uint32_t kMetaSliceAlign = 8U;
-        if (n <= br_dequant::BR_PACKED_META_TILE_ROWS) {
-            SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
-            WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
-            br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
-                meta0GmOff, meta1GmOff, n);
-            SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-            WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-            br_dequant::BrCastPackedMetaToFp32<Q_T>(
-                packedMetaUb, n, meta0Fp32, meta1Fp32);
-            const uint32_t hoistTile = (kTileMax < kMetaSliceAlign)
-                ? kTileMax
-                : (kTileMax / kMetaSliceAlign) * kMetaSliceAlign;
-            if (isKey) {
-                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
-                    uint32_t nb = n - j0;
-                    if (nb > hoistTile) {
-                        nb = hoistTile;
-                    }
-                    br_dequant::BrDecodeKeyTile(
-                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
-                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
-                        nb, headDim, headDimAlign);
-                }
-            } else {
-                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
-                    uint32_t nb = n - j0;
-                    if (nb > hoistTile) {
-                        nb = hoistTile;
-                    }
-                    br_dequant::BrDecodeValueTile(
-                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
-                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
-                        nb, headDim, headDimAlign);
-                }
-            }
-        } else if (isKey) {
-            for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
+        const uint32_t hoistTile = (kTileMax < kMetaSliceAlign)
+            ? kTileMax
+            : (kTileMax / kMetaSliceAlign) * kMetaSliceAlign;
+        SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
+        WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
+        br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
+            meta0GmOff, meta1GmOff, n);
+        SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+        WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
+        br_dequant::BrCastPackedMetaToFp32<Q_T>(
+            packedMetaUb, n, meta0Fp32, meta1Fp32);
+        if (isKey) {
+            for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
                 uint32_t nb = n - j0;
-                if (nb > kTileMax) {
-                    nb = kTileMax;
+                if (nb > hoistTile) {
+                    nb = hoistTile;
                 }
-                SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
-                WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
-                br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
-                    meta0GmOff + j0 * sizeof(Q_T), meta1GmOff + j0 * sizeof(Q_T), nb);
-                SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                br_dequant::BrCastPackedMetaToFp32<Q_T>(
-                    packedMetaUb, nb, meta0Fp32, meta1Fp32);
                 br_dequant::BrDecodeKeyTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
-                    outBatch[j0 * headDimAlign], meta0Fp32, meta1Fp32,
+                    outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
                     nb, headDim, headDimAlign);
             }
         } else {
-            for (uint32_t j0 = 0U; j0 < n; j0 += kTileMax) {
+            for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
                 uint32_t nb = n - j0;
-                if (nb > kTileMax) {
-                    nb = kTileMax;
+                if (nb > hoistTile) {
+                    nb = hoistTile;
                 }
-                SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
-                WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitVMeta);
-                br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
-                    meta0GmOff + j0 * sizeof(Q_T), meta1GmOff + j0 * sizeof(Q_T), nb);
-                SetFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                WaitFlag<HardEvent::MTE2_V>(eventIdVWaitMte2);
-                br_dequant::BrCastPackedMetaToFp32<Q_T>(
-                    packedMetaUb, nb, meta0Fp32, meta1Fp32);
                 br_dequant::BrDecodeValueTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
-                    outBatch[j0 * headDimAlign], meta0Fp32, meta1Fp32,
+                    outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
                     nb, headDim, headDimAlign);
             }
         }
