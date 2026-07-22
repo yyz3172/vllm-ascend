@@ -19,6 +19,8 @@
  * Meta P4: metadata stays in UB after Cast. Brcb expands each row scalar to
  * one FP32 block and row-broadcast Mul/Add consumes it directly, avoiding
  * GetValue and all metadata V_S synchronization.
+ * Meta P9b: dequantInt8Buf_ holds up to BR_S2_SUB_MAX packed meta rows so
+ * each PA run does one meta DMA+cast, then tiles only decode.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -32,13 +34,20 @@ using namespace AscendC;
 using br_pack::BR_HEAD_SIZE;
 
 static constexpr uint32_t BR_S2_SUB_MAX = 64U;
-// Legacy 32B packed slots (16 rows) + FP32 cast at +64/+128.
-static constexpr uint32_t BR_PACKED_META_TILE_ROWS = 16U;
+// P9b: packed meta0/meta1 runs then FP32 cast rows (up to BR_S2_SUB_MAX).
+// Layout: [0, 128) meta0 half, [128, 256) meta1 half, [256, 512) meta0 fp32,
+// [512, 768) meta1 fp32. Cast sources stay 32B-aligned.
+static constexpr uint32_t BR_PACKED_META_TILE_ROWS = BR_S2_SUB_MAX;
 static constexpr uint32_t BR_PACKED_META_BYTES =
     BR_PACKED_META_TILE_ROWS * static_cast<uint32_t>(sizeof(half));
-static constexpr uint32_t BR_META_FP32_0_UB_OFF = 64U;
-static constexpr uint32_t BR_META_FP32_1_UB_OFF = 128U;
-static constexpr uint32_t BR_DEQUANT_UB_BYTES = 256U;
+static constexpr uint32_t BR_META_FP32_ROW_BYTES =
+    BR_PACKED_META_TILE_ROWS * static_cast<uint32_t>(sizeof(float));
+static constexpr uint32_t BR_META_FP32_0_UB_OFF =
+    ((2U * BR_PACKED_META_BYTES + 31U) / 32U) * 32U;
+static constexpr uint32_t BR_META_FP32_1_UB_OFF =
+    BR_META_FP32_0_UB_OFF + BR_META_FP32_ROW_BYTES;
+static constexpr uint32_t BR_DEQUANT_UB_BYTES =
+    BR_META_FP32_1_UB_OFF + BR_META_FP32_ROW_BYTES;
 
 // Legacy single-row staging offsets (BrCopyMetaPair only).
 static constexpr uint32_t BR_META0_UB_OFF = BR_HEAD_SIZE;
