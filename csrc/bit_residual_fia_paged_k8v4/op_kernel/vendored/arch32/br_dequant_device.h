@@ -19,6 +19,8 @@
  * Meta P4: metadata stays in UB after Cast. Brcb expands each row scalar to
  * one FP32 block and row-broadcast Mul/Add consumes it directly, avoiding
  * GetValue and all metadata V_S synchronization.
+ * Meta P9b: dequantInt8Buf_ holds up to BR_S2_SUB_MAX packed meta rows so
+ * each PA run does one meta DMA+cast, then tiles only decode.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -31,13 +33,25 @@ namespace br_dequant {
 using namespace AscendC;
 using br_pack::BR_HEAD_SIZE;
 
-// Staging layout inside dequantInt8Buf_ (uint8):
-//   [0, headDim)           : key codes OR value nibble bytes
-//   [headDim, headDim+32)  : meta0 (base/vmin), 2B used
-//   [headDim+32, headDim+64): meta1 (step/vstep), 2B used
+static constexpr uint32_t BR_S2_SUB_MAX = 64U;
+// P9b: packed meta0/meta1 runs then FP32 cast rows (up to BR_S2_SUB_MAX).
+// Layout: [0, 128) meta0 half, [128, 256) meta1 half, [256, 512) meta0 fp32,
+// [512, 768) meta1 fp32. Cast sources stay 32B-aligned.
+static constexpr uint32_t BR_PACKED_META_TILE_ROWS = BR_S2_SUB_MAX;
+static constexpr uint32_t BR_PACKED_META_BYTES =
+    BR_PACKED_META_TILE_ROWS * static_cast<uint32_t>(sizeof(half));
+static constexpr uint32_t BR_META_FP32_ROW_BYTES =
+    BR_PACKED_META_TILE_ROWS * static_cast<uint32_t>(sizeof(float));
+static constexpr uint32_t BR_META_FP32_0_UB_OFF =
+    ((2U * BR_PACKED_META_BYTES + 31U) / 32U) * 32U;
+static constexpr uint32_t BR_META_FP32_1_UB_OFF =
+    BR_META_FP32_0_UB_OFF + BR_META_FP32_ROW_BYTES;
+static constexpr uint32_t BR_DEQUANT_UB_BYTES =
+    BR_META_FP32_1_UB_OFF + BR_META_FP32_ROW_BYTES;
+
+// Legacy single-row staging offsets (BrCopyMetaPair only).
 static constexpr uint32_t BR_META0_UB_OFF = BR_HEAD_SIZE;
 static constexpr uint32_t BR_META1_UB_OFF = BR_HEAD_SIZE + 32U;
-static constexpr uint32_t BR_DEQUANT_UB_BYTES = BR_HEAD_SIZE + 64U;
 
 // Pack stores base/step/vmin/vstep as 2-byte floats matching the pack input
 // dtype (half or bfloat16). FIA must decode with the same type — reading bf16
@@ -74,12 +88,6 @@ __aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<
         return BrReadFp16FromUb(ub, scratch, byteOffset);
     }
 }
-
-// One packed meta tile buffer; source/destination bases for vector Cast must
-// be 32B aligned on 910B.
-static constexpr uint32_t BR_PACKED_META_BYTES = 32U;
-static constexpr uint32_t BR_META_FP32_0_UB_OFF = 64U;
-static constexpr uint32_t BR_META_FP32_1_UB_OFF = 128U;
 
 // Copy packed meta0/meta1 runs. GM already uses SoA layout, so each run is
 // contiguous; DataCopyPad handles sub-32B tails and potentially unaligned GM.
@@ -170,11 +178,6 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
     DataCopyPad(ub[BR_META1_UB_OFF], srcGm[meta1Off], metaParams, padParams);
 }
 
-static constexpr uint32_t BR_S2_SUB_MAX = 64U;
-// K8 needs three FP32 scratch tensors, while V4 needs two. Keep K at 8 rows
-// and use the released V4 scratch capacity for a 13-row tile. For a 128-row
-// PA block this reduces V4 meta/decode tiles from 18 to 11 per AIV half while
-// preserving enough front space for dual-buffer code/output staging.
 static constexpr uint32_t BR_KEY_DECODE_TILE_MAX = 8U;
 static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX = 13U;
 
