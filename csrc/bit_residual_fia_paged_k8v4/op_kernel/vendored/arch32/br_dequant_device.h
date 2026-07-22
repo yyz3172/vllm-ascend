@@ -31,13 +31,18 @@ namespace br_dequant {
 using namespace AscendC;
 using br_pack::BR_HEAD_SIZE;
 
-// Staging layout inside dequantInt8Buf_ (uint8):
-//   [0, headDim)           : key codes OR value nibble bytes
-//   [headDim, headDim+32)  : meta0 (base/vmin), 2B used
-//   [headDim+32, headDim+64): meta1 (step/vstep), 2B used
+static constexpr uint32_t BR_S2_SUB_MAX = 64U;
+// Legacy 32B packed slots (16 rows) + FP32 cast at +64/+128.
+static constexpr uint32_t BR_PACKED_META_TILE_ROWS = 16U;
+static constexpr uint32_t BR_PACKED_META_BYTES =
+    BR_PACKED_META_TILE_ROWS * static_cast<uint32_t>(sizeof(half));
+static constexpr uint32_t BR_META_FP32_0_UB_OFF = 64U;
+static constexpr uint32_t BR_META_FP32_1_UB_OFF = 128U;
+static constexpr uint32_t BR_DEQUANT_UB_BYTES = 256U;
+
+// Legacy single-row staging offsets (BrCopyMetaPair only).
 static constexpr uint32_t BR_META0_UB_OFF = BR_HEAD_SIZE;
 static constexpr uint32_t BR_META1_UB_OFF = BR_HEAD_SIZE + 32U;
-static constexpr uint32_t BR_DEQUANT_UB_BYTES = BR_HEAD_SIZE + 64U;
 
 // Pack stores base/step/vmin/vstep as 2-byte floats matching the pack input
 // dtype (half or bfloat16). FIA must decode with the same type — reading bf16
@@ -74,12 +79,6 @@ __aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<
         return BrReadFp16FromUb(ub, scratch, byteOffset);
     }
 }
-
-// One packed meta tile buffer; source/destination bases for vector Cast must
-// be 32B aligned on 910B.
-static constexpr uint32_t BR_PACKED_META_BYTES = 32U;
-static constexpr uint32_t BR_META_FP32_0_UB_OFF = 64U;
-static constexpr uint32_t BR_META_FP32_1_UB_OFF = 128U;
 
 // Copy packed meta0/meta1 runs. GM already uses SoA layout, so each run is
 // contiguous; DataCopyPad handles sub-32B tails and potentially unaligned GM.
@@ -170,11 +169,6 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
     DataCopyPad(ub[BR_META1_UB_OFF], srcGm[meta1Off], metaParams, padParams);
 }
 
-static constexpr uint32_t BR_S2_SUB_MAX = 64U;
-// K8 needs three FP32 scratch tensors, while V4 needs two. Keep K at 8 rows
-// and use the released V4 scratch capacity for a 13-row tile. For a 128-row
-// PA block this reduces V4 meta/decode tiles from 18 to 11 per AIV half while
-// preserving enough front space for dual-buffer code/output staging.
 static constexpr uint32_t BR_KEY_DECODE_TILE_MAX = 8U;
 static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX = 13U;
 
