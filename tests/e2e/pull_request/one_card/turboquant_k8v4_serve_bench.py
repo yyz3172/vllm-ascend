@@ -60,6 +60,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -326,6 +327,22 @@ def _extract_bench_metrics(group_dir: Path) -> dict | None:
 # ---------------------------------------------------------------------------
 # serve lifecycle helpers
 # ---------------------------------------------------------------------------
+def _port_in_use(host: str, port: int) -> bool:
+    """Return True if something is already listening on (host, port).
+
+    vllm serve binds with SO_REUSEADDR, so two serves can both LISTEN on the
+    same port without error — connections then get round-robined between them
+    and bench requests silently hit the wrong (often overloaded) server. This
+    guard refuses to start a second serve on an already-occupied port.
+    """
+    # Normalize host for connect: '' / '0.0.0.0' -> 127.0.0.1; vllm default host
+    # is 127.0.0.1. We probe the loopback the bench will actually use.
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "", None) else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((probe_host, port)) == 0
+
+
 def _wait_for_ready(
     base_url: str, timeout_s: float, interval_s: float, *, serve_proc: subprocess.Popen,
 ) -> None:
@@ -588,6 +605,16 @@ def main() -> int:
         print(f"  serve log : {serve_log}")
 
         # ---- launch serve ----
+        # Guard against a stale serve (or another instance of this script)
+        # already LISTENing on the port. vllm binds with SO_REUSEADDR so a
+        # second bind would "succeed" and silently split bench traffic.
+        if _port_in_use(args.host, args.port):
+            print(
+                f"  [!] 端口 {args.port} 已被占用（可能有一个旧的 vllm serve 没关，"
+                f"或另一个本脚本实例在跑）。请换端口（-p）或先 kill 旧 serve 后重试。",
+                file=sys.stderr,
+            )
+            return 4
         print(f"  [launching vllm serve ...]")
         serve_proc = subprocess.Popen(
             serve_cmd,
