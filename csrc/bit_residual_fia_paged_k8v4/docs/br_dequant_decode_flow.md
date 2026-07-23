@@ -22,7 +22,7 @@ Key / Value 在 AIV 上按 **tile（多行）** 解码：先把 pack 码还原�
 | 路径 | 入口 | 公式（每行一套 meta） |
 |------|------|----------------------|
 | Key K8 | `BrDecodeKeyTile` | \(y = \mathrm{sign}_{\pm1}\cdot(\mathrm{base}+q7\cdot\mathrm{step})\) |
-| Value V4 | `BrDecodeValueTile` | \(y = \mathrm{vmin}+(\mathrm{idx4}+8)\cdot\mathrm{vstep}\) |
+| Value V4 | `BrDecodeValueTile` | \(y=\mathrm{vmin}'+s\cdot\mathrm{vstep}\)，\(s=\mathrm{Cast}(\mathrm{int4})\in[-8,7]\)；\(\mathrm{vmin}'=\mathrm{vmin}+8\cdot\mathrm{vstep}\)（P17b-B：PA run 级折算） |
 
 两边共用 `BrApplyRowAffine`：对 `[numRows, headDim]` 做 **按行广播** 的 `dst = src * scale + offset`。
 
@@ -82,20 +82,23 @@ codesUb [numRows × headDim] uint8
 nibble / `int4` 打包：`nibbleUb` 为 `numRows × (headDim/2)` uint8。
 
 \[
-y = \mathrm{vmin} + \underbrace{(\mathrm{idx4}+8)}_{0..15}\cdot\mathrm{vstep}
+y = \mathrm{vmin} + \underbrace{(s+8)}_{0..15}\cdot\mathrm{vstep}
+  = \underbrace{(\mathrm{vmin}+8\cdot\mathrm{vstep})}_{\mathrm{vmin}'} + s\cdot\mathrm{vstep}
 \]
+
+`Cast(int4b_t)` 得到有符号 \(s\in[-8,7]\)。P17b-B 在 `DequantKvImpl` 每个 PA run 上对 `n` 行做一次 `vmin' = vmin + 8*vstep`，tile 内不再 `Adds(+8)`。
 
 ### 3.2 流水
 
 ```
+PA run meta (n rows):  vmin' = vmin + 8*vstep   (P17b-B, once per run)
 nibbleUb (int4 packed)
         │
-        ▼ Cast int4→half
-        ▼ Adds(+8)                      (P13b: 与前后 Cast 同缓冲链式，少 barrier)
+        ▼ Cast int4→half                 (s ∈ [-8,7])
         ▼ Cast half→FP32  (scratchA)
         │
         ▼ BrApplyRowAffine
-   y = vmin + idx * vstep  (scratchB)
+   y = vmin' + s * vstep  (scratchB)
         │
         ▼ Cast → outUb
 ```
@@ -113,9 +116,9 @@ BrApplyRowAffine(dst, src, offsets, scales, broadcast, numRows, headDim);
 
 | 参数 | Key | Value |
 |------|-----|-------|
-| `src` | q7（FP32） | idx（FP32） |
+| `src` | q7（FP32） | \(s\)（有符号 int4→FP32） |
 | `scales` | step | vstep |
-| `offsets` | base | vmin |
+| `offsets` | base | \(\mathrm{vmin}'\)（P17b-B 已折入 \(+8\cdot\mathrm{vstep}\)） |
 
 实现骨架：
 
