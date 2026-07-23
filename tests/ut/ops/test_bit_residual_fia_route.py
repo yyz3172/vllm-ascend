@@ -84,3 +84,8 @@ def test_wrapper_symbol_exported() -> None:
     text = src.read_text(encoding="utf-8")
     assert "def bit_residual_fia_paged_k8v4(" in text
     assert "def bit_residual_attention_paged_k8v4(" in text
+    # Both wrappers accept optional in-place out= (caller buffer).
+    assert "out: torch.Tensor | None = None," in text
+    fia_idx = text.index("def bit_residual_fia_paged_k8v4(")
+    fia_chunk = text[fia_idx : fia_idx + 1200]
+    assert "out: torch.Tensor | None = None," in fia_chunk
