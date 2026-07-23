@@ -1043,9 +1043,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         pre_tokens=SWA_INT_MAX,
                         next_tokens=SWA_INT_MAX,
                         sparse_mode=0 if is_decode else 3,
+                        out=output[:num_tokens],
                     )
                     if attn_output is not None:
-                        output[:num_tokens] = attn_output[:num_tokens]
                         return output
                 if attn_metadata.attn_state in (
                     AscendAttentionState.DecodeOnly,
@@ -1285,9 +1285,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         pre_tokens=SWA_INT_MAX,
                         next_tokens=SWA_INT_MAX,
                         sparse_mode=0,
+                        out=output,
                     )
                     if attn_output is not None:
-                        output.copy_(attn_output)
                         return output
                 attn_output = bit_residual_attention_paged_k8v4(
                     query=query,

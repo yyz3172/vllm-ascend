@@ -817,7 +817,8 @@ at::Tensor bit_residual_fia_paged_k8v4(
     double scale_value,
     int64_t pre_tokens,
     int64_t next_tokens,
-    int64_t sparse_mode)
+    int64_t sparse_mode,
+    c10::optional<at::Tensor> out_opt)
 {
     constexpr int64_t kHeadSize = 128;
     constexpr int64_t kBlockRows = 16;
@@ -870,7 +871,17 @@ at::Tensor bit_residual_fia_paged_k8v4(
                           ? atten_mask->contiguous()
                           : at::empty({0}, query.options().dtype(at::kChar));
 
-    at::Tensor out = at::empty(query_c.sizes(), query_c.options());
+    at::Tensor out;
+    if (out_opt.has_value() && out_opt->defined()) {
+        TORCH_CHECK(out_opt->is_privateuseone(), "out must be on NPU");
+        TORCH_CHECK(out_opt->sizes().equals(query_c.sizes()), "out shape must match query");
+        TORCH_CHECK(out_opt->scalar_type() == query_c.scalar_type(), "out dtype must match query");
+        TORCH_CHECK(out_opt->device() == query_c.device(), "out device must match query");
+        TORCH_CHECK(out_opt->is_contiguous(), "out must be contiguous for in-place write");
+        out = *out_opt;
+    } else {
+        out = at::empty(query_c.sizes(), query_c.options());
+    }
     const c10_npu::OptionalNPUGuard npuGuard(query_c.device());
     EXEC_NPU_CMD(
         aclnnBitResidualFiaPagedK8v4,
@@ -2495,7 +2506,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "int[] actual_seq_len_q, int[] actual_seq_len_kv, "
         "Tensor? atten_mask, Tensor rotation_key, Tensor rotation_value, "
         "int num_heads, int num_kv_heads, int head_size, int block_size, "
-        "float scale_value, int pre_tokens, int next_tokens, int sparse_mode"
+        "float scale_value, int pre_tokens, int next_tokens, int sparse_mode, "
+        "Tensor? out=None"
         ") -> Tensor");
     ops.impl(
         "bit_residual_fia_paged_k8v4",
