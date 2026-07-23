@@ -59,8 +59,8 @@ vstep_off_v       = BS*(64+2) + pos_in_block*2
 ### Key (K8)
 
 ```text
-q7   = code & 0x7F
-sign = code >> 7     // 0→+1, 1→-1
+q7   = code >> 1
+sign = code & 0x01    // 0→+1, 1→-1
 y    = (base + q7 * step) * (sign ? -1 : +1)
 ```
 

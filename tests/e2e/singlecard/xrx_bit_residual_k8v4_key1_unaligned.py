@@ -8,7 +8,7 @@ The test verifies a chain of properties that collectively catch encoding bugs:
 
   1. QDQ round-trip: decoded q7/idx4 precisely reconstruct stored base/step/
      vmin/vstep, proving encoding format and decode logic are correct;
-  2. sign-bit consistency: code = q7 | (sign << 7) holds for every byte;
+  2. sign-bit consistency: code = (q7 << 1) | sign holds for every byte;
   3. encoding range validity: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0;
   4. non-degenerate check: random input produces step > 0 in most groups;
   5. sign bit balance: sign=1 fraction is roughly balanced for random input;
@@ -19,7 +19,7 @@ The test verifies a chain of properties that collectively catch encoding bugs:
 Sign-reversal quantization (no normalization):
   After rotation, generate sig_vec = sign(y) → ±1.0
   rev_vec = y * sig_vec (all dimensions become positive)
-  Quantize rev_vec: base + q7*step, with code = q7|(sign_bit<<7)
+  Quantize rev_vec: base + q7*step, with code = (q7<<1)|sign_bit
   Decode: err = base + q7*step, decoded = err * sig_vec (NO norm)
   Value: vmin/vstep stored raw (no norm folding)
 """
@@ -191,8 +191,8 @@ def _reconstruct_key_vectors(key_dec: dict[str, torch.Tensor]) -> torch.Tensor:
     """Reconstruct approximate rotated vectors from decoded key cache data.
 
     Sign-reversal decode (no normalization):
-    code = q7 | (sign_bit << 7)
-    q7 = code & 0x7f, sign_bit = code >> 7
+    code = (q7 << 1) | sign_bit
+    q7 = code >> 1, sign_bit = code & 0x01
     sig_vec = 1 - 2*sign_bit → {+1.0 (sign_bit=0), -1.0 (sign_bit=1)}
     err = base + q7 * step  (positive residual)
     decoded = err * sig_vec  (restore original sign per dimension)
@@ -200,8 +200,8 @@ def _reconstruct_key_vectors(key_dec: dict[str, torch.Tensor]) -> torch.Tensor:
     code = key_dec["code"]
     base = key_dec["base"]
     step = key_dec["step"]
-    q7 = (code.to(torch.int32) & 0x7F).to(torch.float32)
-    sign_bit = (code.to(torch.int32) >> 7).to(torch.float32)
+    q7 = (code.to(torch.int32) >> 1).to(torch.float32)
+    sign_bit = (code.to(torch.int32) & 0x01).to(torch.float32)
     sig_vec = 1.0 - 2.0 * sign_bit  # {+1.0, -1.0}
     err = base.unsqueeze(-1) + q7 * step.unsqueeze(-1)
     y = err * sig_vec
@@ -235,7 +235,7 @@ def _assert_match(
     1. **QDQ round-trip exactness**: decoded q7/idx4 must precisely reconstruct
        the stored base/step/vmin/vstep — (err_recon - base)/step = q7 and
        (y_recon - vmin)/vstep = idx4. Catches wrong packing, wrong decode logic.
-    2. **Sign-bit consistency**: code = q7 | (sign << 7) must hold for every byte.
+    2. **Sign-bit consistency**: code = (q7 << 1) | sign must hold for every byte.
        Catches wrong bit-split logic.
     3. **Encoding range validity**: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0.
        Catches encoding overflow/underflow.
@@ -249,7 +249,7 @@ def _assert_match(
     # 1. QDQ round-trip exactness.
     # Key: err_recon = base + q7*step. Verify (err_recon - base) / step = q7.
     # For degenerate groups (step=1, q7=0), err_recon=base, so 0/1=0=q7 — OK.
-    q7 = (key_dec["code"].to(torch.int32) & 0x7F).to(torch.float32)
+    q7 = (key_dec["code"].to(torch.int32) >> 1).to(torch.float32)
     err_recon = key_dec["base"].unsqueeze(-1) + q7 * key_dec["step"].unsqueeze(-1)
     step_valid = key_dec["step"] > 1e-6
     if step_valid.any():
@@ -283,12 +283,12 @@ def _assert_match(
             f"(should be < 0.5)"
         )
 
-    # 2. Sign-bit consistency: code = q7 | (sign << 7) for every byte.
-    q7_int = key_dec["code"].to(torch.int32) & 0x7F
-    sign_int = key_dec["code"].to(torch.int32) >> 7
-    reconstructed_code = q7_int | (sign_int.to(torch.int32) << 7)
+    # 2. Sign-bit consistency: code = (q7 << 1) | sign for every byte.
+    q7_int = key_dec["code"].to(torch.int32) >> 1
+    sign_int = key_dec["code"].to(torch.int32) & 0x01
+    reconstructed_code = (q7_int << 1) | sign_int.to(torch.int32)
     assert (reconstructed_code == key_dec["code"].to(torch.int32)).all(), (
-        f"{name}: sign-bit consistency violated: code != q7|(sign<<7)"
+        f"{name}: sign-bit consistency violated: code != (q7<<1)|sign"
     )
 
     # 3. Encoding range validity.

@@ -11,8 +11,8 @@
 // BitResidual K8V4 decode primitives for fused attention.
 //
 // Key decode (sign-reversal quantization, no normalization):
-//   sign_bit = code >> 7 (0=positive, 1=negative)
-//   q7 = code & 0x7f
+//   sign_bit = code & 0x01 (0=positive, 1=negative)
+//   q7 = code >> 1
 //   sig_vec[d] = 1 - 2*sign_bit → {+1, -1}
 //   err = base + q7 * step (all positive residual)
 //   decoded_K = err * sig_vec (restore original sign per dimension)

@@ -191,8 +191,8 @@ def _decode_key_row(
     code_off = pos_in_block * KEY_ROW_CODE_BYTES
     code = block[code_off : code_off + KEY_ROW_CODE_BYTES].to(torch.int32)
 
-    q7 = (code & 0x7F).float()
-    sign = (code >> 7).float()
+    q7 = (code >> 1).float()
+    sign = (code & 0x01).float()
     sign_val = torch.where(sign == 0, 1.0, -1.0)
     base = _read_dtype_scalar(block[
         KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 : KEY_BLOCK_BASE_OFFSET + pos_in_block * 2 + 2
@@ -404,7 +404,7 @@ def _diagnose_key_encoding(
         ((normalized - base_norm.unsqueeze(-1)) / safe_step.unsqueeze(-1)).float()
     ).clamp(0, 127).to(torch.int32)
     expected_sign = (rows < 0).to(torch.int32)
-    expected_codes = expected_q | (expected_sign << 7)
+    expected_codes = (expected_q << 1) | expected_sign
     expected_bases = (base_norm * abs_max.half()).to(dtype).float()
     expected_steps = (step_norm * abs_max.half()).to(dtype).float()
 
@@ -412,8 +412,8 @@ def _diagnose_key_encoding(
     actual_bases_t = torch.tensor(actual_bases)
     actual_steps_t = torch.tensor(actual_steps)
     code_mismatch = actual_codes_t != expected_codes
-    q_mismatch = (actual_codes_t & 0x7F) != expected_q
-    sign_mismatch = (actual_codes_t >> 7) != expected_sign
+    q_mismatch = (actual_codes_t >> 1) != expected_q
+    sign_mismatch = (actual_codes_t & 0x01) != expected_sign
     print(
         "KEY ENCODING DIAG: "
         f"code_mismatch={code_mismatch.float().mean().item():.6f}, "

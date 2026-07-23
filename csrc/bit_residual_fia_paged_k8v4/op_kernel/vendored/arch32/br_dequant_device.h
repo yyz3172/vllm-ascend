@@ -186,7 +186,7 @@ __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
     return (x + 31U) & ~31U;
 }
 
-// Key tile: y = sign * (base + q7 * step), code = q7 | (sign << 7).
+// Key tile: y = sign * (base + q7 * step), code = (q7 << 1) | sign.
 // codesUb: contiguous numRows * headDim uint8.
 // halfScratch / scratchA/B/C: each numRows * headDim elements.
 // outUb: numRows * headDimAlign (CAST writes headDim elems per row).
@@ -217,15 +217,17 @@ __aicore__ inline void BrDecodeKeyTile(
     auto signStorage = scratchC.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
 
-    // Codes are widened uint8 values in [0,255], so shifting directly
-    // extracts the encoded sign bit without constructing a 0x80 mask tile.
-    ShiftRight(signStorageU16, codeU16, static_cast<uint16_t>(7), N);
+    // sign lives in bit0 of the code (code = (q7<<1)|sign).  Isolate it with
+    // a 0x01 mask; no shift needed since it is already the low bit.
+    auto signMaskU16 = halfScratch.template ReinterpretCast<uint16_t>();
+    Duplicate(signMaskU16, static_cast<uint16_t>(0x01), N);
+    PipeBarrier<PIPE_V>();
+    And(signStorageU16, codeU16, signMaskU16, N);
     PipeBarrier<PIPE_V>();
 
-    auto q7MaskU16 = halfScratch.template ReinterpretCast<uint16_t>();
-    Duplicate(q7MaskU16, static_cast<uint16_t>(0x7f), N);
-    PipeBarrier<PIPE_V>();
-    And(codeU16, codeU16, q7MaskU16, N);
+    // q7 lives in bits 1..7; shift right by 1 to drop the sign and align q7
+    // to bits 0..6 (0..127).  In-place on codeU16 (scratchA).
+    ShiftRight(codeU16, codeU16, static_cast<uint16_t>(1), N);
     PipeBarrier<PIPE_V>();
 
     Cast(scratchB, signStorage, RoundMode::CAST_NONE, N);
