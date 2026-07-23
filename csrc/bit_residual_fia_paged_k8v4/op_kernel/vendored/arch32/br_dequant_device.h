@@ -25,6 +25,7 @@
  * P13: BrDecodeKeyTile — merge safe Cast/Muls+Adds chains, fewer barriers.
  * P13b: BrDecodeValueTile Cast→Adds→Cast chain; Key drop non-RAW barriers
  * (LSB-sign layout: And→ShiftRight / ShiftRight→Cast(sign)).
+ * P17a: BrApplyRowAffine — unroll headDim=128 (columnLoops=2) Mul/Add.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -131,17 +132,42 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<float> dst,
 {
     constexpr uint32_t FP32_BLOCK_ELEMS = 8U;
     constexpr uint32_t FP32_REPEAT_ELEMS = 64U;
-    const uint32_t rowStrideBlocks = headDim / FP32_BLOCK_ELEMS;
-    const uint32_t columnLoops =
-        (headDim + FP32_REPEAT_ELEMS - 1U) / FP32_REPEAT_ELEMS;
 
     BinaryRepeatParams repeatParams;
     repeatParams.dstBlkStride = 1U;
     repeatParams.src0BlkStride = 1U;
     repeatParams.src1BlkStride = 0U;
+    repeatParams.src1RepStride = 1U;
+
+    // P17a: headDim=128 → exactly two 64-wide column chunks. Unroll Mul/Add
+    // to drop the column for/if control path seen in L6 source OTHER (~25%).
+    if (headDim == BR_HEAD_SIZE) {
+        constexpr uint32_t ROW_STRIDE_BLOCKS = BR_HEAD_SIZE / FP32_BLOCK_ELEMS;
+        repeatParams.dstRepStride = ROW_STRIDE_BLOCKS;
+        repeatParams.src0RepStride = ROW_STRIDE_BLOCKS;
+
+        Brcb(broadcast, scales, (numRows + FP32_BLOCK_ELEMS - 1U) /
+            FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
+        PipeBarrier<PIPE_V>();
+        Mul(dst[0], src[0], broadcast, FP32_REPEAT_ELEMS, numRows, repeatParams);
+        Mul(dst[FP32_REPEAT_ELEMS], src[FP32_REPEAT_ELEMS], broadcast,
+            FP32_REPEAT_ELEMS, numRows, repeatParams);
+
+        Brcb(broadcast, offsets, (numRows + FP32_BLOCK_ELEMS - 1U) /
+            FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
+        PipeBarrier<PIPE_V>();
+        Add(dst[0], dst[0], broadcast, FP32_REPEAT_ELEMS, numRows, repeatParams);
+        Add(dst[FP32_REPEAT_ELEMS], dst[FP32_REPEAT_ELEMS], broadcast,
+            FP32_REPEAT_ELEMS, numRows, repeatParams);
+        PipeBarrier<PIPE_V>();
+        return;
+    }
+
+    const uint32_t rowStrideBlocks = headDim / FP32_BLOCK_ELEMS;
+    const uint32_t columnLoops =
+        (headDim + FP32_REPEAT_ELEMS - 1U) / FP32_REPEAT_ELEMS;
     repeatParams.dstRepStride = rowStrideBlocks;
     repeatParams.src0RepStride = rowStrideBlocks;
-    repeatParams.src1RepStride = 1U;
 
     Brcb(broadcast, scales, (numRows + FP32_BLOCK_ELEMS - 1U) /
         FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
