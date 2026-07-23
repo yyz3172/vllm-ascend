@@ -23,6 +23,8 @@
  * each PA run does one meta DMA+cast, then tiles only decode.
  * P14: BrApplyRowAffine — one column loop, fewer PipeBarriers.
  * P13: BrDecodeKeyTile — merge safe Cast/Muls+Adds chains, fewer barriers.
+ * P13b: BrDecodeValueTile Cast→Adds→Cast chain; Key drop non-RAW barriers
+ * (LSB-sign layout: And→ShiftRight / ShiftRight→Cast(sign)).
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -208,6 +210,9 @@ __aicore__ inline void BrDecodeKeyTile(
     const uint32_t N = numRows * headDim;
 
     // P13: merge back-to-back Cast; keep barriers on RAW deps only.
+    // P13b (LSB-sign layout): And→ShiftRight and ShiftRight→Cast(sign) are
+    // disjoint-UB; Duplicate→And and ShiftRight→Cast(q7) stay RAW-protected
+    // (q7 Cast after the Adds barrier).
     Cast(halfScratch, codesUb, RoundMode::CAST_NONE, N);
     auto codeI16 = scratchA.template ReinterpretCast<int16_t>();
     Cast(codeI16, halfScratch, RoundMode::CAST_RINT, N);
@@ -223,12 +228,10 @@ __aicore__ inline void BrDecodeKeyTile(
     Duplicate(signMaskU16, static_cast<uint16_t>(0x01), N);
     PipeBarrier<PIPE_V>();
     And(signStorageU16, codeU16, signMaskU16, N);
-    PipeBarrier<PIPE_V>();
 
     // q7 lives in bits 1..7; shift right by 1 to drop the sign and align q7
     // to bits 0..6 (0..127).  In-place on codeU16 (scratchA).
     ShiftRight(codeU16, codeU16, static_cast<uint16_t>(1), N);
-    PipeBarrier<PIPE_V>();
 
     Cast(scratchB, signStorage, RoundMode::CAST_NONE, N);
     Muls(scratchB, scratchB, -2.0f, N);
@@ -273,10 +276,10 @@ __aicore__ inline void BrDecodeValueTile(
 {
     const uint32_t N = numRows * headDim;
 
+    // P13b: same-buffer Cast→Adds→Cast like P13 sign chain; keep barrier
+    // before Affine (reuses halfScratch as metaBroadcast).
     Cast(halfScratch, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
     Adds(halfScratch, halfScratch, static_cast<half>(8.0f), N);
-    PipeBarrier<PIPE_V>();
     Cast(scratchA, halfScratch, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
 
