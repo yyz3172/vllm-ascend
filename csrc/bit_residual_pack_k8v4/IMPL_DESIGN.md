@@ -14,15 +14,16 @@
 1. FP32 `abs` 和 `ReduceMax` 得到 `abs_max`。
 2. 向量除以 `abs_max`，转换为输入 dtype，再转回 FP32 继续量化。
 3. Key 对绝对值做 7-bit min/max 均匀量化，code 为
-   `q7 | (sign << 7)`；base/step 乘回 `abs_max`。
+   `(q7 << 1) | sign`（sign 占 bit0，q7 占 bit1..7）；base/step 乘回 `abs_max`。
 4. Value 对有符号值做 4-bit min/max 均匀量化，每个 byte 保存同一行相邻
    两个维度的 nibble；vmin/vstep 乘回 `abs_max`。
 5. base、step、vmin、vstep 均以输入 dtype 的 16-bit 表示保存。
 
-量化主体使用向量指令。Key 先将 sign 和 7-bit quant code 做 OR，再将后 64 维
-左移 8 bit，并与前 64 维做 OR，得到连续的 64 个 uint16 packed code。Value
-同样一次处理 16 行，批量完成 FP32 abs/max、FP16 归一化、min/max、Brcb 和
-4-bit 量化。两种编码的 metadata 组装均不使用标量 `GetValue/SetValue`。
+量化主体使用向量指令。Key 先将 7-bit quant code 左移 1 bit，再与 sign（bit0）
+做 OR，得到 code = (q7<<1)|sign；再将后 64 维左移 8 bit 并与前 64 维做 OR，
+得到连续的 64 个 uint16 packed code。Value 同样一次处理 16 行，批量完成 FP32
+abs/max、FP16 归一化、min/max、Brcb 和 4-bit 量化。两种编码的 metadata 组装
+均不使用标量 `GetValue/SetValue`。
 
 ## AIC/AIV 双缓冲
 

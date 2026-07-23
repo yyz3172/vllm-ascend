@@ -86,7 +86,7 @@ Value head: [block_size × 64 packed nibbles]
 反量化（kernel）：
 
 ```text
-K: q7=code&0x7F, sign=code>>7
+K: q7=code>>1, sign=code&0x01
    err = base + q7*step
    decoded = err * (±1)
 

@@ -127,7 +127,7 @@ private:
             absVec → quant_16 → quant_i16 → final → pack_u8
           tmpB  (EncodeTmpB, 4 KB half)  — carved from the 4 KB freed by
             halving each XY slot from 8 KB fp32 to 4 KB half.
-            signVec → shiftedSign → pack_half
+            signVec → pack_half
           scal (EncodeBuffer2, sub-blocked; slots are TQ_ENCODE_SCALAR_TILE_ELEMS half apart)
             slot0 [0×]   : maxVec → baseBlk   (max dead after gap; reused)
             slot1 [1×]   : minVec              (long-lived → metadata base)
@@ -150,10 +150,11 @@ private:
         quant    = Div(quant, stepBlk)               (in-place)       [fat]
         // stepBlk dead; slot3 free
         q_i16    = Cast(quant, RINT)                 (in-place)       [fat]
-        shSign   = ShiftLeft(sign, 7)                                [tmpB]
+        q_i16    = ShiftLeft(q_i16, 1)               (in-place)       [fat]
+        // free bit0 for the sign; sign (tmpB) still live
+        final    = Or(q_i16, sign)                   (in-place)       [fat]
+        //   code = (q7 << 1) | sign  (sign=bit0, q7=bits1..7)
         // sign dead; tmpB free for pack_half
-        final    = Or(q_i16, shSign)                  (in-place)       [fat]
-        // shSign dead
         pack_h   = Cast(final, half)                                 [tmpB]
         pack_u8  = Cast(pack_h, u8)                  (in-place)       [fat]
         DataCopy(encodedBatch, pack_u8)
@@ -188,7 +189,7 @@ private:
 
         // yBatch IS the half input (AIC Fixpipe F322F16 output) — no Cast.
         auto origBatch16 = yBatch;       // [yBatch]
-        // fat = absVec → quant chain; tmpB = signVec → shiftedSign → pack_half.
+        // fat = absVec → quant chain; tmpB = signVec → pack_half.
         auto signVec = tmpB.template ReinterpretCast<uint16_t>();  // [tmpB]
         auto absVec = fat;                                            // [fat]
 
@@ -267,19 +268,22 @@ private:
         AscendC::Cast(quant_i16, quant_16, AscendC::RoundMode::CAST_RINT, totalElems);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // ── Step 11: shiftedSign(i16) in tmpB = ShiftLeft(signVec, 7) ──
-        auto shiftedSign = tmpB.template ReinterpretCast<int16_t>();
-        AscendC::ShiftLeft(shiftedSign, signVec.template ReinterpretCast<int16_t>(),
-                           static_cast<int16_t>(7), totalElems);
+        // ── Step 11: quant_i16 <<= 1 (in-place in fat) ──
+        //    Target layout: code = (q7 << 1) | sign  (sign=bit0, q7=bits1..7).
+        //    signVec is the raw 0/1 sign bit (from Step 2 ShiftRight(orig,15)),
+        //    so it lands in bit0 unchanged — no shift needed on the sign side.
+        AscendC::ShiftLeft(quant_i16, quant_i16,
+                           static_cast<int16_t>(1), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // signVec (tmpB input) is dead → tmpB free for pack_half.
+        // signVec (tmpB) still live until Step 12 consumes it; tmpB not reused.
 
         // ── Step 12: final_quant_16(i16) in fat (in-place)
-        //            = Or(quant_i16, shiftedSign) — bit 7 = sign, bits 0..6 =
+        //            = Or(quant_i16, signVec) — bit 0 = sign, bits 1..7 =
         //            7-bit quant code (0..127).
-        AscendC::Or(quant_i16, quant_i16, shiftedSign, totalElems);
+        AscendC::Or(quant_i16, quant_i16,
+                    signVec.template ReinterpretCast<int16_t>(), totalElems);
         AscendC::PipeBarrier<PIPE_V>();
-        // shiftedSign (tmpB) is dead.
+        // signVec (tmpB) is dead → tmpB free for pack_half.
         auto final_quant_16 = quant_i16;
 
         // ── Step 13: pack_half(half) in tmpB = Cast(final_quant_16 → half) ──

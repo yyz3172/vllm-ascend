@@ -154,8 +154,8 @@ row 72 的完整数据：
 **反量化公式**：
 ```
 code = codes[i]                    // uint8
-q7   = code & 0x7F                 // 取低 7 位 → [0, 127]
-sign = code >> 7                    // 取最高位 → 0 或 1
+q7   = code >> 1                   // 取高 7 位 → [0, 127]
+sign = code & 0x01                 // 取最低位 → 0 或 1
 sign_val = (sign == 0) ? +1 : -1   // 符号映射
 
 y = sign_val * (base + q7 * step)  // 最终 float 值
@@ -207,7 +207,7 @@ V = vmin + idx4 * vstep
 | 每行 codes 大小 | 128 bytes (uint8) | 64 bytes (int4 packed) |
 | 每行 meta 大小 | 4 bytes (base + step) | 4 bytes (vmin + vstep) |
 | 量化位宽 | 8-bit (7-bit + sign) | 4-bit |
-| 解包方式 | `code & 0x7F`, `code >> 7` | `int4b_t` 硬件解包, `+8` 转无符号 |
+| 解包方式 | `code >> 1`, `code & 0x01` | `int4b_t` 硬件解包, `+8` 转无符号 |
 | 反量化公式 | `sign * (base + q7 * step)` | `vmin + idx4 * vstep` |
 | Cast 链 | uint8→half→float (2步) | int4b→half (+8)→float (2步) |
 | 每 PA block 大小 | 16896 bytes | 8704 bytes |
