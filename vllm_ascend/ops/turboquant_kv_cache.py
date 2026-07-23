@@ -2499,12 +2499,16 @@ def bit_residual_fia_paged_k8v4(
     pre_tokens: int = 2147483647,
     next_tokens: int = 2147483647,
     sparse_mode: int = 3,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Call BitResidual FIA Paged K8V4 for Prefill / long-KV (FD-capable) path.
 
     Supports fp16 and bf16. Query / rotation dtype must match the pack metadata
     dtype (serving pack uses the model dtype). Returns ``None`` when conditions
     are not met so callers can fall through to vector attn / stock FIA.
+
+    When ``out`` is provided it must be contiguous and match ``query`` shape;
+    the kernel writes in-place (same contract as bit_residual_attention_paged_k8v4).
     """
     if head_size != 128:
         return None
@@ -2557,7 +2561,8 @@ def bit_residual_fia_paged_k8v4(
     rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
     rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
 
-    out = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
+    out_buf = out if out is not None else None
+    result = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
         _contiguous_if_needed(query),
         _contiguous_if_needed(_uint8_storage_view(key_cache)),
         _contiguous_if_needed(_uint8_storage_view(value_cache)),
@@ -2575,5 +2580,8 @@ def bit_residual_fia_paged_k8v4(
         int(pre_tokens),
         int(next_tokens),
         int(sparse_mode),
+        out_buf,
     )
-    return out.view(query.shape[0], num_heads, head_size)
+    if out is not None:
+        return out.view(query.shape[0], num_heads, head_size)
+    return result.view(query.shape[0], num_heads, head_size)

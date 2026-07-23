@@ -30,7 +30,8 @@ at::Tensor bit_residual_fia_paged_k8v4(
     double scale_value,
     int64_t pre_tokens = 2147483647,
     int64_t next_tokens = 2147483647,
-    int64_t sparse_mode = 0)
+    int64_t sparse_mode = 0,
+    c10::optional<at::Tensor> out_opt = c10::nullopt)
 {
     TORCH_CHECK(query.is_privateuseone(), "query must be on NPU");
     TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
@@ -46,7 +47,16 @@ at::Tensor bit_residual_fia_paged_k8v4(
     TORCH_CHECK(value_cache.scalar_type() == at::kByte, "uint8 value_cache");
     TORCH_CHECK(head_size == 128, "head_size=128 only");
 
-    at::Tensor out = at::empty(query.sizes(), query.options());
+    at::Tensor out;
+    if (out_opt.has_value() && out_opt->defined()) {
+        TORCH_CHECK(out_opt->is_privateuseone(), "out must be on NPU");
+        TORCH_CHECK(out_opt->sizes().equals(query.sizes()), "out shape must match query");
+        TORCH_CHECK(out_opt->scalar_type() == query.scalar_type(), "out dtype must match query");
+        TORCH_CHECK(out_opt->is_contiguous(), "out must be contiguous for in-place write");
+        out = *out_opt;
+    } else {
+        out = at::empty(query.sizes(), query.options());
+    }
     at::Tensor mask = atten_mask.has_value() && atten_mask->defined()
                           ? atten_mask.value()
                           : at::empty({0}, query.options().dtype(at::kChar));
