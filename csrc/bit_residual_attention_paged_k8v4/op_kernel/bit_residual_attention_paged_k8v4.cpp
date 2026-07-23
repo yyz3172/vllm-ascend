@@ -10,7 +10,7 @@
 
 // BitResidual K8V4: fused sign-reversal decode + paged attention.
 // Reads packed KV cache in bit_residual format and performs attention:
-//   K: 8-bit code = q7 | (sign<<7) → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
+//   K: 8-bit code = (q7<<1)|sign → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
 //   V: 4-bit idx4 → vmin + idx4*vstep (raw, no norm folding)
 // Rotation: Q @ R^T (pre-rotate) and out @ R (post-rotate) via Cube KFC.
 
@@ -1027,9 +1027,9 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     // Input: CodeI16Buf()[row*128] has the 8-bit code for each dimension.
     // kBaseArr[k], kStepArr[k] are per-row scalar floats (no UB GetValue).
     //
-    // Decode: code = q7 | (sign << 7)
-    //   sign_bit = code >> 7       → 0=positive, 1=negative
-    //   q7       = code & 0x7f     → [0, 127]
+    // Decode: code = (q7 << 1) | sign
+    //   sign_bit = code & 0x01     → 0=positive, 1=negative
+    //   q7       = code >> 1       → [0, 127]
     //   sig_vec  = 1 - 2*sign_bit  → {+1.0, -1.0}
     //   err      = base + q7 * step (positive residual)
     //   decoded  = err * sig_vec
@@ -1046,21 +1046,19 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
     auto codeU16 = codeI16.template ReinterpretCast<uint16_t>();
 
-    // Full-width And: isolate sign (0x00/0x80) then mask q7.
-    Duplicate(signStorageU16, static_cast<uint16_t>(0x80), n);
+    // sign lives in bit0: And with 0x01 yields sign_bit (0/1) directly — no
+    // subsequent shift needed.  q7 lives in bits 1..7: shift right by 1 to
+    // align it to bits 0..6 (0..127), in-place on codeU16 (codeI16 alias).
+    auto signMaskU16 = codeFloat.template ReinterpretCast<uint16_t>();
+    Duplicate(signMaskU16, static_cast<uint16_t>(0x01), n);
     PipeBarrier<PIPE_V>();
-    And(signStorageU16, codeU16, signStorageU16, n);
+    And(signStorageU16, codeU16, signMaskU16, n);
     PipeBarrier<PIPE_V>();
 
-    auto q7MaskU16 = codeFloat.template ReinterpretCast<uint16_t>();
-    Duplicate(q7MaskU16, static_cast<uint16_t>(0x7f), n);
-    PipeBarrier<PIPE_V>();
-    And(codeU16, codeU16, q7MaskU16, n);
+    ShiftRight(codeU16, codeU16, static_cast<uint16_t>(1), n);
     PipeBarrier<PIPE_V>();
 
     // sign_bit → sig_vec = ±1.0 in RotateWork (keeps codeFloat free for q7).
-    ShiftRight(signStorage, signStorage, static_cast<int16_t>(7), n);
-    PipeBarrier<PIPE_V>();
     Cast(signBits, signStorage, RoundMode::CAST_NONE, n);
     PipeBarrier<PIPE_V>();
     Muls(signBits, signBits, -2.0f, n);

@@ -220,7 +220,7 @@ def _assert_qdq_and_ranges(
 ) -> None:
     """QDQ round-trip exactness + sign/range validity (mirrors key1_unaligned)."""
     # Key QDQ: err_recon = base + q7*step; (err-base)/step == q7.
-    q7 = (key_dec["code"].to(torch.int32) & 0x7F).to(torch.float32)
+    q7 = (key_dec["code"].to(torch.int32) >> 1).to(torch.float32)
     err_recon = key_dec["base"].unsqueeze(-1) + q7 * key_dec["step"].unsqueeze(-1)
     step_valid = key_dec["step"] > 1e-6
     if step_valid.any():
@@ -245,11 +245,11 @@ def _assert_qdq_and_ranges(
         max_idx4_err = idx4_err[vstep_valid.unsqueeze(-1).expand_as(idx4_err)].max().item()
         assert max_idx4_err < 0.5, f"{name}: value QDQ violated, max dev {max_idx4_err:.4f}"
 
-    # Sign-bit consistency: code == (code&0x7F) | (sign<<7).
-    q7_int = key_dec["code"].to(torch.int32) & 0x7F
-    sign_int = key_dec["code"].to(torch.int32) >> 7
+    # Sign-bit consistency: code == (q7<<1) | sign.
+    q7_int = key_dec["code"].to(torch.int32) >> 1
+    sign_int = key_dec["code"].to(torch.int32) & 0x01
     assert (
-        (q7_int | (sign_int << 7)) == key_dec["code"].to(torch.int32)
+        ((q7_int << 1) | sign_int) == key_dec["code"].to(torch.int32)
     ).all(), f"{name}: sign-bit consistency violated"
 
     # Range validity.
@@ -418,8 +418,8 @@ def _decode_key_row(cache, block_table, seq_idx, kv_head, abs_pos, block_size, d
     pos_in_block = abs_pos % block_size
     block = cache[block_id, kv_head]
     code = block[pos_in_block * KEY_ROW_CODE_BYTES : pos_in_block * KEY_ROW_CODE_BYTES + HEAD_SIZE].to(torch.int32)
-    q7 = (code & 0x7F).float()
-    sign = torch.where((code >> 7) == 0, 1.0, -1.0)
+    q7 = (code >> 1).float()
+    sign = torch.where((code & 0x01) == 0, 1.0, -1.0)
     base = _u8_to_dtype_float(
         block[block_size * KEY_ROW_CODE_BYTES + pos_in_block * ROW_META_BYTES :
               block_size * KEY_ROW_CODE_BYTES + pos_in_block * ROW_META_BYTES + ROW_META_BYTES], dtype)
