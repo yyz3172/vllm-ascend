@@ -1,6 +1,6 @@
 cd csrc
 rm -rf build output
-bash build.sh -n "bit_residual_pack_k8v4;bit_residual_attention_paged_k8v4" -c ascend910b
+bash build.sh -n "bit_residual_pack_k8v4;bit_residual_fia_paged_k8v4;bit_residual_attention_paged_k8v4" -c ascend910b
 cd ..
 ./csrc/output/CANN-custom_ops--linux.aarch64.run --install-path=/root/x00827378/vllm-ascend/vllm_ascend/_cann_ops_custom
 
