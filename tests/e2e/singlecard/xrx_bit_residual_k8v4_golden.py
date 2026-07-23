@@ -71,7 +71,11 @@ def _require_ops() -> None:
         raise RuntimeError("vllm_ascend_C is not loaded; build/install custom ops first")
     if not hasattr(torch.ops, "_C_ascend"):
         raise RuntimeError("torch.ops._C_ascend is not registered")
-    for op_name in ("bit_residual_pack_k8v4", "bit_residual_attention_paged_k8v4"):
+    for op_name in (
+        "bit_residual_pack_k8v4",
+        "bit_residual_attention_paged_k8v4",
+        "bit_residual_fia_paged_k8v4",
+    ):
         if not hasattr(torch.ops._C_ascend, op_name):
             raise RuntimeError(f"torch.ops._C_ascend.{op_name} is not registered")
 
@@ -309,6 +313,68 @@ def _run_attention_op(
         BLOCK_SIZE,
         max(1, max(actual_seq_lens_kv)),
         float(scale),
+    )
+
+
+# FIA compress causal mask (sparse_mode 2/3/4): 2048x2048 int8, 0=keep/attend,
+# 1=discard.  Lower-triangular (strict upper triangle masked out) encodes a
+# right-down causal mask for single-sequence prefill (q==kv).
+_FIA_COMPRESS_MASK_SIZE = 2048
+_FIA_SPARSE_MODE_RIGHT_DOWN = 3
+_FIA_INT_MAX = 2147483647
+
+
+def _compress_causal_mask(device: torch.device) -> torch.Tensor:
+    """FIA compress mask for sparse_mode 2/3/4: int8 lower-triangular.
+
+    Polarity (FIA docs): 0=keep/attend, 1=discard.  Strict upper triangle = 1
+    (masked out); diagonal + lower = 0 (keep).  Matches the causal mask the
+    golden reference applies via ``causal_end``.
+    """
+    ones = torch.ones(
+        (_FIA_COMPRESS_MASK_SIZE, _FIA_COMPRESS_MASK_SIZE),
+        dtype=torch.int8,
+        device=device,
+    )
+    return torch.triu(ones, diagonal=1)
+
+
+def _run_fia_op(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lens_q: list[int],
+    actual_seq_lens_kv: list[int],
+    rotation_key: torch.Tensor,
+    rotation_value: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> torch.Tensor:
+    """Call the BitResidual FIA paged K8V4 op directly (bypassing the Python
+    wrapper, which would force the internal Haar rotation).  Pass the same
+    rotation the pack op used so encode/decode stay consistent.
+    """
+    return torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
+        query.contiguous(),
+        key_cache.contiguous(),
+        value_cache.contiguous(),
+        block_table.contiguous(),
+        actual_seq_lens_q,
+        actual_seq_lens_kv,
+        _compress_causal_mask(query.device),
+        rotation_key.contiguous(),
+        rotation_value.contiguous(),
+        num_heads,
+        num_kv_heads,
+        HEAD_SIZE,
+        BLOCK_SIZE,
+        float(scale),
+        _FIA_INT_MAX,
+        _FIA_INT_MAX,
+        _FIA_SPARSE_MODE_RIGHT_DOWN,
     )
 
 
@@ -656,7 +722,12 @@ def _run_pack_attention_chain(dtype: torch.dtype, device: torch.device) -> None:
 
 
 def _run_pack_attention_qtile(dtype: torch.dtype, device: torch.device) -> None:
-    """Multi-token Q (num_q > usedCoreNum) exercises SplitBN qTile path."""
+    """Multi-token Q (num_q > usedCoreNum) exercises SplitBN qTile path.
+
+    Uses ``bit_residual_fia_paged_k8v4`` (FlashAttention prefill path with a
+    compress causal mask, sparse_mode=3) instead of the Vector-QK attention op,
+    so the FIA decode/prefill path is exercised against the same golden.
+    """
     torch.manual_seed(SEED + 1)
     num_kv_tokens = 48
     num_query_tokens = 48
@@ -697,7 +768,7 @@ def _run_pack_attention_qtile(dtype: torch.dtype, device: torch.device) -> None:
     torch.npu.synchronize()
     actual_seq_lens_q = [num_query_tokens]
     actual_seq_lens_kv = [num_kv_tokens]
-    actual = _run_attention_op(
+    actual = _run_fia_op(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
@@ -724,7 +795,8 @@ def _run_pack_attention_qtile(dtype: torch.dtype, device: torch.device) -> None:
         num_kv_heads=num_kv_heads,
         scale=scale,
     )
-    # Cube QK casts Q/K to fp16 for matmul; allow slightly looser than Vector QK.
+    # FIA prefill path casts Q/K to fp16 for the FlashAttention matmul; allow
+    # slightly looser tolerance than the Vector-QK chain test.
     _assert_close(
         "pack_attention_qtile",
         actual,
