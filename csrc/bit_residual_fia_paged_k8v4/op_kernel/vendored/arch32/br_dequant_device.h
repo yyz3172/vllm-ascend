@@ -26,6 +26,8 @@
  * P13b: BrDecodeValueTile Cast→Adds→Cast chain; Key drop non-RAW barriers
  * (LSB-sign layout: And→ShiftRight / ShiftRight→Cast(sign)).
  * P17a: BrApplyRowAffine — unroll headDim=128 (columnLoops=2) Mul/Add.
+ * P17b-B: Value +8 folded once per PA run (vmin'=vmin+8*vstep on n rows);
+ * BrDecodeValueTile consumes signed Cast(int4) with pre-folded vmin'.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -284,7 +286,8 @@ __aicore__ inline void BrDecodeKeyTile(
     }
 }
 
-// Value tile: y = vmin + idx4 * vstep (nibble-packed codes).
+// Value tile: y = vmin' + s*vstep, s = Cast(int4) in [-8,7].
+// Caller must pre-fold vmin' = vmin + 8*vstep (P17b-B: once per PA run).
 // nibbleUb: contiguous numRows * (headDim/2) uint8 (int4 packed).
 // halfScratch / scratchA/B: each numRows * headDim elements.
 template <typename OutT>
@@ -302,10 +305,8 @@ __aicore__ inline void BrDecodeValueTile(
 {
     const uint32_t N = numRows * headDim;
 
-    // P13b: same-buffer Cast→Adds→Cast like P13 sign chain; keep barrier
-    // before Affine (reuses halfScratch as metaBroadcast).
+    // Signed int4 → fp32; +8 already absorbed into vmin' by the caller.
     Cast(halfScratch, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, N);
-    Adds(halfScratch, halfScratch, static_cast<half>(8.0f), N);
     Cast(scratchA, halfScratch, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
 
