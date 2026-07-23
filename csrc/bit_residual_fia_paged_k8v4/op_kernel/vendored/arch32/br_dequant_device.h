@@ -25,6 +25,9 @@
  * P13: BrDecodeKeyTile — merge safe Cast/Muls+Adds chains, fewer barriers.
  * P13b: BrDecodeValueTile Cast→Adds→Cast chain; Key drop non-RAW barriers
  * (LSB-sign layout: And→ShiftRight / ShiftRight→Cast(sign)).
+ * P17a: BrApplyRowAffine — unroll headDim=128 (columnLoops=2) Mul/Add.
+ * P17b-B: Value +8 folded once per PA run (vmin'=vmin+8*vstep on n rows);
+ * BrDecodeValueTile consumes signed Cast(int4) with pre-folded vmin'.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -131,17 +134,42 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<float> dst,
 {
     constexpr uint32_t FP32_BLOCK_ELEMS = 8U;
     constexpr uint32_t FP32_REPEAT_ELEMS = 64U;
-    const uint32_t rowStrideBlocks = headDim / FP32_BLOCK_ELEMS;
-    const uint32_t columnLoops =
-        (headDim + FP32_REPEAT_ELEMS - 1U) / FP32_REPEAT_ELEMS;
 
     BinaryRepeatParams repeatParams;
     repeatParams.dstBlkStride = 1U;
     repeatParams.src0BlkStride = 1U;
     repeatParams.src1BlkStride = 0U;
+    repeatParams.src1RepStride = 1U;
+
+    // P17a: headDim=128 → exactly two 64-wide column chunks. Unroll Mul/Add
+    // to drop the column for/if control path seen in L6 source OTHER (~25%).
+    if (headDim == BR_HEAD_SIZE) {
+        constexpr uint32_t ROW_STRIDE_BLOCKS = BR_HEAD_SIZE / FP32_BLOCK_ELEMS;
+        repeatParams.dstRepStride = ROW_STRIDE_BLOCKS;
+        repeatParams.src0RepStride = ROW_STRIDE_BLOCKS;
+
+        Brcb(broadcast, scales, (numRows + FP32_BLOCK_ELEMS - 1U) /
+            FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
+        PipeBarrier<PIPE_V>();
+        Mul(dst[0], src[0], broadcast, FP32_REPEAT_ELEMS, numRows, repeatParams);
+        Mul(dst[FP32_REPEAT_ELEMS], src[FP32_REPEAT_ELEMS], broadcast,
+            FP32_REPEAT_ELEMS, numRows, repeatParams);
+
+        Brcb(broadcast, offsets, (numRows + FP32_BLOCK_ELEMS - 1U) /
+            FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
+        PipeBarrier<PIPE_V>();
+        Add(dst[0], dst[0], broadcast, FP32_REPEAT_ELEMS, numRows, repeatParams);
+        Add(dst[FP32_REPEAT_ELEMS], dst[FP32_REPEAT_ELEMS], broadcast,
+            FP32_REPEAT_ELEMS, numRows, repeatParams);
+        PipeBarrier<PIPE_V>();
+        return;
+    }
+
+    const uint32_t rowStrideBlocks = headDim / FP32_BLOCK_ELEMS;
+    const uint32_t columnLoops =
+        (headDim + FP32_REPEAT_ELEMS - 1U) / FP32_REPEAT_ELEMS;
     repeatParams.dstRepStride = rowStrideBlocks;
     repeatParams.src0RepStride = rowStrideBlocks;
-    repeatParams.src1RepStride = 1U;
 
     Brcb(broadcast, scales, (numRows + FP32_BLOCK_ELEMS - 1U) /
         FP32_BLOCK_ELEMS, {1, FP32_BLOCK_ELEMS});
@@ -258,7 +286,8 @@ __aicore__ inline void BrDecodeKeyTile(
     }
 }
 
-// Value tile: y = vmin + idx4 * vstep (nibble-packed codes).
+// Value tile: y = vmin' + s*vstep, s = Cast(int4) in [-8,7].
+// Caller must pre-fold vmin' = vmin + 8*vstep (P17b-B: once per PA run).
 // nibbleUb: contiguous numRows * (headDim/2) uint8 (int4 packed).
 // halfScratch / scratchA/B: each numRows * headDim elements.
 template <typename OutT>
@@ -276,10 +305,8 @@ __aicore__ inline void BrDecodeValueTile(
 {
     const uint32_t N = numRows * headDim;
 
-    // P13b: same-buffer Cast→Adds→Cast like P13 sign chain; keep barrier
-    // before Affine (reuses halfScratch as metaBroadcast).
+    // Signed int4 → fp32; +8 already absorbed into vmin' by the caller.
     Cast(halfScratch, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, N);
-    Adds(halfScratch, halfScratch, static_cast<half>(8.0f), N);
     Cast(scratchA, halfScratch, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
 

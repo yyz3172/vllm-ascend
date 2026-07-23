@@ -1459,6 +1459,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                     nb, headDim, headDimAlign);
             }
         } else {
+            // P17b-B: fold +8 into vmin once per PA run (n rows), then tiles
+            // decode signed int4 against vmin' (fp32UbA reused as scratch).
+            Muls(fp32UbA, meta1Fp32, 8.0f, n);
+            Add(meta0Fp32, meta0Fp32, fp32UbA, n);
+            PipeBarrier<PIPE_V>();
             for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
                 uint32_t nb = n - j0;
                 if (nb > hoistTile) {
