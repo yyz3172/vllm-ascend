@@ -2521,16 +2521,6 @@ def bit_residual_fia_paged_k8v4(
     if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         return None
 
-    key_last_dim = key_cache.shape[-1]
-    value_last_dim = value_cache.shape[-1]
-    expected_key_width = bit_residual_k8v4_key_packed_width(block_size)
-    expected_value_width = bit_residual_k8v4_value_packed_width(block_size)
-    if key_last_dim != expected_key_width or value_last_dim != expected_value_width:
-        return None
-
-    if not _c_ascend_turboquant_op_available("bit_residual_fia_paged_k8v4"):
-        return None
-
     actual_seq_lengths_q = [int(length) for length in actual_seq_lengths_q]
     actual_seq_lengths_kv = [int(length) for length in actual_seq_lengths_kv]
     if (
@@ -2563,15 +2553,15 @@ def bit_residual_fia_paged_k8v4(
 
     out_buf = out if out is not None else None
     result = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
-        _contiguous_if_needed(query),
-        _contiguous_if_needed(_uint8_storage_view(key_cache)),
-        _contiguous_if_needed(_uint8_storage_view(value_cache)),
-        _int32_contiguous_if_needed(block_tables),
+        query,
+        _uint8_storage_view(key_cache),
+        _uint8_storage_view(value_cache),
+        block_tables,
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
-        None if mask_arg is None else _contiguous_if_needed(mask_arg),
-        _contiguous_if_needed(rotation_key),
-        _contiguous_if_needed(rotation_value),
+        mask_arg,
+        rotation_key,
+        rotation_value,
         int(num_heads),
         int(num_kv_heads),
         int(head_size),
