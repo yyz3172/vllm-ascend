@@ -22,8 +22,9 @@
 | **P9b（64 行全 hoist）** | **~807** | **~834** | **−10%+** | **合入** |
 | P7a（减 PipeBarrier） | ~824 | ~860 | 回退 | **回退/勿合入** |
 | P10（128B bank pad） | ~803 | ~835 | ≈噪声 | 可选/弱收益 |
+| **P18（MTE2⇄VEC 跨 run）** | **~628** | **~663** | **decode −13% vs P17b-B** | **合入** `f4b6a7b7` |
 
-当前生产基线以 **P9b** 为准（commit `c40ff40a`）。P10 在工作区可保留作布局实验，端到端几乎无墙钟收益。
+当前生产基线以 **P18** 为准（叠在 P9b + P13–P17b-B 之上）。详见 [`p18_mte2_vec_overlap_report.md`](../../../tools/bit_residual_fia_paged_k8v4/docs/p18_mte2_vec_overlap_report.md)。
 
 ### 1.2 合入 / 否决一览
 
@@ -1133,6 +1134,7 @@ maxSub 实际 ~20–24（由 UB 算出），不是 64 全满
 | P10 | scratch 128B pad | §4.3 | ⚠️ |
 | P11 | maxSub | §4.4 | ❌ |
 | P12 | Vec1 barrier | §3.8 | ✅ |
+| P18 | meta ping-pong + MTE2∥VEC | 见 flow §8 / p18 report | ✅ |
 
 ---
 
