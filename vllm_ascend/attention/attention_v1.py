@@ -505,12 +505,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.turboquant_kv_bits_key = 4
                 self.turboquant_kv_bits_value = 4
             # Eager-register pack v2 tables (codebook + R^T) on the default NPU device.
+            # Only for TurboQuant [8,8] registered-pack; BitResidual K8V4 does not use them.
             try:
-                ensure_turboquant_pack_tables_registered(
-                    torch.device("npu"),
-                    head_size,
-                    self.turboquant_kv_bits_key,
-                )
+                if (
+                    self.turboquant_kv_bits_key == 8
+                    and self.turboquant_kv_bits_value == 8
+                ):
+                    ensure_turboquant_pack_tables_registered(
+                        torch.device("npu"),
+                        head_size,
+                        self.turboquant_kv_bits_key,
+                    )
                 warm_up_turboquant_4bit_tables(
                     torch.device("npu"),
                     head_size,

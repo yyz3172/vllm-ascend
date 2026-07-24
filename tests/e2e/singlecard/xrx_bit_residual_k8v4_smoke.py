@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 
 import torch
 from vllm import LLM, SamplingParams
@@ -41,7 +42,7 @@ from vllm_ascend.ascend_config import clear_ascend_config
 MODEL_PATH = os.getenv("MODEL_PATH", "/root/yyz/models/Qwen3-0.6B")
 PROFILE_DIR = os.getenv(
     "PROFILE_DIR",
-    "/root/yyz/pytorch_profiler/BitResidualSmoke/260723/paged",
+    "/root/yyz/pytorch_profiler/BitResidualSmoke/260724/paged_base",
 )
 
 
@@ -98,16 +99,33 @@ def main() -> None:
         )
         if enable_profile:
             llm.start_profile()
+        # Wall-clock end-to-end: covers host dispatch + NPU compute + idle,
+        # measured outside profiler step boundaries. Synchronize first so the
+        # timer captures real device completion, not just Python-side return.
+        prompts = ["Hello, my name is", "介绍turboquant技术"]
+        sampling_params = SamplingParams(temperature=0.7, max_tokens=40)
+        torch.npu.synchronize()
+        t_start = time.perf_counter()
         try:
             outs = llm.generate(
-                ["Hello, my name is", "介绍turboquant技术"],
-                sampling_params=SamplingParams(temperature=0.7, max_tokens=40),
+                prompts,
+                sampling_params=sampling_params,
                 use_tqdm=False,
             )
         finally:
+            torch.npu.synchronize()
+            t_end = time.perf_counter()
             if enable_profile:
                 llm.stop_profile()
+    wall_us = (t_end - t_start) * 1e6
+    n_prompts = len(prompts)
+    total_tokens = sum(len(o.outputs[0].token_ids) for o in outs)
     print("k8v4 smoke output:", [out.outputs[0].text for out in outs])
+    print(
+        f"k8v4 smoke wall_clock: {wall_us / 1e3:.2f} ms "
+        f"({n_prompts} prompts, {total_tokens} tokens, "
+        f"{wall_us / max(total_tokens, 1):.1f} us/token)"
+    )
     if enable_profile:
         print("k8v4 smoke profile_dir:", PROFILE_DIR)
 
