@@ -28,6 +28,8 @@
  * P17a: BrApplyRowAffine — unroll headDim=128 (columnLoops=2) Mul/Add.
  * P17b-B: Value +8 folded once per PA run (vmin'=vmin+8*vstep on n rows);
  * BrDecodeValueTile consumes signed Cast(int4) with pre-folded vmin'.
+ * P18 spike: meta UB ping-pong (2×768B) so next-run MTE2 can overlap
+ * current-run VEC (issue after SetFlag(V_MTE3), before WaitFlag).
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -42,8 +44,8 @@ using br_pack::BR_HEAD_SIZE;
 
 static constexpr uint32_t BR_S2_SUB_MAX = 64U;
 // P9b: packed meta0/meta1 runs then FP32 cast rows (up to BR_S2_SUB_MAX).
-// Layout: [0, 128) meta0 half, [128, 256) meta1 half, [256, 512) meta0 fp32,
-// [512, 768) meta1 fp32. Cast sources stay 32B-aligned.
+// Layout (per slot): [0, 128) meta0 half, [128, 256) meta1 half,
+// [256, 512) meta0 fp32, [512, 768) meta1 fp32. Cast sources stay 32B-aligned.
 static constexpr uint32_t BR_PACKED_META_TILE_ROWS = BR_S2_SUB_MAX;
 static constexpr uint32_t BR_PACKED_META_BYTES =
     BR_PACKED_META_TILE_ROWS * static_cast<uint32_t>(sizeof(half));
@@ -55,6 +57,10 @@ static constexpr uint32_t BR_META_FP32_1_UB_OFF =
     BR_META_FP32_0_UB_OFF + BR_META_FP32_ROW_BYTES;
 static constexpr uint32_t BR_DEQUANT_UB_BYTES =
     BR_META_FP32_1_UB_OFF + BR_META_FP32_ROW_BYTES;
+// P18: two independent meta slots; run r uses slot (runId % 2).
+static constexpr uint32_t BR_META_SLOT_BYTES = BR_DEQUANT_UB_BYTES;
+static constexpr uint32_t BR_DEQUANT_UB_BYTES_PINGPONG =
+    2U * BR_META_SLOT_BYTES;
 
 // Legacy single-row staging offsets (BrCopyMetaPair only).
 static constexpr uint32_t BR_META0_UB_OFF = BR_HEAD_SIZE;
