@@ -25,7 +25,7 @@ import torch
 MODEL_PATH = os.getenv("MODEL_PATH", "/root/yyz/models/Qwen3-0.6B")
 PROFILE_DIR = os.getenv(
     "PROFILE_DIR",
-    "/root/yyz/pytorch_profiler/BitResidualLong/260716/k8v4_Qwen3-0.6B",
+    "/root/yyz/pytorch_profiler/BitResidualLong/260723/paged",
 )
 
 

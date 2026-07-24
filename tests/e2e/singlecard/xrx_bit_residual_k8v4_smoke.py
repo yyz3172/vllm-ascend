@@ -38,10 +38,10 @@ from vllm import LLM, SamplingParams
 
 from vllm_ascend.ascend_config import clear_ascend_config
 
-MODEL_PATH = os.getenv("MODEL_PATH", "/root/l00856060/model/Qwen3-0.6B")
+MODEL_PATH = os.getenv("MODEL_PATH", "/root/yyz/models/Qwen3-0.6B")
 PROFILE_DIR = os.getenv(
     "PROFILE_DIR",
-    "/root/l00856060/perflog2",
+    "/root/yyz/pytorch_profiler/BitResidualSmoke/260723/paged",
 )
 
 
