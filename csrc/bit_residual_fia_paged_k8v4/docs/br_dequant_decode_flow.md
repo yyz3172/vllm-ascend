@@ -1,7 +1,10 @@
 # BitResidual K8/V4 AIV Decode 流程说明
 
-> 源码：`op_kernel/vendored/arch32/br_dequant_device.h`  
-> 覆盖：`BrDecodeKeyTile` / `BrDecodeValueTile` / `BrApplyRowAffine`，以及 `FP32_BLOCK_ELEMS` / `FP32_REPEAT_ELEMS` 的硬件依据。
+> 源码：`op_kernel/vendored/arch32/br_dequant_device.h`、  
+> `fia_block_vec_turboquant_p0.h`（`DequantKvImpl` / P18）  
+> 覆盖：`BrDecodeKeyTile` / `BrDecodeValueTile` / `BrApplyRowAffine`、  
+> `FP32_BLOCK_ELEMS` / `FP32_REPEAT_ELEMS`，以及跨 PA-run MTE2⇄VEC 重叠。  
+> **PA run / tile / 列拍分层与 FP16 影响面**：见 [`dequant_pa_run_tile_hierarchy.md`](dequant_pa_run_tile_hierarchy.md)。
 
 ## 目录
 
@@ -12,6 +15,7 @@
 5. [分块与广播图示](#5-分块与广播图示)
 6. [为什么是 8 和 64](#6-为什么是-8-和-64)
 7. [AscendC 256B 上限如何确认](#7-ascendc-256b-上限如何确认)
+8. [P18：跨 run MTE2⇄VEC 重叠](#8-p18跨-run-mte2vec-重叠)
 
 ---
 
@@ -257,3 +261,58 @@ SetMask → vmul/vadd(..., repeatTime, BlkStride, RepStride)
 - 因此 FP32 下列方向单次安全上限为 **64**；`headDim=128` → `columnLoops=2`
 
 **结论**：910B 上 256B/repeat、64 FP32/repeat、8 FP32/block 是 AscendC 明确定义的常量，与本文件中的 `FP32_*` 一一对应。
+
+---
+
+## 8. P18：跨 run MTE2⇄VEC 重叠
+
+> 实现：`DequantKvImpl`（`fia_block_vec_turboquant_p0.h`）  
+> 方案 / 验收：[`dequant_mte2_vec_overlap_plan.md`](dequant_mte2_vec_overlap_plan.md)、  
+> [`tools/.../docs/p18_mte2_vec_overlap_report.md`](../../../tools/bit_residual_fia_paged_k8v4/docs/p18_mte2_vec_overlap_report.md)
+
+### 8.1 动机
+
+A1 只让下一 run 的 MTE2 与当前 **MTE3** 重叠（短窗口，~−0.4%）。  
+真正的长窗口是 **VEC decode**；P18 把下一 run 的 codes/meta **MTE2 读**藏进当前 run 的 VEC 排水窗口。
+
+### 8.2 Meta UB ping-pong
+
+`dequantInt8Buf_` 从单区 768B 扩成 **2×768B**（`BR_DEQUANT_UB_BYTES_PINGPONG`）：
+
+```text
+slot0 (run even)              slot1 (run odd)
+┌─ meta0/1 half ─┬─ fp32 ─┐  ┌─ meta0/1 half ─┬─ fp32 ─┐
+│ 0……256……768    │        │  │ 768……1536      │        │
+└────────────────┴────────┘  └────────────────┴────────┘
+  每 slot 布局同 P9b；run r 用 slot (runId % 2)
+```
+
+codes/out 仍用 A1 的 `tmpBuff1` 双 half；decode scratch 仍在 `tmpBuff1` 尾部（**未**跨 run 双缓冲，故只能预取 DMA，不能提前 Cast/decode）。
+
+### 8.3 流水（正确发点）
+
+AscendC 队列模型下，应在 **发完当前 VEC 指令并 `SetFlag(V_MTE3)` 之后、`WaitFlag(V_MTE3)` 之前** 发起下一 run 的 MTE2（此时 VEC 硬件仍在飞）：
+
+```text
+run r:
+  Wait MTE2_r → Cast meta → BrDecode* → SetFlag(V_MTE3)
+       │                                    │
+       │         ┌─ prefetch run r+1 ───────┤  ← MTE2∥VEC
+       │         │  Wait MTE3 half if needed│
+       │         │  codes+meta DataCopy     │
+       │         │  SetFlag(MTE2_V)[r+1]    │
+       │         └──────────────────────────┤
+       └─ WaitFlag(V_MTE3) → MTE3_r → …
+
+run r+1:
+  WaitFlag(MTE2_V)[r+1] → Cast → decode → …
+```
+
+- codes + meta **一次 burst** 发出，去掉 run 内 `V_MTE2` 门控。
+- `eventIdCodesWait[2]` 按 `runId % 2` 配对 Set/Wait。
+- 首 run / 单 run：无预取，退化为同步 DMA。
+
+### 8.4 实测（同口径）
+
+Fair L6 `kv=2000`，warm-up=5，launch=20：Task Duration **722 → 628 µs（−13%）**；  
+longquery decode med **690 → 610 µs**。AIV `mte2_ratio`↓、`vec_ratio`↑，Vec FOPS 近似持平。
