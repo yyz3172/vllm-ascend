@@ -1314,6 +1314,9 @@ def ensure_turboquant_pack_tables_registered(
 ) -> bool:
     """Register fp16 codebook + R^T on the NPU for pack kernels (once per device/head/bits).
 
+    Intended for TurboQuant ``[8, 8]`` registered-pack paths only. BitResidual
+    K8V4 (``[8, 4]``) does not use these tables and should not call this helper.
+
     Returns True when tables are registered and register op is available.
     """
     if bits_key != 8 or head_size != 128:
