@@ -49,6 +49,28 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
 
     # 保留 serve 不关（便于挂 profiler），仅单组时常用
     python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -k
+
+【profiler】--profile 开启 torch profiler（NPU 上落盘 Ascend msprof trace）：
+  serve 带 --profiler-config.*（profiler=torch + torch_profiler_dir + with_stack），
+  bench 带 --profile（warmup 后 POST /start_profile，跑完 POST /stop_profile，
+  故 trace 只含压测段、不含 warmup）。profiler 目录是 serve 级（启动时固定）配置，
+  所以开 --profile 时每个 (fia,io,conc) combo 各重启一次 serve、各落独立 trace 目录
+  （<output-dir>/<ts>/<fia>/in<i>_out<o>_conc<c>/profiler/，复用 --output-dir，
+  无需额外参数；要落到别处磁盘就把 --output-dir 指过去）。不开 --profile 时仍走原
+  per-fia 复用 serve 模式，默认行为零回归。可加 --profiler-ignore-frontend 只采 NPU
+  worker、跳过前端 CPU trace 以降开销。
+
+    # 单组 + profiler：trace 落 <output-dir>/<ts>/off/in200_out200_conc16/profiler/
+    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+        --profile
+
+    # 多组 + profiler：每个 combo 各重启 serve、各一份 trace
+    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+        --profile -f off,all -L 200:200,1024:200 -c 16,32
+
+    # 落到大磁盘：把 --output-dir 指过去，profiler trace 作为其子目录跟过去
+    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+        --profile -O /root/yyz/perfprof/runA
 """
 
 from __future__ import annotations
@@ -69,49 +91,49 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ---- Defaults mirroring the reference command pair --------------------------
+# ---- 默认值（与参考命令对保持一致）----------------------------------------
 DEFAULT_MODEL = "/root/yyz/models/Qwen3-0.6B"
 DEFAULT_PORT = 9875
 DEFAULT_KV_BITS = "8,4"  # -> additional_config={"turboquant_kv_bits":[8,4]}
 DEFAULT_KV_CACHE_DTYPE = "turboquant"
 DEFAULT_OUTPUT_ROOT = "/root/yyz/perflog/k8v4_serve_bench"
 
-# Bench defaults (match the reference `vllm bench serve` command)
+# bench 默认值（与参考 `vllm bench serve` 命令对齐）
 DEFAULT_IO = "200:200"
 DEFAULT_NUM_PROMPTS = 256
 DEFAULT_CONCURRENCY = "16"
 DEFAULT_FIA = "off"
 
-# Ready-check defaults
+# 就绪检测默认值
 DEFAULT_READY_TIMEOUT_S = 120
 DEFAULT_READY_INTERVAL_S = 2.0
 
-# FIA toggles (see vllm_ascend/envs.py). The bit_residual k8v4 path routes
-# prefill/decode attention to ``bit_residual_fia_paged_k8v4`` when these are ON;
-# OFF falls back to the vector paged attn op ``bit_residual_attention_paged_k8v4``.
+# FIA 开关（见 vllm_ascend/envs.py）。bit_residual k8v4 路径在这些开关打开时，
+# 把 prefill/decode 的 attention 走到 ``bit_residual_fia_paged_k8v4``；
+# 关闭时回退到向量 paged attn 算子 ``bit_residual_attention_paged_k8v4``。
 FIA_ENV_PREFILL = "VLLM_ASCEND_BIT_RESIDUAL_FIA"
 FIA_ENV_DECODE = "VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA"
 FIA_CHOICES = ("off", "prefill", "decode", "all")
-# NPU visible-devices env (Ascend's CUDA_VISIBLE_DEVICES equivalent; see
-# vllm_ascend/platform.py device_control_env_var).
+# NPU 可见设备环境变量（Ascend 版的 CUDA_VISIBLE_DEVICES；见
+# vllm_ascend/platform.py 的 device_control_env_var）。
 NPU_VISIBLE_ENV = "ASCEND_RT_VISIBLE_DEVICES"
-# Env defaults applied to the serve subprocess so the bit_residual k8v4 path is
-# fully enabled (matches the offline smoke/long-query scripts).
+# 作用到 serve 子进程的默认环境变量，使 bit_residual k8v4 路径完整启用
+# （与离线 smoke / 长查询脚本保持一致）。
 SERVE_ENV_DEFAULTS = {
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     "VLLM_ENGINE_CORE_MULTIPROC_METHOD": "spawn",
     "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
 }
 
-# tqdm progress bars render as lines like "  38%|██▊  | 97/256 [00:46<01:04, 2.45it/s]".
+# tqdm 进度条会渲染成形如 "  38%|██▊  | 97/256 [00:46<01:04, 2.45it/s]" 的行。
 _TQDM_RE = re.compile(r"^\s*\d+%\|")
 
 
 # ---------------------------------------------------------------------------
-# Multi-value parsers (comma-separated)
+# 多值解析（逗号分隔）
 # ---------------------------------------------------------------------------
 def _parse_io_pairs(s: str) -> list[tuple[int, int]]:
-    """Parse "200:200,1024:200" into [(200,200),(1024,200)]."""
+    """把 "200:200,1024:200" 解析成 [(200,200),(1024,200)]。"""
     pairs: list[tuple[int, int]] = []
     for chunk in s.split(","):
         chunk = chunk.strip()
@@ -137,7 +159,7 @@ def _parse_io_pairs(s: str) -> list[tuple[int, int]]:
 
 
 def _parse_int_list(s: str, name: str) -> list[int]:
-    """Parse "16,32,64" into [16,32,64]."""
+    """把 "16,32,64" 解析成 [16,32,64]。"""
     vals: list[int] = []
     for chunk in s.split(","):
         chunk = chunk.strip()
@@ -156,7 +178,7 @@ def _parse_int_list(s: str, name: str) -> list[int]:
 
 
 def _parse_fia_list(s: str) -> list[str]:
-    """Parse "off,all,prefill" into ["off","all","prefill"] with validation."""
+    """把 "off,all,prefill" 解析成 ["off","all","prefill"]，并校验取值合法。"""
     vals: list[str] = []
     for chunk in s.split(","):
         chunk = chunk.strip().lower()
@@ -173,10 +195,10 @@ def _parse_fia_list(s: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Config helpers
+# 配置辅助
 # ---------------------------------------------------------------------------
 def _kv_bits_to_config(kv_bits: str) -> str:
-    """Turn "8,4" into the additional_config JSON {"turboquant_kv_bits":[8,4]}."""
+    """把 "8,4" 转成 additional_config 的 JSON {"turboquant_kv_bits":[8,4]}。"""
     parts = [int(x.strip()) for x in kv_bits.split(",") if x.strip() != ""]
     if len(parts) != 2:
         raise ValueError(f"--kv-bits must be two comma-separated ints, got {kv_bits!r}")
@@ -184,7 +206,7 @@ def _kv_bits_to_config(kv_bits: str) -> str:
 
 
 def _fia_env(fia: str) -> dict[str, str]:
-    """Map a single fia choice to the VLLM_ASCEND_BIT_RESIDUAL_*FIA env vars."""
+    """把单个 fia 取值映射到 VLLM_ASCEND_BIT_RESIDUAL_*FIA 环境变量。"""
     prefill = "1" if fia in ("prefill", "all") else "0"
     decode = "1" if fia in ("decode", "all") else "0"
     return {FIA_ENV_PREFILL: prefill, FIA_ENV_DECODE: decode}
@@ -193,6 +215,7 @@ def _fia_env(fia: str) -> dict[str, str]:
 def _build_serve_cmd(
     *, model: str, kv_cache_dtype: str, kv_bits: str, port: int, host: str,
     trust_remote_code: bool, serve_extra: str,
+    profiler_dir: str | None = None, profiler_ignore_frontend: bool = False,
 ) -> list[str]:
     cmd: list[str] = [
         "vllm", "serve", model,
@@ -203,6 +226,18 @@ def _build_serve_cmd(
     ]
     if trust_remote_code:
         cmd.append("--trust-remote-code")
+    # 给了 profiler_dir 时，通过嵌套的 --profiler-config.* CLI 让 serve 进程开启
+    # torch profiler（vLLM 只有在配置了 profiler 时才会挂载 /start_profile、
+    # /stop_profile 端点）。目录必须是绝对路径——ProfilerConfig 会拒绝相对路径；
+    # NPU 上该目录落盘的是 Ascend（torch_npu.profiler）trace。
+    if profiler_dir is not None:
+        cmd += [
+            "--profiler-config.profiler=torch",
+            f"--profiler-config.torch_profiler_dir={profiler_dir}",
+            "--profiler-config.torch_profiler_with_stack=true",
+        ]
+        if profiler_ignore_frontend:
+            cmd.append("--profiler-config.ignore_frontend=true")
     if serve_extra:
         cmd += shlex.split(serve_extra)
     return cmd
@@ -211,7 +246,7 @@ def _build_serve_cmd(
 def _build_bench_cmd(
     *, model: str, port: int, host: str, input_len: int, output_len: int,
     num_prompts: int, concurrency: int, request_rate: float | None,
-    bench_extra: str, result_dir: Path,
+    bench_extra: str, result_dir: Path, profile: bool = False,
 ) -> list[str]:
     cmd: list[str] = [
         "vllm", "bench", "serve",
@@ -229,23 +264,27 @@ def _build_bench_cmd(
     ]
     if request_rate is not None:
         cmd.append(f"--request-rate={request_rate}")
+    # --profile 让 `vllm bench serve` 在 warmup 之后 POST /start_profile、主流程
+    # 跑完 POST /stop_profile，因此 trace 精确只覆盖压测段（不含 warmup）。
+    # 要求 serve 已经带 --profiler-config.* 启动（见 _build_serve_cmd）。
+    if profile:
+        cmd.append("--profile")
     if bench_extra:
         cmd += shlex.split(bench_extra)
     return cmd
 
 
 # ---------------------------------------------------------------------------
-# serve log streaming (background thread, no terminal echo)
+# serve 日志流式读取（后台线程，不回显到终端）
 # ---------------------------------------------------------------------------
 class _ServeLogStreamer:
-    """Background-thread reader for the serve process stdout/stderr.
+    """serve 进程 stdout/stderr 的后台线程读取器。
 
-    A long-lived `vllm serve` emits a lot of output during startup. If nobody
-    drains the pipe, its kernel buffer (typically 64 KiB) fills and the serve
-    process blocks on write — which then looks exactly like "server never
-    becomes ready". This reader keeps the pipe drained into ``log_path``
-    (silently — output is NOT echoed to the terminal; on failure the caller
-    prints the tail via ``.tail()``), while the main thread polls /health.
+    常驻的 `vllm serve` 启动期间会产出大量输出。若没人消费管道，其内核缓冲区
+    （通常 64 KiB）会被写满，serve 进程阻塞在 write 上——表现就和"服务一直
+    起不来"一样。本读取器把管道内容排空写入 ``log_path``（静默——输出不会
+    回显到终端；失败时由调用方通过 ``.tail()`` 打印尾部），同时主线程轮询
+    /health。
     """
 
     def __init__(self, proc: subprocess.Popen, log_path: Path):
@@ -272,16 +311,14 @@ class _ServeLogStreamer:
 
 
 # ---------------------------------------------------------------------------
-# bench streaming (tqdm progress only on terminal; key fields from JSON)
+# bench 输出流式处理（终端只回显 tqdm 进度条；关键字段从 JSON 取）
 # ---------------------------------------------------------------------------
 def _stream_bench(proc: subprocess.Popen, log_path: Path) -> int:
-    """Stream bench output to ``log_path`` fully; echo only the tqdm progress line.
+    """把 bench 输出完整写入 ``log_path``；终端只回显 tqdm 进度行。
 
-    Everything (INFO/namespace/warnings/result table) goes to the file for
-    later debugging. To the terminal we echo only the tqdm progress bar, which
-    refreshes in place via ``\\r`` (one line, not a flood). The actual result
-    metrics are extracted from the result JSON and printed separately by the
-    caller — so we deliberately do NOT echo the result table here.
+    所有内容（INFO/namespace/警告/result 表）都进文件以便事后排查。终端只回显
+    tqdm 进度条，它通过 ``\\r`` 原地刷新（只占一行，不会刷屏）。真正的结果
+    指标由调用方从 result JSON 提取后单独打印——所以这里刻意不回显 result 表。
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "w", buffering=1) as f:
@@ -299,10 +336,10 @@ def _stream_bench(proc: subprocess.Popen, log_path: Path) -> int:
 
 
 def _extract_bench_metrics(group_dir: Path) -> dict | None:
-    """Pull the key fields from the vllm-written result JSON in ``group_dir``.
+    """从 ``group_dir`` 里 vllm 写出的 result JSON 中提取关键字段。
 
-    Returns None if no json landed (bench failed before writing). vllm names the
-    file itself (see compute_result_filename), so we glob for *.json.
+    若没有 json 落盘（bench 在写文件前就失败了）返回 None。vllm 自己命名该文件
+    （见 compute_result_filename），所以这里 glob *.json。
     """
     jsons = sorted(group_dir.glob("*.json"))
     if not jsons:
@@ -325,18 +362,17 @@ def _extract_bench_metrics(group_dir: Path) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# serve lifecycle helpers
+# serve 生命周期辅助
 # ---------------------------------------------------------------------------
 def _port_in_use(host: str, port: int) -> bool:
-    """Return True if something is already listening on (host, port).
+    """若已有进程在 (host, port) 上监听则返回 True。
 
-    vllm serve binds with SO_REUSEADDR, so two serves can both LISTEN on the
-    same port without error — connections then get round-robined between them
-    and bench requests silently hit the wrong (often overloaded) server. This
-    guard refuses to start a second serve on an already-occupied port.
+    vllm serve 用 SO_REUSEADDR 绑定，所以两个 serve 能同时 LISTEN 同一端口而不
+    报错——连接会被轮询分发到两者之间，bench 请求会静默打到错误（通常已过载）
+    的 server。本守卫拒绝在已被占用的端口上再起第二个 serve。
     """
-    # Normalize host for connect: '' / '0.0.0.0' -> 127.0.0.1; vllm default host
-    # is 127.0.0.1. We probe the loopback the bench will actually use.
+    # 连接用的 host 归一化：'' / '0.0.0.0' -> 127.0.0.1；vllm 默认 host 是
+    # 127.0.0.1。探测的是 bench 实际会用的那个回环地址。
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "", None) else host
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
@@ -346,7 +382,7 @@ def _port_in_use(host: str, port: int) -> bool:
 def _wait_for_ready(
     base_url: str, timeout_s: float, interval_s: float, *, serve_proc: subprocess.Popen,
 ) -> None:
-    """Poll /health until 200 or timeout. Fail fast if serve exits early."""
+    """轮询 /health 直到 200 或超时。serve 提前退出则快速失败。"""
     health_url = f"{base_url}/health"
     deadline = time.perf_counter() + timeout_s
     last_err: str | None = None
@@ -372,7 +408,7 @@ def _wait_for_ready(
 
 
 def _terminate(proc: subprocess.Popen, grace_s: float = 10.0) -> int:
-    """SIGTERM the process, then SIGKILL if it doesn't die within grace_s."""
+    """先 SIGTERM 进程，若 grace_s 内未退出再 SIGKILL。"""
     if proc.poll() is not None:
         return proc.returncode
     try:
@@ -388,13 +424,13 @@ def _terminate(proc: subprocess.Popen, grace_s: float = 10.0) -> int:
 
 
 # ---------------------------------------------------------------------------
-# one (fia, io, conc) combination runner
+# 单个 (fia, io, conc) 组合的执行器
 # ---------------------------------------------------------------------------
 def _run_one_combo(
     *, serve_proc: subprocess.Popen, serve_streamer: _ServeLogStreamer,
     bench_cmd: list[str], group_dir: Path, label: str,
 ) -> tuple[int, dict | None]:
-    """Run one bench combination into ``group_dir``. Returns (bench_rc, metrics)."""
+    """把一个 bench 组合跑进 ``group_dir``。返回 (bench_rc, metrics)。"""
     print(f"\n--- {label} ---")
     bench_log = group_dir / "bench.log"
     print(f"    bench cmd: {' '.join(shlex.quote(c) for c in bench_cmd)}")
@@ -423,14 +459,13 @@ def _run_one_combo(
 
 
 # ---------------------------------------------------------------------------
-# summary table
+# 汇总表
 # ---------------------------------------------------------------------------
 def _print_summary(rows: list[dict], log_path: Path | None = None) -> None:
-    """Print one row per combo with the key fields; also write to ``log_path``.
+    """每组 combo 打印一行关键字段；同时写入 ``log_path``。
 
-    The same table is written to stdout (for the live terminal) and, if
-    ``log_path`` is given, appended to that file so the summary survives in a
-    durable log alongside the per-combo serve/bench logs.
+    同一张表写到 stdout（给现场终端看），并在给出 ``log_path`` 时追加到该文件，
+    使汇总与各 combo 的 serve/bench 日志一同留在持久日志里。
     """
     lines: list[str] = []
     if not rows:
@@ -450,6 +485,17 @@ def _print_summary(rows: list[dict], log_path: Path | None = None) -> None:
         for r in rows:
             lines.append("  ".join(_fmt(r.get(c)).rjust(widths[c]) for c in cols))
         lines.append(bar)
+        # profiler 目录是长路径；为保持对齐表的紧凑，把各组 profiler 目录单
+        # 列在表下方的独立块里（仅当某组确有值时才出现——即用 --profile 时）。
+        prof_rows = [r for r in rows if r.get("profiler_dir")]
+        if prof_rows:
+            lines.append("")
+            lines.append("profiler dir per combo:")
+            for r in prof_rows:
+                lines.append(
+                    f"  fia={r['fia']} in={r['in']} out={r['out']} conc={r['conc']} "
+                    f"-> {r['profiler_dir']}"
+                )
         print("\n".join(lines))
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -466,7 +512,7 @@ def _fmt(v) -> str:
 
 
 # ---------------------------------------------------------------------------
-# main
+# 主入口
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -474,7 +520,7 @@ def main() -> int:
                     "with multi-config permutations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # ---- shared ----
+    # ---- 共用 ----
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help="model path/name.")
     parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help="serve & bench port.")
     parser.add_argument("--host", default="127.0.0.1", help="serve & bench host.")
@@ -491,7 +537,7 @@ def main() -> int:
         help="pass --trust-remote-code to vllm serve (on by default for local HF paths).",
     )
 
-    # ---- serve group ----
+    # ---- serve 参数组 ----
     serve = parser.add_argument_group("serve")
     serve.add_argument(
         "-d", "--device", default=None,
@@ -518,7 +564,7 @@ def main() -> int:
              "ignored when -f has multiple values).",
     )
 
-    # ---- bench group (multi-value, comma-separated) ----
+    # ---- bench 参数组（多值，逗号分隔）----
     bench = parser.add_argument_group("bench")
     bench.add_argument(
         "-L", "--io", default=DEFAULT_IO,
@@ -542,12 +588,31 @@ def main() -> int:
         help="extra args appended verbatim to `vllm bench serve` (shell-split).",
     )
 
-    # ---- output ----
+    # ---- 输出 ----
     out = parser.add_argument_group("output")
     out.add_argument(
         "-O", "--output-dir", default=DEFAULT_OUTPUT_ROOT,
         help="root dir for logs/json; per-fia subdir <fia>_<ts>/ holds per-combo "
              "subdirs in<i>_out<o>_conc<c>/.",
+    )
+
+    # ---- profiler 参数 ----
+    prof = parser.add_argument_group("profiler")
+    prof.add_argument(
+        "--profile", action="store_true",
+        help="enable torch profiler: inject --profiler-config.* into `vllm serve` "
+             "and --profile into `vllm bench serve`. bench POSTs /start_profile after "
+             "warmup and /stop_profile after the run, so the trace covers only the "
+             "bench segment. On NPU the trace (msprof-style) lands under --output-dir "
+             "(<output-dir>/<ts>/<fia>/in<i>_out<o>_conc<c>/profiler/). When set, serve "
+             "is restarted per combo so each combo gets an isolated profiler dir "
+             "(slower: one serve boot per combo).",
+    )
+    prof.add_argument(
+        "--profiler-ignore-frontend", action="store_true",
+        help="only profile the NPU worker (EngineCore subprocess), skip the AsyncLLM "
+             "frontend CPU trace, to reduce overhead. Adds "
+             "--profiler-config.ignore_frontend=true to `vllm serve`.",
     )
 
     args = parser.parse_args()
@@ -559,7 +624,6 @@ def main() -> int:
     io_pairs = _parse_io_pairs(args.io)
     conc_list = _parse_int_list(args.concurrency, "--concurrency")
     fia_list = _parse_fia_list(args.fia)
-    # num_combos = len(fia_list) * len(io_pairs) * len(conc_list)
 
     base_url = f"http://{args.host}:{args.port}"
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -579,12 +643,11 @@ def main() -> int:
     print(f"  output root : {run_dir}")
     print("=" * 80)
 
-    # ---- outer loop: per fia (each fia restarts serve) ----
-    for fia_idx, fia in enumerate(fia_list):
-        fia_root = run_dir / fia
-        fia_root.mkdir(parents=True, exist_ok=True)
-        serve_log = fia_root / "serve.log"
-
+    # ---- serve 起停辅助（下方两种模式共用）----
+    # _launch 返回 (proc, streamer, busy)：busy=True 表示端口已被占用
+    # （调用方中止整次运行）；proc 为 None 表示 serve 没起来（调用方跳过
+    # 这个 combo/fia）。借此让 per-fia 与 per-combo 两条分支保持精简。
+    def _launch(fia: str, serve_log: Path, profiler_dir: str | None):
         serve_env = os.environ.copy()
         serve_env.update(SERVE_ENV_DEFAULTS)
         if args.device is not None:
@@ -595,94 +658,152 @@ def main() -> int:
             model=args.model, kv_cache_dtype=args.kv_cache_dtype, kv_bits=args.kv_bits,
             port=args.port, host=args.host, trust_remote_code=args.trust_remote_code,
             serve_extra=args.serve_extra,
+            profiler_dir=profiler_dir,
+            profiler_ignore_frontend=args.profiler_ignore_frontend,
         )
-
-        print(f"\n[fia {fia_idx + 1}/{len(fia_list)}] {fia}  ->  {fia_root}")
         print(f"  serve env : {NPU_VISIBLE_ENV}={serve_env.get(NPU_VISIBLE_ENV, '(inherited)')} "
               f"{FIA_ENV_PREFILL}={serve_env[FIA_ENV_PREFILL]} "
               f"{FIA_ENV_DECODE}={serve_env[FIA_ENV_DECODE]}")
         print(f"  serve cmd : {' '.join(shlex.quote(c) for c in serve_cmd)}")
         print(f"  serve log : {serve_log}")
+        if profiler_dir:
+            print(f"  profiler dir : {profiler_dir}")
 
-        # ---- launch serve ----
-        # Guard against a stale serve (or another instance of this script)
-        # already LISTENing on the port. vllm binds with SO_REUSEADDR so a
-        # second bind would "succeed" and silently split bench traffic.
+        # 防止有旧 serve（或本脚本的另一个实例）已在端口上 LISTEN。vllm 用
+        # SO_REUSEADDR 绑定，第二次 bind 也会“成功”并静默分流 bench 流量。
         if _port_in_use(args.host, args.port):
             print(
                 f"  [!] 端口 {args.port} 已被占用（可能有一个旧的 vllm serve 没关，"
                 f"或另一个本脚本实例在跑）。请换端口（-p）或先 kill 旧 serve 后重试。",
                 file=sys.stderr,
             )
-            return 4
+            return None, None, True  # 端口忙 -> 中止整次运行
         print(f"  [launching vllm serve ...]")
-        serve_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             serve_cmd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
             env=serve_env,
         )
-        serve_streamer = _ServeLogStreamer(serve_proc, serve_log)
-
-        is_last_fia = (fia_idx == len(fia_list) - 1)
-        keep = args.keep_server and is_last_fia and len(fia_list) == 1
-
+        streamer = _ServeLogStreamer(proc, serve_log)
+        print(f"  [waiting for {base_url}/health (timeout {args.serve_ready_timeout:.0f}s) ...]")
         try:
-            print(f"  [waiting for {base_url}/health (timeout {args.serve_ready_timeout:.0f}s) ...]")
-            try:
-                _wait_for_ready(
-                    base_url, args.serve_ready_timeout, args.serve_ready_interval,
-                    serve_proc=serve_proc,
-                )
-            except RuntimeError as e:
-                print(f"  [!] {e}", file=sys.stderr)
-                print(f"  [!] serve.log tail:\n{serve_streamer.tail(40)}", file=sys.stderr)
-                overall_rc = 3
-                continue  # try next fia
-            print(f"  [server is ready.]")
+            _wait_for_ready(
+                base_url, args.serve_ready_timeout, args.serve_ready_interval,
+                serve_proc=proc,
+            )
+        except RuntimeError as e:
+            print(f"  [!] {e}", file=sys.stderr)
+            print(f"  [!] serve.log tail:\n{streamer.tail(40)}", file=sys.stderr)
+            _terminate(proc)
+            streamer.join(timeout=5.0)
+            return None, None, False  # 端口不忙但 serve 没起来 -> 跳过本 combo
+        print(f"  [server is ready.]")
+        return proc, streamer, False
 
-            # ---- inner loop: all io x conc combos on this serve ----
-            for (input_len, output_len), concurrency in itertools.product(
-                io_pairs, conc_list
-            ):
-                group_dir = fia_root / f"in{input_len}_out{output_len}_conc{concurrency}"
-                group_dir.mkdir(parents=True, exist_ok=True)
-                bench_cmd = _build_bench_cmd(
-                    model=args.model, port=args.port, host=args.host,
-                    input_len=input_len, output_len=output_len,
-                    num_prompts=args.num_prompts, concurrency=concurrency,
-                    request_rate=args.request_rate, bench_extra=args.bench_extra,
-                    result_dir=group_dir,
-                )
-                label = f"fia={fia} in={input_len} out={output_len} conc={concurrency}"
-                rc, metrics = _run_one_combo(
-                    serve_proc=serve_proc, serve_streamer=serve_streamer,
-                    bench_cmd=bench_cmd, group_dir=group_dir, label=label,
-                )
+    def _bench_combo(fia: str, il: int, ol: int, c: int, proc, streamer,
+                     group_dir: Path, profiler_dir: str | None) -> int:
+        """把一个 (fia, io, conc) bench 跑进 group_dir。返回 bench 退出码。"""
+        group_dir.mkdir(parents=True, exist_ok=True)
+        bench_cmd = _build_bench_cmd(
+            model=args.model, port=args.port, host=args.host,
+            input_len=il, output_len=ol,
+            num_prompts=args.num_prompts, concurrency=c,
+            request_rate=args.request_rate, bench_extra=args.bench_extra,
+            result_dir=group_dir, profile=args.profile,
+        )
+        label = f"fia={fia} in={il} out={ol} conc={c}"
+        rc, metrics = _run_one_combo(
+            serve_proc=proc, serve_streamer=streamer,
+            bench_cmd=bench_cmd, group_dir=group_dir, label=label,
+        )
+        if metrics:
+            summary_rows.append({
+                "fia": fia, "in": il, "out": ol, "conc": c,
+                "completed": metrics["completed"],
+                "duration": metrics["duration"],
+                "in_tok": metrics["total_input_tokens"],
+                "out_tok": metrics["total_output_tokens"],
+                "tok/s": metrics["total_token_throughput"],
+                "ttft": metrics["mean_ttft_ms"],
+                "tpot": metrics["mean_tpot_ms"],
+                "profiler_dir": profiler_dir,
+            })
+        return rc
+
+    def _stop(proc, streamer, keep: bool) -> None:
+        if keep:
+            print(f"  [--keep-server] leaving serve alive (pid {proc.pid})")
+        else:
+            print(f"  [stopping serve (pid {proc.pid}) ...]")
+            _terminate(proc)
+            streamer.join(timeout=5.0)
+            print(f"  [serve stopped.]")
+
+    # ---- 分支：per-combo 重启 serve（仅当 --profile）----
+    # profiler_dir 是 server 级（serve 启动时固定）配置，因此必须每个 combo
+    # 重启一次 serve，才能让每个 combo 各得一个隔离的 profiler 目录。
+    if args.profile:
+        print(f"  profiler  : enabled (per-combo serve restart; isolated trace dir per combo)")
+        if args.profiler_ignore_frontend:
+            print(f"             ignore_frontend=True (NPU worker only)")
+        print("=" * 80)
+        combos = [(fia, il, ol, c)
+                  for fia in fia_list for (il, ol) in io_pairs for c in conc_list]
+        for idx, (fia, il, ol, c) in enumerate(combos):
+            fia_root = run_dir / fia
+            fia_root.mkdir(parents=True, exist_ok=True)
+            group_dir = fia_root / f"in{il}_out{ol}_conc{c}"
+            group_dir.mkdir(parents=True, exist_ok=True)
+            # 每 combo 隔离的 profiler 目录，与该组的日志放在一起。
+            profiler_dir = str((group_dir / "profiler").resolve())
+            (group_dir / "profiler").mkdir(parents=True, exist_ok=True)
+            serve_log = group_dir / "serve.log"
+
+            print(f"\n[combo {idx + 1}/{len(combos)}] "
+                  f"fia={fia} in={il} out={ol} conc={c}  ->  {group_dir}")
+            proc, streamer, busy = _launch(fia, serve_log, profiler_dir)
+            if busy:
+                return 4
+            if proc is None:
+                overall_rc = 3
+                continue  # serve 没起来；尝试下一个 combo
+            is_last = (idx == len(combos) - 1)
+            keep = args.keep_server and is_last and len(combos) == 1
+            try:
+                rc = _bench_combo(fia, il, ol, c, proc, streamer, group_dir, profiler_dir)
                 if rc != 0:
                     overall_rc = max(overall_rc, rc)
-                if metrics:
-                    summary_rows.append({
-                        "fia": fia, "in": input_len, "out": output_len,
-                        "conc": concurrency,
-                        "completed": metrics["completed"],
-                        "duration": metrics["duration"],
-                        "in_tok": metrics["total_input_tokens"],
-                        "out_tok": metrics["total_output_tokens"],
-                        "tok/s": metrics["total_token_throughput"],
-                        "ttft": metrics["mean_ttft_ms"],
-                        "tpot": metrics["mean_tpot_ms"],
-                    })
-        finally:
-            if keep:
-                print(f"  [--keep-server] leaving serve alive (pid {serve_proc.pid})")
-            else:
-                print(f"  [stopping serve (pid {serve_proc.pid}) ...]")
-                _terminate(serve_proc)
-                serve_streamer.join(timeout=5.0)
-                print(f"  [serve stopped.]")
+            finally:
+                _stop(proc, streamer, keep)
 
-    # ---- final summary (stdout + a durable summary.log) ----
+    # ---- 分支：per-fia 复用 serve（默认；不开 profiler）----
+    # 原始行为：每个 fia 起一次 serve，所有 io×conc 组合共用它。
+    else:
+        for fia_idx, fia in enumerate(fia_list):
+            fia_root = run_dir / fia
+            fia_root.mkdir(parents=True, exist_ok=True)
+            serve_log = fia_root / "serve.log"
+
+            print(f"\n[fia {fia_idx + 1}/{len(fia_list)}] {fia}  ->  {fia_root}")
+            proc, streamer, busy = _launch(fia, serve_log, None)
+            if busy:
+                return 4
+            if proc is None:
+                overall_rc = 3
+                continue  # 尝试下一个 fia
+            is_last_fia = (fia_idx == len(fia_list) - 1)
+            keep = args.keep_server and is_last_fia and len(fia_list) == 1
+            try:
+                for (il, ol), c in itertools.product(io_pairs, conc_list):
+                    group_dir = fia_root / f"in{il}_out{ol}_conc{c}"
+                    rc = _bench_combo(fia, il, ol, c, proc, streamer, group_dir, None)
+                    if rc != 0:
+                        overall_rc = max(overall_rc, rc)
+            finally:
+                _stop(proc, streamer, keep)
+
+    # ---- 最终汇总（stdout + 持久 summary.log）----
     summary_log = run_dir / "summary.log"
     _print_summary(summary_rows, log_path=summary_log)
     print(f"\n[+] summary written to: {summary_log}")
