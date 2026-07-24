@@ -3,13 +3,20 @@
 
 Reads ``ASCEND_PROFILER_OUTPUT/operator_details.csv`` and
 ``ASCEND_PROFILER_OUTPUT/kernel_details.csv`` under one or more
-``rank0_*_ascend_pt`` directories (torch / NPU profiler).
+``rank0_*_ascend_pt`` directories (torch / NPU profiler), plus
+``step_trace_time.csv`` for per-step end-to-end NPU time.
 
 Supports BitResidual vector attn (``BitResidualAttentionPagedK8v4``), FIA
 (``BitResidualFiaPagedK8v4``), and TurboQuant. Attention kernels are split into
 decode vs prefill using the query token count from ``Input Shapes`` (first dim).
 Default: ``Q <= --decode-q-max`` → decode, else prefill
 (typical: decode Q=num_prompts, chunked-prefill Q≈241).
+
+Output is intentionally lean: unified_attention device latency, per-kernel
+decode/prefill breakdown with HW counters (``-v``), and per-step end-to-end NPU
+trace. Host-side wrappers / aten overhead are still collected (JSON) but no
+longer printed — they are noise in eager+small-model smoke and are dominated by
+PyTorch dispatch, not the op under optimization.
 
 Example::
 
@@ -200,6 +207,51 @@ class ProfileSummary:
     kernel_phase_stats: dict[str, KernelStats] = field(default_factory=dict)
     decode_q_max: int = 32
     host_overhead: dict[str, DurationStats] = field(default_factory=dict)
+    # Per-step end-to-end NPU trace from step_trace_time.csv. Keys = CSV columns.
+    step_trace: list[dict[str, float]] = field(default_factory=list)
+
+
+_STEP_TRACE_COLUMNS = (
+    "Computing",
+    "Communication(Not Overlapped)",
+    "Overlapped",
+    "Communication",
+    "Free",
+    "Stage",
+    "Bubble",
+    "Communication(Not Overlapped and Exclude Receive)",
+    "Preparing",
+)
+
+# Columns summed per-step into a "total per-step" row (us). Stage already
+# includes Computing + Communication + Free etc. on Ascend, so we keep Stage
+# as the canonical end-to-end per-step number and also surface Computing.
+_STEP_TRACE_SUMMARY_COLS = ("Computing", "Stage", "Free", "Preparing")
+
+
+def _read_step_trace(profile_dir: Path) -> list[dict[str, float]]:
+    """Parse step_trace_time.csv → list of per-step dicts (values in us)."""
+    csv_path = profile_dir / "ASCEND_PROFILER_OUTPUT" / "step_trace_time.csv"
+    if not csv_path.exists():
+        return []
+    steps: list[dict[str, float]] = []
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            parsed: dict[str, float] = {}
+            for col in _STEP_TRACE_COLUMNS:
+                if col in row:
+                    parsed[col] = _f(row, col)
+            if "Step" in row:
+                try:
+                    parsed["Step"] = int(float(row["Step"]))
+                except (ValueError, TypeError):
+                    parsed["Step"] = -1
+            if "Device_id" in row:
+                parsed["Device_id"] = _f(row, "Device_id")
+            steps.append(parsed)
+    return steps
+
 
 
 # Absolute delta below this (us) is treated as noise in compare tables.
@@ -577,6 +629,7 @@ def summarize_profile(
     kernel_stats, kernel_phase_stats = _summarize_kernels(
         profile_dir, flavor, decode_q_max=decode_q_max
     )
+    step_trace = _read_step_trace(profile_dir)
     return ProfileSummary(
         profile_dir=profile_dir,
         flavor=flavor,
@@ -587,6 +640,7 @@ def summarize_profile(
         kernel_phase_stats=kernel_phase_stats,
         decode_q_max=decode_q_max,
         host_overhead=host_overhead,
+        step_trace=step_trace,
     )
 
 
@@ -646,35 +700,13 @@ def _print_summary(
         f"layers : total={len(summary.layer_blocks)} "
         f"steady={len(summary.steady_blocks)}"
     )
-    print(
-        "stats  : med/mean/p90"
-        + ("  (+ pack/attn device, wrappers, aten overhead, HW)" if verbose else "")
-    )
+    print("stats  : med/mean/p90")
 
     print("\n[latency / per-layer steady-state]")
     _print_op_row(
         "unified_attention device",
         summary.operator_stats.get("unified_attention_device"),
     )
-    ratio = _host_device_ratio_line(summary)
-    if ratio:
-        print(f"  {'host / device':30s} {ratio}")
-
-    if verbose:
-        for row_label, key in (
-            ("pack device", "pack_aclnn"),
-            ("attn device", "attn_aclnn"),
-            ("fia device", "fia_aclnn"),
-            ("unified_attention host", "unified_attention_host"),
-        ):
-            _print_op_row(row_label, summary.operator_stats.get(key))
-        print("\n[host wrappers]")
-        for row_label, key in (
-            ("pack_wrapper host", "pack_wrapper_host"),
-            ("attn_wrapper host", "attn_wrapper_host"),
-            ("fia_wrapper host", "fia_wrapper_host"),
-        ):
-            _print_op_row(row_label, summary.operator_stats.get(key))
 
     if summary.kernel_stats or summary.kernel_phase_stats:
         print(
@@ -724,21 +756,17 @@ def _print_summary(
                 indent=2,
             )
 
-    if verbose:
-        overhead_items = [
-            (op, summary.host_overhead.get(op))
-            for op in HOST_OVERHEAD_OPS
-            if summary.host_overhead.get(op) and summary.host_overhead[op].count
-        ]
-        if overhead_items:
-            print("\n[host overhead inside attention blocks]")
-            for op_name, stats in overhead_items:
-                assert stats is not None
-                dev_stats = summary.host_overhead.get(f"{op_name}_device")
-                host_part = f"host {stats.fmt_triple()}"
-                if dev_stats and dev_stats.count:
-                    host_part += f"  device {dev_stats.fmt_triple()}"
-                print(f"  {op_name:28s} {host_part}")
+    if summary.step_trace:
+        # Single-line end-to-end totals only; per-step Free/Preparing are noise
+        # in low-util smoke and are surfaced via compare's TOTAL rows instead.
+        cols = ("Computing", "Stage", "Free")
+        totals = {c: sum(s.get(c, 0.0) for s in summary.step_trace) for c in cols}
+        print("\n[end-to-end / NPU totals (us)]")
+        print(
+            f"  TOTAL Computing(NPU算力)={_fmt_dur(totals['Computing'])}  "
+            f"Stage(wall clock含空转)={_fmt_dur(totals['Stage'])}  "
+            f"Free(空转)={_fmt_dur(totals['Free'])}"
+        )
 
 
 def _col_width(*labels: str, minimum: int = 10) -> int:
@@ -779,6 +807,7 @@ def _print_compare_dur_row(
     return True
 
 
+
 def _print_compare(
     base_label: str,
     base: ProfileSummary,
@@ -800,21 +829,6 @@ def _print_compare(
     op_rows = [
         ("unified_attention device", "unified_attention_device"),
     ]
-    if verbose:
-        op_rows.extend(
-            [
-                ("attn device", "attn_aclnn"),
-                ("fia device", "fia_aclnn"),
-                ("pack device", "pack_aclnn"),
-                ("unified_attention host", "unified_attention_host"),
-                ("pack_wrapper host", "pack_wrapper_host"),
-                ("attn_wrapper host", "attn_wrapper_host"),
-                ("fia_wrapper host", "fia_wrapper_host"),
-                ("pack_aclnn host", "pack_aclnn_host"),
-                ("attn_aclnn host", "attn_aclnn_host"),
-                ("fia_aclnn host", "fia_aclnn_host"),
-            ]
-        )
     for metric, key in op_rows:
         b = base.operator_stats.get(key)
         o = other.operator_stats.get(key)
@@ -827,6 +841,21 @@ def _print_compare(
             col_w=col_w,
             force=key == "unified_attention_device",
         )
+
+    # End-to-end overview from step_trace: Stage TOTAL (wall clock proxy) and
+    # Computing TOTAL (NPU compute) up front so the op-vs-E2E gap is visible.
+    if base.step_trace and other.step_trace:
+        for col in ("Stage", "Computing"):
+            bv = sum(s.get(col, 0.0) for s in base.step_trace)
+            ov = sum(s.get(col, 0.0) for s in other.step_trace)
+            tag = "wall clock" if col == "Stage" else "NPU compute"
+            _print_compare_dur_row(
+                f"TOTAL {col} ({tag})",
+                bv,
+                ov,
+                col_w=col_w,
+                force=True,
+            )
 
     # Kernels: same-name first; then role-aligned attn (AttentionPaged <-> FiaPaged)
     compared_names: set[str] = set()
@@ -902,18 +931,6 @@ def _print_compare(
             force=True,
         )
 
-    if verbose:
-        print("\n[host overhead deltas]")
-        _print_compare_table_header(base_label, other_label, col_w=col_w)
-        for op_name in HOST_OVERHEAD_OPS:
-            b = base.host_overhead.get(op_name)
-            o = other.host_overhead.get(op_name)
-            if not b or not o or b.count == 0 or o.count == 0:
-                continue
-            _print_compare_dur_row(
-                op_name, b.value(stat), o.value(stat), col_w=col_w
-            )
-
 
 def _to_json(summary: ProfileSummary) -> dict:
     def stats_dict(stats: DurationStats) -> dict:
@@ -959,6 +976,7 @@ def _to_json(summary: ProfileSummary) -> dict:
             name: kernel_dict(name, stats)
             for name, stats in summary.kernel_phase_stats.items()
         },
+        "step_trace": summary.step_trace,
     }
 
 
@@ -1011,10 +1029,7 @@ def main() -> None:
         "--verbose",
         "-v",
         action="store_true",
-        help=(
-            "show host wrappers, host overhead inside attention blocks, "
-            "and HW counters (aic/aiv/mte)"
-        ),
+        help="show HW counters (aic/aiv/vec/mte2/mte3) per kernel",
     )
     parser.add_argument(
         "--decode-q-max",
