@@ -28,16 +28,17 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
 【serve 处理】FIA 是 serve 侧（引擎进程）的环境变量，每个 -f 值需重启 serve：
   外层按 -f 循环，每个 -f 值起一次 serve；内层跑完所有 -L × -c 排列，serve 复用。
 
-【日志结构】多级目录（时间戳只在最外一层，整次运行归到一个 run 目录）：
-  <output-dir>/<时间戳>/                        # 一次运行一个 run 目录
+【日志结构】多级目录（日期/时间两层，时间后可拼 --ts-suffix 后缀，整次运行归到一个 run 目录）：
+  <output-dir>/<日期>/<时间>[<后缀>]/               # 一次运行一个 run 目录
     <fia>/serve.log                             #   该 fia 的 serve 完整日志（每个 fia 重启 serve）
     <fia>/in<i>_out<o>_conc<c>/{bench.log,result.json}
     summary.log                                 #   跨所有组的总汇总表
+  （日期=YYYYMMDD，时间=HHMMSS；后缀默认空串。例 --ts-suffix _eager → <日期>/HHMMSS_eager/）
 
 【bench 输出】只回显关键字段（从 vllm 写出的 result JSON 提取，不依赖文本对齐）：
   Successful requests / Benchmark duration / Total input tokens /
   Total generated tokens / Total token throughput / Mean TTFT / Mean TPOT。
-  全部组跑完后打印一张总汇总表，并额外写一份到 <output-dir>/<时间戳>/summary.log。
+  全部组跑完后打印一张总汇总表，并额外写一份到 <output-dir>/<日期>/<时间>[<后缀>]/summary.log。
 
 典型用法：
     # 默认单组：fia=off, io=200:200, conc=16
@@ -55,12 +56,12 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
   bench 带 --profile（warmup 后 POST /start_profile，跑完 POST /stop_profile，
   故 trace 只含压测段、不含 warmup）。profiler 目录是 serve 级（启动时固定）配置，
   所以开 --profile 时每个 (fia,io,conc) combo 各重启一次 serve、各落独立 trace 目录
-  （<output-dir>/<ts>/<fia>/in<i>_out<o>_conc<c>/profiler/，复用 --output-dir，
+  （<output-dir>/<日期>/<时间>[<后缀>]/<fia>/in<i>_out<o>_conc<c>/profiler/，复用 --output-dir，
   无需额外参数；要落到别处磁盘就把 --output-dir 指过去）。不开 --profile 时仍走原
   per-fia 复用 serve 模式，默认行为零回归。可加 --profiler-ignore-frontend 只采 NPU
   worker、跳过前端 CPU trace 以降开销。
 
-    # 单组 + profiler：trace 落 <output-dir>/<ts>/off/in200_out200_conc16/profiler/
+    # 单组 + profiler：trace 落 <output-dir>/<日期>/<时间>/off/in200_out200_conc16/profiler/
     python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
         --profile
 
@@ -592,8 +593,15 @@ def main() -> int:
     out = parser.add_argument_group("output")
     out.add_argument(
         "-O", "--output-dir", default=DEFAULT_OUTPUT_ROOT,
-        help="root dir for logs/json; per-fia subdir <fia>_<ts>/ holds per-combo "
-             "subdirs in<i>_out<o>_conc<c>/.",
+        help="root dir for logs/json; run 目录按 日期/时间 两层下挂: "
+             "<output-dir>/<日期>/<时间>[<后缀>]/<fia>/in<i>_out<o>_conc<c>/ 。"
+             "(日期=YYYYMMDD，时间=HHMMSS，后缀由 --ts-suffix 给)。",
+    )
+    out.add_argument(
+        "--ts-suffix", default="",
+        help="时间目录的后缀，拼在时间之后(默认空串)。用于给同一次运行打标签，"
+             "如 --ts-suffix _eager 把目录变成 <日期>/HHMMSS_eager/。注意需自带分隔符"
+             "(_eager 而非 eager)。",
     )
 
     # ---- profiler 参数 ----
@@ -604,7 +612,7 @@ def main() -> int:
              "and --profile into `vllm bench serve`. bench POSTs /start_profile after "
              "warmup and /stop_profile after the run, so the trace covers only the "
              "bench segment. On NPU the trace (msprof-style) lands under --output-dir "
-             "(<output-dir>/<ts>/<fia>/in<i>_out<o>_conc<c>/profiler/). When set, serve "
+             "(<output-dir>/<日期>/<时间>[<后缀>]/<fia>/in<i>_out<o>_conc<c>/profiler/). When set, serve "
              "is restarted per combo so each combo gets an isolated profiler dir "
              "(slower: one serve boot per combo).",
     )
@@ -626,8 +634,12 @@ def main() -> int:
     fia_list = _parse_fia_list(args.fia)
 
     base_url = f"http://{args.host}:{args.port}"
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(args.output_dir) / ts
+    # run 目录拆成 日期/时间 两层，时间后可拼 --ts-suffix 后缀，便于按天归档与打标签：
+    #   <output-dir>/<日期>/<时间>[<后缀>]/...
+    now = datetime.datetime.now()
+    date_part = now.strftime("%Y%m%d")
+    time_part = now.strftime("%H%M%S") + args.ts_suffix
+    run_dir = Path(args.output_dir) / date_part / time_part
     run_dir.mkdir(parents=True, exist_ok=True)
     overall_rc = 0
     summary_rows: list[dict] = []
