@@ -34,6 +34,8 @@
  * BrDecodeValueTile consumes signed Cast(int4) with pre-folded vmin'.
  * P18 spike: meta UB ping-pong (2×768B) so next-run MTE2 can overlap
  * current-run VEC (issue after SetFlag(V_MTE3), before WaitFlag).
+ * Half affine (OutT=half only): u8/int4→half → BrApplyRowAffine(half) →
+ * store half WS (no CAST #1). bf16 OutT keeps fp32 affine + Cast→bf16.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -216,6 +218,83 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<float> dst,
     PipeBarrier<PIPE_V>();
 }
 
+// fp16 path: one 128-wide column (256B/repeat). Used only when WS_T=half.
+// Brcb still consumes 8 src scalars per repeat (same as fp32); each dst block
+// is 16×half. Do NOT use ceil(numRows/16) — that mis-sizes the expand.
+__aicore__ inline void BrApplyRowAffine(LocalTensor<half> dst,
+    LocalTensor<half> src, LocalTensor<half> offsets,
+    LocalTensor<half> scales, LocalTensor<half> broadcast,
+    uint32_t numRows, uint32_t headDim)
+{
+    constexpr uint32_t FP16_BLOCK_ELEMS = 16U;
+    constexpr uint32_t FP16_REPEAT_ELEMS = 128U;
+    constexpr uint32_t BRCB_SRC_PER_REPEAT = 8U;
+
+    BinaryRepeatParams repeatParams;
+    repeatParams.dstBlkStride = 1U;
+    repeatParams.src0BlkStride = 1U;
+    repeatParams.src1BlkStride = 0U;
+    repeatParams.src1RepStride = 1U;
+
+    if (headDim == BR_HEAD_SIZE) {
+        constexpr uint32_t ROW_STRIDE_BLOCKS = BR_HEAD_SIZE / FP16_BLOCK_ELEMS;
+        repeatParams.dstRepStride = ROW_STRIDE_BLOCKS;
+        repeatParams.src0RepStride = ROW_STRIDE_BLOCKS;
+
+        Brcb(broadcast, scales, (numRows + BRCB_SRC_PER_REPEAT - 1U) /
+            BRCB_SRC_PER_REPEAT, {1, BRCB_SRC_PER_REPEAT});
+        PipeBarrier<PIPE_V>();
+        Mul(dst, src, broadcast, FP16_REPEAT_ELEMS, numRows, repeatParams);
+
+        Brcb(broadcast, offsets, (numRows + BRCB_SRC_PER_REPEAT - 1U) /
+            BRCB_SRC_PER_REPEAT, {1, BRCB_SRC_PER_REPEAT});
+        PipeBarrier<PIPE_V>();
+        Add(dst, dst, broadcast, FP16_REPEAT_ELEMS, numRows, repeatParams);
+        PipeBarrier<PIPE_V>();
+        return;
+    }
+
+    const uint32_t rowStrideBlocks = headDim / FP16_BLOCK_ELEMS;
+    const uint32_t columnLoops =
+        (headDim + FP16_REPEAT_ELEMS - 1U) / FP16_REPEAT_ELEMS;
+    repeatParams.dstRepStride = rowStrideBlocks;
+    repeatParams.src0RepStride = rowStrideBlocks;
+
+    Brcb(broadcast, scales, (numRows + BRCB_SRC_PER_REPEAT - 1U) /
+        BRCB_SRC_PER_REPEAT, {1, BRCB_SRC_PER_REPEAT});
+    PipeBarrier<PIPE_V>();
+    for (uint32_t columnLoop = 0U; columnLoop < columnLoops; ++columnLoop) {
+        const uint32_t columnOffset = columnLoop * FP16_REPEAT_ELEMS;
+        uint32_t columnCount = headDim - columnOffset;
+        if (columnCount > FP16_REPEAT_ELEMS) {
+            columnCount = FP16_REPEAT_ELEMS;
+        }
+        Mul(dst[columnOffset], src[columnOffset], broadcast, columnCount,
+            numRows, repeatParams);
+    }
+    Brcb(broadcast, offsets, (numRows + BRCB_SRC_PER_REPEAT - 1U) /
+        BRCB_SRC_PER_REPEAT, {1, BRCB_SRC_PER_REPEAT});
+    PipeBarrier<PIPE_V>();
+    for (uint32_t columnLoop = 0U; columnLoop < columnLoops; ++columnLoop) {
+        const uint32_t columnOffset = columnLoop * FP16_REPEAT_ELEMS;
+        uint32_t columnCount = headDim - columnOffset;
+        if (columnCount > FP16_REPEAT_ELEMS) {
+            columnCount = FP16_REPEAT_ELEMS;
+        }
+        Add(dst[columnOffset], dst[columnOffset], broadcast, columnCount,
+            numRows, repeatParams);
+    }
+    PipeBarrier<PIPE_V>();
+}
+
+// Copy nb meta scalars into a 32B-aligned half buffer for Brcb (half block=16).
+__aicore__ inline void BrStageMetaHalfAligned(LocalTensor<half> dstAlign,
+    LocalTensor<half> src, uint32_t nb)
+{
+    Adds(dstAlign, src, static_cast<half>(0.0f), nb);
+    PipeBarrier<PIPE_V>();
+}
+
 __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<uint8_t> ub,
     uint64_t meta0Off, uint64_t meta1Off)
 {
@@ -299,6 +378,7 @@ __aicore__ inline void BrDecodeKeyTile(
 // A: y = base + q * step
 // B: y = s * (q - 127.5) via meta0=-127.5*s, meta1=s
 // halfScratch / scratchA/B: each numRows * headDim (2×fp32 + half).
+// bf16 OutT: fp32 affine + Cast→OutT (avoid half→fp32→bf16).
 template <typename OutT>
 __aicore__ inline void BrDecodeKeyTile(
     LocalTensor<uint8_t> codesUb,
@@ -333,10 +413,31 @@ __aicore__ inline void BrDecodeKeyTile(
         }
     }
 }
-#endif
 
-// Value tile: y = vmin' + s*vstep, s = Cast(int4) in [-8,7].
-// Caller must pre-fold vmin' = vmin + 8*vstep (P17b-B: once per PA run).
+#endif  // BR_KEY_UNIFORM_SCHEME == 3
+
+// fp16 OutT Key path (Scheme A/B only at call sites). Always declared so
+// if constexpr name lookup succeeds under Scheme C builds.
+__aicore__ inline void BrDecodeKeyTileHalf(
+    LocalTensor<uint8_t> codesUb,
+    LocalTensor<half> halfSrc,
+    LocalTensor<half> halfBroadcast,
+    LocalTensor<half> outUb,
+    LocalTensor<half> bases,
+    LocalTensor<half> steps,
+    uint32_t numRows,
+    uint32_t headDim,
+    uint32_t headDimAlign)
+{
+    (void)headDimAlign;
+    const uint32_t N = numRows * headDim;
+    Cast(halfSrc, codesUb, RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+    BrApplyRowAffine(
+        outUb, halfSrc, bases, steps, halfBroadcast, numRows, headDim);
+}
+
+// Value tile: y = vmin' + s*vstep, s = Cast(int4) in [-8,7].// Caller must pre-fold vmin' = vmin + 8*vstep (P17b-B: once per PA run).
 // nibbleUb: contiguous numRows * (headDim/2) uint8 (int4 packed).
 // halfScratch / scratchA/B: each numRows * headDim elements.
 template <typename OutT>
@@ -372,6 +473,26 @@ __aicore__ inline void BrDecodeValueTile(
             PipeBarrier<PIPE_V>();
         }
     }
+}
+
+// fp16 OutT value path (mirror BrDecodeKeyTileHalf).
+__aicore__ inline void BrDecodeValueTileHalf(
+    LocalTensor<uint8_t> nibbleUb,
+    LocalTensor<half> halfSrc,
+    LocalTensor<half> halfBroadcast,
+    LocalTensor<half> outUb,
+    LocalTensor<half> vmins,
+    LocalTensor<half> vsteps,
+    uint32_t numRows,
+    uint32_t headDim,
+    uint32_t headDimAlign)
+{
+    (void)headDimAlign;
+    const uint32_t N = numRows * headDim;
+    Cast(halfSrc, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+    BrApplyRowAffine(
+        outUb, halfSrc, vmins, vsteps, halfBroadcast, numRows, headDim);
 }
 
 }  // namespace br_dequant
