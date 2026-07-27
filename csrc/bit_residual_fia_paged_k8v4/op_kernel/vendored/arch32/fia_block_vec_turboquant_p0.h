@@ -1313,14 +1313,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     }
 
     // A1 dual-buffer staging in tmpBuff1 front; decode scratch in the tail
-    // (shared). K8 uses 8 rows/3 FP32 tensors, while V4 uses 13 rows/2 FP32
-    // tensors. Vec1/Vec2 reclaim the full 32KB after dequant returns.
+    // (shared). Key Scheme A/B: 2×fp32; Scheme C (legacy sign): 3×fp32.
+    // Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
     const uint32_t kTileMax = isKey
         ? br_dequant::BR_KEY_DECODE_TILE_MAX
         : br_dequant::BR_VALUE_DECODE_TILE_MAX;
     const uint32_t kScratchElems = kTileMax * br_pack::BR_HEAD_SIZE;
-    const uint32_t kFp32ScratchCount = isKey ? 3U : 2U;
+    const uint32_t kFp32ScratchCount =
+        (isKey && br_dequant::BR_KEY_SCHEME_LEGACY_SIGN) ? 3U : 2U;
     const uint32_t kFp32ScratchBytes =
         kScratchElems * kFp32ScratchCount * static_cast<uint32_t>(sizeof(float));
     const uint32_t kFp16ScratchBytes =
@@ -1333,10 +1334,12 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
     LocalTensor<float> fp32UbB =
         tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes + kScratchElems * sizeof(float));
+#if BR_KEY_UNIFORM_SCHEME == 3
     LocalTensor<float> fp32UbC = isKey
         ? tmpBuff1.GetWithOffset<float>(
             kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float))
         : dequantFp32Buf_.Get<float>();
+#endif
     LocalTensor<half> halfScratch =
         tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
 
@@ -1466,10 +1469,17 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 if (nb > hoistTile) {
                     nb = hoistTile;
                 }
+#if BR_KEY_UNIFORM_SCHEME == 3
                 br_dequant::BrDecodeKeyTile(
                     batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
                     outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
                     nb, headDim, headDimAlign);
+#else
+                br_dequant::BrDecodeKeyTile(
+                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
+                    outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
+                    nb, headDim, headDimAlign);
+#endif
             }
         } else {
             // P17b-B: fold +8 into vmin once per PA run (n rows), then tiles

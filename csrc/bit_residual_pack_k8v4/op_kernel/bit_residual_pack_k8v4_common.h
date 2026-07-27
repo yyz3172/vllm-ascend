@@ -40,6 +40,13 @@ static constexpr uint32_t TqAlignUp32(uint32_t x) {
 // -----------global--------------------------------------------------------
 static constexpr int ASCEND_BLOCK_BYTES = 32;
 static constexpr int TQ_PACK_D = 128;
+// Must match br_dequant BR_KEY_UNIFORM_SCHEME:
+//   1=A asymmetric uniform, 2=B symmetric uniform, 3=C legacy LSB-sign+q7.
+// Default A; tests / serving use A. Set to 3 only for legacy A/B perf compare.
+#ifndef BR_KEY_UNIFORM_SCHEME
+#define BR_KEY_UNIFORM_SCHEME 1
+#endif
+static constexpr uint32_t TQ_KEY_UNIFORM_SCHEME = BR_KEY_UNIFORM_SCHEME;
 static constexpr uint32_t TQ_BLOCK_ROWS = 16;
 static constexpr uint32_t TQ_CUBE_M_ALIGN = 16;
 static constexpr uint32_t TQ_VECTOR_BATCH = TQ_BLOCK_ROWS;
