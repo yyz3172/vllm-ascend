@@ -143,13 +143,6 @@ public:
     }
 
 private:
-    __aicore__ inline constexpr QuantMode_t FixpipeQuantMode() const {
-        if constexpr (AscendC::IsSameType<T, bfloat16_t>::value) {
-            return QuantMode_t::F322BF16;
-        }
-        return QuantMode_t::F322F16;
-    }
-
     __aicore__ inline void LoadResidentRotation(
         TqManualMmadResource& resource,
         AscendC::GlobalTensor<T>& rotationTGm) {
@@ -253,20 +246,26 @@ private:
         }
     }
 
-    // ── Rotation-only slice: A × RotB → cWorkGm ──────────────────────────
+    // ── Rotation-only: A × RotB → cWorkGm (merged m=32) ──────────────
     //
-    // Per-slice event sequence (unitFlag=0b11):
+    // Single Mmad(m=32, n=128, k=128) + Fixpipe replaces the previous
+    // two-slice loop (2 × Mmad(m=16)).  The L1 layout already stores
+    // both 16-row NZ slices contiguously (C0 block 0 at offset 0, C0
+    // block 1 at offset 2048 elements), so one LoadData of 16 fractals
+    // (2 M-direction × 8 K-direction) loads the full 32×128 tile into
+    // L0A.  The workspace stride (TQ_MANUAL_WORKSPACE_STRIDE_ELEMS =
+    // 32×128) already covers the merged tile; AIV reads its 16-row
+    // slice at the same GM offsets as before.
+    //
+    // Per-stream event sequence (unitFlag=0b11):
     //
     //   Wait<M_MTE1>  — M done with prev L0A; MTE1 can write
-    //   LoadData L1→L0A[0]
+    //   LoadData L1→L0A[0]  (repeatTimes=16, 2×8 fractals)
     //   Set<MTE1_M>   — L0A ready for M
     //   Wait<MTE1_M>  — L0A ready
-    //   Mmad L0A×RotB→L0C_rot  (unitFlag=0b11 → M_FIX)
-    //   Fixpipe L0C_rot→GM      (unitFlag=0b11 → FIX_M)
+    //   Mmad L0A×RotB→L0C_rot  (m=32, unitFlag=0b11 → M_FIX)
+    //   Fixpipe L0C_rot→GM      (mSize=32, unitFlag=0b11 → FIX_M)
     //   Set<M_MTE1>   — M freed L0A (MMAD done)
-    //
-    // Resident RotB in L0B[0]: stays resident for all iterations.
-    // No per-slice MTE1_M sync for RotB.
 
     __aicore__ inline void ComputeSlice(
         TqManualMmadResource& resource,
@@ -278,64 +277,66 @@ private:
             resource.l1Buf.template GetBufferByByte<T>(TQ_MANUAL_ROT_A_L1_OFFSET);
         auto aL0 = resource.l0ABuf.template GetBufferByByte<T>(0);
         auto bL0_rot = resource.l0BBuf.template GetBufferByByte<T>(0);
-        auto cL0_rot_base = resource.l0CBuf.template GetBufferByByte<float>(0);
+        auto cL0_rot = resource.l0CBuf.template GetBufferByByte<float>(0);
 
-        for (uint32_t slice = 0; slice < TQ_AIV_SUB_BLOCKS; ++slice) {
-            const uint32_t l1SliceOffset =
-                slice * TQ_MANUAL_AIV_SLICE_ELEMS;
-            const uint8_t unitFlag = 0b11;
+        const uint8_t unitFlag = 0b11;
 
-            // ── MTE1: load L0A[0] from L1 ──────────────────────────────
+        // ── MTE1: load L0A[0] from L1 (full 32×128 tile, 16 fractals) ──
 
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1);
 
-            AscendC::LoadData2DParams aLoad;
-            aLoad.startIndex = 0;
-            aLoad.repeatTimes = TQ_ROT_K / TQ_CUBE_M_ALIGN;
-            aLoad.srcStride = 1;
-            aLoad.sid = 0;
-            aLoad.dstGap = 0;
-            aLoad.ifTranspose = false;
-            aLoad.addrMode = 0;
-            AscendC::LoadData(aL0, aL1[l1SliceOffset], aLoad);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M);
+        AscendC::LoadData2DParams aLoad;
+        aLoad.startIndex = 0;
+        // 2 M-fractals × 8 K-fractals = 16 total (was 8 for single slice)
+        aLoad.repeatTimes =
+            (TQ_MANUAL_ROT_TILE_M / TQ_CUBE_M_ALIGN) *
+            (TQ_ROT_K / TQ_CUBE_M_ALIGN);
+        aLoad.srcStride = 1;
+        aLoad.sid = 0;
+        aLoad.dstGap = 0;
+        aLoad.ifTranspose = false;
+        aLoad.addrMode = 0;
+        AscendC::LoadData(aL0, aL1[0], aLoad);
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M);
 
-            // ── M: Rotation MMAD  L0A[0] × RotB → L0C_rot ────────────
+        // ── M: Rotation MMAD  L0A × RotB → L0C_rot (m=32) ──────────
 
-            AscendC::MmadParams rotMmParams;
-            rotMmParams.m = TQ_CUBE_M_ALIGN;
-            rotMmParams.n = TQ_ROT_N;
-            rotMmParams.k = TQ_ROT_K;
-            rotMmParams.cmatrixInitVal = true;
-            rotMmParams.cmatrixSource = false;
-            rotMmParams.unitFlag = unitFlag;
+        AscendC::MmadParams rotMmParams;
+        rotMmParams.m = TQ_MANUAL_ROT_TILE_M;   // 32 (was TQ_CUBE_M_ALIGN=16)
+        rotMmParams.n = TQ_ROT_N;
+        rotMmParams.k = TQ_ROT_K;
+        rotMmParams.cmatrixInitVal = true;
+        rotMmParams.cmatrixSource = false;
+        rotMmParams.unitFlag = unitFlag;
 
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(eventListMte1M);
 
-            auto cL0_rot =
-                cL0_rot_base[slice * TQ_MANUAL_AIV_SLICE_M * TQ_ROT_N];
-            AscendC::Mmad(cL0_rot, aL0, bL0_rot, rotMmParams);
+        AscendC::Mmad(cL0_rot, aL0, bL0_rot, rotMmParams);
 
-            AscendC::FixpipeParamsV220 rotFixParams;
-            rotFixParams.nSize = TQ_ROT_N;
-            rotFixParams.mSize = TQ_CUBE_M_ALIGN;
-            rotFixParams.srcStride = TQ_CUBE_M_ALIGN;
-            rotFixParams.dstStride = TQ_ROT_N;
-            rotFixParams.ndNum = 1;
-            rotFixParams.unitFlag = unitFlag;
-            // F322F16: cast L0C float → GM half in-place on the L0C→GM store.
-            // Required quantPre for Fixpipe<half, float> on dav_c220 (910B3),
-            // so the AIV reads cWorkGm as half directly (no fp32→half Cast).
-            rotFixParams.quantPre = QuantMode_t::F322F16;
-            rotFixParams.reluEn = false;
-            AscendC::Fixpipe<half, float, AscendC::CFG_ROW_MAJOR>(
-                cWorkGm[cOffset + slice * TQ_MANUAL_AIV_SLICE_M * TQ_ROT_N],
-                cL0_rot,
-                rotFixParams);
+        AscendC::FixpipeParamsV220 rotFixParams;
+        rotFixParams.nSize = TQ_ROT_N;
+        rotFixParams.mSize = TQ_MANUAL_ROT_TILE_M;   // 32 (was 16)
+        rotFixParams.srcStride = TQ_MANUAL_ROT_TILE_M;  // 32 (was 16)
+        rotFixParams.dstStride = TQ_ROT_N;
+        rotFixParams.ndNum = 1;
+        rotFixParams.unitFlag = unitFlag;
+        // F322F16: cast L0C float → GM half in-place on the L0C→GM store.
+        // Required quantPre for Fixpipe<half, float> on dav_c220 (910B3),
+        // so the AIV reads cWorkGm as half directly (no fp32→half Cast).
+        // NOTE: Always F322F16 (never F322BF16) even for bf16 inputs.
+        // The workspace is always in half format; AIV reads it as half and
+        // the encode functions operate on half-domain data.  Using F322BF16
+        // would output bf16 bit patterns that are misinterpreted as half by
+        // the AIV DataCopy + encode pipeline.
+        rotFixParams.quantPre = QuantMode_t::F322F16;
+        rotFixParams.reluEn = false;
+        AscendC::Fixpipe<half, float, AscendC::CFG_ROW_MAJOR>(
+            cWorkGm[cOffset],
+            cL0_rot,
+            rotFixParams);
 
-            // ── Release L0A for next slice's MTE1 ──────────────────────
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1);
-        }
+        // ── Release L0A for next stream's MTE1 ──────────────────────
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventListMmte1);
     }
 
     __aicore__ inline void ComputeStream(
