@@ -172,10 +172,14 @@ void ApplySplitResult(BitResidualFiaPagedK8v4TilingData& tiling, const SplitResu
         bN2End[i] = res.bN2End[i];
         gS1End[i] = res.gS1End[i];
         s2End[i] = res.s2End[i];
+        s2SplitStartIdxOfCore[i] = res.fdRes.s2SplitStartIdxOfCore[i];
+    }
+    // FD head tables are indexed by numOfFdHead, not usedCoreNum.
+    const uint32_t nFd = std::min(res.numOfFdHead, TQ_FIA_MAX_AIC_CORE_NUM);
+    for (uint32_t i = 0; i < nFd; ++i) {
         bN2IdxOfFdHead[i] = res.fdRes.bN2IdxOfFdHead[i];
         gS1IdxOfFdHead[i] = res.fdRes.gS1IdxOfFdHead[i];
         s2SplitNumOfFdHead[i] = res.fdRes.s2SplitNumOfFdHead[i];
-        s2SplitStartIdxOfCore[i] = res.fdRes.s2SplitStartIdxOfCore[i];
         gS1SplitNumOfFdHead[i] = res.fdRes.gS1SplitNumOfFdHead[i];
         gS1LastPartSizeOfFdHead[i] = res.fdRes.gS1LastPartSizeOfFdHead[i];
     }
@@ -396,8 +400,10 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
         s2BaseSize = (s2BaseSize / static_cast<uint32_t>(blockSize)) *
                      static_cast<uint32_t>(blockSize);
     }
-    const uint32_t sInnerSizeAlign = AlignUp(std::min(s2Size, s2BaseSize), 16U);
-    const uint32_t headDimAlign = AlignUp(static_cast<uint32_t>(headSize), 16U);
+    // Device Softmax/Cube row stride is Align(actualS2, BYTE_BLOCK=32).
+    // Host mm1Res must match; AlignUp(..., 16) under-allocates (e.g. 208→208 vs 224).
+    const uint32_t sInnerSizeAlign = AlignUp(std::min(s2Size, s2BaseSize), kByteBlock);
+    const uint32_t headDimAlign = AlignUp(static_cast<uint32_t>(headSize), kByteBlock);
 
     BaseInfo baseInfo {};
     SplitParam splitParam {};
@@ -458,7 +464,7 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
     base.set_outputLayout(3U);  // FIA_LAYOUT::TND
     base.set_batchContinuous(1U);
     base.set_softmaxLseFlag(0U);
-    base.set_needInit(0U);
+    base.set_needInit(enableFd ? 1U : 0U);
     base.set_slidingFlag(0U);
     base.set_l2CacheOffFlag(0U);
     base.set_isLegacyIfa(0U);
@@ -485,11 +491,23 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
 
     ApplySplitResult(tiling, splitRes, aicNum, cvRatio);
 
-    // FD workspace element counts (mirror FiaTilingNonQuant::FillTilingWorkspaceParams).
+    // FD workspace: writers index by prefix-sum of s2SplitNumOfFdHead (global
+    // split slots), NOT per-core*2. Stock FillTilingWorkspaceParams uses
+    // aicNum*2 which under-allocates when sum(s2SplitNum) is large (multi-batch
+    // FD). Size to max(aicNum*2, totalSplitSlots) so both layouts stay safe.
+    uint64_t totalFdSplitSlots = 0ULL;
+    for (uint32_t i = 0; i < splitRes.numOfFdHead; ++i) {
+        totalFdSplitSlots += static_cast<uint64_t>(splitRes.fdRes.s2SplitNumOfFdHead[i]);
+    }
+    const uint64_t fdSlotAic = static_cast<uint64_t>(aicNum) * 2U;
+    const uint64_t fdSlotCap =
+        (fdSlotAic > totalFdSplitSlots) ? fdSlotAic : totalFdSplitSlots;
     const uint64_t fdAccumOutSize =
-        enableFd ? (static_cast<uint64_t>(aicNum) * 2ULL * kMBaseSize * headDimAlign) : 0ULL;
+        enableFd ? (fdSlotCap * kMBaseSize * headDimAlign) : 0ULL;
     const uint64_t fdLogSumExpSize =
-        enableFd ? (2ULL * aicNum * 2ULL * kMBaseSize * (kByteBlock / kBlockTableElemByte)) : 0ULL;
+        enableFd ? (2ULL * fdSlotCap * kMBaseSize *
+                    (kByteBlock / kBlockTableElemByte))
+                 : 0ULL;
     tiling.workspaceParams.set_fdAccumOutSize(static_cast<uint32_t>(fdAccumOutSize));
     tiling.workspaceParams.set_fdLogSumExpSize(static_cast<uint32_t>(fdLogSumExpSize));
 
@@ -519,8 +537,8 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
          static_cast<uint64_t>(mm1ResSize) * 2ULL +
          static_cast<uint64_t>(mm2ResSize) * 4ULL +
          static_cast<uint64_t>(mm2ResSize) * 4ULL);
-    // FD bytes: (accumOut + logSumExp) * sizeof(float) with paramNums = aic*2*mBase
-    const uint64_t fdParamNums = static_cast<uint64_t>(aicNum) * 2ULL * kMBaseSize;
+    // FD bytes: sized to fdSlotCap (=max(aic*2, sum s2SplitNum)) * mBase
+    const uint64_t fdParamNums = enableFd ? (fdAccumOutSize / headDimAlign) : 0ULL;
     const uint64_t fdWs =
         enableFd ? ((fdParamNums * headDimAlign +
                      2ULL * fdParamNums * (kByteBlock / kBlockTableElemByte)) *

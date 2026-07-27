@@ -458,6 +458,42 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
 
     InitWorkspace(workspace);
 
+    // FlashDecode combine reads accumOut / lseMax / lseSum. needInit=0 leaves them
+    // dirty → multi-batch long-KV NaN (test_flash_decode_multibatch_vs_attn).
+    if ASCEND_IS_AIV {
+        if constexpr (FLASH_DECODE) {
+            const uint32_t accumElems = tilingData->workspaceParams.fdAccumOutSize;
+            const uint32_t lseElems = tilingData->workspaceParams.fdLogSumExpSize;
+            if (accumElems > 0U && lseElems > 0U) {
+                const uint32_t aivNum = usedCoreNum * 2U;
+                const uint32_t accumChunk = (accumElems + aivNum - 1U) / aivNum;
+                const uint32_t lseHalf = lseElems / 2U;
+                const uint32_t lseChunk = (lseHalf + aivNum - 1U) / aivNum;
+                const uint32_t accumOff = tmpBlockIdx * accumChunk;
+                const uint32_t lseOff = tmpBlockIdx * lseChunk;
+                if (accumOff < accumElems) {
+                    const uint32_t n = (accumOff + accumChunk <= accumElems)
+                        ? accumChunk
+                        : (accumElems - accumOff);
+                    if (n > 0U) {
+                        matmul::InitOutput<float>(accumOutGm[accumOff], n, 0.0f);
+                    }
+                }
+                if (lseOff < lseHalf) {
+                    const uint32_t n = (lseOff + lseChunk <= lseHalf)
+                        ? lseChunk
+                        : (lseHalf - lseOff);
+                    if (n > 0U) {
+                        matmul::InitOutput<float>(lseSumFdGm[lseOff], n, 0.0f);
+                        matmul::InitOutput<float>(
+                            lseMaxFdGm[lseOff], n, -3.402823466e+38f);
+                    }
+                }
+                SyncAll();
+            }
+        }
+    }
+
     if ASCEND_IS_AIC {
         matmulService.InitParams(constInfo);
         matmulService.Init(query, key, value, pseShift, attenMask, actualSeqLengthsQ, actualSeqLengths,
@@ -556,12 +592,25 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
 #endif
         uint64_t accumTmpOutNum = 0;
         uint32_t taskId = 0;
+        const uint32_t numOfFdHead = tilingData->fdParams.numOfFdHead;
         uint32_t curbN2Idx = info.bIdx * constInfo.kvHeadNum + info.n2Idx;
-        while (taskId < usedCoreNum && (bN2IdxOfFdHead[taskId] != curbN2Idx || gS1IdxOfFdHead[taskId] * constInfo.mBaseSize != info.gS1Idx)) {
+        // Must bound by numOfFdHead (NOT usedCoreNum): s2SplitNumOfFdHead beyond
+        // numOfFdHead is uninitialized → multi-batch FD accumTmpOutNum OOB.
+        while (taskId < numOfFdHead &&
+               (bN2IdxOfFdHead[taskId] != curbN2Idx ||
+                gS1IdxOfFdHead[taskId] * constInfo.mBaseSize != info.gS1Idx)) {
             accumTmpOutNum += s2SplitNumOfFdHead[taskId];
             taskId++;
         }
-        info.accumTmpOutNum = accumTmpOutNum;
+        // Not an FD-listed head: do not write FD workspace (false-positive
+        // tndIsS2SplitCore would collide / OOB under multi-batch).
+        if (taskId >= numOfFdHead) {
+            info.tndIsS2SplitCore = false;
+            info.tndCoreStartKVSplitPos = 0;
+            info.accumTmpOutNum = 0;
+        } else {
+            info.accumTmpOutNum = accumTmpOutNum;
+        }
     }
 }
 
@@ -586,6 +635,8 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
     if (((s2Cur + 1) * constInfo.s2BaseSize) > info.actS2Size) {
         info.actualSingleProcessSInnerSize = info.actS2Size - s2Cur * constInfo.s2BaseSize;
     }
+    // Softmax/Cube mm1 row stride: Align(S2, BYTE_BLOCK=32) matching stock FIA
+    // nonquant (element-count align). Host mm1Res uses the same unit.
     info.actualSingleProcessSInnerSizeAlign =
         Align((uint32_t)info.actualSingleProcessSInnerSize, (uint32_t)fa_base_vector::BYTE_BLOCK);
 
@@ -632,6 +683,10 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
     info.isLastS2Loop = (s2Cur + 1 == curS2End);
     info.curSInnerLoopTimes = curS2End - curS2Start;
 
+    // Match stock FIA NonQuant: only the first/mid FD segment carries
+    // coreStartKVSplitPos. The tail writer is always split index 0 (it owns
+    // s2 from the row start). Setting tail to coreStartKVSplitPos collides
+    // when the same core earlier continued a different FD head.
     if (constInfo.bN2Start == constInfo.bN2End && constInfo.gS1Start == constInfo.gS1End) {
         info.tndIsS2SplitCore = true;
         info.tndCoreStartKVSplitPos = constInfo.coreStartKVSplitPos;
@@ -639,8 +694,10 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
         if (constInfo.headS2Split && (bN2Cur == constInfo.bN2Start) && (gS1Cur == constInfo.gS1Start)) {
             info.tndIsS2SplitCore = true;
             info.tndCoreStartKVSplitPos = constInfo.coreStartKVSplitPos;
-        } else if (constInfo.tailS2Split && (bN2Cur == constInfo.bN2End) && (gS1Cur == constInfo.gS1End)) {
+        } else if (constInfo.tailS2Split && (bN2Cur == constInfo.bN2End) &&
+                   (gS1Cur == constInfo.gS1End)) {
             info.tndIsS2SplitCore = true;
+            // tndCoreStartKVSplitPos stays 0 (initialized above)
         }
     }
 

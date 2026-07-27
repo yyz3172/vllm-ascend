@@ -1,3 +1,8 @@
+import json
+import os
+import time
+from pathlib import Path
+
 import torch
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.triton_utils import HAS_TRITON
@@ -10,6 +15,61 @@ from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
 
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
+
+# Set VLLM_ASCEND_DEBUG_TOPK_LOGITS=1 to dump per-call logits stats before
+# apply_top_k_top_p (jsonl). Optional: VLLM_ASCEND_DEBUG_TOPK_LOGITS_PATH.
+_TOPK_LOGITS_DEBUG = os.getenv("VLLM_ASCEND_DEBUG_TOPK_LOGITS", "0") == "1"
+_TOPK_LOGITS_DEBUG_PATH = Path(
+    os.getenv(
+        "VLLM_ASCEND_DEBUG_TOPK_LOGITS_PATH",
+        "/tmp/vllm_ascend_topk_logits_debug.jsonl",
+    )
+)
+_TOPK_LOGITS_CALL_IDX = 0
+
+
+def _debug_dump_topk_logits(logits: torch.Tensor, k, p, op_ms: float | None = None) -> None:
+    """Lightweight host-side stats to bisect ApplyTopKTopPCustom remain-path triggers."""
+    global _TOPK_LOGITS_CALL_IDX
+    _TOPK_LOGITS_CALL_IDX += 1
+    # Keep dumps cheap: sync once, reduce on device, then few scalars to CPU.
+    torch.npu.synchronize()
+    x = logits.detach()
+    if x.dtype != torch.float32:
+        x = x.float()
+    finite = torch.isfinite(x)
+    nan_n = int(torch.isnan(x).sum().item())
+    inf_n = int(torch.isinf(x).sum().item())
+    # Per-row: how many values equal the row max (ties at the top).
+    row_max = x.amax(dim=-1, keepdim=True)
+    n_at_max = int((x == row_max).sum().item())
+    # Approx "flatness": fraction of vocab within 1e-3 of row max.
+    n_near_max = int((x >= (row_max - 1e-3)).sum().item())
+    std = float(x.std().item()) if x.numel() > 1 else 0.0
+    rec = {
+        "i": _TOPK_LOGITS_CALL_IDX,
+        "shape": list(x.shape),
+        "dtype": str(logits.dtype),
+        "contig": bool(logits.is_contiguous()),
+        "stride": list(logits.stride()),
+        "nan": nan_n,
+        "inf": inf_n,
+        "finite_all": bool(finite.all().item()),
+        "min": float(x.min().item()) if x.numel() else None,
+        "max": float(x.max().item()) if x.numel() else None,
+        "mean": float(x.mean().item()) if x.numel() else None,
+        "std": std,
+        "n_at_max": n_at_max,
+        "n_near_max_1e-3": n_near_max,
+        "frac_at_max": n_at_max / x.numel() if x.numel() else 0.0,
+        "frac_near_max_1e-3": n_near_max / x.numel() if x.numel() else 0.0,
+        "k_is_none": k is None,
+        "p_is_none": p is None,
+        "op_ms": op_ms,
+    }
+    _TOPK_LOGITS_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _TOPK_LOGITS_DEBUG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def random_sample(
@@ -103,7 +163,16 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         # or it will make batch_invariant mode not working.
         if vllm_is_batch_invariant():
             return super().forward_native(logits, generators, k, p)
-        logits = self.apply_top_k_top_p(logits, k, p)
+        if _TOPK_LOGITS_DEBUG:
+            # Stats must be taken on *pre*-mask logits (remain-path trigger).
+            pre = logits.detach()
+            torch.npu.synchronize()
+            t0 = time.perf_counter()
+            logits = self.apply_top_k_top_p(logits, k, p)
+            torch.npu.synchronize()
+            _debug_dump_topk_logits(pre, k, p, op_ms=(time.perf_counter() - t0) * 1e3)
+        else:
+            logits = self.apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
@@ -164,8 +233,22 @@ def _apply_top_k_top_p_ascendc(
     return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
 
 
+def _use_ascendc_top_k_top_p() -> bool:
+    """A2/A3 use AscendC op by default.
+
+    Set VLLM_ASCEND_FORCE_PYTORCH_TOPK=1 to force the PyTorch reference path.
+    Useful to bisect graph+FIA regressions in ApplyTopKTopPCustom (~25ms
+    stalls observed at decode batch≈16 with top_k).
+    """
+    import os
+
+    if os.getenv("VLLM_ASCEND_FORCE_PYTORCH_TOPK", "0") == "1":
+        return False
+    return get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]
+
+
 apply_top_k_top_p = (
     _apply_top_k_top_p_ascendc
-    if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]
+    if _use_ascendc_top_k_top_p()
     else _apply_top_k_top_p_pytorch
 )

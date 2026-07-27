@@ -215,6 +215,17 @@ def _compare_tria(
     attn_cpu = out_attn.float().cpu()
     exp_cpu = expected.float().cpu()
 
+    if not torch.isfinite(fia_cpu).all():
+        n_nan = int(torch.isnan(fia_cpu).sum().item())
+        raise AssertionError(
+            f"{name}: FIA output has non-finite values (nan_count={n_nan}); "
+            f"attn_finite={bool(torch.isfinite(attn_cpu).all())}"
+        )
+    if not torch.isfinite(attn_cpu).all():
+        raise AssertionError(f"{name}: attn output has non-finite values")
+    if not torch.isfinite(exp_cpu).all():
+        raise AssertionError(f"{name}: golden expected has non-finite values")
+
     diff_golden = (fia_cpu - exp_cpu).abs().max().item()
     diff_attn = (fia_cpu - attn_cpu).abs().max().item()
     print(
@@ -754,6 +765,15 @@ def test_flash_decode_multibatch_vs_attn(device: torch.device) -> None:
         num_kv_heads=num_kv_heads,
     )
     torch.npu.synchronize()
+
+    if not torch.isfinite(out_fia).all():
+        raise AssertionError(
+            f"flash_decode_multibatch_vs_attn: FIA has non-finite values "
+            f"(nan_count={int(torch.isnan(out_fia.float()).sum())}); "
+            f"attn_finite={bool(torch.isfinite(out_attn).all())}"
+        )
+    if not torch.isfinite(out_attn).all():
+        raise AssertionError("flash_decode_multibatch_vs_attn: attn has non-finite values")
 
     diff = (out_fia.float() - out_attn.float()).abs().max().item()
     print(f"flash_decode_multibatch_vs_attn: fia_vs_attn={diff:.6f}")

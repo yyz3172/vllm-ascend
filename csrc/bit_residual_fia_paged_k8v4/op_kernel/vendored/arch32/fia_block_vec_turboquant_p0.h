@@ -1305,9 +1305,20 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
 
     // Dual-AIV S2 split (ops-transformer TQ pattern): sub0=[0,half), sub1=[half,s2Count).
     // Each writes disjoint WS rows via global si → no race; slot size unchanged.
+    // When s2%32!=0 (rem16/rem8/...), dual split correlates with multi-batch NaN;
+    // run the full S2 range on sub0 only until a real dual rem fix lands.
     uint32_t subCoreId = GetBlockIdx() % 2U;
     uint32_t siStart = (s2Count * subCoreId) / 2U;
     uint32_t siEnd = (s2Count * (subCoreId + 1U)) / 2U;
+    if ((s2Count % 32U) != 0U) {
+        if (subCoreId == 0U) {
+            siStart = 0U;
+            siEnd = s2Count;
+        } else {
+            siStart = 0U;
+            siEnd = 0U;
+        }
+    }
     if (siStart >= siEnd) {
         return;
     }
