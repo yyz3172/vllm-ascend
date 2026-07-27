@@ -218,57 +218,43 @@ def _assert_qdq_and_ranges(
     key_dec: dict[str, torch.Tensor],
     value_dec: dict[str, torch.Tensor],
 ) -> None:
-    """QDQ round-trip exactness + sign/range validity (mirrors key1_unaligned)."""
-    # Key QDQ: err_recon = base + q7*step; (err-base)/step == q7.
-    q7 = (key_dec["code"].to(torch.int32) >> 1).to(torch.float32)
-    err_recon = key_dec["base"].unsqueeze(-1) + q7 * key_dec["step"].unsqueeze(-1)
+    """QDQ round-trip exactness + range validity (Key Scheme A uniform)."""
+    q = key_dec["code"].to(torch.float32)
+    y_recon = key_dec["base"].unsqueeze(-1) + q * key_dec["step"].unsqueeze(-1)
     step_valid = key_dec["step"] > 1e-6
     if step_valid.any():
-        q7_rt = (
-            (err_recon - key_dec["base"].unsqueeze(-1))
+        q_rt = (
+            (y_recon - key_dec["base"].unsqueeze(-1))
             / key_dec["step"].unsqueeze(-1).clamp(min=1e-6)
         ).nan_to_num(0.0)
-        q7_err = (q7_rt - q7).abs()
-        max_q7_err = q7_err[step_valid.unsqueeze(-1).expand_as(q7_err)].max().item()
-        assert max_q7_err < 0.5, f"{name}: key QDQ violated, max dev {max_q7_err:.4f}"
+        q_err = (q_rt - q).abs()
+        max_q_err = q_err[step_valid.unsqueeze(-1).expand_as(q_err)].max().item()
+        assert max_q_err < 0.5, f"{name}: key QDQ violated, max dev {max_q_err:.4f}"
 
-    # Value QDQ: y = vmin + idx4*vstep; (y-vmin)/vstep == idx4.
     idx4 = value_dec["idx4"].to(torch.float32)
-    y_recon = value_dec["vmin"].unsqueeze(-1) + idx4 * value_dec["vstep"].unsqueeze(-1)
+    y_recon_v = value_dec["vmin"].unsqueeze(-1) + idx4 * value_dec["vstep"].unsqueeze(-1)
     vstep_valid = value_dec["vstep"] > 1e-6
     if vstep_valid.any():
         idx4_rt = (
-            (y_recon - value_dec["vmin"].unsqueeze(-1))
+            (y_recon_v - value_dec["vmin"].unsqueeze(-1))
             / value_dec["vstep"].unsqueeze(-1).clamp(min=1e-6)
         ).nan_to_num(0.0)
         idx4_err = (idx4_rt - idx4).abs()
         max_idx4_err = idx4_err[vstep_valid.unsqueeze(-1).expand_as(idx4_err)].max().item()
         assert max_idx4_err < 0.5, f"{name}: value QDQ violated, max dev {max_idx4_err:.4f}"
 
-    # Sign-bit consistency: code == (q7<<1) | sign.
-    q7_int = key_dec["code"].to(torch.int32) >> 1
-    sign_int = key_dec["code"].to(torch.int32) & 0x01
-    assert (
-        ((q7_int << 1) | sign_int) == key_dec["code"].to(torch.int32)
-    ).all(), f"{name}: sign-bit consistency violated"
-
-    # Range validity.
-    assert (q7_int >= 0).all() and (q7_int <= 127).all(), f"{name}: q7 out of [0,127]"
+    q_int = key_dec["code"].to(torch.int32)
+    assert (q_int >= 0).all() and (q_int <= 255).all(), f"{name}: q out of [0,255]"
     assert (value_dec["idx4"] <= 15).all(), f"{name}: idx4 out of [0,15]"
     assert (key_dec["step"] >= 0).all(), f"{name}: negative key step"
     assert (value_dec["vstep"] >= 0).all(), f"{name}: negative value vstep"
 
-    # Non-degenerate: most groups must have a real range.
     key_ratio = step_valid.sum().item() / key_dec["step"].numel()
     val_ratio = vstep_valid.sum().item() / value_dec["vstep"].numel()
     assert key_ratio >= 0.5, f"{name}: too many degenerate key groups ({key_ratio:.2f})"
     assert val_ratio >= 0.5, f"{name}: too many degenerate value groups ({val_ratio:.2f})"
-
-    # Sign balance for random input.
-    sign1_frac = (sign_int == 1).sum().item() / sign_int.numel()
-    assert 0.25 <= sign1_frac <= 0.75, f"{name}: sign skew {sign1_frac:.3f}"
     print(
-        f"PASS {name}: dtype={dtype}, qdq=OK, sign=OK({sign1_frac:.2f}), "
+        f"PASS {name}: dtype={dtype}, qdq=OK (uniform Scheme A), "
         f"nondeg=OK(key={key_ratio:.2f},val={val_ratio:.2f})"
     )
 
@@ -418,15 +404,14 @@ def _decode_key_row(cache, block_table, seq_idx, kv_head, abs_pos, block_size, d
     pos_in_block = abs_pos % block_size
     block = cache[block_id, kv_head]
     code = block[pos_in_block * KEY_ROW_CODE_BYTES : pos_in_block * KEY_ROW_CODE_BYTES + HEAD_SIZE].to(torch.int32)
-    q7 = (code >> 1).float()
-    sign = torch.where((code & 0x01) == 0, 1.0, -1.0)
+    q = code.float()
     base = _u8_to_dtype_float(
         block[block_size * KEY_ROW_CODE_BYTES + pos_in_block * ROW_META_BYTES :
               block_size * KEY_ROW_CODE_BYTES + pos_in_block * ROW_META_BYTES + ROW_META_BYTES], dtype)
     step = _u8_to_dtype_float(
         block[block_size * (KEY_ROW_CODE_BYTES + ROW_META_BYTES) + pos_in_block * ROW_META_BYTES :
               block_size * (KEY_ROW_CODE_BYTES + ROW_META_BYTES) + pos_in_block * ROW_META_BYTES + ROW_META_BYTES], dtype)
-    return (base + q7 * step) * sign
+    return base + q * step
 
 
 def _unpack_value_idx4_code(code: torch.Tensor) -> torch.Tensor:

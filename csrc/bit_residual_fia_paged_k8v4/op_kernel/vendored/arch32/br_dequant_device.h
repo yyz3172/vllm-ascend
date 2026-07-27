@@ -12,6 +12,13 @@
  * tile=8 scratch overlays tmpBuff1 tail (dedicated dequantFp* stays 1-row).
  * Dual-AIV S2 split: both subcores dequant disjoint [0,half)/[half,s2) WS rows.
  *
+ * Key quant schemes (must match pack EncodeKeyBatch):
+ *   BR_KEY_UNIFORM_SCHEME=1 (A, default): y = base + q*step, q in [0,255]
+ *   BR_KEY_UNIFORM_SCHEME=2 (B): y = s*(q-127.5); meta0=-127.5*s, meta1=s
+ *   BR_KEY_UNIFORM_SCHEME=3 (C, legacy): y = sign*(base + q7*step),
+ *     code = (q7<<1)|sign; needs 3×fp32 scratch (fp32UbC)
+ * A/B use 2×fp32 scratch; C uses 3×fp32.
+ *
  * Meta P1: each decode tile copies contiguous GM meta0/meta1 runs into two
  * aligned 32B UB buffers, then batch-Casts both runs.
  * This replaces 2*numRows 2B DataCopyPad transactions and 32B-per-row slots
@@ -22,9 +29,6 @@
  * Meta P9b: dequantInt8Buf_ holds up to BR_S2_SUB_MAX packed meta rows so
  * each PA run does one meta DMA+cast, then tiles only decode.
  * P14: BrApplyRowAffine — one column loop, fewer PipeBarriers.
- * P13: BrDecodeKeyTile — merge safe Cast/Muls+Adds chains, fewer barriers.
- * P13b: BrDecodeValueTile Cast→Adds→Cast chain; Key drop non-RAW barriers
- * (LSB-sign layout: And→ShiftRight / ShiftRight→Cast(sign)).
  * P17a: BrApplyRowAffine — unroll headDim=128 (columnLoops=2) Mul/Add.
  * P17b-B: Value +8 folded once per PA run (vmin'=vmin+8*vstep on n rows);
  * BrDecodeValueTile consumes signed Cast(int4) with pre-folded vmin'.
@@ -41,6 +45,14 @@ namespace br_dequant {
 
 using namespace AscendC;
 using br_pack::BR_HEAD_SIZE;
+
+// 1=A asymmetric uniform; 2=B symmetric uniform; 3=C legacy LSB-sign+q7.
+// Default A; tests use A. Compile with -DBR_KEY_UNIFORM_SCHEME=3 for legacy.
+#ifndef BR_KEY_UNIFORM_SCHEME
+#define BR_KEY_UNIFORM_SCHEME 1
+#endif
+static constexpr uint32_t BR_KEY_UNIFORM_SCHEME_ID = BR_KEY_UNIFORM_SCHEME;
+static constexpr bool BR_KEY_SCHEME_LEGACY_SIGN = (BR_KEY_UNIFORM_SCHEME == 3);
 
 static constexpr uint32_t BR_S2_SUB_MAX = 64U;
 // P9b: packed meta0/meta1 runs then FP32 cast rows (up to BR_S2_SUB_MAX).
@@ -222,11 +234,9 @@ __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
     return (x + 31U) & ~31U;
 }
 
-// Key tile: y = sign * (base + q7 * step), code = (q7 << 1) | sign.
-// codesUb: contiguous numRows * headDim uint8.
-// halfScratch / scratchA/B/C: each numRows * headDim elements.
-// outUb: numRows * headDimAlign (CAST writes headDim elems per row).
-// bases/steps: UB tensors containing numRows FP32 values.
+#if BR_KEY_UNIFORM_SCHEME == 3
+// Scheme C (legacy): y = sign * (base + q7 * step), code = (q7 << 1) | sign.
+// halfScratch / scratchA/B/C: each numRows * headDim (3×fp32 + half).
 template <typename OutT>
 __aicore__ inline void BrDecodeKeyTile(
     LocalTensor<uint8_t> codesUb,
@@ -243,10 +253,8 @@ __aicore__ inline void BrDecodeKeyTile(
 {
     const uint32_t N = numRows * headDim;
 
-    // P13: merge back-to-back Cast; keep barriers on RAW deps only.
-    // P13b (LSB-sign layout): And→ShiftRight and ShiftRight→Cast(sign) are
-    // disjoint-UB; Duplicate→And and ShiftRight→Cast(q7) stay RAW-protected
-    // (q7 Cast after the Adds barrier).
+    // P13/P13b LSB-sign: And→ShiftRight and ShiftRight→Cast(sign) are
+    // disjoint-UB; Duplicate→And and ShiftRight→Cast(q7) stay RAW-protected.
     Cast(halfScratch, codesUb, RoundMode::CAST_NONE, N);
     auto codeI16 = scratchA.template ReinterpretCast<int16_t>();
     Cast(codeI16, halfScratch, RoundMode::CAST_RINT, N);
@@ -256,15 +264,11 @@ __aicore__ inline void BrDecodeKeyTile(
     auto signStorage = scratchC.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
 
-    // sign lives in bit0 of the code (code = (q7<<1)|sign).  Isolate it with
-    // a 0x01 mask; no shift needed since it is already the low bit.
     auto signMaskU16 = halfScratch.template ReinterpretCast<uint16_t>();
     Duplicate(signMaskU16, static_cast<uint16_t>(0x01), N);
     PipeBarrier<PIPE_V>();
     And(signStorageU16, codeU16, signMaskU16, N);
 
-    // q7 lives in bits 1..7; shift right by 1 to drop the sign and align q7
-    // to bits 0..6 (0..127).  In-place on codeU16 (scratchA).
     ShiftRight(codeU16, codeU16, static_cast<uint16_t>(1), N);
 
     Cast(scratchB, signStorage, RoundMode::CAST_NONE, N);
@@ -272,7 +276,6 @@ __aicore__ inline void BrDecodeKeyTile(
     Adds(scratchB, scratchB, 1.0f, N);
     PipeBarrier<PIPE_V>();
 
-    // q7 → scratchC; err = base + q7*step → scratchA (overwrites codeI16).
     Cast(scratchC, codeI16, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
     auto metaBroadcast = halfScratch.template ReinterpretCast<float>();
@@ -291,6 +294,46 @@ __aicore__ inline void BrDecodeKeyTile(
         }
     }
 }
+#else
+// Scheme A/B (uniform): code stores q in [0,255] as uint8.
+// A: y = base + q * step
+// B: y = s * (q - 127.5) via meta0=-127.5*s, meta1=s
+// halfScratch / scratchA/B: each numRows * headDim (2×fp32 + half).
+template <typename OutT>
+__aicore__ inline void BrDecodeKeyTile(
+    LocalTensor<uint8_t> codesUb,
+    LocalTensor<half> halfScratch,
+    LocalTensor<float> scratchA,
+    LocalTensor<float> scratchB,
+    LocalTensor<OutT> outUb,
+    LocalTensor<float> bases,
+    LocalTensor<float> steps,
+    uint32_t numRows,
+    uint32_t headDim,
+    uint32_t headDimAlign)
+{
+    const uint32_t N = numRows * headDim;
+
+    // 910B: no float←uint8; widen via half then fp32 (q as float).
+    Cast(halfScratch, codesUb, RoundMode::CAST_NONE, N);
+    Cast(scratchA, halfScratch, RoundMode::CAST_NONE, N);
+    PipeBarrier<PIPE_V>();
+
+    auto metaBroadcast = halfScratch.template ReinterpretCast<float>();
+    BrApplyRowAffine(
+        scratchB, scratchA, bases, steps, metaBroadcast, numRows, headDim);
+
+    if (headDimAlign == headDim) {
+        Cast(outUb, scratchB, RoundMode::CAST_RINT, N);
+        PipeBarrier<PIPE_V>();
+    } else {
+        for (uint32_t row = 0U; row < numRows; ++row) {
+            Cast(outUb[row * headDimAlign], scratchB[row * headDim], RoundMode::CAST_RINT, headDim);
+            PipeBarrier<PIPE_V>();
+        }
+    }
+}
+#endif
 
 // Value tile: y = vmin' + s*vstep, s = Cast(int4) in [-8,7].
 // Caller must pre-fold vmin' = vmin + 8*vstep (P17b-B: once per PA run).
