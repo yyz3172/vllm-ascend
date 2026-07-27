@@ -10,12 +10,11 @@
 
 // BitResidual K8V4 decode primitives for fused attention.
 //
-// Key decode (sign-reversal quantization, no normalization):
-//   sign_bit = code & 0x01 (0=positive, 1=negative)
-//   q7 = code >> 1
-//   sig_vec[d] = 1 - 2*sign_bit → {+1, -1}
-//   err = base + q7 * step (all positive residual)
-//   decoded_K = err * sig_vec (restore original sign per dimension)
+// Key schemes (must match pack EncodeKeyBatch / FIA BrDecodeKeyTile):
+//   BR_KEY_UNIFORM_SCHEME=1 (A, default): y = base + q*step, q = code in [0,255]
+//   BR_KEY_UNIFORM_SCHEME=2 (B): same affine; meta0=-127.5*s, meta1=s
+//   BR_KEY_UNIFORM_SCHEME=3 (C, legacy): code=(q7<<1)|sign;
+//     y = sign_pm * (base + q7*step)
 //
 // Value decode (4-bit uniform, raw vmin/vstep without norm folding):
 //   y = vmin + idx4 * vstep
@@ -24,6 +23,11 @@
 
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
+
+// Keep in sync with bit_residual_pack_k8v4_common.h / br_dequant_device.h.
+#ifndef BR_KEY_UNIFORM_SCHEME
+#define BR_KEY_UNIFORM_SCHEME 1
+#endif
 
 namespace bit_residual_attn {
 
