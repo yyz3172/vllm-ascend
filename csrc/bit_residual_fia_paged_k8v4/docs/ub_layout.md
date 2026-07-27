@@ -75,18 +75,18 @@ tmpBuff1 = 32KB = 32768 B
 | 符号 | Key（tile=8） | Value（tile=13） | 含义 |
 |------|---------------|------------------|------|
 | `kScratchElems` | 8×128=1024 | 13×128=1664 | 一个 decode tile 的元素数 |
-| `kFp32ScratchCount` | **3** | **2** | Key 多一块给 sign |
-| `kScratchBytes` | **14336** | **16640** | `elems×(4×nFp32+2)` |
-| `kStageBytes` | 18432 | 16128 | `32768 − scratch` |
-| `kHalfBytes` | **9216** | **8064** | 每个 staging half 的字节 |
-| 有效 `maxSub` | **≈23** | **≈24** | `min(64, (kHalfBytes−128)/perRow)` |
+| `kFp32ScratchCount` | **2** | **2** | Key 均匀量化后与 Value 同形（无 sign/C） |
+| `kScratchBytes` | **10240** | **16640** | `elems×(4×nFp32+2)` |
+| `kStageBytes` | 22528 | 16128 | `32768 − scratch` |
+| `kHalfBytes` | **11264** | **8064** | 每个 staging half 的字节 |
+| 有效 `maxSub` | **≈29** | **≈24** | `min(64, (kHalfBytes−128)/perRow)` |
 
 ```text
-Key 主例（数字）：
-┌──────── half0 9216B ────────┬──────── half1 9216B ────────┬── scratch 14336B ──┐
-│ run 偶数: codes ∥ out        │ run 奇数: codes ∥ out        │ A+B+C+halfScratch   │
+Key 主例（数字，均匀量化后）：
+┌──────── half0 11264B ───────┬──────── half1 11264B ───────┬── scratch 10240B ──┐
+│ run 偶数: codes ∥ out        │ run 奇数: codes ∥ out        │ A+B+halfScratch     │
 └─────────────────────────────┴─────────────────────────────┴─────────────────────┘
- 0                         9216                        18432                   32768
+ 0                        11264                       22528                   32768
 ```
 
 ### 2.2 单个 staging half：codes ∥ out
@@ -116,33 +116,27 @@ Val 一行: codes  64B + out 256B                 → perRow = 320
 **为何双 half（A1）**
 
 - half0 的 MTE3 还在吐 `out` 时，half1 可先 MTE2 拉下一 run 的 `codes`
-- 与 P18「VEC 末尾预取下一 run」叠加，换流水重叠，代价是 staging 字节减半 → `maxSub` 被压到 ~23
+- 与 P18「VEC 末尾预取下一 run」叠加，换流水重叠；Key 均匀量化把 scratch 3→2 后 `maxSub` 抬到 ~29
 
 ### 2.3 尾部 decode scratch（按 tile，不是按 maxSub）
 
 预留宽度 = **`BR_*_DECODE_TILE_MAX`**（Key 8 / Val 13），与 `maxSub` 无关。
 
-#### Key（3×fp32 + half）
+#### Key（2×fp32 + half；均匀量化）
 
 ```text
 offset = kStageBytes
-┌─ fp32UbA  1024×4 = 4096B ─┐  scratchA
-│ code 的 int16 视图 → 后变 err/y │
-├─ fp32UbB  4096B ──────────┤  scratchB
-│ sign → Cast/Muls/Adds → ±1     │
-├─ fp32UbC  4096B ──────────┤  scratchC
-│ 抽 sign bit → 再变 q7 fp32     │
-├─ halfScratch 1024×2=2048B ┤
-│ u8→half；mask；Brcb 广播区     │
-└───────────────────────────┘  合计 14336B
+┌─ fp32UbA  1024×4 = 4096B ─┐  scratchA：q (u8→fp32)
+├─ fp32UbB  4096B ──────────┤  scratchB：BrApplyRowAffine 输出 y
+├─ halfScratch 1024×2=2048B ┤  u8→half；Brcb 广播区
+└───────────────────────────┘  合计 10240B
 ```
 
 | 块 | 生命周期内角色 |
 |----|----------------|
-| **A** | ① `Cast` 后的 code(int16)；② 右移后的 q7(int16)；③ `BrApplyRowAffine` 输出 `base+q7·step`；④ `×sign` 后的 y |
-| **B** | 专放 **±1** 符号向量，最后与 A 做 `Mul` |
-| **C** | ① `And` 出的 sign bit；② `Cast` 后的 **q7 fp32**（affine 的 `src`） |
-| **halfScratch** | ① `u8→half` 中转；② `Duplicate(0x01)` 掩码；③ reinterpret 成 fp32 给 `Brcb` |
+| **A** | `Cast` 后的 \(q\) fp32（affine 的 `src`） |
+| **B** | \(y=\mathrm{meta0}+q\cdot\mathrm{meta1}\) |
+| **halfScratch** | ① `u8→half` 中转；② reinterpret 成 fp32 给 `Brcb` |
 
 #### Value（2×fp32 + half；无 C）
 
@@ -181,8 +175,8 @@ dequantInt8Buf_ = 2 × 768B = 1536B
 |------|------|----------|------------|
 | packed meta0 | 128 | `base`（B16） | `vmin` |
 | packed meta1 | 128 | `step` | `vstep` |
-| fp32 meta0 | 256 | `Cast` 后的 base | vmin（可被 fold 成 vmin'） |
-| fp32 meta1 | 256 | step | vstep |
+| fp32 meta0 | 256 | `Cast` 后的 base（A）/ −127.5·s（B） | vmin（可被 fold 成 vmin'） |
+| fp32 meta1 | 256 | step（A）/ s（B） | vstep |
 
 **用途**
 
@@ -230,7 +224,7 @@ dequantFp16Buf_ 256B
 
 | Buffer | Key 路径 | Value 路径 | 结论 |
 |--------|----------|------------|------|
-| **`dequantFp32Buf_`** | **不用**。Key 的 `fp32UbC` 在 `tmpBuff1` 尾（tile×128） | 代码把 `fp32UbC = dequantFp32Buf_.Get<float>()`，但 **`BrDecodeValueTile` 只收 A/B**，从未传入 C | 实质 **空转占位**：为了 Key/Value 共用同一套 `fp32UbA/B/C` 局部变量写法 |
+| **`dequantFp32Buf_`** | **不用**（Key 仅 A/B，均在 `tmpBuff1` 尾） | 代码仍可能取假 `fp32UbC`，但 **`BrDecodeValueTile` 只收 A/B** | 实质 **空转占位** |
 | **`dequantFp16Buf_`** | **无任何 `.Get<>()`** | 同左 | **完全闲置**；`halfScratch` 一律 overlay 在 `tmpBuff1` 尾 |
 
 Value 的 **vmin' fold**（`vmin' = vmin + 8·vstep`）发生在：
@@ -245,20 +239,20 @@ Add(meta0Fp32, meta0Fp32, fp32UbA, n);
 ### 4.3 和 `tmpBuff1` scratch 怎么分工（一张图）
 
 ```text
-                    ┌─ 真正干活（P18）──────────────────────────────┐
-                    │ tmpBuff1 尾：tile 级 A / B [/C] / halfScratch │
+                    ┌─ 真正干活（均匀 Key）────────────────────────┐
+                    │ tmpBuff1 尾：tile 级 A / B / halfScratch     │
                     │ meta：dequantInt8Buf_ 双槽                     │
                     └───────────────────────────────────────────────┘
 
                     ┌─ 仍 Init、几乎不读写 ─────────────────────────┐
-                    │ dequantFp32Buf_ 1536B  Value 的假 fp32UbC     │
+                    │ dequantFp32Buf_ 1536B  遗留假 fp32UbC         │
                     │ dequantFp16Buf_  256B  无引用                  │
                     └───────────────────────────────────────────────┘
 ```
 
 | 需要的空间 | 放哪里 | 宽度 |
 |------------|--------|------|
-| Key 位提取 + affine（A/B/C + half） | `tmpBuff1` 尾 | `8×128` |
+| Key u8→fp32 + affine（A/B + half） | `tmpBuff1` 尾 | `8×128` |
 | Value int4 + affine（A/B + half） | `tmpBuff1` 尾 | `13×128` |
 | Value vmin' fold 短向量 | **复用** `tmpBuff1` 的 `fp32UbA` 前 `n` 元 | `n≤64` |
 | 行 meta packed + fp32 | `dequantInt8Buf_` | 最多 64 行 |
@@ -267,8 +261,7 @@ Add(meta0Fp32, meta0Fp32, fp32UbA, n);
 ### 4.4 为何还留着
 
 1. **Init 口径未删**：注释仍按「dedicated 1-row」申请，避免和早期单行 decode / `architecture.md` 布局脱节。  
-2. **Value 的 `fp32UbC` 赋值**：`isKey ? tmpBuff1.C : dequantFp32Buf_` 让两侧局部变量形状一致；Value 不传 C，缓冲内容不被读。  
-3. **可回收空间**：若确认无单行回退路径，可去掉这两块（约 **1.75KB** 常驻 UB），不影响 `maxSub`（`maxSub` 只吃 `tmpBuff1` staging）。
+2. **可回收空间**：若确认无单行回退路径，可去掉这两块（约 **1.75KB** 常驻 UB），不影响 `maxSub`（`maxSub` 只吃 `tmpBuff1` staging）。
 
 ---
 
@@ -290,8 +283,8 @@ GM pack cache                    GM dequant workspace
 └───────────────────────────┘
              │
 ┌─ tmpBuff1 scratch ────────┐
-│ Key: A/B/C/half 位提取+affine │
-│ Val: A/B/half   int4+affine   │
+│ Key: A/B/half  u8+affine      │
+│ Val: A/B/half  int4+affine    │
 └───────────────────────────────┘
 ```
 
@@ -322,10 +315,10 @@ run r:   Wait V_MTE3 → MTE3(out_r)
 | 项 | 值 |
 |----|-----|
 | `tmpBuff1` | 32768 |
-| Key scratch | 14336（3×fp32×1024 + half×1024） |
-| Key 单 half | 9216 |
+| Key scratch | 10240（2×fp32×1024 + half×1024） |
+| Key 单 half | 11264 |
 | Key `perRow` | 384 |
-| Key `maxSub` | \(\lfloor(9216-128)/384\rfloor=23\) |
+| Key `maxSub` | \(\lfloor(11264-128)/384\rfloor=29\) |
 | meta 单槽 | 768；双槽 1536 |
 | meta 行上限 | 64（今日松于 staging） |
 | A1 双 half 硬顶（scratch→0） | \(\lfloor(16384-128)/384\rfloor=42\) |
@@ -336,10 +329,10 @@ run r:   Wait V_MTE3 → MTE3(out_r)
 
 | 常量 / 逻辑 | 文件 |
 |-------------|------|
-| `BR_S2_SUB_MAX`、`BR_DEQUANT_UB_BYTES*`、`BR_*_DECODE_TILE_MAX` | `br_dequant_device.h` |
+| `BR_S2_SUB_MAX`、`BR_DEQUANT_UB_BYTES*`、`BR_*_DECODE_TILE_MAX`、`BR_KEY_UNIFORM_SCHEME` | `br_dequant_device.h` |
 | `InitBuffers`、Que/Softmax/`dequant*` 申请 | `fia_block_vec_turboquant_p0.h` |
 | `kStageBytes` / `kHalfBytes` / `maxSub` / half 内 `codes∥out` | `DequantKvImpl` 同文件 |
 
 ---
 
-*文档状态：说明现网 P18 布局。若改为方案 A/B（减少 Key `nFp32`）或取消 A1，应同步改 §2 数字与图。*
+*文档状态：Key 均匀量化方案 A（`nFp32=2`，`maxSub≈29`）。方案 B 同 UB 账；A/B 性能见 `tools/.../key_uniform_ab_report.md`。*

@@ -16,8 +16,12 @@ KEY_BLOCK_STRIDE = BLOCK_ROWS * (HEAD_SIZE + 4)  # 2112
 VALUE_BLOCK_STRIDE = BLOCK_ROWS * (HEAD_SIZE // 2 + 4)  # 1088
 KEY_ROW_CODE_BYTES = HEAD_SIZE
 VALUE_ROW_CODE_BYTES = HEAD_SIZE // 2
-KEY_QUANT_LEVELS = 127
+KEY_QUANT_LEVELS = 255
+KEY_Q7_LEVELS = 127
 VAL_QUANT_LEVELS = 15
+# 1=A asymmetric uniform, 2=B symmetric uniform, 3=C legacy LSB-sign+q7.
+# Must match BR_KEY_UNIFORM_SCHEME (default A; tests use A).
+KEY_UNIFORM_SCHEME = int(__import__("os").environ.get("BR_KEY_UNIFORM_SCHEME", "1"))
 
 
 def key_code_offset(pos_in_block: int) -> int:
@@ -74,12 +78,16 @@ def decode_key_row(
     base: float,
     step: float,
 ) -> torch.Tensor:
-    code = codes.to(torch.int32)
-    q7 = (code & 0x7F).float()
-    sign = (code >> 7).float()
-    sign_val = torch.where(sign == 0, 1.0, -1.0)
-    err = base + q7 * step
-    return err * sign_val
+    if KEY_UNIFORM_SCHEME == 3:
+        # Legacy: code = (q7 << 1) | sign; y = sign_pm * (base + q7 * step)
+        codes_i = codes.to(torch.int32)
+        sign_bit = codes_i & 1
+        q7 = (codes_i >> 1).to(torch.float32)
+        # Device: Cast(sign) → Muls(-2) → Adds(1) ⇒ 0→+1, 1→−1
+        sign_pm = 1.0 - 2.0 * sign_bit.to(torch.float32)
+        return sign_pm * (base + q7 * step)
+    q = codes.to(torch.float32)
+    return base + q * step
 
 
 def decode_value_row(
@@ -92,20 +100,48 @@ def decode_value_row(
 
 
 def encode_key_row(y: torch.Tensor, dtype: torch.dtype = torch.float16) -> tuple[torch.Tensor, float, float]:
-    """Pack-side K8 encode (matches bit_residual_pack_k8v4_aiv.h semantics)."""
+    """Pack-side K8 encode (matches bit_residual_pack_k8v4_aiv.h schemes A/B/C)."""
     y_f = y.to(torch.float32)
-    m = y_f.abs().max().item()
-    m = max(m, 1.0e-12)
-    abs_norm = y_f.abs() / m
-    base_norm = abs_norm.min().item()
-    step_norm = (1.0 - base_norm) / KEY_QUANT_LEVELS if base_norm < 1.0 else 1.0
-    step_norm = max(step_norm, 1.0e-6)
-    q7 = torch.round((abs_norm - base_norm) / step_norm).clamp_(0, KEY_QUANT_LEVELS).to(torch.int32)
-    sign = (y_f < 0).to(torch.int32)
-    code = (q7 | (sign << 7)).to(torch.uint8)
-    base = base_norm * m
-    step = step_norm * m
-    return code, float(torch.tensor(base, dtype=dtype)), float(torch.tensor(step, dtype=dtype))
+    if KEY_UNIFORM_SCHEME == 3:
+        # Legacy LSB-sign + q7 on |y|
+        sign = (y_f < 0).to(torch.int32)
+        abs_y = y_f.abs()
+        ymin = abs_y.min().item()
+        ymax = abs_y.max().item()
+        step = (ymax - ymin) / KEY_Q7_LEVELS
+        step = max(step, 1.0e-6)
+        q7 = torch.round((abs_y - ymin) / step).clamp_(0, KEY_Q7_LEVELS).to(torch.int32)
+        code = ((q7 << 1) | sign).to(torch.uint8)
+        return (
+            code,
+            float(torch.tensor(ymin, dtype=dtype)),
+            float(torch.tensor(step, dtype=dtype)),
+        )
+    if KEY_UNIFORM_SCHEME == 2:
+        abs_max = max(y_f.abs().max().item(), 1.0e-6)
+        scale = abs_max / 127.5
+        scale = max(scale, 1.0e-6)
+        q = torch.round(y_f / scale + 127.5).clamp_(0, KEY_QUANT_LEVELS).to(torch.int32)
+        code = q.to(torch.uint8)
+        meta0 = -127.5 * scale
+        meta1 = scale
+        return (
+            code,
+            float(torch.tensor(meta0, dtype=dtype)),
+            float(torch.tensor(meta1, dtype=dtype)),
+        )
+    # Scheme A: asymmetric uniform
+    ymin = y_f.min().item()
+    ymax = y_f.max().item()
+    step = (ymax - ymin) / KEY_QUANT_LEVELS
+    step = max(step, 1.0e-6)
+    q = torch.round((y_f - ymin) / step).clamp_(0, KEY_QUANT_LEVELS).to(torch.int32)
+    code = q.to(torch.uint8)
+    return (
+        code,
+        float(torch.tensor(ymin, dtype=dtype)),
+        float(torch.tensor(step, dtype=dtype)),
+    )
 
 
 def encode_value_row(y: torch.Tensor, dtype: torch.dtype = torch.float16) -> tuple[torch.Tensor, float, float]:

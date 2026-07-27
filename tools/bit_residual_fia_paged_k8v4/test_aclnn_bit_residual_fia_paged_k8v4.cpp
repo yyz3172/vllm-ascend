@@ -274,8 +274,8 @@ vector<uint8_t> BuildKeyCacheHost()
             uint8_t *head = data.data() + static_cast<size_t>((blk * kNumKvHeads + n2) * headStride);
             for (uint32_t sb = 0; sb < subBlocks; ++sb) {
                 uint8_t *tile = head + sb * kBrKeyTileBytes;
-                // codes: mid-range unsigned q7 with sign=0
-                memset(tile, 0x40, kBrBlockRows * 128U);
+                // codes: mid-range unsigned q in [0,255]
+                memset(tile, 0x80, kBrBlockRows * 128U);
                 // base / step: fp16 1.0 for each of 16 rows
                 uint16_t *base = reinterpret_cast<uint16_t *>(tile + kBrBlockRows * 128U);
                 uint16_t *step = reinterpret_cast<uint16_t *>(tile + kBrBlockRows * 130U);

@@ -25,10 +25,12 @@ Key / Value 在 AIV 上按 **tile（多行）** 解码：先把 pack 码还原�
 
 | 路径 | 入口 | 公式（每行一套 meta） |
 |------|------|----------------------|
-| Key K8 | `BrDecodeKeyTile` | \(y = \mathrm{sign}_{\pm1}\cdot(\mathrm{base}+q7\cdot\mathrm{step})\) |
+| Key K8 | `BrDecodeKeyTile` | **方案 A（默认）**：\(y=\mathrm{base}+q\cdot\mathrm{step}\)，\(q\in[0,255]\)；方案 B：\(y=s\cdot(q-127.5)\)；**方案 C（legacy）**：\(y=\mathrm{sign}_{\pm1}\cdot(\mathrm{base}+q7\cdot\mathrm{step})\)，`code=(q7<<1)|sign` |
 | Value V4 | `BrDecodeValueTile` | \(y=\mathrm{vmin}'+s\cdot\mathrm{vstep}\)，\(s=\mathrm{Cast}(\mathrm{int4})\in[-8,7]\)；\(\mathrm{vmin}'=\mathrm{vmin}+8\cdot\mathrm{vstep}\)（P17b-B：PA run 级折算） |
 
 两边共用 `BrApplyRowAffine`：对 `[numRows, headDim]` 做 **按行广播** 的 `dst = src * scale + offset`。
+
+开关：`BR_KEY_UNIFORM_SCHEME`（**1=A 默认**，2=B，3=C）。pack encode 与 FIA decode 必须同值。现网与测试用 A；C 仅作对照/回退编译。A/B 实测见 [`key_uniform_ab_report.md`](../../../tools/bit_residual_fia_paged_k8v4/docs/key_uniform_ab_report.md)。
 
 Pack 布局、PA 寻址等见 [`architecture.md`](architecture.md)。
 
@@ -36,47 +38,42 @@ Pack 布局、PA 寻址等见 [`architecture.md`](architecture.md)。
 
 ## 2. Key Decode
 
-### 2.1 Pack 约定（LSB sign）
+### 2.1 Pack 约定（均匀量化）
 
-上游当前布局：
+**方案 A（默认，现网）**：
 
 \[
-\mathrm{code} = (q7 \ll 1) \mid \mathrm{sign},\quad q7\in[0,127],\ \mathrm{sign}\in\{0,1\}
+\mathrm{base}=\min(y),\quad
+\mathrm{step}=(\max-\min)/255,\quad
+q=\mathrm{round}((y-\mathrm{base})/\mathrm{step})\in[0,255]
 \]
 
-- sign 在 **bit0（LSB）**
-- q7 在 **bits 1..7**，`>> 1` 取出
+整字节存 \(q\)；meta 仍为 **base + step**（各 2B/行），SoA 布局不变。
 
-> 历史曾用 MSB sign：`code = q7 | (sign << 7)`。与 LSB 不兼容，rebase 时必须跟 pack 约定对齐。
+**方案 B（spike）**：\(s=\max(|y|,\varepsilon)/127.5\)，\(q=\mathrm{round}(y/s+127.5)\)；meta0=\(-127.5\cdot s\)，meta1=\(s\)（双槽兼容，不改 pack stride）。
 
-### 2.2 流水
+**方案 C（legacy LSB-sign，`BR_KEY_UNIFORM_SCHEME=3`）**：对 \(|y|\) 做 7bit 均匀 + 符号位；`code=(q7<<1)|sign`；decode 需 **3×fp32** scratch。默认不启用；编译打开后可与 A 对照。
+
+> 历史 MSB sign 与 LSB/均匀码均不兼容。
+
+### 2.2 流水（方案 A / B 同形）
 
 ```
 codesUb [numRows × headDim] uint8
         │
-        ▼ Cast uint8→half→int16          (P13: 合并相邻 Cast)
+        ▼ Cast uint8→half→fp32           (910B 无 float←uint8)
         │
-        ├─ And 0x01  → signStorage       (LSB sign)
-        └─ >> 1      → q7 in codeU16
+        ▼ BrApplyRowAffine               (scratchA=q, scratchB=y)
+   y = meta0 + q * meta1
         │
-        ├─ sign: Cast→Muls(-2)→Adds(1) → ±1  (scratchB)
-        └─ q7:   Cast→FP32                 (scratchC)
-                    │
-                    ▼ BrApplyRowAffine
-               err = base + q7 * step      (scratchA)
-                    │
-                    ▼ Mul(err, ±1)
-               y_fp32
-                    │
-                    ▼ Cast → outUb (headDim 或按行写到 headDimAlign)
+        ▼ Cast → outUb (headDim 或按行写到 headDimAlign)
 ```
 
 要点：
 
-- `Duplicate(0x01)` → `And` 需要 barrier（RAW：mask）
-- `And` → `ShiftRight`、`ShiftRight` → `Cast(sign)` 写不同 UB，P13b 可去掉中间 barrier
-- `Cast(q7)` 依赖 `ShiftRight` 写完；由 Adds 链后的 barrier 一并保护
-
+- 已去掉 `And` / `ShiftRight` / sign→±1 / `Mul(sign)` 与 **fp32UbC**
+- Key scratch：**2×fp32 + half**（与 Value 同形）；`kFp32ScratchCount=2`
+- 方案 B 仍走同一 affine：pack 把中心化折进 meta0
 ---
 
 ## 3. Value Decode
@@ -120,7 +117,7 @@ BrApplyRowAffine(dst, src, offsets, scales, broadcast, numRows, headDim);
 
 | 参数 | Key | Value |
 |------|-----|-------|
-| `src` | q7（FP32） | \(s\)（有符号 int4→FP32） |
+| `src` | \(q\)（u8→FP32，0..255） | \(s\)（有符号 int4→FP32） |
 | `scales` | step | vstep |
 | `offsets` | base | \(\mathrm{vmin}'\)（P17b-B 已折入 \(+8\cdot\mathrm{vstep}\)） |
 

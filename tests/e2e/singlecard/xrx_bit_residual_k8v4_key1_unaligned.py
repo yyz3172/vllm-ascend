@@ -190,22 +190,13 @@ def _decode_value_cache(cache: torch.Tensor, slots: torch.Tensor, dtype: torch.d
 def _reconstruct_key_vectors(key_dec: dict[str, torch.Tensor]) -> torch.Tensor:
     """Reconstruct approximate rotated vectors from decoded key cache data.
 
-    Sign-reversal decode (no normalization):
-    code = (q7 << 1) | sign_bit
-    q7 = code >> 1, sign_bit = code & 0x01
-    sig_vec = 1 - 2*sign_bit → {+1.0 (sign_bit=0), -1.0 (sign_bit=1)}
-    err = base + q7 * step  (positive residual)
-    decoded = err * sig_vec  (restore original sign per dimension)
+    Scheme A uniform: y = base + q * step, q = code in [0,255].
     """
     code = key_dec["code"]
     base = key_dec["base"]
     step = key_dec["step"]
-    q7 = (code.to(torch.int32) >> 1).to(torch.float32)
-    sign_bit = (code.to(torch.int32) & 0x01).to(torch.float32)
-    sig_vec = 1.0 - 2.0 * sign_bit  # {+1.0, -1.0}
-    err = base.unsqueeze(-1) + q7 * step.unsqueeze(-1)
-    y = err * sig_vec
-    return y
+    q = code.to(torch.float32)
+    return base.unsqueeze(-1) + q * step.unsqueeze(-1)
 
 
 def _reconstruct_value_vectors(value_dec: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -226,47 +217,22 @@ def _assert_match(
     key_dec: dict[str, torch.Tensor],
     value_dec: dict[str, torch.Tensor],
 ) -> None:
-    """Verify NPU cache correctness.
+    """Verify NPU cache correctness for Key Scheme A uniform + Value V4."""
 
-    Since the kernel's Cube Mmad produces different rounding than torch.matmul
-    (even in the same dtype on the same NPU), we cannot reproduce the kernel's
-    pre-quantization output externally. Instead, we verify a chain of properties:
-
-    1. **QDQ round-trip exactness**: decoded q7/idx4 must precisely reconstruct
-       the stored base/step/vmin/vstep — (err_recon - base)/step = q7 and
-       (y_recon - vmin)/vstep = idx4. Catches wrong packing, wrong decode logic.
-    2. **Sign-bit consistency**: code = (q7 << 1) | sign must hold for every byte.
-       Catches wrong bit-split logic.
-    3. **Encoding range validity**: q7 ∈ [0,127], idx4 ∈ [0,15], step/vstep ≥ 0.
-       Catches encoding overflow/underflow.
-    4. **Non-degenerate check**: random input should produce non-zero range
-       in most groups (step > 0). Catches kernel that outputs constant vectors.
-    5. **Sign bit balance**: for random input, sign=1 fraction should be
-       roughly balanced ([0.25, 0.75]). Catches kernel that always sets sign=0
-       or sign=1 regardless of input.
-    """
-
-    # 1. QDQ round-trip exactness.
-    # Key: err_recon = base + q7*step. Verify (err_recon - base) / step = q7.
-    # For degenerate groups (step=1, q7=0), err_recon=base, so 0/1=0=q7 — OK.
-    q7 = (key_dec["code"].to(torch.int32) >> 1).to(torch.float32)
-    err_recon = key_dec["base"].unsqueeze(-1) + q7 * key_dec["step"].unsqueeze(-1)
+    q = key_dec["code"].to(torch.float32)
+    y_recon = key_dec["base"].unsqueeze(-1) + q * key_dec["step"].unsqueeze(-1)
     step_valid = key_dec["step"] > 1e-6
     if step_valid.any():
-        q7_roundtrip = (
-            (err_recon - key_dec["base"].unsqueeze(-1))
+        q_rt = (
+            (y_recon - key_dec["base"].unsqueeze(-1))
             / key_dec["step"].unsqueeze(-1).clamp(min=1e-6)
-        )
-        q7_err = (q7_roundtrip - q7).abs()
-        # Filter to only valid groups and replace NaN with 0 (from degenerate rows)
-        q7_err = q7_err.nan_to_num(0.0)
-        max_q7_err = q7_err[step_valid.unsqueeze(-1).expand_as(q7_err)].max().item()
-        assert max_q7_err < 0.5, (
-            f"{name}: key QDQ round-trip violated: max deviation={max_q7_err:.4f} "
-            f"(should be < 0.5)"
+        ).nan_to_num(0.0)
+        q_err = (q_rt - q).abs()
+        max_q_err = q_err[step_valid.unsqueeze(-1).expand_as(q_err)].max().item()
+        assert max_q_err < 0.5, (
+            f"{name}: key QDQ round-trip violated: max deviation={max_q_err:.4f}"
         )
 
-    # Value: y_recon = vmin + idx4*vstep. Verify round-trip.
     idx4 = value_dec["idx4"].to(torch.float32)
     y_val_recon = value_dec["vmin"].unsqueeze(-1) + idx4 * value_dec["vstep"].unsqueeze(-1)
     vstep_valid = value_dec["vstep"] > 1e-6
@@ -275,57 +241,27 @@ def _assert_match(
             (y_val_recon - value_dec["vmin"].unsqueeze(-1))
             / value_dec["vstep"].unsqueeze(-1).clamp(min=1e-6)
         )
-        idx4_err = (idx4_roundtrip - idx4).abs()
-        idx4_err = idx4_err.nan_to_num(0.0)
+        idx4_err = (idx4_roundtrip - idx4).abs().nan_to_num(0.0)
         max_idx4_err = idx4_err[vstep_valid.unsqueeze(-1).expand_as(idx4_err)].max().item()
         assert max_idx4_err < 0.5, (
-            f"{name}: value QDQ round-trip violated: max deviation={max_idx4_err:.4f} "
-            f"(should be < 0.5)"
+            f"{name}: value QDQ round-trip violated: max deviation={max_idx4_err:.4f}"
         )
 
-    # 2. Sign-bit consistency: code = (q7 << 1) | sign for every byte.
-    q7_int = key_dec["code"].to(torch.int32) >> 1
-    sign_int = key_dec["code"].to(torch.int32) & 0x01
-    reconstructed_code = (q7_int << 1) | sign_int.to(torch.int32)
-    assert (reconstructed_code == key_dec["code"].to(torch.int32)).all(), (
-        f"{name}: sign-bit consistency violated: code != (q7<<1)|sign"
+    q_int = key_dec["code"].to(torch.int32)
+    assert (q_int >= 0).all() and (q_int <= 255).all(), (
+        f"{name}: q out of [0,255] range"
     )
-
-    # 3. Encoding range validity.
-    assert (q7_int >= 0).all() and (q7_int <= 127).all(), (
-        f"{name}: q7 out of [0,127] range"
-    )
-    assert (value_dec["idx4"] <= 15).all(), (
-        f"{name}: idx4 out of [0,15] range"
-    )
+    assert (value_dec["idx4"] <= 15).all(), f"{name}: idx4 out of [0,15]"
     assert (key_dec["step"] >= 0).all(), f"{name}: negative key step"
     assert (value_dec["vstep"] >= 0).all(), f"{name}: negative value vstep"
 
-    # 4. Non-degenerate check: at least 50% of groups should have step > 0.
-    # (sign-reversal quantization can produce more degenerate groups with narrow ranges)
-    key_ratio = (step_valid.sum().item() / key_dec["step"].numel())
-    val_ratio = (vstep_valid.sum().item() / value_dec["vstep"].numel())
-    assert key_ratio >= 0.5, (
-        f"{name}: too many degenerate key groups: "
-        f"{step_valid.sum().item()}/{key_dec['step'].numel()} "
-        f"(ratio={key_ratio:.2f}, expected >= 0.5)"
-    )
-    assert val_ratio >= 0.5, (
-        f"{name}: too many degenerate value groups: "
-        f"{vstep_valid.sum().item()}/{value_dec['vstep'].numel()} "
-        f"(ratio={val_ratio:.2f}, expected >= 0.5)"
-    )
-
-    # 5. Sign bit balance: sign=1 fraction in [0.25, 0.75].
-    sign1_frac = (sign_int == 1).sum().item() / sign_int.numel()
-    assert 0.25 <= sign1_frac <= 0.75, (
-        f"{name}: sign bit distribution skewed: "
-        f"sign=1 fraction={sign1_frac:.3f} (expected [0.25, 0.75])"
-    )
+    key_ratio = step_valid.sum().item() / key_dec["step"].numel()
+    val_ratio = vstep_valid.sum().item() / value_dec["vstep"].numel()
+    assert key_ratio >= 0.5, f"{name}: too many degenerate key groups ({key_ratio:.2f})"
+    assert val_ratio >= 0.5, f"{name}: too many degenerate value groups ({val_ratio:.2f})"
 
     print(
-        f"PASS {name}: dtype={dtype}, "
-        f"qdq=OK, sign=OK({sign1_frac:.2f}), "
+        f"PASS {name}: dtype={dtype}, qdq=OK (uniform Scheme A), "
         f"nondeg=OK(key={key_ratio:.2f},val={val_ratio:.2f})"
     )
 
