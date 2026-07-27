@@ -1312,36 +1312,68 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         return;
     }
 
-    // A1 dual-buffer staging in tmpBuff1 front; decode scratch in the tail
-    // (shared). Key Scheme A/B: 2×fp32; Scheme C (legacy sign): 3×fp32.
+    // A1 dual-buffer staging in tmpBuff1 front; decode scratch in the tail.
+    // fp16 (WS_T=half, Scheme A/B): 2×half scratch, half affine, no CAST #1.
+    // bf16 / Scheme C: 2×fp32 (+optional C) + half widen, fp32 affine.
     // Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
+    constexpr bool kUseHalfAffine =
+#if BR_KEY_UNIFORM_SCHEME == 3
+        false;
+#else
+        IsSameType<WS_T, half>::value;
+#endif
     const uint32_t kTileMax = isKey
         ? br_dequant::BR_KEY_DECODE_TILE_MAX
         : br_dequant::BR_VALUE_DECODE_TILE_MAX;
     const uint32_t kScratchElems = kTileMax * br_pack::BR_HEAD_SIZE;
-    const uint32_t kFp32ScratchCount =
-        (isKey && br_dequant::BR_KEY_SCHEME_LEGACY_SIGN) ? 3U : 2U;
+    // half path: halfSrc + halfBroadcast + 32B-aligned meta0/meta1 (16 half each).
+    constexpr uint32_t kMetaAlignElems = 16U;
+    const uint32_t kFp32ScratchCount = kUseHalfAffine
+        ? 0U
+        : ((isKey && br_dequant::BR_KEY_SCHEME_LEGACY_SIGN) ? 3U : 2U);
     const uint32_t kFp32ScratchBytes =
         kScratchElems * kFp32ScratchCount * static_cast<uint32_t>(sizeof(float));
-    const uint32_t kFp16ScratchBytes =
-        kScratchElems * static_cast<uint32_t>(sizeof(half));
+    const uint32_t kFp16ScratchBytes = kUseHalfAffine
+        ? (kScratchElems * 2U + kMetaAlignElems * 2U) *
+              static_cast<uint32_t>(sizeof(half))
+        : kScratchElems * static_cast<uint32_t>(sizeof(half));
     const uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes;
     const uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;
     const uint32_t kHalfBytes = kStageBytes / 2U;
 
-    LocalTensor<float> fp32UbA =
-        tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
-    LocalTensor<float> fp32UbB =
-        tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes + kScratchElems * sizeof(float));
+    LocalTensor<float> fp32UbA;
+    LocalTensor<float> fp32UbB;
 #if BR_KEY_UNIFORM_SCHEME == 3
-    LocalTensor<float> fp32UbC = isKey
-        ? tmpBuff1.GetWithOffset<float>(
-            kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float))
-        : dequantFp32Buf_.Get<float>();
+    LocalTensor<float> fp32UbC;
 #endif
-    LocalTensor<half> halfScratch =
-        tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes + kFp32ScratchBytes);
+    LocalTensor<half> halfScratch;
+    LocalTensor<half> halfSrc;
+    LocalTensor<half> halfBroadcast;
+    LocalTensor<half> meta0Align;
+    LocalTensor<half> meta1Align;
+    if constexpr (kUseHalfAffine) {
+        halfSrc = tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes);
+        halfBroadcast = tmpBuff1.GetWithOffset<half>(
+            kScratchElems, kStageBytes + kScratchElems * sizeof(half));
+        const uint32_t metaAlignOff =
+            kStageBytes + kScratchElems * 2U * sizeof(half);
+        meta0Align = tmpBuff1.GetWithOffset<half>(kMetaAlignElems, metaAlignOff);
+        meta1Align = tmpBuff1.GetWithOffset<half>(
+            kMetaAlignElems, metaAlignOff + kMetaAlignElems * sizeof(half));
+    } else {
+        fp32UbA = tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
+        fp32UbB = tmpBuff1.GetWithOffset<float>(
+            kScratchElems, kStageBytes + kScratchElems * sizeof(float));
+#if BR_KEY_UNIFORM_SCHEME == 3
+        fp32UbC = isKey
+            ? tmpBuff1.GetWithOffset<float>(
+                  kScratchElems, kStageBytes + kScratchElems * 2U * sizeof(float))
+            : dequantFp32Buf_.Get<float>();
+#endif
+        halfScratch = tmpBuff1.GetWithOffset<half>(
+            kScratchElems, kStageBytes + kFp32ScratchBytes);
+    }
 
     GlobalTensor<uint8_t> srcGm = isKey ? keyCacheGm_ : valueCacheGm_;
     GlobalTensor<WS_T> dstWsGm = isKey ? dequantKeyWsGm_ : dequantValueWsGm_;
@@ -1373,8 +1405,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         }
     }
 
-    // P9b: one meta DMA+cast per run. meta0Fp32[j0] must stay 32B-aligned for
-    // Brcb, so decode tile step is a multiple of 8 floats.
+    // P9b: one meta DMA(+cast) per run. meta[j0] must stay 32B-aligned for
+    // Brcb: fp32 path step multiple of 8 floats; half path stages into
+    // 16-half aligned buffers each tile.
     constexpr uint32_t kMetaSliceAlign = 8U;
     const uint32_t hoistTile = (kTileMax < kMetaSliceAlign)
         ? kTileMax
@@ -1392,10 +1425,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         const uint32_t metaSlotOff = bufIdx * br_dequant::BR_META_SLOT_BYTES;
         LocalTensor<uint8_t> packedMetaUb = dequantInt8Buf_.GetWithOffset<uint8_t>(
             br_dequant::BR_DEQUANT_UB_BYTES, metaSlotOff);
-        LocalTensor<float> meta0Fp32 = packedMetaUb[
-            br_dequant::BR_META_FP32_0_UB_OFF].template ReinterpretCast<float>();
-        LocalTensor<float> meta1Fp32 = packedMetaUb[
-            br_dequant::BR_META_FP32_1_UB_OFF].template ReinterpretCast<float>();
         LocalTensor<uint8_t> batchUb =
             tmpBuff1.GetWithOffset<uint8_t>(kHalfBytes, bufIdx * kHalfBytes);
 
@@ -1461,41 +1490,95 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         LocalTensor<WS_T> outBatch =
             batchUb[outOff].template ReinterpretCast<WS_T>();
 
-        br_dequant::BrCastPackedMetaToFp32<Q_T>(
-            packedMetaUb, n, meta0Fp32, meta1Fp32);
-        if (isKey) {
-            for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
-                uint32_t nb = n - j0;
-                if (nb > hoistTile) {
-                    nb = hoistTile;
+        if constexpr (kUseHalfAffine) {
+            // Meta: half→fp32 once (n scalars, uses existing aligned fp32 slots),
+            // then per-tile fp32→half into 32B-aligned meta0/1Align.
+            // Avoids unaligned half src at metaHalf[j0] when j0%16!=0 (VEC fault).
+            LocalTensor<float> meta0Fp32 = packedMetaUb[
+                br_dequant::BR_META_FP32_0_UB_OFF].template ReinterpretCast<float>();
+            LocalTensor<float> meta1Fp32 = packedMetaUb[
+                br_dequant::BR_META_FP32_1_UB_OFF].template ReinterpretCast<float>();
+            br_dequant::BrCastPackedMetaToFp32<Q_T>(
+                packedMetaUb, n, meta0Fp32, meta1Fp32);
+
+            LocalTensor<half> outHalf = outBatch.template ReinterpretCast<half>();
+
+            if (isKey) {
+                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
+                    uint32_t nb = n - j0;
+                    if (nb > hoistTile) {
+                        nb = hoistTile;
+                    }
+                    Cast(meta0Align, meta0Fp32[j0], RoundMode::CAST_NONE, nb);
+                    Cast(meta1Align, meta1Fp32[j0], RoundMode::CAST_NONE, nb);
+                    PipeBarrier<PIPE_V>();
+                    br_dequant::BrDecodeKeyTileHalf(
+                        batchUb[j0 * codeRowBytes], halfSrc, halfBroadcast,
+                        outHalf[j0 * headDimAlign], meta0Align, meta1Align,
+                        nb, headDim, headDimAlign);
                 }
-#if BR_KEY_UNIFORM_SCHEME == 3
-                br_dequant::BrDecodeKeyTile(
-                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
-                    outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
-                    nb, headDim, headDimAlign);
-#else
-                br_dequant::BrDecodeKeyTile(
-                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
-                    outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
-                    nb, headDim, headDimAlign);
-#endif
+            } else {
+                // P17b-B fold in fp32 (aligned), then tiles Cast→half affine.
+                auto fp32FoldTmp = halfSrc.template ReinterpretCast<float>();
+                Muls(fp32FoldTmp, meta1Fp32, 8.0f, n);
+                Add(meta0Fp32, meta0Fp32, fp32FoldTmp, n);
+                PipeBarrier<PIPE_V>();
+                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
+                    uint32_t nb = n - j0;
+                    if (nb > hoistTile) {
+                        nb = hoistTile;
+                    }
+                    Cast(meta0Align, meta0Fp32[j0], RoundMode::CAST_NONE, nb);
+                    Cast(meta1Align, meta1Fp32[j0], RoundMode::CAST_NONE, nb);
+                    PipeBarrier<PIPE_V>();
+                    br_dequant::BrDecodeValueTileHalf(
+                        batchUb[j0 * codeRowBytes], halfSrc, halfBroadcast,
+                        outHalf[j0 * headDimAlign], meta0Align, meta1Align,
+                        nb, headDim, headDimAlign);
+                }
             }
         } else {
-            // P17b-B: fold +8 into vmin once per PA run (n rows), then tiles
-            // decode signed int4 against vmin' (fp32UbA reused as scratch).
-            Muls(fp32UbA, meta1Fp32, 8.0f, n);
-            Add(meta0Fp32, meta0Fp32, fp32UbA, n);
-            PipeBarrier<PIPE_V>();
-            for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
-                uint32_t nb = n - j0;
-                if (nb > hoistTile) {
-                    nb = hoistTile;
+            LocalTensor<float> meta0Fp32 = packedMetaUb[
+                br_dequant::BR_META_FP32_0_UB_OFF].template ReinterpretCast<float>();
+            LocalTensor<float> meta1Fp32 = packedMetaUb[
+                br_dequant::BR_META_FP32_1_UB_OFF].template ReinterpretCast<float>();
+
+            br_dequant::BrCastPackedMetaToFp32<Q_T>(
+                packedMetaUb, n, meta0Fp32, meta1Fp32);
+            if (isKey) {
+                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
+                    uint32_t nb = n - j0;
+                    if (nb > hoistTile) {
+                        nb = hoistTile;
+                    }
+#if BR_KEY_UNIFORM_SCHEME == 3
+                    br_dequant::BrDecodeKeyTile(
+                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB, fp32UbC,
+                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
+                        nb, headDim, headDimAlign);
+#else
+                    br_dequant::BrDecodeKeyTile(
+                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
+                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
+                        nb, headDim, headDimAlign);
+#endif
                 }
-                br_dequant::BrDecodeValueTile(
-                    batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
-                    outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
-                    nb, headDim, headDimAlign);
+            } else {
+                // P17b-B: fold +8 into vmin once per PA run (n rows), then tiles
+                // decode signed int4 against vmin' (fp32UbA reused as scratch).
+                Muls(fp32UbA, meta1Fp32, 8.0f, n);
+                Add(meta0Fp32, meta0Fp32, fp32UbA, n);
+                PipeBarrier<PIPE_V>();
+                for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
+                    uint32_t nb = n - j0;
+                    if (nb > hoistTile) {
+                        nb = hoistTile;
+                    }
+                    br_dequant::BrDecodeValueTile(
+                        batchUb[j0 * codeRowBytes], halfScratch, fp32UbA, fp32UbB,
+                        outBatch[j0 * headDimAlign], meta0Fp32[j0], meta1Fp32[j0],
+                        nb, headDim, headDimAlign);
+                }
             }
         }
 
