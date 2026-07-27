@@ -8,9 +8,10 @@
  * http://www.apache.org/licenses/LICENSE-2.0
  */
 
-// BitResidual K8V4: fused sign-reversal decode + paged attention.
+// BitResidual K8V4: fused Key/Value decode + paged attention.
 // Reads packed KV cache in bit_residual format and performs attention:
-//   K: 8-bit code = (q7<<1)|sign → sig_vec=±1, err=base+q7*step → decoded=err*sig_vec
+//   K: BR_KEY_UNIFORM_SCHEME (default A: y=base+q*step, q in [0,255]);
+//      Scheme C (=3) keeps legacy (q7<<1)|sign path.
 //   V: 4-bit idx4 → vmin + idx4*vstep (raw, no norm folding)
 // Rotation: Q @ R^T (pre-rotate) and out @ R (post-rotate) via Cube KFC.
 
@@ -1024,31 +1025,26 @@ template <typename TilingT, typename QueryT>
 __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::DecodeKeyTileToFloat(
     uint32_t mRows, const float* kBaseArr, const float* kStepArr)
 {
-    // Input: CodeI16Buf()[row*128] has the 8-bit code for each dimension.
+    // Input: CodeI16Buf()[row*128] holds the packed Key code byte (widened).
     // kBaseArr[k], kStepArr[k] are per-row scalar floats (no UB GetValue).
-    //
-    // Decode: code = (q7 << 1) | sign
-    //   sign_bit = code & 0x01     → 0=positive, 1=negative
-    //   q7       = code >> 1       → [0, 127]
-    //   sig_vec  = 1 - 2*sign_bit  → {+1.0, -1.0}
-    //   err      = base + q7 * step (positive residual)
-    //   decoded  = err * sig_vec
+    // Must match pack BR_KEY_UNIFORM_SCHEME (default A).
 
     const uint32_t D = TQ_BR_HEAD_SIZE;
     const uint32_t n = mRows * D;
     auto codeI16 = CodeI16Buf();
     auto codeFloat = CodeFloatBuf();
     auto decoded = DecodedBuf();
-    // RotateWork is idle during DecodeKey (Cube QK staging uses it later).
-    auto signBits = RotateWorkBuf().template ReinterpretCast<float>();
 
+#if BR_KEY_UNIFORM_SCHEME == 3
+    // Scheme C (legacy LSB-sign): code = (q7 << 1) | sign
+    //   sign_bit = code & 0x01 → sig_vec = ±1
+    //   q7 = code >> 1
+    //   y = sig_vec * (base + q7 * step)
+    auto signBits = RotateWorkBuf().template ReinterpretCast<float>();
     auto signStorage = decoded.template ReinterpretCast<int16_t>();
     auto signStorageU16 = signStorage.template ReinterpretCast<uint16_t>();
     auto codeU16 = codeI16.template ReinterpretCast<uint16_t>();
 
-    // sign lives in bit0: And with 0x01 yields sign_bit (0/1) directly — no
-    // subsequent shift needed.  q7 lives in bits 1..7: shift right by 1 to
-    // align it to bits 0..6 (0..127), in-place on codeU16 (codeI16 alias).
     auto signMaskU16 = codeFloat.template ReinterpretCast<uint16_t>();
     Duplicate(signMaskU16, static_cast<uint16_t>(0x01), n);
     PipeBarrier<PIPE_V>();
@@ -1058,7 +1054,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     ShiftRight(codeU16, codeU16, static_cast<uint16_t>(1), n);
     PipeBarrier<PIPE_V>();
 
-    // sign_bit → sig_vec = ±1.0 in RotateWork (keeps codeFloat free for q7).
     Cast(signBits, signStorage, RoundMode::CAST_NONE, n);
     PipeBarrier<PIPE_V>();
     Muls(signBits, signBits, -2.0f, n);
@@ -1066,7 +1061,6 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
     Adds(signBits, signBits, 1.0f, n);
     PipeBarrier<PIPE_V>();
 
-    // q7 → float in codeFloat; err = base + q7*step in decoded via Duplicate+Axpy.
     Cast(codeFloat, codeI16, RoundMode::CAST_NONE, n);
     PipeBarrier<PIPE_V>();
     for (uint32_t row = 0; row < mRows; ++row) {
@@ -1081,6 +1075,21 @@ __aicore__ inline void BitResidualAttentionPagedK8v4Kernel<TilingT, QueryT>::Dec
 
     Mul(decoded, decoded, signBits, n);
     PipeBarrier<PIPE_V>();
+#else
+    // Scheme A/B (uniform): code stores q in [0,255]; y = meta0 + q * meta1.
+    // A: meta0=base, meta1=step; B: meta0=-127.5*s, meta1=s.
+    Cast(codeFloat, codeI16, RoundMode::CAST_NONE, n);
+    PipeBarrier<PIPE_V>();
+    for (uint32_t row = 0; row < mRows; ++row) {
+        const float base = kBaseArr[row];
+        const float step = kStepArr[row];
+        auto rowFloat = decoded[row * D];
+        Duplicate(rowFloat, base, D);
+        PipeBarrier<PIPE_V>();
+        Axpy(rowFloat, codeFloat[row * D], step, D);
+        PipeBarrier<PIPE_V>();
+    }
+#endif
 }
 
 // ---------------------------------------------------------------
