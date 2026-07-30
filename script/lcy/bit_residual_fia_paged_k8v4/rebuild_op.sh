@@ -37,12 +37,18 @@ elif [[ -f "${ASCEND_HOME_PATH}/set_env.sh" ]]; then
     source "${ASCEND_HOME_PATH}/set_env.sh" || true
 fi
 
-CUSTOM_OPS="bit_residual_fia_paged_k8v4;bit_residual_attention_paged_k8v4;bit_residual_pack_k8v4"
+# Include add_rms_norm_bias so slim rebuilds do not overwrite libcust_opapi.so
+# without aclnnAddRmsNormBias (breaks LLM serving / layernorm).
+CUSTOM_OPS="bit_residual_fia_paged_k8v4;bit_residual_attention_paged_k8v4;bit_residual_pack_k8v4;add_rms_norm_bias"
 INSTALL_PATH="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
+# 1=A asymmetric uniform (default), 2=B symmetric, 3=C legacy LSB-sign+q7.
+# Pack + FIA + attn kernels all read this via CMake; golden uses same env.
+export BR_KEY_UNIFORM_SCHEME="${BR_KEY_UNIFORM_SCHEME:-1}"
 
 echo "[rebuild] ROOT=${ROOT_DIR}"
 echo "[rebuild] SOC=${SOC_ARG}"
 echo "[rebuild] OPS=${CUSTOM_OPS}"
+echo "[rebuild] BR_KEY_UNIFORM_SCHEME=${BR_KEY_UNIFORM_SCHEME}"
 echo "[rebuild] INSTALL=${INSTALL_PATH}"
 
 cd "${ROOT_DIR}/csrc"
