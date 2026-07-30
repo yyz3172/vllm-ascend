@@ -6,6 +6,14 @@ set(_TQ_PACK_COMPILE_OPTIONS
         -Werror
 )
 
+# Key encode scheme: 1=A asymmetric, 2=B symmetric, 3=C legacy LSB-sign+q7.
+# Must match FIA / attention BR_KEY_UNIFORM_SCHEME (env or default 1).
+set(_BR_KEY_UNIFORM_SCHEME "1")
+if(DEFINED ENV{BR_KEY_UNIFORM_SCHEME})
+    set(_BR_KEY_UNIFORM_SCHEME "$ENV{BR_KEY_UNIFORM_SCHEME}")
+endif()
+list(APPEND _TQ_PACK_COMPILE_OPTIONS -DBR_KEY_UNIFORM_SCHEME=${_BR_KEY_UNIFORM_SCHEME})
+
 set(BIT_RESIDUAL_PACK_K8V4_DEBUG_LINE "OFF" CACHE STRING
         "Enable -g for BitResidualPackK8v4 AscendC kernel compile.")
 
