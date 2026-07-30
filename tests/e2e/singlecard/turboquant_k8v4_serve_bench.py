@@ -217,6 +217,7 @@ def _build_serve_cmd(
     *, model: str, kv_cache_dtype: str, kv_bits: str, port: int, host: str,
     trust_remote_code: bool, serve_extra: str,
     profiler_dir: str | None = None, profiler_ignore_frontend: bool = False,
+    profiler_active_iterations: int | None = None,
 ) -> list[str]:
     cmd: list[str] = [
         "vllm", "serve", model,
@@ -239,6 +240,12 @@ def _build_serve_cmd(
         ]
         if profiler_ignore_frontend:
             cmd.append("--profiler-config.ignore_frontend=true")
+        # active_iterations 控制 schedule 里 ACTIVE 段长度；默认 vLLM=5，
+        # 实测 TopK 往往只录到 ~4 次。需要更多采样（如 20）时显式拉高。
+        if profiler_active_iterations is not None:
+            cmd.append(
+                f"--profiler-config.active_iterations={profiler_active_iterations}"
+            )
     if serve_extra:
         cmd += shlex.split(serve_extra)
     return cmd
@@ -622,6 +629,12 @@ def main() -> int:
              "frontend CPU trace, to reduce overhead. Adds "
              "--profiler-config.ignore_frontend=true to `vllm serve`.",
     )
+    prof.add_argument(
+        "--profiler-active-iterations", type=int, default=None,
+        help="set --profiler-config.active_iterations=N on `vllm serve` when "
+             "--profile is on. Default leaves vLLM's own default (5). Use 20 to "
+             "capture ~20 decode steps / TopK calls in the Ascend trace.",
+    )
 
     args = parser.parse_args()
 
@@ -672,6 +685,9 @@ def main() -> int:
             serve_extra=args.serve_extra,
             profiler_dir=profiler_dir,
             profiler_ignore_frontend=args.profiler_ignore_frontend,
+            profiler_active_iterations=(
+                args.profiler_active_iterations if profiler_dir is not None else None
+            ),
         )
         print(f"  serve env : {NPU_VISIBLE_ENV}={serve_env.get(NPU_VISIBLE_ENV, '(inherited)')} "
               f"{FIA_ENV_PREFILL}={serve_env[FIA_ENV_PREFILL]} "
@@ -680,6 +696,8 @@ def main() -> int:
         print(f"  serve log : {serve_log}")
         if profiler_dir:
             print(f"  profiler dir : {profiler_dir}")
+            if args.profiler_active_iterations is not None:
+                print(f"  profiler active_iterations : {args.profiler_active_iterations}")
 
         # 防止有旧 serve（或本脚本的另一个实例）已在端口上 LISTEN。vllm 用
         # SO_REUSEADDR 绑定，第二次 bind 也会“成功”并静默分流 bench 流量。
@@ -759,6 +777,8 @@ def main() -> int:
         print(f"  profiler  : enabled (per-combo serve restart; isolated trace dir per combo)")
         if args.profiler_ignore_frontend:
             print(f"             ignore_frontend=True (NPU worker only)")
+        if args.profiler_active_iterations is not None:
+            print(f"             active_iterations={args.profiler_active_iterations}")
         print("=" * 80)
         combos = [(fia, il, ol, c)
                   for fia in fia_list for (il, ol) in io_pairs for c in conc_list]
