@@ -12,9 +12,10 @@
  *
  * Env:
  *   BR_FIA_WORKLOAD=decode|prefill
+ *   BR_FIA_DTYPE=fp16|bf16 (default fp16; Q/rot/out + pack meta bits)
  *   Q_TOKENS_PER_BATCH (prefill only, default 15)
  *   ASCEND_DEVICE_ID, KV_SEQ_LEN, ASCEND_CUSTOM_OPP_PATH
- *   Q_PATH, PI_PATH (optional fp16 bins; PI used for both rotation_key/value)
+ *   Q_PATH, PI_PATH (optional 2-byte float bins matching BR_FIA_DTYPE)
  *   GOLDEN_OUT_PATH, WS_DUMP_PATH
  *
  * Build:
@@ -66,6 +67,28 @@ constexpr int64_t kValPackedBytes =
     static_cast<int64_t>((kBlockSize / kBrBlockRows) * kBrValTileBytes);  // 8704
 constexpr uint16_t kFp16Zero = 0x0000;
 constexpr uint16_t kFp16One = 0x3C00;
+constexpr uint16_t kBf16One = 0x3F80;  // bfloat16 1.0
+
+struct DtypeConfig {
+    const char *name;
+    aclDataType aclType;
+    uint16_t oneBits;
+};
+
+DtypeConfig gDtype{ "fp16", aclDataType::ACL_FLOAT16, kFp16One };
+
+DtypeConfig ResolveDtype()
+{
+    const char *env = getenv("BR_FIA_DTYPE");
+    if (env == nullptr || env[0] == '\0' || strcmp(env, "fp16") == 0 || strcmp(env, "float16") == 0) {
+        return DtypeConfig{"fp16", aclDataType::ACL_FLOAT16, kFp16One};
+    }
+    if (strcmp(env, "bf16") == 0 || strcmp(env, "bfloat16") == 0) {
+        return DtypeConfig{"bf16", aclDataType::ACL_BF16, kBf16One};
+    }
+    LOG_PRINT("[dtype] WARN: unknown BR_FIA_DTYPE=%s, using fp16\n", env);
+    return DtypeConfig{"fp16", aclDataType::ACL_FLOAT16, kFp16One};
+}
 
 struct WorkloadConfig {
     const char *name;
@@ -210,7 +233,7 @@ vector<uint16_t> BuildIdentityPi()
 {
     vector<uint16_t> pi(static_cast<size_t>(kHeadDim * kHeadDim), kFp16Zero);
     for (int64_t i = 0; i < kHeadDim; ++i) {
-        pi[static_cast<size_t>(i * kHeadDim + i)] = kFp16One;
+        pi[static_cast<size_t>(i * kHeadDim + i)] = gDtype.oneBits;
     }
     return pi;
 }
@@ -234,14 +257,14 @@ vector<uint16_t> LoadPiOrIdentity()
         LOG_PRINT("[pi] WARN: PI_PATH=%s short read %zu/%zu, using identity\n", piPath, got, need);
         return BuildIdentityPi();
     }
-    LOG_PRINT("[pi] loaded %zu fp16 from %s\n", pi.size(), piPath);
+    LOG_PRINT("[pi] loaded %zu %s from %s\n", pi.size(), gDtype.name, piPath);
     return pi;
 }
 
 vector<uint16_t> LoadQueryOrOnes(const vector<int64_t> &shape)
 {
     const char *path = getenv("Q_PATH");
-    vector<uint16_t> data(static_cast<size_t>(GetShapeSize(shape)), kFp16One);
+    vector<uint16_t> data(static_cast<size_t>(GetShapeSize(shape)), gDtype.oneBits);
     if (path == nullptr || path[0] == '\0') {
         return data;
     }
@@ -255,14 +278,14 @@ vector<uint16_t> LoadQueryOrOnes(const vector<int64_t> &shape)
     fclose(fp);
     if (got != need) {
         LOG_PRINT("[q] WARN: Q_PATH=%s short read, using all-ones\n", path);
-        fill(data.begin(), data.end(), kFp16One);
+        fill(data.begin(), data.end(), gDtype.oneBits);
         return data;
     }
-    LOG_PRINT("[q] loaded %zu fp16 from %s\n", data.size(), path);
+    LOG_PRINT("[q] loaded %zu %s from %s\n", data.size(), gDtype.name, path);
     return data;
 }
 
-// Fill BR pack cache with non-zero codes + fp16-one meta so dequant is well-defined.
+// Fill BR pack cache with non-zero codes + dtype-matched meta ones.
 vector<uint8_t> BuildKeyCacheHost()
 {
     const size_t n = static_cast<size_t>(kBlockNum * kNumKvHeads * kKeyPackedBytes);
@@ -276,12 +299,12 @@ vector<uint8_t> BuildKeyCacheHost()
                 uint8_t *tile = head + sb * kBrKeyTileBytes;
                 // codes: mid-range unsigned q in [0,255]
                 memset(tile, 0x80, kBrBlockRows * 128U);
-                // base / step: fp16 1.0 for each of 16 rows
+                // base / step: 1.0 in Q dtype for each of 16 rows
                 uint16_t *base = reinterpret_cast<uint16_t *>(tile + kBrBlockRows * 128U);
                 uint16_t *step = reinterpret_cast<uint16_t *>(tile + kBrBlockRows * 130U);
                 for (uint32_t r = 0; r < kBrBlockRows; ++r) {
-                    base[r] = kFp16One;
-                    step[r] = kFp16One;
+                    base[r] = gDtype.oneBits;
+                    step[r] = gDtype.oneBits;
                 }
             }
         }
@@ -306,7 +329,7 @@ vector<uint8_t> BuildValueCacheHost()
                 uint16_t *vstep = reinterpret_cast<uint16_t *>(tile + kBrBlockRows * 66U);
                 for (uint32_t r = 0; r < kBrBlockRows; ++r) {
                     vmin[r] = kFp16Zero;
-                    vstep[r] = kFp16One;
+                    vstep[r] = gDtype.oneBits;
                 }
             }
         }
@@ -330,6 +353,19 @@ float HalfBitsToFloat(uint16_t bits)
     return sign ? -val : val;
 }
 
+float Bf16BitsToFloat(uint16_t bits)
+{
+    uint32_t u = static_cast<uint32_t>(bits) << 16U;
+    float val;
+    memcpy(&val, &u, sizeof(val));
+    return val;
+}
+
+float BitsToFloat(uint16_t bits)
+{
+    return (gDtype.aclType == aclDataType::ACL_BF16) ? Bf16BitsToFloat(bits) : HalfBitsToFloat(bits);
+}
+
 bool ValidateAttentionOutNonZero(const vector<uint16_t> &outHostData, int64_t sampleCount = 8)
 {
     int64_t total = static_cast<int64_t>(outHostData.size());
@@ -341,17 +377,17 @@ bool ValidateAttentionOutNonZero(const vector<uint16_t> &outHostData, int64_t sa
             continue;
         }
         ++nonZeroCount;
-        float val = HalfBitsToFloat(outHostData[static_cast<size_t>(i)]);
+        float val = BitsToFloat(outHostData[static_cast<size_t>(i)]);
         float absVal = fabsf(val);
         maxAbs = max(maxAbs, absVal);
         sumAbs += absVal;
     }
-    LOG_PRINT("Output check: total=%ld nonZero=%ld maxAbs=%.6f meanAbs=%.6f\n", total, nonZeroCount, maxAbs,
-              nonZeroCount > 0 ? (sumAbs / static_cast<float>(nonZeroCount)) : 0.0f);
+    LOG_PRINT("Output check (%s): total=%ld nonZero=%ld maxAbs=%.6f meanAbs=%.6f\n", gDtype.name, total,
+              nonZeroCount, maxAbs, nonZeroCount > 0 ? (sumAbs / static_cast<float>(nonZeroCount)) : 0.0f);
     int64_t printCount = min(sampleCount, total);
     LOG_PRINT("Output sample[0:%ld]:", printCount);
     for (int64_t i = 0; i < printCount; ++i) {
-        LOG_PRINT(" %.6f", HalfBitsToFloat(outHostData[static_cast<size_t>(i)]));
+        LOG_PRINT(" %.6f", BitsToFloat(outHostData[static_cast<size_t>(i)]));
     }
     LOG_PRINT("\n");
     if (nonZeroCount == 0) {
@@ -369,8 +405,10 @@ int main()
     setenv("ASCEND_SLOG_PRINT_TO_STDOUT", "1", 1);
     setenv("ASCEND_GLOBAL_LOG_LEVEL", "3", 1);
 
+    gDtype = ResolveDtype();
     const WorkloadConfig wl = ResolveWorkload();
     const int64_t kvSeqLen = ResolveKvSeqLenPerBatch();
+    LOG_PRINT("[dtype] BR_FIA_DTYPE=%s aclType=%d\n", gDtype.name, static_cast<int>(gDtype.aclType));
 
     int32_t deviceId = 0;
     if (const char *devEnv = getenv("ASCEND_DEVICE_ID")) {
@@ -424,15 +462,15 @@ int main()
     vector<int64_t> actualSeqQ = BuildCumulativeActualSeqLengths(kBatch, wl.qTokensPerBatch);
     vector<int64_t> actualSeqKv(static_cast<size_t>(kBatch), kvSeqLen);
 
-    ret = CreateAclTensor(queryHostData, queryShape, &queryDeviceAddr, aclDataType::ACL_FLOAT16, &queryTensor);
+    ret = CreateAclTensor(queryHostData, queryShape, &queryDeviceAddr, gDtype.aclType, &queryTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
     ret = CreateAclTensor(keyHostData, keyCacheShape, &keyDeviceAddr, aclDataType::ACL_UINT8, &keyTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
     ret = CreateAclTensor(valueHostData, valueCacheShape, &valueDeviceAddr, aclDataType::ACL_UINT8, &valueTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
-    ret = CreateAclTensor(rotHostData, rotShape, &rotKeyDeviceAddr, aclDataType::ACL_FLOAT16, &rotKeyTensor);
+    ret = CreateAclTensor(rotHostData, rotShape, &rotKeyDeviceAddr, gDtype.aclType, &rotKeyTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
-    ret = CreateAclTensor(rotHostData, rotShape, &rotValDeviceAddr, aclDataType::ACL_FLOAT16, &rotValTensor);
+    ret = CreateAclTensor(rotHostData, rotShape, &rotValDeviceAddr, gDtype.aclType, &rotValTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
     ret = CreateAclTensor(attenMaskHostData, attenMaskShape, &attenMaskDeviceAddr, aclDataType::ACL_INT8,
                           &attenMaskTensor);
@@ -440,7 +478,7 @@ int main()
     ret = CreateAclTensor(blockTableHostData, blockTableShape, &blockTableDeviceAddr, aclDataType::ACL_INT32,
                           &blockTableTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
-    ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT16, &outTensor);
+    ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, gDtype.aclType, &outTensor);
     if (!CHECK_RET(ret == ACL_SUCCESS)) return ret;
 
     actualSeqQArr = aclCreateIntArray(actualSeqQ.data(), actualSeqQ.size());
@@ -455,10 +493,10 @@ int main()
     constexpr int64_t kNextTokens = 2147483647;
     constexpr int64_t kSparseMode = 3;
     LOG_PRINT(
-        "BitResidualFiaPagedK8v4 TND+PA workload=%s: Q=%ld (q/seq=%ld) B=%ld "
+        "BitResidualFiaPagedK8v4 TND+PA workload=%s dtype=%s: Q=%ld (q/seq=%ld) B=%ld "
         "rot=[%ld,%ld] keyPack=[%ld,%ld,%ld] valPack=[%ld,%ld,%ld] kvSeq=%ld sparseMode=%ld\n",
-        wl.name, wl.totalTokens, wl.qTokensPerBatch, kBatch, kHeadDim, kHeadDim, kBlockNum, kNumKvHeads,
-        kKeyPackedBytes, kBlockNum, kNumKvHeads, kValPackedBytes, kvSeqLen, kSparseMode);
+        wl.name, gDtype.name, wl.totalTokens, wl.qTokensPerBatch, kBatch, kHeadDim, kHeadDim, kBlockNum,
+        kNumKvHeads, kKeyPackedBytes, kBlockNum, kNumKvHeads, kValPackedBytes, kvSeqLen, kSparseMode);
     if (kvSeqLen > 512 && kBatch >= 8) {
         LOG_PRINT(
             "[FD] Workload B=%ld kv=%ld > s2Base=512: expect tiling key=1 when "
@@ -520,7 +558,7 @@ int main()
         if (fp != nullptr) {
             size_t wrote = fwrite(outHostData.data(), sizeof(uint16_t), outHostData.size(), fp);
             fclose(fp);
-            LOG_PRINT("[golden] wrote %zu fp16 to %s\n", wrote, goldenOutPath);
+            LOG_PRINT("[golden] wrote %zu %s to %s\n", wrote, gDtype.name, goldenOutPath);
         } else {
             LOG_PRINT("[golden] WARN: failed to open %s\n", goldenOutPath);
         }
