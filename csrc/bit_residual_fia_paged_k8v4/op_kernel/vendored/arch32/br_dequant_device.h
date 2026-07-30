@@ -118,12 +118,13 @@ __aicore__ inline float BrReadMeta16FromUb(LocalTensor<uint8_t> ub, LocalTensor<
 
 // Copy packed meta0/meta1 runs. GM already uses SoA layout, so each run is
 // contiguous; DataCopyPad handles sub-32B tails and potentially unaligned GM.
+// Caller must V_MTE2-drain prior V before this MTE2.
 __aicore__ inline void BrCopyPackedMetaTile(GlobalTensor<uint8_t> srcGm,
     LocalTensor<uint8_t> dst, uint64_t meta0GmOff, uint64_t meta1GmOff,
     uint32_t numRows)
 {
-    DataCopyExtParams metaParams{
-        1, numRows * static_cast<uint32_t>(sizeof(half)), 0, 0, 0};
+    const uint32_t copyBytes = numRows * static_cast<uint32_t>(sizeof(half));
+    DataCopyExtParams metaParams{1, copyBytes, 0, 0, 0};
     DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
     DataCopyPad(dst, srcGm[meta0GmOff], metaParams, padParams);
     DataCopyPad(dst[BR_PACKED_META_BYTES], srcGm[meta1GmOff], metaParams, padParams);
@@ -152,6 +153,7 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<float> dst,
     LocalTensor<float> scales, LocalTensor<float> broadcast,
     uint32_t numRows, uint32_t headDim)
 {
+    // Cast→Brcb are both V-pipe; PipeBarrier after caller Cast is enough.
     constexpr uint32_t FP32_BLOCK_ELEMS = 8U;
     constexpr uint32_t FP32_REPEAT_ELEMS = 64U;
 
@@ -226,6 +228,7 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<half> dst,
     LocalTensor<half> scales, LocalTensor<half> broadcast,
     uint32_t numRows, uint32_t headDim)
 {
+    // Same as fp32: Cast→Brcb is V→V.
     constexpr uint32_t FP16_BLOCK_ELEMS = 16U;
     constexpr uint32_t FP16_REPEAT_ELEMS = 128U;
     constexpr uint32_t BRCB_SRC_PER_REPEAT = 8U;

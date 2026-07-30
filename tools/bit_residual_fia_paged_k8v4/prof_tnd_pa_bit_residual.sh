@@ -14,6 +14,7 @@
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=1000 --skip-build
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=2000 --source
 #   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=2000 --workload=prefill --source
+#   bash tools/bit_residual_fia_paged_k8v4/prof_tnd_pa_bit_residual.sh msprof --kv=2000 --dtype=bf16 --device=0
 #   python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --explain
 #   python3 tools/bit_residual_fia_paged_k8v4/analyze_opprof.py --latest \\
 #       tools/bit_residual_fia_paged_k8v4/prof_output/tnd_pa_bit_residual/kv1000/decode/op
@@ -37,12 +38,13 @@ WARM_UP="${WARM_UP:-0}"
 OP_AIC_METRICS="${OP_AIC_METRICS:-PipeUtilization,ArithmeticUtilization,Memory,MemoryUB,ResourceConflictRatio}"
 KV_SEQ_LEN="${KV_SEQ_LEN:-1000}"
 BR_FIA_WORKLOAD="${BR_FIA_WORKLOAD:-decode}"
+BR_FIA_DTYPE="${BR_FIA_DTYPE:-fp16}"
 Q_TOKENS_PER_BATCH="${Q_TOKENS_PER_BATCH:-}"
 ASCEND_DEVICE_ID="${ASCEND_DEVICE_ID:-1}"
 OP_DEBUG_CONFIG="${OP_DEBUG_CONFIG:-}"
 
 usage() {
-    sed -n '2,20p' "$0"
+    sed -n '2,21p' "$0"
     exit 1
 }
 
@@ -58,6 +60,7 @@ for arg in "$@"; do
         --warm-up=*) WARM_UP="${arg#*=}" ;;
         --kv=*) KV_SEQ_LEN="${arg#*=}" ;;
         --workload=*) BR_FIA_WORKLOAD="${arg#*=}" ;;
+        --dtype=*) BR_FIA_DTYPE="${arg#*=}" ;;
         --q-per-batch=*) Q_TOKENS_PER_BATCH="${arg#*=}" ;;
         --device=*) ASCEND_DEVICE_ID="${arg#*=}" ;;
         --source) WANT_SOURCE=true ;;
@@ -76,6 +79,16 @@ if [[ "${BR_FIA_WORKLOAD}" != "decode" && "${BR_FIA_WORKLOAD}" != "prefill" ]]; 
     exit 1
 fi
 
+if [[ "${BR_FIA_DTYPE}" != "fp16" && "${BR_FIA_DTYPE}" != "bf16" && \
+      "${BR_FIA_DTYPE}" != "float16" && "${BR_FIA_DTYPE}" != "bfloat16" ]]; then
+    echo "Error: --dtype must be fp16 or bf16 (got: ${BR_FIA_DTYPE})"
+    exit 1
+fi
+case "${BR_FIA_DTYPE}" in
+    float16) BR_FIA_DTYPE="fp16" ;;
+    bfloat16) BR_FIA_DTYPE="bf16" ;;
+esac
+
 if [[ "${WANT_SOURCE}" == "true" ]]; then
     if [[ "${OP_AIC_METRICS}" != *"Source"* ]]; then
         OP_AIC_METRICS="${OP_AIC_METRICS},Source"
@@ -85,7 +98,12 @@ if [[ "${WANT_SOURCE}" == "true" ]]; then
     fi
 fi
 
-PROF_ROOT="${PROF_ROOT}/kv${KV_SEQ_LEN}/${BR_FIA_WORKLOAD}"
+# Keep fp16 path as kvN/decode for back-compat; bf16 goes to kvN/bf16/decode.
+if [[ "${BR_FIA_DTYPE}" == "fp16" ]]; then
+    PROF_ROOT="${PROF_ROOT}/kv${KV_SEQ_LEN}/${BR_FIA_WORKLOAD}"
+else
+    PROF_ROOT="${PROF_ROOT}/kv${KV_SEQ_LEN}/${BR_FIA_DTYPE}/${BR_FIA_WORKLOAD}"
+fi
 
 source_cann_env() {
     if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -116,6 +134,7 @@ setup_runtime_env() {
     export ASCEND_DEVICE_ID
     export KV_SEQ_LEN
     export BR_FIA_WORKLOAD
+    export BR_FIA_DTYPE
     if [[ -n "${Q_TOKENS_PER_BATCH}" ]]; then
         export Q_TOKENS_PER_BATCH
     fi
@@ -123,7 +142,7 @@ setup_runtime_env() {
         # shellcheck disable=SC1090
         source "${CUSTOM_OPP_PATH}/bin/set_env.bash"
     fi
-    echo "KV_SEQ_LEN=${KV_SEQ_LEN} BR_FIA_WORKLOAD=${BR_FIA_WORKLOAD} ASCEND_DEVICE_ID=${ASCEND_DEVICE_ID}"
+    echo "KV_SEQ_LEN=${KV_SEQ_LEN} BR_FIA_WORKLOAD=${BR_FIA_WORKLOAD} BR_FIA_DTYPE=${BR_FIA_DTYPE} ASCEND_DEVICE_ID=${ASCEND_DEVICE_ID}"
     if [[ -n "${Q_TOKENS_PER_BATCH:-}" ]]; then
         echo "Q_TOKENS_PER_BATCH=${Q_TOKENS_PER_BATCH}"
     fi
@@ -141,6 +160,7 @@ export LD_LIBRARY_PATH="${CUSTOM_OPP_PATH}/op_api/lib:\${LD_LIBRARY_PATH}"
 export ASCEND_DEVICE_ID="${ASCEND_DEVICE_ID}"
 export KV_SEQ_LEN="${KV_SEQ_LEN}"
 export BR_FIA_WORKLOAD="${BR_FIA_WORKLOAD}"
+export BR_FIA_DTYPE="${BR_FIA_DTYPE}"
 EOF
     if [[ -n "${Q_TOKENS_PER_BATCH}" ]]; then
         printf 'export Q_TOKENS_PER_BATCH=%q\n' "${Q_TOKENS_PER_BATCH}" >> "${run_wrapper}"
@@ -277,6 +297,7 @@ do_msprof_op() {
     echo "Output     : ${out_dir}"
     echo "KV_SEQ_LEN : ${KV_SEQ_LEN}"
     echo "Workload   : ${BR_FIA_WORKLOAD}"
+    echo "Dtype      : ${BR_FIA_DTYPE}"
     echo "Kernel     : ${KERNEL_NAME}"
     echo "aic-metrics: ${OP_AIC_METRICS}"
     echo "OP_DEBUG   : ${OP_DEBUG_CONFIG:-<none>}"
@@ -293,7 +314,7 @@ do_msprof_op() {
     fi
 }
 
-echo "=== BitResidualFiaPagedK8v4 mode=${PROF_MODE} kv=${KV_SEQ_LEN} workload=${BR_FIA_WORKLOAD} ==="
+echo "=== BitResidualFiaPagedK8v4 mode=${PROF_MODE} kv=${KV_SEQ_LEN} workload=${BR_FIA_WORKLOAD} dtype=${BR_FIA_DTYPE} ==="
 case "${PROF_MODE}" in
     build) do_build ;;
     run) do_run ;;

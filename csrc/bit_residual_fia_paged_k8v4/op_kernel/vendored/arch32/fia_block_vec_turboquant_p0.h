@@ -1242,17 +1242,20 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::InitDequantWorkspace(__gm_
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantK(const RunInfo &info)
 {
-    // Dual-AIV S2 split: both subcores run DequantKvImpl on disjoint token halves of the
-    // shared WS (si is a global index → no GM race). FIA_SYNC_MODE2 still needs both flags.
+    // Dual-AIV: both subcores dequant disjoint S2 halves (see DequantKvImpl).
+    // FIA_SYNC_MODE2 Cube wait requires both flags after real work.
+    // Note: AIV↔AIV MODE2 join before Cube notify deadlocks on 910B.
     DequantKvImpl(info, true);
-    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(TQ_VEC_DEQ_K0_READY_VEC + (info.loop % 2));
+    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
+        TQ_VEC_DEQ_K0_READY_VEC + (info.loop % 2));
 }
 
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantV(const RunInfo &info)
 {
     DequantKvImpl(info, false);
-    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(TQ_VEC_DEQ_V0_READY_VEC + (info.loop % 2));
+    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
+        TQ_VEC_DEQ_V0_READY_VEC + (info.loop % 2));
 }
 
 template <typename FIAT>
@@ -1303,11 +1306,15 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint64_t wsStride = static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(headDimAlign);
     uint64_t wsOffset = static_cast<uint64_t>(info.loop % 2) * wsStride;
 
-    // Dual-AIV S2 split (ops-transformer TQ pattern): sub0=[0,half), sub1=[half,s2Count).
-    // Each writes disjoint WS rows via global si → no race; slot size unchanged.
+    // Dual-AIV element half-split at any PA position.  Both subcores own a
+    // contiguous, disjoint WS range.  Do NOT block-align the cut: that only
+    // masks mid-block tails and fails when s2Count <= block_size.
+    // Correctness: V_MTE2 before meta/codes MTE2 (ablation: V_MTE3 dual-event
+    // / drain-before-prefetch not required for NaN).
     uint32_t subCoreId = GetBlockIdx() % 2U;
-    uint32_t siStart = (s2Count * subCoreId) / 2U;
-    uint32_t siEnd = (s2Count * (subCoreId + 1U)) / 2U;
+    uint32_t split = s2Count / 2U;
+    uint32_t siStart = (subCoreId == 0U) ? 0U : split;
+    uint32_t siEnd = (subCoreId == 0U) ? split : s2Count;
     if (siStart >= siEnd) {
         return;
     }
@@ -1387,6 +1394,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     event_t eventIdMte3WaitV0 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
     event_t eventIdMte3WaitV1 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
     event_t eventIdMte2WaitS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE2));
+    // NaN fix: drain PIPE_V before meta/codes MTE2 (same slot reuse / prefetch).
+    event_t eventIdMte2WaitV =
+        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
 
     const uint32_t bs = constInfo.kvCacheBlockSize;
     const uint32_t codeRowBytes =
@@ -1460,6 +1470,10 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 WaitFlag<HardEvent::MTE3_V>(reuseEv);
             }
 
+            // Drain prior V before meta/codes MTE2.
+            SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
+            WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
+
             const uint32_t codesBytes = n * codeRowBytes;
             uint64_t meta0GmOff;
             uint64_t meta1GmOff;
@@ -1474,7 +1488,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                 meta0GmOff = br_pack::BrValVminOffset(headBase, bs, pos0);
                 meta1GmOff = br_pack::BrValVstepOffset(headBase, bs, pos0);
             }
-            // Codes + meta in one MTE2 burst (no mid Wait / no V_MTE2 gate).
             br_dequant::BrCopyPackedMetaTile(srcGm, packedMetaUb,
                 meta0GmOff, meta1GmOff, n);
             SetFlag<HardEvent::MTE2_V>(eventIdCodesWait[bufIdx]);
@@ -1484,7 +1497,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             WaitFlag<HardEvent::MTE2_V>(eventIdCodesWait[bufIdx]);
             nextDmaInFlight = false;
         }
-
         const uint32_t codesBytes = n * codeRowBytes;
         const uint32_t outOff = br_dequant::BrAlignUp32(codesBytes);
         LocalTensor<WS_T> outBatch =
@@ -1582,7 +1594,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             }
         }
 
-        // Queue VEC→MTE3 sync, then prefetch next run's MTE2 while VEC drains.
+        // P18: Set V_MTE3, prefetch next run while VEC drains, then Wait + store.
         SetFlag<HardEvent::V_MTE3>(eventIdVWaitMte3);
 
         const uint32_t nextSiCandidate = si + n;
@@ -1612,7 +1624,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             const uint32_t nextBufIdx = (runId + 1U) % 2U;
             const uint32_t nextMetaSlotOff =
                 nextBufIdx * br_dequant::BR_META_SLOT_BYTES;
-            // Next half may still be owned by an in-flight MTE3 store.
             if (runId + 1U >= 2U) {
                 event_t reuseEv =
                     (nextBufIdx == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
@@ -1624,6 +1635,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             LocalTensor<uint8_t> nextPackedMetaUb =
                 dequantInt8Buf_.GetWithOffset<uint8_t>(
                     br_dequant::BR_DEQUANT_UB_BYTES, nextMetaSlotOff);
+
+            SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
+            WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
 
             const uint32_t nextCodesBytes = nextN * codeRowBytes;
             uint64_t nextMeta0GmOff;
