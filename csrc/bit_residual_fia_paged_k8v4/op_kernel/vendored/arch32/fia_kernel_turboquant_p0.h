@@ -1001,7 +1001,10 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
 template <typename FIAT, typename CubeBlockType, typename VecBlockType, typename FdBlockType>
 __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, FdBlockType>::FlashAttentionTq()
 {
-    RunInfo extraInfo[FIA_PRELOAD_TASK_CACHE_SIZE];
+    // Device-local arrays are not guaranteed to apply RunInfo's member default
+    // initializers. ShouldExecuteTask reads every slot before all slots have
+    // been created, so explicitly zero them to prevent stale task dispatch.
+    RunInfo extraInfo[FIA_PRELOAD_TASK_CACHE_SIZE] = {};
 
     uint32_t bN2Cur = constInfo.bN2Start;
     uint32_t gS1Cur = constInfo.gS1Start;
