@@ -605,6 +605,81 @@ def test_prefill_full_seq_dense_rotation(device: torch.device) -> None:
     _compare_tria("prefill_full_seq_dense_rotation", out_fia, out_attn, expected)
 
 
+def test_decode_kv_len_regression(device: torch.device) -> None:
+    """Decode FIA vs attn across KV lengths that NaN'd under dual-AIV dequant.
+
+    Mid-block element half-split (e.g. kv=76 → half=38) stresses ping-pong
+    meta/codes MTE2 reuse. Regression gate: no NaN and FIA close to attn.
+    """
+    dtype = torch.float16
+    num_kv_heads = 2
+    num_heads = 8
+    kv_lens_atol = [32, 48, 64, 76, 78, 80, 96]
+    kv_lens_finite = [112, 128]
+    repeats = 3
+
+    for num_kv_tokens in kv_lens_atol + kv_lens_finite:
+        check_atol = num_kv_tokens in kv_lens_atol
+        for rep in range(repeats):
+            torch.manual_seed(SEED + num_kv_tokens * 17 + rep)
+            block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+            key = torch.randn(
+                (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+            ).contiguous()
+            value = torch.randn(
+                (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+            ).contiguous()
+            query = torch.randn(
+                (1, num_heads, HEAD_SIZE), dtype=dtype, device=device
+            ).contiguous()
+            rotation = _identity(dtype, device)
+            key_cache, value_cache = _pack_kv_cache(
+                key=key,
+                value=value,
+                rotation_t=rotation,
+                num_blocks=num_blocks,
+                num_kv_heads=num_kv_heads,
+            )
+            actual_seq_lens_q = [1]
+            actual_seq_lens_kv = [num_kv_tokens]
+            out_attn = _run_attn(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table_cpu.to(device),
+                actual_seq_lens_q=actual_seq_lens_q,
+                actual_seq_lens_kv=actual_seq_lens_kv,
+                rotation_key=rotation,
+                rotation_value=rotation,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            out_fia = _run_fia(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table_cpu.to(device),
+                actual_seq_lens_q=actual_seq_lens_q,
+                actual_seq_lens_kv=actual_seq_lens_kv,
+                rotation_key=rotation,
+                rotation_value=rotation,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            torch.npu.synchronize()
+            if torch.isnan(out_fia).any() or torch.isnan(out_attn).any():
+                raise AssertionError(
+                    f"decode_kv_len_regression: NaN at kv={num_kv_tokens} rep={rep}"
+                )
+            diff = (out_fia.float() - out_attn.float()).abs().max().item()
+            if check_atol and diff > FIA_VS_ATTN_ATOL:
+                raise AssertionError(
+                    f"decode_kv_len_regression: kv={num_kv_tokens} rep={rep} "
+                    f"max_diff {diff} exceeds {FIA_VS_ATTN_ATOL}"
+                )
+    print("PASS decode_kv_len_regression")
+
+
 def test_flash_decode_long_kv(device: torch.device) -> None:
     """Long-KV decode (kv=1000 > s2Base=512): multi-s2Base / FD-capable path.
 
@@ -983,6 +1058,7 @@ def main() -> None:
     test_pack_fia_chain_dense_rotation(device)
     test_prefill_causal_gqa(device)
     test_prefill_full_seq_dense_rotation(device)
+    test_decode_kv_len_regression(device)
     test_flash_decode_long_kv(device)
     test_flash_decode_multibatch_vs_attn(device)
     test_bf16_decode_multi_kv_gqa(device)
