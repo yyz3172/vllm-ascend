@@ -1,6 +1,12 @@
 # Vendored/arch32 is on -I for FIA headers, but do NOT name any vendored file
 # the same as AscendC headers (e.g. former kernel_common.h) — that shadows
 # AscendC includes mid-kernel_operator.h and breaks matmul (FixpipeConfig/TPipe).
+# Key decode scheme: 1=A, 2=B, 3=C; must match pack / attention (env BR_KEY_UNIFORM_SCHEME).
+set(_BR_KEY_UNIFORM_SCHEME "1")
+if(DEFINED ENV{BR_KEY_UNIFORM_SCHEME})
+    set(_BR_KEY_UNIFORM_SCHEME "$ENV{BR_KEY_UNIFORM_SCHEME}")
+endif()
+
 add_ops_compile_options(
         OP_NAME BitResidualFiaPagedK8v4
         OPTIONS --cce-auto-sync=on
@@ -8,6 +14,7 @@ add_ops_compile_options(
                 -Wno-deprecated-declarations
                 -Werror
                 -fpermissive
+                -DBR_KEY_UNIFORM_SCHEME=${_BR_KEY_UNIFORM_SCHEME}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/vendored
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/vendored/arch32
