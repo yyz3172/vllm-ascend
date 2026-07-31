@@ -10,6 +10,9 @@
 # 环境变量（均可覆盖）:
 #   VISIBLE_DEVICES             NPU 卡号，默认 7（在 source infoenvs 之后强制生效，
 #                               避免被 infoenvs 里的 ASCEND_RT_VISIBLE_DEVICES=0 覆盖）
+#   VLLM_ASCEND_BIT_RESIDUAL_FIA            PrefillCacheHit/ChunkedPrefill FIA，默认 1
+#   VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA     DecodeOnly FIA，默认 1
+#   VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA    PrefillNoCache paged FIA，默认 0
 #   SERVE_MODEL_PATH            服务加载权重，默认 /root/cyl/model/Qwen3-4B
 #   EVAL_MODEL_PATH             evalscope --model，默认与 SERVE_MODEL_PATH 相同
 #   PORT                        默认 9555
@@ -33,6 +36,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VISIBLE_DEVICES="${VISIBLE_DEVICES:-7}"
 _FIA="${VLLM_ASCEND_BIT_RESIDUAL_FIA:-1}"
 _DECODE_FIA="${VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA:-1}"
+_NOCACHE_FIA="${VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA:-0}"
 
 SERVE_MODEL_PATH="${SERVE_MODEL_PATH:-${MODEL_PATH:-/root/cyl/model/Qwen3-4B}}"
 EVAL_MODEL_PATH="${EVAL_MODEL_PATH:-${SERVE_MODEL_PATH}}"
@@ -187,12 +191,13 @@ start_serve() {
 
     log "启动 vllm serve -> ${serve_log}"
     log "  model=${SERVE_MODEL_PATH} port=${PORT} util=${GPU_MEMORY_UTILIZATION} max_len=${MAX_MODEL_LEN}"
-    log "  devices=${ASCEND_RT_VISIBLE_DEVICES} FIA=${VLLM_ASCEND_BIT_RESIDUAL_FIA}/${VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA}"
+    log "  devices=${ASCEND_RT_VISIBLE_DEVICES} FIA=${VLLM_ASCEND_BIT_RESIDUAL_FIA}/${VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA}/${VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA}"
 
     (
         export ASCEND_RT_VISIBLE_DEVICES
         export VLLM_ASCEND_BIT_RESIDUAL_FIA
         export VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA
+        export VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA
         # 避免父 shell 的 MODEL_PATH 干扰
         export MODEL_PATH="${SERVE_MODEL_PATH}"
         exec setsid vllm serve "${SERVE_MODEL_PATH}" \
@@ -277,10 +282,11 @@ source_runtime_env
 export ASCEND_RT_VISIBLE_DEVICES="${VISIBLE_DEVICES}"
 export VLLM_ASCEND_BIT_RESIDUAL_FIA="${_FIA}"
 export VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA="${_DECODE_FIA}"
+export VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA="${_NOCACHE_FIA}"
 
 log "WORK_ROOT=${WORK_ROOT}"
 log "LOG_ROOT=${LOG_ROOT}"
-log "VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} BATCH_SIZES=${BATCH_SIZES} ROUNDS=${ROUNDS}"
+log "VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} FIA=${_FIA}/${_DECODE_FIA}/${_NOCACHE_FIA} BATCH_SIZES=${BATCH_SIZES} ROUNDS=${ROUNDS}"
 
 fail_count=0
 for bs in ${BATCH_SIZES}; do

@@ -113,10 +113,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE", "0"))),
     # BitResidual k8v4 Prefill path (default OFF). When ON, attention_v1 routes
     # PrefillCacheHit / ChunkedPrefill to ``bit_residual_fia_paged_k8v4``.
-    # PrefillNoCache always uses float key/value (block_table=None), never this op.
-    # DecodeOnly is controlled by ``VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA``.
+    # PrefillNoCache is controlled separately by
+    # ``VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA``. DecodeOnly is controlled by
+    # ``VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA``.
     "VLLM_ASCEND_BIT_RESIDUAL_FIA":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_FIA", "0"))),
+    # BitResidual k8v4 PrefillNoCache A/B (default OFF). When ON, PrefillNoCache
+    # uses already-packed paged KV via ``bit_residual_fia_paged_k8v4`` instead of
+    # float key/value ``npu_fused_infer_attention_score``. Falls back to float
+    # FIA if the paged op returns None.
+    "VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA", "0"))),
     # BitResidual k8v4 Decode A/B (default OFF). When ON, DecodeOnly uses
     # ``bit_residual_fia_paged_k8v4`` instead of ``bit_residual_attention_paged_k8v4``
     # so FIA vs vector paged attn latency can be compared. Falls back to vector
