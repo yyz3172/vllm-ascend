@@ -1002,11 +1002,52 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
 
+        # PrefillNoCache normally uses float key/value FIA (block_table=None).
+        # When VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA is ON, use already-packed
+        # paged KV via bit_residual_fia_paged_k8v4; fall back to float FIA if
+        # the op returns None. Do not mutate _get_fia_params float-path defaults.
+        if (
+            self.kv_cache_dtype == "turboquant"
+            and attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            and envs_ascend.VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA
+            and self.turboquant_kv_bits_key == 8
+            and self.turboquant_kv_bits_value == 4
+            and self.head_size == 128
+            and self.key_cache is not None
+            and self.value_cache is not None
+            and attn_metadata.block_tables is not None
+            and self.attn_type != AttentionType.ENCODER_DECODER
+        ):
+            batch_size = attn_metadata.seq_lens.shape[0]
+            nocache_bt = attn_metadata.block_tables[:batch_size, :]
+            if int(nocache_bt.numel()) > 0:
+                nocache_block_size = self.vllm_config.cache_config.block_size
+                attn_output = bit_residual_fia_paged_k8v4(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=nocache_bt,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=nocache_block_size,
+                    scale=self.scale,
+                    atten_mask=attn_metadata.attn_mask,
+                    pre_tokens=SWA_INT_MAX,
+                    next_tokens=SWA_INT_MAX,
+                    sparse_mode=3,
+                    out=output[:num_tokens],
+                )
+                if attn_output is not None:
+                    return output
+
         if self.kv_cache_dtype == "turboquant" and block_table is not None:
             assert self.key_cache is not None and self.value_cache is not None
 
             # BitResidual k8v4:
-            # - PrefillNoCache: not here (block_table is None) → float key/value FIA
+            # - PrefillNoCache: optional paged FIA via NOCACHE_FIA (handled above)
             # - PrefillCacheHit / ChunkedPrefill: FIA when VLLM_ASCEND_BIT_RESIDUAL_FIA
             # - DecodeOnly: FIA when VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA (A/B vs vector)
             # - else / fallback: bit_residual_attention_paged_k8v4
