@@ -1429,6 +1429,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     // before WaitFlag(V_MTE3), overlapping current-run VEC drain.
     bool nextDmaInFlight = false;
     uint32_t prefN = 0U;
+    // Scheme A: reuse block_table phys + pack headBase across consecutive
+    // PA runs that share the same blockInBatch (BS=128 / maxSub~29 → many
+    // runs per block). Skip GetValue + HeadBase + S_MTE2 when unchanged.
+    uint32_t cachedBlockInBatch = 0xFFFFFFFFu;
+    uint64_t cachedHeadBase = 0ULL;
 
     while (si < siEnd) {
         const uint32_t bufIdx = runId % 2U;
@@ -1446,12 +1451,17 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             uint32_t globalS2 = info.s2Idx * constInfo.s2BaseSize + si;
             uint32_t blockInBatch = globalS2 / bs;
             pos0 = globalS2 % bs;
-            uint32_t btIdx = info.bIdx * constInfo.maxBlockNumPerBatch + blockInBatch;
-
-            SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
-            headBase = GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
+            if (blockInBatch != cachedBlockInBatch) {
+                uint32_t btIdx =
+                    info.bIdx * constInfo.maxBlockNumPerBatch + blockInBatch;
+                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
+                cachedHeadBase =
+                    GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
+                cachedBlockInBatch = blockInBatch;
+            }
+            headBase = cachedHeadBase;
 
             // P15: O(1) run length within same PA block and [si, siEnd).
             uint32_t maxInBlock = bs - pos0;
@@ -1599,17 +1609,21 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
 
         const uint32_t nextSiCandidate = si + n;
         if (nextSiCandidate < siEnd) {
-            uint32_t nextGlobalS2 = info.s2Idx * constInfo.s2BaseSize + nextSiCandidate;
+            uint32_t nextGlobalS2 =
+                info.s2Idx * constInfo.s2BaseSize + nextSiCandidate;
             uint32_t nextBlockInBatch = nextGlobalS2 / bs;
             uint32_t nextPos0 = nextGlobalS2 % bs;
-            uint32_t nextBtIdx =
-                info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
-
-            SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
-            uint64_t nextHeadBase =
-                GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
+            if (nextBlockInBatch != cachedBlockInBatch) {
+                uint32_t nextBtIdx =
+                    info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
+                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
+                cachedHeadBase =
+                    GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
+                cachedBlockInBatch = nextBlockInBatch;
+            }
+            uint64_t nextHeadBase = cachedHeadBase;
 
             uint32_t nextMaxInBlock = bs - nextPos0;
             uint32_t nextRemaining = siEnd - nextSiCandidate;
