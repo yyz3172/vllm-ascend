@@ -76,20 +76,16 @@ public:
             if (seqStart == seqEnd) {
                 continue;
             }
-            uint32_t firstSlot = 0;
-            if (!op.ResolveTokenSlotU(seqStart, firstSlot)) {
-                return;
-            }
             const uint32_t rowCount = seqEnd - seqStart;
-            const uint32_t leadingGroupRow = firstSlot % TQ_MANUAL_GROUP_ROWS;
             for (uint32_t rowOff = 0; rowOff < rowCount;) {
-                const uint32_t startGroupRow = (rowOff == 0) ? leadingGroupRow : 0;
-                const uint32_t rowsInThisGroup = TQ_MANUAL_GROUP_ROWS - startGroupRow;
-                const uint32_t validRows = (rowCount - rowOff > rowsInThisGroup)
-                    ? rowsInThisGroup
-                    : rowCount - rowOff;
                 const uint32_t tokenStart = seqStart + rowOff;
-                const uint32_t slot = firstSlot + rowOff;
+                uint32_t slot = 0;
+                uint32_t startGroupRow = 0;
+                uint32_t validRows = 0;
+                if (!op.ResolvePackChunk(tokenStart, rowCount - rowOff, slot,
+                                         startGroupRow, validRows)) {
+                    return;
+                }
                 const uint32_t blockIdx = slot / op.blockSize_;
                 const uint32_t blockOffset = slot - blockIdx * op.blockSize_;
                 const uint32_t subBlockInBlock = blockOffset / TQ_BLOCK_ROWS;

@@ -573,9 +573,11 @@ public:
             if (rowCount == 0) {
                 continue;
             }
+            // Gate only: first token must have a valid slot. Per-token paged
+            // addressing is handled in ResolvePackChunk (do not assume
+            // firstSlot+rowCount is a contiguous physical range).
             uint32_t firstSlot = 0;
-            if (!ResolveTokenSlotU(seqStart, firstSlot) ||
-                firstSlot + rowCount > cacheSlots_) {
+            if (!ResolveTokenSlotU(seqStart, firstSlot)) {
                 return false;
             }
             totalTiles += ((rowCount + TQ_MANUAL_GROUP_ROWS - 1) / TQ_MANUAL_GROUP_ROWS) *
@@ -597,6 +599,33 @@ public:
         }
         slotU = static_cast<uint32_t>(slot);
         return true;
+    }
+
+    // One ManualKey1 stream must cover a contiguous physical-slot run that
+    // stays inside a single 16-row tile group and a single PA block. Callers
+    // re-resolve at each chunk so non-contiguous block_table (e.g. [6,5])
+    // maps token 128 to slot 5*bs rather than firstSlot+128.
+    __aicore__ inline bool ResolvePackChunk(
+        uint32_t tokenStart,
+        uint32_t tokensLeft,
+        uint32_t& slotOut,
+        uint32_t& startGroupRowOut,
+        uint32_t& validRowsOut) const {
+        if (tokensLeft == 0 || !ResolveTokenSlotU(tokenStart, slotOut)) {
+            return false;
+        }
+        startGroupRowOut = slotOut % TQ_MANUAL_GROUP_ROWS;
+        const uint32_t rowsInGroup = TQ_MANUAL_GROUP_ROWS - startGroupRowOut;
+        const uint32_t rowsInBlock = blockSize_ - (slotOut % blockSize_);
+        uint32_t n = tokensLeft;
+        if (n > rowsInGroup) {
+            n = rowsInGroup;
+        }
+        if (n > rowsInBlock) {
+            n = rowsInBlock;
+        }
+        validRowsOut = n;
+        return n != 0;
     }
 
 public:

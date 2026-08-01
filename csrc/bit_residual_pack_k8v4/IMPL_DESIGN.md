@@ -78,6 +78,10 @@ metadata 的 GM copy 需要物理块对齐。AIV 以 16-row tile 为单位：
 
 该 read-modify-write 方案保证非对齐 slot、跨 block 和多请求场景不会破坏旧值。
 
+ManualKey1 调度按 `slot_mapping[token]` 解析每个 chunk 的物理起点，并在
+16-row tile / 单 PA block 边界拆分；禁止用 `firstSlot+rowOff` 假定跨 block
+物理 slot 连续（reclaim 后 `block_table` 常为非递增 id）。
+
 ## Attention decode
 
 `bit_residual_attention_paged_k8v4` 使用相同的 2112/1088 tile stride，按行读取
