@@ -24,6 +24,9 @@
 #   MAX_MODEL_LEN               默认 8500
 #   BATCH_SIZES                 默认 "16"（空格分隔；多项时与卡/端口一一对应并行）
 #   ROUNDS                      每个 batch_size 下客户端压测轮数，默认 3（同一 serve）
+#   CEVAL_LOCAL_PATH            ceval 本地数据集根目录，默认 /root/cyl/dataset
+#   CEVAL_SUBSET                ceval subset；默认 computer_network。
+#                               设为空（CEVAL_SUBSET=）则不传 subset_list，跑全量子集
 #   WORK_ROOT                   evalscope 结果根目录，默认 ./output/ceval_batch_sweep_<ts>
 #   LOG_ROOT                    日志根目录，默认 ${WORK_ROOT}/logs
 #   READY_TIMEOUT               服务就绪等待秒数，默认 600
@@ -63,7 +66,7 @@ LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs}"
 
 # ---------- CLI ----------
 usage() {
-    sed -n '2,32p' "$0" | sed 's/^# \?//'
+    sed -n '2,35p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
@@ -268,14 +271,21 @@ run_eval() {
     fi
 
     local dataset_args
-    dataset_args="$(printf '{"ceval": {"local_path": "%s", "subset_list": ["%s"]}}' \
-        "${CEVAL_LOCAL_PATH}" "${CEVAL_SUBSET}")"
+    if [[ -n "${CEVAL_SUBSET}" ]]; then
+        dataset_args="$(printf '{"ceval": {"local_path": "%s", "subset_list": ["%s"]}}' \
+            "${CEVAL_LOCAL_PATH}" "${CEVAL_SUBSET}")"
+    else
+        # 不配 subset_list：evalscope 跑 ceval 全量子集
+        dataset_args="$(printf '{"ceval": {"local_path": "%s"}}' \
+            "${CEVAL_LOCAL_PATH}")"
+    fi
     local gen_config
     gen_config="$(printf '{"temperature": %s, "max_tokens": %s}' \
         "${TEMPERATURE}" "${MAX_TOKENS}")"
 
     wlog "开始 eval: batch_size=${batch_size} round=${round}/${ROUNDS}"
     wlog "  api=${api_url} work_dir=${work_dir} eval_log=${eval_log}"
+    wlog "  ceval subset=${CEVAL_SUBSET:-<all>}"
 
     set +e
     evalscope eval \
@@ -401,6 +411,7 @@ fi
 log "WORK_ROOT=${WORK_ROOT}"
 log "LOG_ROOT=${LOG_ROOT}"
 log "BLOCK_SIZE=${BLOCK_SIZE} FIA=${_FIA}/${_DECODE_FIA}/${_NOCACHE_FIA} ROUNDS=${ROUNDS} PARALLEL=${PARALLEL}"
+log "CEVAL_LOCAL_PATH=${CEVAL_LOCAL_PATH} CEVAL_SUBSET=${CEVAL_SUBSET:-<all>}"
 for ((i = 0; i < n_bs; i++)); do
     log "  slot[${i}]: batch_size=${BS_ARR[i]} device=${DEV_ARR[i]} port=${PORT_ARR[i]}"
 done
