@@ -6,9 +6,12 @@
 #   2. xrx_bit_residual_k8v4_batch_tiers.py
 #   3. xrx_bit_residual_k8v4_golden.py
 #   4. xrx_bit_residual_fia_paged_k8v4_smoke.py
-#   5. xrx_bit_residual_k8v4_smoke.py
-#   6. xrx_bit_residual_k8v4_long_query_profile.py
-#   7. xrx_bit_residual_k8v4_bs1_long_profile.py
+#      (includes test_decode_kv_len_regression — NaN / mid-block dual-AIV gate)
+#   5. xrx_bit_residual_k8v4_noncontig_blocks.py --with-fia
+#      (pack via slot_mapping across non-contiguous phys blocks + FIA)
+#   6. xrx_bit_residual_k8v4_smoke.py
+#   7. xrx_bit_residual_k8v4_long_query_profile.py
+#   8. xrx_bit_residual_k8v4_bs1_long_profile.py
 #
 # Usage (inside container, after activate + infoenvs):
 #   bash tools/bit_residual_fia_paged_k8v4/run_merge_smoke.sh
@@ -46,7 +49,7 @@ for arg in "$@"; do
         --with-fia-serving) WITH_FIA_SERVING=1 ;;
         --profile) ENABLE_TORCH_PROFILE=1 ;;
         -h|--help)
-            sed -n '2,28p' "$0"
+            sed -n '2,32p' "$0"
             exit 0
             ;;
         *)
@@ -265,6 +268,11 @@ run_case "golden" \
 
 run_case "fia_paged_smoke" \
     python "${TEST_DIR}/xrx_bit_residual_fia_paged_k8v4_smoke.py"
+
+# Reclaim / non-monotonic block_table: pack must follow slot_mapping, not
+# firstSlot+rowOff; --with-fia also checks FIA contig vs noncontig phys.
+run_case "noncontig_blocks" \
+    python "${TEST_DIR}/xrx_bit_residual_k8v4_noncontig_blocks.py" --with-fia
 
 # --- Serving smoke ---
 # Clear FIA gates unless explicitly requested.

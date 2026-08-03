@@ -1,37 +1,40 @@
 #!/usr/bin/env bash
-# ceval computer_network 并发压测：不同 --eval-batch-size；
-# 每个 batch_size 启一次 vllm serve，客户端连跑 ROUNDS 轮后再停服。
-# 多 batch_size 时可在多卡并行：BATCH_SIZES / VISIBLE_DEVICES / PORTS 一一对应。
+# vllm bench serve 并发压测：不同 --max-concurrency；
+# 每个 concurrency 启一次 vllm serve，客户端连跑 ROUNDS 轮后再停服。
+# 服务启动与 run_ceval_batch_sweep.sh 一致；压测逻辑来自 script/xrx/pd/start_bench.sh。
+# 多 concurrency 时可在多卡并行：MAX_CONCURRENCIES / VISIBLE_DEVICES / PORTS 一一对应。
 #
 # 用法:
-#   bash script/xrx/run_ceval_batch_sweep.sh
-#   BATCH_SIZES="16" ROUNDS=3 bash script/xrx/run_ceval_batch_sweep.sh
-#   # 三卡并行三个 batch_size：
-#   BATCH_SIZES="1 8 16" VISIBLE_DEVICES="5 6 7" PORTS="9555 9556 9557" \
-#     ROUNDS=3 bash script/xrx/run_ceval_batch_sweep.sh
+#   bash script/xrx/run_bench_batch_sweep.sh
+#   MAX_CONCURRENCIES="64" ROUNDS=1 bash script/xrx/run_bench_batch_sweep.sh
+#   # 三卡并行三个 concurrency：
+#   MAX_CONCURRENCIES="16 32 64" VISIBLE_DEVICES="5 6 7" PORTS="9555 9556 9557" \
+#     ROUNDS=1 bash script/xrx/run_bench_batch_sweep.sh
 #
 # 环境变量（均可覆盖）:
-#   VISIBLE_DEVICES             NPU 卡号列表，默认 "7"；与 BATCH_SIZES/PORTS 等长一一对应
-#   PORTS                       端口列表，默认取 PORT（9555）；与 BATCH_SIZES 等长
+#   VISIBLE_DEVICES             NPU 卡号列表，默认 "7"；与 MAX_CONCURRENCIES/PORTS 等长一一对应
+#   PORTS                       端口列表，默认取 PORT（9555）；与 MAX_CONCURRENCIES 等长
 #   PORT                        单端口时的默认值（兼容旧用法），默认 9555
 #   BLOCK_SIZE                  vllm --block-size，默认 128（所有 serve 共用）
 #   VLLM_ASCEND_BIT_RESIDUAL_FIA            PrefillCacheHit/ChunkedPrefill FIA，默认 1
 #   VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA     DecodeOnly FIA，默认 1
 #   VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA    PrefillNoCache paged FIA，默认 0
 #   SERVE_MODEL_PATH            服务加载权重，默认 /root/cyl/model/Qwen3-4B
-#   EVAL_MODEL_PATH             evalscope --model，默认与 SERVE_MODEL_PATH 相同
+#   BENCH_MODEL_PATH            bench --model，默认与 SERVE_MODEL_PATH 相同
 #   GPU_MEMORY_UTILIZATION      默认 0.3
 #   MAX_MODEL_LEN               默认 8500
-#   BATCH_SIZES                 默认 "16"（空格分隔；多项时与卡/端口一一对应并行）
-#   ROUNDS                      每个 batch_size 下客户端压测轮数，默认 3（同一 serve）
-#   CEVAL_LOCAL_PATH            ceval 本地数据集根目录，默认 /root/cyl/dataset
-#   CEVAL_SUBSET                ceval subset；默认 computer_network。
-#                               设为空（CEVAL_SUBSET=）则不传 subset_list，跑全量子集
-#   WORK_ROOT                   evalscope 结果根目录，默认 ./output/ceval_batch_sweep_<ts>
+#   MAX_CONCURRENCIES           默认 "64"（空格分隔；多项时与卡/端口一一对应并行）
+#   ROUNDS                      每个 concurrency 下客户端压测轮数，默认 1（同一 serve）
+#   BENCH_INPUT_LEN             random dataset input_len，默认 10
+#   BENCH_OUTPUT_LEN            random dataset output_len，默认 200
+#   BENCH_NUM_PROMPTS           请求数，默认 1000
+#   BENCH_REQUEST_RATE          请求速率，默认 inf
+#   BENCH_ENDPOINT              默认 /v1/completions
+#   WORK_ROOT                   结果根目录，默认 ./output/bench_batch_sweep_<ts>
 #   LOG_ROOT                    日志根目录，默认 ${WORK_ROOT}/logs
 #   READY_TIMEOUT               服务就绪等待秒数，默认 600
 #   SOURCE_ENV                  可选，默认仓库 infoenvs（存在则 source）
-#   PARALLEL                    多 batch_size 是否并行，默认 1（1=并行，0=串行）
+#   PARALLEL                    多 concurrency 是否并行，默认 1（1=并行，0=串行）
 
 set -euo pipefail
 
@@ -45,28 +48,29 @@ _DECODE_FIA="${VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA:-1}"
 _NOCACHE_FIA="${VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA:-0}"
 
 SERVE_MODEL_PATH="${SERVE_MODEL_PATH:-${MODEL_PATH:-/root/cyl/model/Qwen3-4B}}"
-EVAL_MODEL_PATH="${EVAL_MODEL_PATH:-${SERVE_MODEL_PATH}}"
+BENCH_MODEL_PATH="${BENCH_MODEL_PATH:-${SERVE_MODEL_PATH}}"
 PORT="${PORT:-9555}"
 PORTS="${PORTS:-${PORT}}"
 BLOCK_SIZE="${BLOCK_SIZE:-128}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8500}"
-BATCH_SIZES="${BATCH_SIZES:-16}"
-ROUNDS="${ROUNDS:-3}"
-TEMPERATURE="${TEMPERATURE:-0}"
-MAX_TOKENS="${MAX_TOKENS:-2048}"
-CEVAL_LOCAL_PATH="${CEVAL_LOCAL_PATH:-/root/cyl/dataset}"
-CEVAL_SUBSET="${CEVAL_SUBSET:-computer_network}"
+MAX_CONCURRENCIES="${MAX_CONCURRENCIES:-64}"
+ROUNDS="${ROUNDS:-1}"
+BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-10}"
+BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-200}"
+BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-1000}"
+BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-inf}"
+BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/completions}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 PARALLEL="${PARALLEL:-1}"
 
 STAMP="$(date '+%Y%m%d_%H%M%S')"
-WORK_ROOT="${WORK_ROOT:-${PWD}/output/ceval_batch_sweep_${STAMP}}"
+WORK_ROOT="${WORK_ROOT:-${PWD}/output/bench_batch_sweep_${STAMP}}"
 LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs}"
 
 # ---------- CLI ----------
 usage() {
-    sed -n '2,35p' "$0" | sed 's/^# \?//'
+    sed -n '2,40p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
@@ -90,8 +94,8 @@ while [[ $# -gt 0 ]]; do
             BLOCK_SIZE="$2"
             shift 2
             ;;
-        --batch-sizes)
-            BATCH_SIZES="$2"
+        --max-concurrencies|--concurrencies)
+            MAX_CONCURRENCIES="$2"
             shift 2
             ;;
         --rounds)
@@ -119,12 +123,12 @@ mkdir -p "${LOG_ROOT}" "${WORK_ROOT}"
 SWEEP_LOG="${LOG_ROOT}/sweep.log"
 
 log() {
-    printf '%s [ceval-sweep] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "${SWEEP_LOG}"
+    printf '%s [bench-sweep] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "${SWEEP_LOG}"
 }
 
 wlog() {
     local msg
-    msg="$(printf '%s [ceval-sweep%s] %s' "$(date '+%Y-%m-%d %H:%M:%S')" "${WORKER_TAG:+ ${WORKER_TAG}}" "$*")"
+    msg="$(printf '%s [bench-sweep%s] %s' "$(date '+%Y-%m-%d %H:%M:%S')" "${WORKER_TAG:+ ${WORKER_TAG}}" "$*")"
     echo "${msg}" | tee -a "${SWEEP_LOG}" ${WORKER_LOG:+-a "${WORKER_LOG}"}
 }
 
@@ -252,89 +256,82 @@ start_serve() {
     wait_ready "${READY_TIMEOUT}" "http://127.0.0.1:${port}/health" "${pid_file}"
 }
 
-run_eval() {
-    local batch_size="$1"
+# Migrated from script/xrx/pd/start_bench.sh — targets this worker's serve port.
+run_bench() {
+    local max_concurrency="$1"
     local round="$2"
     local port="$3"
     local worker_dir="$4"
-    local tag="bs${batch_size}_r${round}"
-    local eval_log="${worker_dir}/eval_${tag}.log"
-    local work_dir="${WORK_ROOT}/bs${batch_size}/${tag}"
-    local api_url="http://127.0.0.1:${port}/v1/chat/completions"
+    local tag="mc${max_concurrency}_r${round}"
+    local bench_log="${worker_dir}/bench_${tag}.log"
+    local work_dir="${WORK_ROOT}/mc${max_concurrency}/${tag}"
 
     mkdir -p "${work_dir}"
 
-    local eval_model="${EVAL_MODEL_PATH}"
-    if [[ ! -e "${eval_model}" ]]; then
-        wlog "WARN: EVAL_MODEL_PATH 不存在: ${eval_model}，改用 SERVE_MODEL_PATH"
-        eval_model="${SERVE_MODEL_PATH}"
+    local bench_model="${BENCH_MODEL_PATH}"
+    if [[ ! -e "${bench_model}" ]]; then
+        wlog "WARN: BENCH_MODEL_PATH 不存在: ${bench_model}，改用 SERVE_MODEL_PATH"
+        bench_model="${SERVE_MODEL_PATH}"
     fi
 
-    local dataset_args
-    if [[ -n "${CEVAL_SUBSET}" ]]; then
-        dataset_args="$(printf '{"ceval": {"local_path": "%s", "subset_list": ["%s"]}}' \
-            "${CEVAL_LOCAL_PATH}" "${CEVAL_SUBSET}")"
-    else
-        # 不配 subset_list：evalscope 跑 ceval 全量子集
-        dataset_args="$(printf '{"ceval": {"local_path": "%s"}}' \
-            "${CEVAL_LOCAL_PATH}")"
-    fi
-    local gen_config
-    gen_config="$(printf '{"temperature": %s, "max_tokens": %s}' \
-        "${TEMPERATURE}" "${MAX_TOKENS}")"
-
-    wlog "开始 eval: batch_size=${batch_size} round=${round}/${ROUNDS}"
-    wlog "  api=${api_url} work_dir=${work_dir} eval_log=${eval_log}"
-    wlog "  ceval subset=${CEVAL_SUBSET:-<all>}"
+    wlog "开始 bench: max_concurrency=${max_concurrency} round=${round}/${ROUNDS}"
+    wlog "  host=127.0.0.1 port=${port} endpoint=${BENCH_ENDPOINT}"
+    wlog "  input_len=${BENCH_INPUT_LEN} output_len=${BENCH_OUTPUT_LEN}"
+    wlog "  num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE}"
+    wlog "  work_dir=${work_dir} bench_log=${bench_log}"
 
     set +e
-    evalscope eval \
-        --model "${eval_model}" \
-        --api-url "${api_url}" \
-        --api-key EMPTY \
-        --datasets ceval \
-        --dataset-args "${dataset_args}" \
-        --generation-config "${gen_config}" \
-        --eval-batch-size "${batch_size}" \
-        --debug \
-        --work-dir "${work_dir}" \
-        --no-timestamp \
-        >"${eval_log}" 2>&1
+    vllm bench serve \
+        --backend vllm \
+        --model "${bench_model}" \
+        --host 127.0.0.1 \
+        --port "${port}" \
+        --endpoint "${BENCH_ENDPOINT}" \
+        --dataset-name random \
+        --input-len "${BENCH_INPUT_LEN}" \
+        --output-len "${BENCH_OUTPUT_LEN}" \
+        --num-prompts "${BENCH_NUM_PROMPTS}" \
+        --max-concurrency "${max_concurrency}" \
+        --request-rate "${BENCH_REQUEST_RATE}" \
+        --ignore-eos \
+        >"${bench_log}" 2>&1
     local rc=$?
     set -e
 
     if [[ ${rc} -ne 0 ]]; then
-        wlog "ERROR: eval 失败 rc=${rc}，见 ${eval_log}"
-        tail -n 40 "${eval_log}" || true
+        wlog "ERROR: bench 失败 rc=${rc}，见 ${bench_log}"
+        tail -n 40 "${bench_log}" || true
         return "${rc}"
     fi
-    wlog "eval 完成: ${tag}"
+    # Keep a copy under WORK_ROOT for easy aggregation.
+    cp -f "${bench_log}" "${work_dir}/bench.log" 2>/dev/null || true
+    wlog "bench 完成: ${tag}"
     return 0
 }
 
-# One batch_size on one device/port: start serve once, run ROUNDS client evals.
+# One max_concurrency on one device/port: start serve once, run ROUNDS benches.
 run_worker() {
-    local batch_size="$1"
+    local max_concurrency="$1"
     local device="$2"
     local port="$3"
-    local worker_dir="${LOG_ROOT}/bs${batch_size}_dev${device}_port${port}"
+    local worker_dir="${LOG_ROOT}/mc${max_concurrency}_dev${device}_port${port}"
     local pid_file="${worker_dir}/vllm_serve.pid"
     local fail=0
 
     mkdir -p "${worker_dir}"
-    WORKER_TAG="bs${batch_size}/dev${device}/port${port}"
+    WORKER_TAG="mc${max_concurrency}/dev${device}/port${port}"
     WORKER_LOG="${worker_dir}/worker.log"
 
-    wlog "======== worker start batch_size=${batch_size} device=${device} port=${port} ========"
-    if ! start_serve "bs${batch_size}" "${device}" "${port}" "${worker_dir}"; then
+    wlog "======== worker start max_concurrency=${max_concurrency} device=${device} port=${port} ========"
+    if ! start_serve "mc${max_concurrency}" "${device}" "${port}" "${worker_dir}"; then
         wlog "ERROR: worker serve 启动失败"
         echo 1 > "${worker_dir}/fail_count"
         return 1
     fi
 
     for ((r = 1; r <= ROUNDS; r++)); do
-        wlog "-------- client bs${batch_size} r${r} --------"
-        if ! run_eval "${batch_size}" "${r}" "${port}" "${worker_dir}"; then
+        wlog "-------- client mc${max_concurrency} r${r} --------"
+        if ! run_bench "${max_concurrency}" "${r}" "${port}" "${worker_dir}"; then
             fail=$((fail + 1))
             wlog "本轮失败，继续下一轮（服务保持运行）"
         fi
@@ -342,7 +339,7 @@ run_worker() {
 
     stop_serve_on "${pid_file}" "${port}"
     echo "${fail}" > "${worker_dir}/fail_count"
-    wlog "======== worker done batch_size=${batch_size} fail=${fail} ========"
+    wlog "======== worker done max_concurrency=${max_concurrency} fail=${fail} ========"
     return 0
 }
 
@@ -367,35 +364,35 @@ export VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA="${_DECODE_FIA}"
 export VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA="${_NOCACHE_FIA}"
 
 # shellcheck disable=SC2206
-BS_ARR=(${BATCH_SIZES})
+MC_ARR=(${MAX_CONCURRENCIES})
 # shellcheck disable=SC2206
 DEV_ARR=(${VISIBLE_DEVICES})
 # shellcheck disable=SC2206
 PORT_ARR=(${PORTS})
 
-n_bs=${#BS_ARR[@]}
+n_mc=${#MC_ARR[@]}
 n_dev=${#DEV_ARR[@]}
 n_port=${#PORT_ARR[@]}
 
-if [[ ${n_bs} -gt 1 && ${n_dev} -eq 1 ]]; then
-    log "ERROR: 多 BATCH_SIZES (${n_bs}) 需要等长 VISIBLE_DEVICES（当前 ${n_dev}），以便卡一一对应"
+if [[ ${n_mc} -gt 1 && ${n_dev} -eq 1 ]]; then
+    log "ERROR: 多 MAX_CONCURRENCIES (${n_mc}) 需要等长 VISIBLE_DEVICES（当前 ${n_dev}），以便卡一一对应"
     exit 1
 fi
-if [[ ${n_bs} -gt 1 && ${n_port} -eq 1 ]]; then
-    log "ERROR: 多 BATCH_SIZES (${n_bs}) 需要等长 PORTS（当前 ${n_port}），以便端口一一对应"
+if [[ ${n_mc} -gt 1 && ${n_port} -eq 1 ]]; then
+    log "ERROR: 多 MAX_CONCURRENCIES (${n_mc}) 需要等长 PORTS（当前 ${n_port}），以便端口一一对应"
     exit 1
 fi
-if [[ ${n_bs} -ne ${n_dev} || ${n_bs} -ne ${n_port} ]]; then
-    log "ERROR: BATCH_SIZES/VISIBLE_DEVICES/PORTS 长度须一致: ${n_bs}/${n_dev}/${n_port}"
-    log "  BATCH_SIZES=${BATCH_SIZES}"
+if [[ ${n_mc} -ne ${n_dev} || ${n_mc} -ne ${n_port} ]]; then
+    log "ERROR: MAX_CONCURRENCIES/VISIBLE_DEVICES/PORTS 长度须一致: ${n_mc}/${n_dev}/${n_port}"
+    log "  MAX_CONCURRENCIES=${MAX_CONCURRENCIES}"
     log "  VISIBLE_DEVICES=${VISIBLE_DEVICES}"
     log "  PORTS=${PORTS}"
     exit 1
 fi
 
-if [[ "${PARALLEL}" == "1" && ${n_bs} -gt 1 ]]; then
-    for ((i = 0; i < n_bs; i++)); do
-        for ((j = i + 1; j < n_bs; j++)); do
+if [[ "${PARALLEL}" == "1" && ${n_mc} -gt 1 ]]; then
+    for ((i = 0; i < n_mc; i++)); do
+        for ((j = i + 1; j < n_mc; j++)); do
             if [[ "${DEV_ARR[i]}" == "${DEV_ARR[j]}" ]]; then
                 log "ERROR: 并行时 VISIBLE_DEVICES 不能重复: ${DEV_ARR[i]}"
                 exit 1
@@ -411,36 +408,36 @@ fi
 log "WORK_ROOT=${WORK_ROOT}"
 log "LOG_ROOT=${LOG_ROOT}"
 log "BLOCK_SIZE=${BLOCK_SIZE} FIA=${_FIA}/${_DECODE_FIA}/${_NOCACHE_FIA} ROUNDS=${ROUNDS} PARALLEL=${PARALLEL}"
-log "CEVAL_LOCAL_PATH=${CEVAL_LOCAL_PATH} CEVAL_SUBSET=${CEVAL_SUBSET:-<all>}"
-for ((i = 0; i < n_bs; i++)); do
-    log "  slot[${i}]: batch_size=${BS_ARR[i]} device=${DEV_ARR[i]} port=${PORT_ARR[i]}"
+log "bench: input_len=${BENCH_INPUT_LEN} output_len=${BENCH_OUTPUT_LEN} num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE}"
+for ((i = 0; i < n_mc; i++)); do
+    log "  slot[${i}]: max_concurrency=${MC_ARR[i]} device=${DEV_ARR[i]} port=${PORT_ARR[i]}"
 done
 
 worker_pids=()
-if [[ "${PARALLEL}" == "1" && ${n_bs} -gt 1 ]]; then
-    for ((i = 0; i < n_bs; i++)); do
-        run_worker "${BS_ARR[i]}" "${DEV_ARR[i]}" "${PORT_ARR[i]}" &
+if [[ "${PARALLEL}" == "1" && ${n_mc} -gt 1 ]]; then
+    for ((i = 0; i < n_mc; i++)); do
+        run_worker "${MC_ARR[i]}" "${DEV_ARR[i]}" "${PORT_ARR[i]}" &
         wpid=$!
         worker_pids+=("${wpid}")
-        log "spawned worker pid=${wpid} bs=${BS_ARR[i]} dev=${DEV_ARR[i]} port=${PORT_ARR[i]}"
+        log "spawned worker pid=${wpid} mc=${MC_ARR[i]} dev=${DEV_ARR[i]} port=${PORT_ARR[i]}"
     done
     for pid in "${worker_pids[@]}"; do
         wait "${pid}" || true
     done
 else
-    for ((i = 0; i < n_bs; i++)); do
-        run_worker "${BS_ARR[i]}" "${DEV_ARR[i]}" "${PORT_ARR[i]}" || true
+    for ((i = 0; i < n_mc; i++)); do
+        run_worker "${MC_ARR[i]}" "${DEV_ARR[i]}" "${PORT_ARR[i]}" || true
     done
 fi
 
 fail_count=0
-for ((i = 0; i < n_bs; i++)); do
-    fc_file="${LOG_ROOT}/bs${BS_ARR[i]}_dev${DEV_ARR[i]}_port${PORT_ARR[i]}/fail_count"
+for ((i = 0; i < n_mc; i++)); do
+    fc_file="${LOG_ROOT}/mc${MC_ARR[i]}_dev${DEV_ARR[i]}_port${PORT_ARR[i]}/fail_count"
     if [[ -f "${fc_file}" ]]; then
         fail_count=$((fail_count + $(cat "${fc_file}")))
     else
         fail_count=$((fail_count + 1))
-        log "WARN: missing fail_count for bs${BS_ARR[i]}"
+        log "WARN: missing fail_count for mc${MC_ARR[i]}"
     fi
 done
 

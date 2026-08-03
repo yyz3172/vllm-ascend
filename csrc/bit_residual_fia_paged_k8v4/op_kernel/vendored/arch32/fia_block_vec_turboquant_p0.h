@@ -1320,8 +1320,10 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     }
 
     // A1 dual-buffer staging in tmpBuff1 front; decode scratch in the tail.
-    // fp16 (WS_T=half, Scheme A/B): 2×half scratch, half affine, no CAST #1.
-    // bf16 / Scheme C: 2×fp32 (+optional C) + half widen, fp32 affine.
+    // half (Scheme A/B): 2×half scratch, native half affine, no CAST #1;
+    //   meta stays half (stage to meta0/1Align; no half↔fp32).
+    // bf16 (Scheme A/B): fp32 affine — 910B AscendC has no bf16 Mul/Add.
+    // Scheme C legacy: always fp32 affine (+ optional fp32UbC).
     // Vec1/Vec2 reclaim the full 32KB after dequant returns.
     constexpr uint32_t kTmp1Bytes = ConstInfo::BUFFER_SIZE_BYTE_32K;
     constexpr bool kUseHalfAffine =
@@ -1330,20 +1332,22 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
 #else
         IsSameType<WS_T, half>::value;
 #endif
-    const uint32_t kTileMax = isKey
-        ? br_dequant::BR_KEY_DECODE_TILE_MAX
-        : br_dequant::BR_VALUE_DECODE_TILE_MAX;
+    // half: tile=16 for meta Brcb align; bf16/Scheme C: tile=8/13 (fp32 path).
+    const uint32_t kTileMax = kUseHalfAffine
+        ? (isKey ? br_dequant::BR_KEY_DECODE_TILE_MAX_HALF
+                 : br_dequant::BR_VALUE_DECODE_TILE_MAX_HALF)
+        : (isKey ? br_dequant::BR_KEY_DECODE_TILE_MAX
+                 : br_dequant::BR_VALUE_DECODE_TILE_MAX);
     const uint32_t kScratchElems = kTileMax * br_pack::BR_HEAD_SIZE;
-    // half path: halfSrc + halfBroadcast + 32B-aligned meta0/meta1 (16 half each).
-    constexpr uint32_t kMetaAlignElems = 16U;
+    // half path: halfSrc + halfBroadcast. Meta feeds Brcb from packed SoA
+    // directly (tile starts are 16-half aligned — no meta0/1Align staging).
     const uint32_t kFp32ScratchCount = kUseHalfAffine
         ? 0U
         : ((isKey && br_dequant::BR_KEY_SCHEME_LEGACY_SIGN) ? 3U : 2U);
     const uint32_t kFp32ScratchBytes =
         kScratchElems * kFp32ScratchCount * static_cast<uint32_t>(sizeof(float));
     const uint32_t kFp16ScratchBytes = kUseHalfAffine
-        ? (kScratchElems * 2U + kMetaAlignElems * 2U) *
-              static_cast<uint32_t>(sizeof(half))
+        ? kScratchElems * 2U * static_cast<uint32_t>(sizeof(half))
         : kScratchElems * static_cast<uint32_t>(sizeof(half));
     const uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes;
     const uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;
@@ -1357,17 +1361,10 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     LocalTensor<half> halfScratch;
     LocalTensor<half> halfSrc;
     LocalTensor<half> halfBroadcast;
-    LocalTensor<half> meta0Align;
-    LocalTensor<half> meta1Align;
     if constexpr (kUseHalfAffine) {
         halfSrc = tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes);
         halfBroadcast = tmpBuff1.GetWithOffset<half>(
             kScratchElems, kStageBytes + kScratchElems * sizeof(half));
-        const uint32_t metaAlignOff =
-            kStageBytes + kScratchElems * 2U * sizeof(half);
-        meta0Align = tmpBuff1.GetWithOffset<half>(kMetaAlignElems, metaAlignOff);
-        meta1Align = tmpBuff1.GetWithOffset<half>(
-            kMetaAlignElems, metaAlignOff + kMetaAlignElems * sizeof(half));
     } else {
         fp32UbA = tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
         fp32UbB = tmpBuff1.GetWithOffset<float>(
@@ -1416,9 +1413,9 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     }
 
     // P9b: one meta DMA(+cast) per run. meta[j0] must stay 32B-aligned for
-    // Brcb: fp32 path step multiple of 8 floats; half path stages into
-    // 16-half aligned buffers each tile.
-    constexpr uint32_t kMetaSliceAlign = 8U;
+    // Brcb: fp32 path step multiple of 8 floats; half path step multiple of
+    // 16 half (pass packed metaHalf[j0] directly — no align staging).
+    constexpr uint32_t kMetaSliceAlign = kUseHalfAffine ? 16U : 8U;
     const uint32_t hoistTile = (kTileMax < kMetaSliceAlign)
         ? kTileMax
         : (kTileMax / kMetaSliceAlign) * kMetaSliceAlign;
@@ -1429,6 +1426,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     // before WaitFlag(V_MTE3), overlapping current-run VEC drain.
     bool nextDmaInFlight = false;
     uint32_t prefN = 0U;
+    // Scheme A: reuse block_table phys + pack headBase across consecutive
+    // PA runs that share the same blockInBatch (BS=128 / maxSub~29 → many
+    // runs per block). Skip GetValue + HeadBase + S_MTE2 when unchanged.
+    uint32_t cachedBlockInBatch = 0xFFFFFFFFu;
+    uint64_t cachedHeadBase = 0ULL;
 
     while (si < siEnd) {
         const uint32_t bufIdx = runId % 2U;
@@ -1446,12 +1448,17 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             uint32_t globalS2 = info.s2Idx * constInfo.s2BaseSize + si;
             uint32_t blockInBatch = globalS2 / bs;
             pos0 = globalS2 % bs;
-            uint32_t btIdx = info.bIdx * constInfo.maxBlockNumPerBatch + blockInBatch;
-
-            SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
-            headBase = GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
+            if (blockInBatch != cachedBlockInBatch) {
+                uint32_t btIdx =
+                    info.bIdx * constInfo.maxBlockNumPerBatch + blockInBatch;
+                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
+                cachedHeadBase =
+                    GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
+                cachedBlockInBatch = blockInBatch;
+            }
+            headBase = cachedHeadBase;
 
             // P15: O(1) run length within same PA block and [si, siEnd).
             uint32_t maxInBlock = bs - pos0;
@@ -1503,16 +1510,12 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             batchUb[outOff].template ReinterpretCast<WS_T>();
 
         if constexpr (kUseHalfAffine) {
-            // Meta: half→fp32 once (n scalars, uses existing aligned fp32 slots),
-            // then per-tile fp32→half into 32B-aligned meta0/1Align.
-            // Avoids unaligned half src at metaHalf[j0] when j0%16!=0 (VEC fault).
-            LocalTensor<float> meta0Fp32 = packedMetaUb[
-                br_dequant::BR_META_FP32_0_UB_OFF].template ReinterpretCast<float>();
-            LocalTensor<float> meta1Fp32 = packedMetaUb[
-                br_dequant::BR_META_FP32_1_UB_OFF].template ReinterpretCast<float>();
-            br_dequant::BrCastPackedMetaToFp32<Q_T>(
-                packedMetaUb, n, meta0Fp32, meta1Fp32);
-
+            // Native half meta: packed SoA is already half (Q_T=half). hoistTile
+            // is a multiple of 16 so metaHalf[j0] is 32B-aligned for Brcb.
+            // No half→fp32→half and no Adds staging (both fault on unaligned src).
+            LocalTensor<half> meta0Half = packedMetaUb.template ReinterpretCast<half>();
+            LocalTensor<half> meta1Half = packedMetaUb[
+                br_dequant::BR_PACKED_META_BYTES].template ReinterpretCast<half>();
             LocalTensor<half> outHalf = outBatch.template ReinterpretCast<half>();
 
             if (isKey) {
@@ -1521,31 +1524,24 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
                     if (nb > hoistTile) {
                         nb = hoistTile;
                     }
-                    Cast(meta0Align, meta0Fp32[j0], RoundMode::CAST_NONE, nb);
-                    Cast(meta1Align, meta1Fp32[j0], RoundMode::CAST_NONE, nb);
-                    PipeBarrier<PIPE_V>();
                     br_dequant::BrDecodeKeyTileHalf(
                         batchUb[j0 * codeRowBytes], halfSrc, halfBroadcast,
-                        outHalf[j0 * headDimAlign], meta0Align, meta1Align,
+                        outHalf[j0 * headDimAlign], meta0Half[j0], meta1Half[j0],
                         nb, headDim, headDimAlign);
                 }
             } else {
-                // P17b-B fold in fp32 (aligned), then tiles Cast→half affine.
-                auto fp32FoldTmp = halfSrc.template ReinterpretCast<float>();
-                Muls(fp32FoldTmp, meta1Fp32, 8.0f, n);
-                Add(meta0Fp32, meta0Fp32, fp32FoldTmp, n);
-                PipeBarrier<PIPE_V>();
+                // P17b-B fold in half; foldTmp reuses the unused fp32 meta slot.
+                LocalTensor<half> foldTmp = packedMetaUb[
+                    br_dequant::BR_META_FP32_0_UB_OFF].template ReinterpretCast<half>();
+                br_dequant::BrFoldValueMetaHalf(meta0Half, meta1Half, foldTmp, n);
                 for (uint32_t j0 = 0U; j0 < n; j0 += hoistTile) {
                     uint32_t nb = n - j0;
                     if (nb > hoistTile) {
                         nb = hoistTile;
                     }
-                    Cast(meta0Align, meta0Fp32[j0], RoundMode::CAST_NONE, nb);
-                    Cast(meta1Align, meta1Fp32[j0], RoundMode::CAST_NONE, nb);
-                    PipeBarrier<PIPE_V>();
                     br_dequant::BrDecodeValueTileHalf(
                         batchUb[j0 * codeRowBytes], halfSrc, halfBroadcast,
-                        outHalf[j0 * headDimAlign], meta0Align, meta1Align,
+                        outHalf[j0 * headDimAlign], meta0Half[j0], meta1Half[j0],
                         nb, headDim, headDimAlign);
                 }
             }
@@ -1599,17 +1595,21 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
 
         const uint32_t nextSiCandidate = si + n;
         if (nextSiCandidate < siEnd) {
-            uint32_t nextGlobalS2 = info.s2Idx * constInfo.s2BaseSize + nextSiCandidate;
+            uint32_t nextGlobalS2 =
+                info.s2Idx * constInfo.s2BaseSize + nextSiCandidate;
             uint32_t nextBlockInBatch = nextGlobalS2 / bs;
             uint32_t nextPos0 = nextGlobalS2 % bs;
-            uint32_t nextBtIdx =
-                info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
-
-            SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-            int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
-            uint64_t nextHeadBase =
-                GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
+            if (nextBlockInBatch != cachedBlockInBatch) {
+                uint32_t nextBtIdx =
+                    info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
+                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
+                int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
+                cachedHeadBase =
+                    GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
+                cachedBlockInBatch = nextBlockInBatch;
+            }
+            uint64_t nextHeadBase = cachedHeadBase;
 
             uint32_t nextMaxInBlock = bs - nextPos0;
             uint32_t nextRemaining = siEnd - nextSiCandidate;
