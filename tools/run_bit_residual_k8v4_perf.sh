@@ -65,7 +65,7 @@ Instructions:
 
   2. Run inside docker container:
      docker exec -it vllm.x00827378 bash
-     cd /root/x00827378/vllm-ascend
+     cd .   # vllm-ascend project root
      bash tools/run_bit_residual_k8v4_perf.sh [scenario]
 
   3. Example runs:

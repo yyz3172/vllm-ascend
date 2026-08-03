@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /root/x00827378/vllm-ascend
+cd .
 source xrx_infoenvs
-exec ../../ztmp/run_turboquant4bit_op_quick.sh -- \
+exec ztmp/run_turboquant4bit_op_quick.sh -- \
     --attention-only \
     --skip-cache-fill \
     --seq-len 512 \

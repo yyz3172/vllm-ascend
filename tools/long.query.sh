@@ -1,4 +1,4 @@
-export PYTHONPATH="/root/x00827378/vllm-ascend:/root/x00827378/code/vllm018/vllm:$PYTHONPATH"
+export PYTHONPATH=".:../code/vllm018/vllm:$PYTHONPATH"
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_CONFIGURE_LOGGING=1
 export ASCEND_RT_VISIBLE_DEVICES=0
@@ -12,6 +12,6 @@ export VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA=1
 
 XRX_K8V4_PROFILE=1 \
 XRX_TQ4BIT_PROFILE=1 \
-MODEL_PATH="/root/x00827378/model/Qwen3-0.6B" \
-PROFILE_DIR="/root/x00827378/vllm-ascend/ztmp/perflog" \
+MODEL_PATH="../model/Qwen3-0.6B" \
+PROFILE_DIR="ztmp/perflog" \
 python tests/e2e/singlecard/xrx_bit_residual_k8v4_long_query_profile.py

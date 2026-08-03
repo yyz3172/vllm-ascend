@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /root/x00827378/vllm-ascend
+cd .
 source xrx_infoenvs
-exec ../../ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf \
+exec ztmp/flex_tq_4bit_perf/flex_tq_4bit_perf \
     --attention-only \
     --skip-cache-fill \
     --q-lens 1 \
