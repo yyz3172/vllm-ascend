@@ -34,8 +34,13 @@
  * BrDecodeValueTile consumes signed Cast(int4) with pre-folded vmin'.
  * P18 spike: meta UB ping-pong (2×768B) so next-run MTE2 can overlap
  * current-run VEC (issue after SetFlag(V_MTE3), before WaitFlag).
- * Half affine (OutT=half only): u8/int4→half → BrApplyRowAffine(half) →
- * store half WS (no CAST #1). bf16 OutT keeps fp32 affine + Cast→bf16.
+ * Native 16-bit affine (Scheme A/B only):
+ *   half OutT: u8/int4→half → BrApplyRowAffine(half) → store half WS (no CAST #1).
+ *     Meta stays half end-to-end (no half→fp32→half); stage into 32B-aligned
+ *     meta0/1Align for Brcb when j0%16!=0.
+ *   bf16 OutT: AscendC dav_c220 Mul/Add/Adds/Muls do NOT support bfloat16_t,
+ *     and Cast has no uint8/int4→bf16 — keep fp32 affine + Cast→bf16.
+ * Scheme C legacy (BR_KEY_UNIFORM_SCHEME=3): always fp32 affine.
  */
 #ifndef BR_DEQUANT_DEVICE_H
 #define BR_DEQUANT_DEVICE_H
@@ -291,10 +296,24 @@ __aicore__ inline void BrApplyRowAffine(LocalTensor<half> dst,
 }
 
 // Copy nb meta scalars into a 32B-aligned half buffer for Brcb (half block=16).
+// BOTH src and dst must be 32B-aligned — Adds faults on unaligned half src
+// (e.g. metaHalf[j0] with j0%16!=0). Prefer tile starts at multiples of 16 and
+// pass metaHalf[j0] directly instead of staging.
 __aicore__ inline void BrStageMetaHalfAligned(LocalTensor<half> dstAlign,
     LocalTensor<half> src, uint32_t nb)
 {
     Adds(dstAlign, src, static_cast<half>(0.0f), nb);
+    PipeBarrier<PIPE_V>();
+}
+
+// P17b-B Value fold on native half meta: vmin' = vmin + 8*vstep (n rows).
+// foldTmp must be a disjoint half buffer of at least n elements.
+// vmin/vstep bases are the packed SoA runs (offset 0 → 32B-aligned).
+__aicore__ inline void BrFoldValueMetaHalf(LocalTensor<half> vmin,
+    LocalTensor<half> vstep, LocalTensor<half> foldTmp, uint32_t n)
+{
+    Muls(foldTmp, vstep, static_cast<half>(8.0f), n);
+    Add(vmin, vmin, foldTmp, n);
     PipeBarrier<PIPE_V>();
 }
 
@@ -308,8 +327,15 @@ __aicore__ inline void BrCopyMetaPair(GlobalTensor<uint8_t> srcGm, LocalTensor<u
     DataCopyPad(ub[BR_META1_UB_OFF], srcGm[meta1Off], metaParams, padParams);
 }
 
+// fp32 affine (bf16 OutT / Scheme C legacy): Brcb needs j0%8==0; keep prior
+// tile widths so tmpBuff1 scratch stays smaller and maxSub is not crushed.
 static constexpr uint32_t BR_KEY_DECODE_TILE_MAX = 8U;
 static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX = 13U;
+// Half-affine: Brcb needs 32B-aligned meta src (16×half). Tile starts must be
+// multiples of 16 so metaHalf[j0] feeds Brcb directly (Adds/Cast also fault on
+// unaligned half src). Do NOT reuse these for bf16 — doubles fp32 scratch.
+static constexpr uint32_t BR_KEY_DECODE_TILE_MAX_HALF = 16U;
+static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX_HALF = 16U;
 
 __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
 {
