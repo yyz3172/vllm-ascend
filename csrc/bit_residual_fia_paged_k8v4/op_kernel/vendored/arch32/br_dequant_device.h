@@ -336,6 +336,12 @@ static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX = 13U;
 // unaligned half src). Do NOT reuse these for bf16 — doubles fp32 scratch.
 static constexpr uint32_t BR_KEY_DECODE_TILE_MAX_HALF = 16U;
 static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX_HALF = 16U;
+// Brcb writes 1 FP16 block (16 half) per row. Footprint = tile_rows × 16, not
+// tile×headDim. Shrinking frees tmpBuff1 staging so PA run can reach 32.
+static constexpr uint32_t BR_HALF_BRCB_FOOTPRINT =
+    BR_KEY_DECODE_TILE_MAX_HALF * 16U;  // 256 half = 512B
+// Cap PA run length to BS=128 divisor (128/32=4 equal runs, no tail).
+static constexpr uint32_t BR_HALF_PA_RUN_CAP = 32U;
 
 __aicore__ inline uint32_t BrAlignUp32(uint32_t x)
 {
