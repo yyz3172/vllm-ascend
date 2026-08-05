@@ -1339,15 +1339,17 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         : (isKey ? br_dequant::BR_KEY_DECODE_TILE_MAX
                  : br_dequant::BR_VALUE_DECODE_TILE_MAX);
     const uint32_t kScratchElems = kTileMax * br_pack::BR_HEAD_SIZE;
-    // half path: halfSrc + halfBroadcast. Meta feeds Brcb from packed SoA
-    // directly (tile starts are 16-half aligned — no meta0/1Align staging).
+    // half path: halfSrc (tile×headDim) + halfBroadcast (Brcb footprint only).
+    // Meta feeds Brcb from packed SoA directly (tile starts 16-half aligned).
+    // Shrinking broadcast frees staging so maxSub can reach BR_HALF_PA_RUN_CAP.
     const uint32_t kFp32ScratchCount = kUseHalfAffine
         ? 0U
         : ((isKey && br_dequant::BR_KEY_SCHEME_LEGACY_SIGN) ? 3U : 2U);
     const uint32_t kFp32ScratchBytes =
         kScratchElems * kFp32ScratchCount * static_cast<uint32_t>(sizeof(float));
     const uint32_t kFp16ScratchBytes = kUseHalfAffine
-        ? kScratchElems * 2U * static_cast<uint32_t>(sizeof(half))
+        ? (kScratchElems + br_dequant::BR_HALF_BRCB_FOOTPRINT) *
+              static_cast<uint32_t>(sizeof(half))
         : kScratchElems * static_cast<uint32_t>(sizeof(half));
     const uint32_t kScratchBytes = kFp32ScratchBytes + kFp16ScratchBytes;
     const uint32_t kStageBytes = kTmp1Bytes - kScratchBytes;
@@ -1364,7 +1366,8 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     if constexpr (kUseHalfAffine) {
         halfSrc = tmpBuff1.GetWithOffset<half>(kScratchElems, kStageBytes);
         halfBroadcast = tmpBuff1.GetWithOffset<half>(
-            kScratchElems, kStageBytes + kScratchElems * sizeof(half));
+            br_dequant::BR_HALF_BRCB_FOOTPRINT,
+            kStageBytes + kScratchElems * sizeof(half));
     } else {
         fp32UbA = tmpBuff1.GetWithOffset<float>(kScratchElems, kStageBytes);
         fp32UbB = tmpBuff1.GetWithOffset<float>(
@@ -1409,6 +1412,13 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         }
         if (maxSub < 1U) {
             maxSub = 1U;
+        }
+        // Half: pin PA run to 32 so BS=128 splits into 4 equal runs (tile=16×2).
+        // Requires BR_HALF_BRCB_FOOTPRINT shrink so byUb Key ≥ 32.
+        if constexpr (kUseHalfAffine) {
+            if (br_dequant::BR_HALF_PA_RUN_CAP < maxSub) {
+                maxSub = br_dequant::BR_HALF_PA_RUN_CAP;
+            }
         }
     }
 
