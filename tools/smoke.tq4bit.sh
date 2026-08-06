@@ -1,4 +1,4 @@
-export PYTHONPATH=".:../code/vllm018/vllm:$PYTHONPATH"
+#export PYTHONPATH=".:../code/vllm018/vllm:$PYTHONPATH"
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_CONFIGURE_LOGGING=1
 export ASCEND_RT_VISIBLE_DEVICES=0
