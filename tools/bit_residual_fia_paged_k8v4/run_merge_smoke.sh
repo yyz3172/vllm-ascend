@@ -6,7 +6,8 @@
 #   2. xrx_bit_residual_k8v4_batch_tiers.py
 #   3. xrx_bit_residual_k8v4_golden.py
 #   4. xrx_bit_residual_fia_paged_k8v4_smoke.py
-#      (includes test_decode_kv_len_regression — NaN / mid-block dual-AIV gate)
+#      (includes test_decode_kv_len_regression — NaN / mid-block dual-AIV gate;
+#       test_mm1_s2_align32_workspace — S2%32!=0 mm1 WS Align32 vs Fixpipe)
 #   5. xrx_bit_residual_k8v4_noncontig_blocks.py --with-fia
 #      (pack via slot_mapping across non-contiguous phys blocks + FIA)
 #   6. xrx_bit_residual_k8v4_smoke.py

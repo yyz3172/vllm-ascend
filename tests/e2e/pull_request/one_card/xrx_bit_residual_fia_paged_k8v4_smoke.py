@@ -10,6 +10,7 @@
 # 4. Prefill: multi-Q + sparse_mode=3 compress causal mask
 # 5. FlashDecode: long KV (kv>~s2Base=512) tiling key 1 path
 # 6. bf16: pack meta + query/rotation (serving dtype for Qwen bf16)
+# 7. mm1 S2 Align32 workspace: KV lens with S2%32!=0 (host must size WS to 32)
 #
 # Run on NPU after building custom ops:
 #   bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh
@@ -63,6 +64,11 @@ SPARSE_MODE_RIGHT_DOWN = 3
 INT_MAX = 2147483647
 # s2Base=512; kv beyond this can enable FlashDecode when SplitCore splits S2.
 FD_KV_TOKENS = 1000
+# Host mm1/vec1 WS must AlignUp(S2, BYTE_BLOCK=32). Align16 under-sizes when
+# S2%32!=0 (e.g. 144→host 144 vs device stride 160) → Fixpipe OOB → NaN.
+MM1_ALIGN32_DIRTY_KV = (144, 168, 176, 200)
+MM1_ALIGN32_CLEAN_KV = (160, 192)
+MM1_ALIGN32_REPEATS = 8
 
 
 def _require_npu() -> torch.device:
@@ -680,6 +686,80 @@ def test_decode_kv_len_regression(device: torch.device) -> None:
     print("PASS decode_kv_len_regression")
 
 
+def test_mm1_s2_align32_workspace(device: torch.device) -> None:
+    """Regression: host sInnerSizeAlign must match device BYTE_BLOCK=32.
+
+    When S2%32!=0, AlignUp(S2, 16) under-sizes mm1/vec1 workspace vs Fixpipe
+    dstStride Align(S2, 32) → OOB writes → nondeterministic NaN. Dirty-band
+    KV lengths must stay finite across repeats; clean (%32==0) are controls.
+    """
+    dtype = torch.float16
+    num_kv_heads = 2
+    num_heads = 8
+    kv_lens = list(MM1_ALIGN32_DIRTY_KV) + list(MM1_ALIGN32_CLEAN_KV)
+
+    for num_kv_tokens in kv_lens:
+        for rep in range(MM1_ALIGN32_REPEATS):
+            torch.manual_seed(SEED + 101 * num_kv_tokens + rep)
+            block_table_cpu, num_blocks = _build_block_table([num_kv_tokens])
+            key = torch.randn(
+                (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+            ).contiguous()
+            value = torch.randn(
+                (num_kv_tokens, num_kv_heads, HEAD_SIZE), dtype=dtype, device=device
+            ).contiguous()
+            query = torch.randn(
+                (1, num_heads, HEAD_SIZE), dtype=dtype, device=device
+            ).contiguous()
+            rotation = _identity(dtype, device)
+            key_cache, value_cache = _pack_kv_cache(
+                key=key,
+                value=value,
+                rotation_t=rotation,
+                num_blocks=num_blocks,
+                num_kv_heads=num_kv_heads,
+            )
+            actual_seq_lens_q = [1]
+            actual_seq_lens_kv = [num_kv_tokens]
+            out_attn = _run_attn(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table_cpu.to(device),
+                actual_seq_lens_q=actual_seq_lens_q,
+                actual_seq_lens_kv=actual_seq_lens_kv,
+                rotation_key=rotation,
+                rotation_value=rotation,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            out_fia = _run_fia(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table_cpu.to(device),
+                actual_seq_lens_q=actual_seq_lens_q,
+                actual_seq_lens_kv=actual_seq_lens_kv,
+                rotation_key=rotation,
+                rotation_value=rotation,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            torch.npu.synchronize()
+            if not torch.isfinite(out_fia).all() or not torch.isfinite(out_attn).all():
+                raise AssertionError(
+                    f"mm1_s2_align32_workspace: non-finite at kv={num_kv_tokens} "
+                    f"rep={rep} (S2%32={num_kv_tokens % 32})"
+                )
+            diff = (out_fia.float() - out_attn.float()).abs().max().item()
+            if diff > FIA_VS_ATTN_ATOL:
+                raise AssertionError(
+                    f"mm1_s2_align32_workspace: kv={num_kv_tokens} rep={rep} "
+                    f"max_diff {diff} exceeds {FIA_VS_ATTN_ATOL}"
+                )
+    print("PASS mm1_s2_align32_workspace")
+
+
 def test_flash_decode_long_kv(device: torch.device) -> None:
     """Long-KV decode (kv=1000 > s2Base=512): multi-s2Base / FD-capable path.
 
@@ -1059,6 +1139,7 @@ def main() -> None:
     test_prefill_causal_gqa(device)
     test_prefill_full_seq_dense_rotation(device)
     test_decode_kv_len_regression(device)
+    test_mm1_s2_align32_workspace(device)
     test_flash_decode_long_kv(device)
     test_flash_decode_multibatch_vs_attn(device)
     test_bf16_decode_multi_kv_gqa(device)
