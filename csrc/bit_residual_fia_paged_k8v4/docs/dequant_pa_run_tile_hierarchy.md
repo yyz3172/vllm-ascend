@@ -1,11 +1,61 @@
 # BitResidual Dequant：PA Run / Tile / Affine 分层与 FP16 影响面
 
-> 源码：`fia_block_vec_turboquant_p0.h`（`DequantKvImpl`）、`br_dequant_device.h`  
+> 源码：`fia_block_vec_turboquant_p0.h`（`DequantKvImpl`）、`br_dequant_device.h`、`br_pack_layout.h`  
 > 相关：[`br_dequant_decode_flow.md`](br_dequant_decode_flow.md)、[`dequant_opt_p0_p12_report.md`](dequant_opt_p0_p12_report.md)
 
-本文说明反量化路径上的 **多层批大小**，以及把 **affine 中间计算从 fp32 降到 fp16** 时，**哪一层能多处理数据、哪一层不会自动变大**。
+本文说明反量化路径上的 **多层批大小**，以及 **affine 中间计算从 fp32 降到 fp16** 时，**哪一层能多处理数据、哪一层不会自动变大**。
 
-用例口径与仓库 L6 / longquery 对齐：
+---
+
+## 术语：S1 / S2 / N1 / N2 / G / BS 等
+
+这套术语沿用 CANN FIA（`FusedInferAttentionScore`）host tiling 的命名（见 `fia_tiling_info.h` 的 `bSize/n1Size/n2Size/s1Size/s2Size/gSize`）。先统一口径，否则下文公式里的字母容易和「KV head 数」「batch」混。
+
+| 符号 | 全称 | 含义 | 本文主例值 |
+|------|------|------|-----------|
+| **B** | batch | 请求数（推理 batch size） | 16 |
+| **S1** | query seq len | Q 侧序列长（每 batch 的 token 数）。TND 下用「每 batch S1 的 **max**」作为 tiling 的 `s1Size`，**不是 1**（即便 decode S1=1 也取 max，避免触发 FIA 的 `S1_EQUAL1` mask 布局） | prefill 240 / decode 16 |
+| **S2** | kv seq len | KV 侧序列长（每 batch 已写入的历史 token 数）。tiling 用「每 batch S2 的 **max**」= `maxKvSeq` | 2000 |
+| **N1** | num heads (Q) | Q 头数 = `num_heads` | —（见 N2/G） |
+| **N2** | num kv heads | KV 头数 = `num_kv_heads`（GQA 的 K/V 头数，mBA/dPA 等模型常 =8） | 8 |
+| **G** | group size | GQA group = `N1 / N2`（每个 KV head 服务 G 个 Q head） | `N1/8` |
+| **D** | head dim | 每头维度。本算子硬约束 `head_size == 128` | 128 |
+| **BS** | block size | paged-attention 物理 block 行数（`block_size`，须是 16 的倍数） | 128 |
+| **s2Base** | S2 base tile | S2 方向外层基本块（host `kS2BaseSize=512`，且向 BS 对齐）。FD 按此切 chunk | 512 |
+| **mBase** | M base tile | M（=S1×G）方向外层基本块（host `kMBaseSize=512`，对齐 FIA TND `M_BASE_SIZE_512`） | 512 |
+| **maxSub** | PA run 行数 | 单次 PA run 反量化的 KV 行数上限 = `min(BR_S2_SUB_MAX=64, byUb)` | 见 §1.3.5，随 scheme/dtype 变 |
+| **byUb** | staging 半区行数 | 一个 ping-pong staging half 能装下的「codes+out 同驻」行数 | 同上 |
+| **hoistTile** | decode tile | 一次 `BrDecode*Tile` 处理的行数（Brcb 32B 对齐 → 8 的倍数） | Key 8 / Val 13 |
+
+**几个易混点**：
+
+- **N1/N2 vs NKV**：本文与代码里「KV head 数」用 **N2**（FIA 命名）；`NKV` 是同一概念在 pack/文档别处的别名，**N2 = NKV = num_kv_heads**。`N1 = N2 × G`。
+- **S1G**：外层 SplitCore 的 M 轴实际是 `S1 × G`（把 G 个 Q head 摊进 M），代码里记作 `s1GBaseNum = ceil(S1*G / mBase)`。所以「M 轴」「S1G 轴」是同一件事。
+- **S2 在 dequant 里有三级**：外层 FD 切的 `s2Count`（≈ s2Base 或尾块）→ L0 Dual-AIV 对半的 `[siStart,siEnd)` → L1 PA run 的 `n`。别把 `kvSeq=2000` 直接塞进 `n` 的公式。
+- **BS（block_size）≠ s2Base**：BS=128 是 paged 物理页行数，只卡连续 DMA 与 `pos0`；s2Base=512 是 FD 外层切 chunk 的大小。
+
+### Scheme（Key 反量化公式，决定 scratch fp32 槽数）
+
+`BR_KEY_UNIFORM_SCHEME`（`br_dequant_device.h`，**默认 = 1**）：
+
+| Scheme | 公式 | scratch fp32 槽 | 默认编译? |
+|--------|------|----------------|----------|
+| **A (1, 默认)** | `y = base + q*step`，q∈[0,255] uint8 | **2×fp32** + 1×half | ✅ 默认 |
+| B (2) | `y = s*(q-127.5)`，meta0=-127.5*s, meta1=s | 2×fp32 + 1×half | 否 |
+| C (3, legacy) | `y = sign*(base+q7*step)`，code=(q7<<1)\|sign | **3×fp32** + 1×half | 否（需 `-D...=3`） |
+
+> ⚠️ 下文若见「Key 3×fp32 / maxSub=23 / scratch=14336B」，那是 **Scheme C** 的数字。**默认 Scheme A** 编译下 Key 是 **2×fp32**，scratch=10240B，`byUb≈28`（见 §1.3.5 的 scheme 对比表）。本文 §1.3.5 起已按 scheme 分列。
+
+### Dequant 分层对 prefill / decode 相同
+
+都走 `DequantKvImpl`；差别在外层 Q/Cube/Softmax，不在 L1–L3 公式。
+`Q=240` / `B=16` **不进入** `siStart/siEnd` 与 `n` 的公式，只影响调度多少任务和 Cube 侧 M 维。
+
+---
+
+## 用例口径
+
+与仓库 L6 / longquery 对齐：
 
 | 用例 | 入口 | 典型 shape | 说明 |
 |------|------|------------|------|
@@ -17,11 +67,9 @@
 
 ```text
 Prefill L6: Q=240（q/seq≈15）, B=16, kvSeq=2000, s2Base=512, BS=128
-            NKV=8, D=128；Key 有效 maxSub≈23, hoistTile=8
+            N2=8, D=128；hoistTile=8（Key）/ 13（Val）
+            Key 有效 maxSub：默认 Scheme A ≈28；Scheme C ≈23；half-affine ≈36
 ```
-
-**Dequant 分层对 prefill / decode 相同**（都走 `DequantKvImpl`）；差别在外层 Q/Cube/Softmax，不在 L1–L3 公式。  
-`Q=240` / `B=16` **不进入** `siStart/siEnd` 与 `n` 的公式，只影响调度多少任务和 Cube 侧 M 维。
 
 ---
 
@@ -58,15 +106,16 @@ s2Idx=0                  1             2             3
 |------|------|----------------|--------------|--------------|
 | （外） | **FD S2 chunk** | 3×512 + **1×464** | 一段连续 KV | `s2Base=512` |
 | L0 | **S2 子核区间** | 满块每核 256；尾块每核 **232** | `[siStart, siEnd)` | Dual-AIV 对半 |
-| L1 | **PA run** | Key `n≤23` | 同 PA block 连续 `n` 行 DMA+decode | PA∩子核剩余∩`maxSub` |
+| L1 | **PA run** | Key `n≤28`（Scheme A 默认）/ `≤23`（Scheme C）/ `≤36`（half-affine） | 同 PA block 连续 `n` 行 DMA+decode | PA∩子核剩余∩`maxSub` |
 | L2 | **Decode tile** | `hoistTile=8`；`n=23`→3 tile | 一次 `BrDecode*Tile` | scratch + Brcb 8 对齐 |
-| L3 | **Affine 列拍** | 每行 **2** 拍 @fp32 | `headDim=128` 的 Mul/Add | 256B/repeat |
+| L3 | **Affine 列拍** | 每行 **2** 拍 @fp32 / **1** 拍 @fp16 | `headDim=128` 的 Mul/Add | 256B/repeat |
 
 **一句话**：FD 决定「这次 dequant 面对多长的 S2」；L0 决定「两个 AIV 各拿一段」；PA run 决定「一次从 GM 拉多少行」；tile 决定「拉进来后一次 VEC 算多少行」；列拍决定「一行 128 维要几次 Mul/Add」。
 
 > **约束公式**见 [§1.1–§1.5](#11-约束总图谁卡谁)（每层含主例）。  
 > **整体流水 vs Dequant 内部流水（图示）**见 [§1.6](#16-主例整体流水-vs-dequant-内部流水图示)。  
-> **Prefill vs Decode / longquery / fp16**见 [§1.7](#17-prefill-vs-decode-longquery-与-fp16)。
+> **Prefill vs Decode / longquery / fp16**见 [§1.7](#17-prefill-vs-decode-longquery-与-fp16)。  
+> **Host 侧 SplitCore 核间负载均衡**（FD chunk 由谁切、每核拿哪段 S2）见 [§1.8](#18-host-侧-splitcore核间负载均衡cube-分核)。
 
 ```mermaid
 flowchart TB
@@ -103,7 +152,8 @@ flowchart TB
                     └────┬─────────────────────────────────────┘
                          │
                     ┌────▼─────────────────────────────────────┐
-   L1 n = min(…)    │ maxSub = min(64 meta, byUb staging≈23)   │
+   L1 n = min(…)    │ maxSub = min(64 meta, byUb staging)      │
+                    │   byUb: A默认≈28 / Scheme C≈23 / half≈36 │
                     └────┬─────────────────────────────────────┘
                          │
                     ┌────▼─────────────────────────────────────┐
@@ -120,7 +170,7 @@ flowchart LR
   PA["PA: BS-pos0"] --> N["n"]
   REM["siEnd-si"] --> N
   META["meta≤64"] --> MS["maxSub"]
-  STG["staging byUb≈23"] --> MS
+  STG["staging byUb<br/>A默认28/C23/half36"] --> MS
   MS --> N
   SCR["scratch"] --> HT["hoistTile"]
   HW["256B/repeat"] --> CL["columnLoops"]
@@ -192,14 +242,14 @@ maxInBlock = BS - pos0;                    // 本块从 pos0 到块尾还能连�
 
 ```cpp
 n = min(maxInBlock, siEnd - si, maxSub);
-// maxSub = min(BR_S2_SUB_MAX=64, byUb≈23)  → Key 有效 23
+// maxSub = min(BR_S2_SUB_MAX=64, byUb)  → Key 有效：A默认 28 / Scheme C 23 / half 36
 ```
 
 | 闸门 | 主例含义 |
 |------|----------|
 | `maxInBlock` | 同物理块内连续行；跨块必须换 `physBlock` / `headBase` |
 | `siEnd-si` | 不写过本 AIV 的 L0 区间 |
-| `maxSub≈23` | staging 半区装不下更多（meta 64 仍松） |
+| `maxSub≈28`（A默认）/ `23`（C）/ `36`（half） | staging 半区装不下更多（meta 64 仍松） |
 
 ### 1.3.3 主例：满块 `s2Idx=0`，AIV0，`si` 从 0 起（块对齐）
 
@@ -235,7 +285,7 @@ AIV1: si∈[232,464) → 232 行
   → 每 AIV 约 6+5=11 次 Key PA run（尾块比满块的 12 略少）
 ```
 
-### 1.3.5 `maxSub`：为何是 ~23 不是 64（布局约束）
+### 1.3.5 `maxSub`：为何远小于 64（布局约束）
 
 `maxSub` 取两道闸的更紧者：
 
@@ -243,7 +293,9 @@ AIV1: si∈[232,464) → 232 行
 maxSub = min(BR_S2_SUB_MAX /*=64, meta 槽*/, byUb /*staging 半区能装几行*/);
 ```
 
-主例 Key 上 **`byUb=23 < 64`**，所以有效值是 23。下面从 **UB 布局公式**说明为什么，以及「只改 dtype」为何冲不到 64。
+`byUb` 随 **scheme + dtype** 变（详见下表与 §C）：Scheme A（默认，2×fp32）Key `byUb≈28`；Scheme C（legacy 3×fp32）`≈23`；half-affine（已落地）`≈36`。三者都 `<64`，所以有效 maxSub 都被 staging 卡住，而非 meta。
+
+> ⚠️ 下文 §1.3.5–§1.6 的逐行数值推演以 **Scheme C（maxSub=23）** 为示例口径（6 run/128 的叙述最直观）；**默认 Scheme A 编译**下把 23 换成 28、`ceil(128/28)=5 run`，几何关系完全一致。各 scheme 的精确 `byUb` 见本节 §A 末与 §C 表。
 
 #### A. 两块独立 UB，卡的不是同一处
 
@@ -265,7 +317,7 @@ maxSub = min(BR_S2_SUB_MAX /*=64, meta 槽*/, byUb /*staging 半区能装几行*
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**meta=64 与 staging≈23 是两道闸**；今天绑死的是 **staging `byUb`**。  
+**meta=64 与 staging（A默认28 / C23 / half36）是两道闸**；今天绑死的是 **staging `byUb`**（meta 64 仍松）。
 下面把 `tmpBuff1` 里 **ping-pong 存什么、scratch 存什么、Key 为何要 3×fp32** 展开。
 
 ##### A.1 A1 ping-pong staging：存什么、为何双份
@@ -280,7 +332,7 @@ batchUb = tmpBuff1.GetWithOffset<uint8_t>(kHalfBytes, bufIdx * kHalfBytes);
 **每个 half 里同时驻留两类数据**（同一 run 的 `n` 行）：
 
 ```text
-half[bufIdx]  （主例 Key: kHalfBytes=9216，n≤23）
+half[bufIdx]  （主例 Key: kHalfBytes=9216(Scheme C)/11264(A默认)/14304(half)，n≤maxSub）
 ┌─────────────────────────────────────────────────────────────┐
 │ codes 区（MTE2 从 GM pack cache 读入）                        │
 │   Key: n × 128 B  uint8 codes     （每行 128 维 q7|sign）   │
@@ -477,7 +529,7 @@ nibbles → Cast → halfScratch → Cast → scratchA (s 的 fp32)
 
 | Buffer | 粒度 | 内容 |
 |--------|------|------|
-| staging half0/1 | **PA run**（最多 ~23 行） | codes + 反量化后的 out |
+| staging half0/1 | **PA run**（最多 maxSub 行：A默认28/C23/half36） | codes + 反量化后的 out |
 | decode scratch | **decode tile**（Key 8 行） | 解 bit / sign / affine 临时 |
 | `dequantInt8Buf_` slot | **PA run**（设计最多 64 行） | meta0/1 packed + fp32 meta（给 Brcb） |
 
@@ -486,15 +538,17 @@ nibbles → Cast → halfScratch → Cast → scratchA (s 的 fp32)
 ---
 
 ```text
-1) scratch（Key, tile=8, 现 fp32 中间态）
+1) scratch（Key, tile=8）
    elems = 8 × 128 = 1024
-   fp32×3 = 1024 × 3 × 4 = 12288 B
-   half×1 = 1024 × 2     =  2048 B
-   kScratchBytes         = 14336 B
+   fp32×2 (Scheme A/B) = 1024 × 2 × 4 =  8192 B
+   fp32×3 (Scheme C)  = 1024 × 3 × 4 = 12288 B
+   half×1             = 1024 × 2     =  2048 B
+   ─────────────────────────────────────────────
+   kScratchBytes:  Scheme A = 10240 B；Scheme C = 14336 B
 
 2) staging 总预算（A1 双缓冲）
-   kStageBytes = 32768 − 14336 = 18432 B
-   kHalfBytes  = 18432 / 2     =  9216 B   ← 每个 ping-pong 半区
+   Scheme A:  kStageBytes = 32768 − 10240 = 22528 B → kHalfBytes = 11264 B
+   Scheme C:  kStageBytes = 32768 − 14336 = 18432 B → kHalfBytes =  9216 B
 
 3) 每行要同时驻留的东西（关键）
    codes: BR_KEY_CODE_BYTES = 128 B/行
@@ -503,25 +557,27 @@ nibbles → Cast → halfScratch → Cast → scratchA (s 的 fp32)
    （meta 在独立 buffer，不占这 384）
 
 4) byUb = (kHalfBytes − 128) / perRow
-        = (9216 − 128) / 384
-        = 9088 / 384
-        = 23.666… → 整数 23
+   Scheme A: (11264 − 128) / 384 = 11136 / 384 = 28.999… → 整数 28
+   Scheme C: ( 9216 − 128) / 384 =  9088 / 384 = 23.666… → 整数 23
 
-5) maxSub = min(64, 23) = 23
+5) maxSub = min(64, byUb)
+   Scheme A 默认 = 28；Scheme C = 23
 ```
 
-Value 同理：`perRow=64+256=320`，tile=13 时 scratch 更大 → `byUb=24`，有效 maxSub=24。
+Value（`perRow=64+256=320`，tile=13 → scratch 更大）同理：Scheme A 下 `byUb=24`、有效 maxSub=24（Scheme C 因 fp32 槽同 Key，scratch 更大，`byUb` 更小）。
 
 ```text
          meta 槽允许 ──────────────────────── 64
                           ╲
                            ╲ min
                             ╲
-         staging byUb ───────●── 23 (Key)   ← 当前绑点
-                             n ≤ 23
+         staging byUb ───────●── 28 (Key, Scheme A 默认)   ← 当前绑点
+                             │    23 (Key, Scheme C legacy)
+                             │   ~36 (Key, half-affine, 见 §C 表)
+                             n ≤ maxSub
 ```
 
-主例「每 128 行约 6 次 PA run」来自 **`ceil(128/23)=6`**，与 meta 64 无关。
+主例「每 128 行约 6 次 PA run」对应 Scheme C（`ceil(128/23)=6`）；Scheme A 默认下 `ceil(128/28)=5`。与 meta 64 无关。
 
 #### C. 为何「只改 dtype（affine→fp16）」也到不了 64
 
@@ -529,8 +585,10 @@ dtype 只变瘦 **scratch**（尾部），staging 仍是 **A1 双 half + 每行 
 
 | 布局假设 | Key scratch | `kHalfBytes` | `byUb` | 能否到 64？ |
 |----------|-------------|--------------|-------|-------------|
-| **现网** fp32 scratch, tile=8, A1 双 half | 14336 | 9216 | **23** | 否 |
-| **只改 affine→fp16**（tile 仍 8，scratch 按 2B×3 + half） | 8192 | 12288 | **31** | 否（抬一截，仍远低于 64） |
+| Scheme C fp32 scratch (3×fp32+half), tile=8, A1 双 half | 14336 | 9216 | **23** | 否 |
+| **Scheme A fp32 scratch (2×fp32+half), tile=8, A1 双 half — 默认编译** | 10240 | 11264 | **28** | 否 |
+| **half-affine 已落地**（WS_T=half, Scheme A/B, scratch=2×half+32B meta对齐槽） | 4160 | 14304 | **36** | 否（抬一截，仍远低于 64） |
+| Scheme C 只改 affine→fp16（tile 仍 8，scratch 按 2B×3 + half） | 8192 | 12288 | **31** | 否 |
 | 极限：scratch=0，仍 A1 双 half | 0 | 16384 | **42** | **否**（双缓冲硬顶） |
 | 要 `byUb≥64` 且保留 A1 双 half | — | ≥24704 | ≥64 | **不可能**：需 `kStageBytes≥49408 > 32KB` |
 
@@ -543,7 +601,7 @@ A1 双 half 在 32KB 内的 Key 理论上限:
 → 在「双 staging + codes/out 同驻」前提下，dtype 怎么改都不够
 ```
 
-所以：**fp16 值得做（列拍减半 + 可选把字节分给 tile 或把 maxSub 23→~31）**；  
+所以：**fp16 已落地（见下）**，确实把列拍 2→1、并把 Key `byUb` 从 28→~36；  
 **但它解不开「冲到 64」**——那是 **A1 双缓冲 × perRow=384** 的几何问题，不是 meta、也不是 Cast 精度问题。
 
 #### D. 若要扩大 `maxSub`，可以怎么走
@@ -552,7 +610,7 @@ A1 双 half 在 32KB 内的 Key 理论上限:
 
 | 路径 | 做法 | 预期 Key `byUb` | 代价 / 风险 |
 |------|------|-----------------|-------------|
-| **D1. 减 scratch（含 fp16）** | affine→fp16，或减 fp32 临时张量；tile 先不动 | **~31** | 精度；与加大 tile **零和** |
+| **D1. 减 scratch（含 fp16）** | affine→fp16（**已落地**），或减 fp32 临时张量 | 28→**~36**（实测） | 精度；与加大 tile **零和** |
 | **D2. 取消 A1 双 half** | staging 单区，靠 MTE3 排空后再 MTE2 | 现 scratch 下 ~**47**；fp16 scratch ~**63**；零 scratch ~**85** | 失去 A1 的 MTE2∥MTE3；可能回退 P18 部分重叠收益 |
 | **D3. 缩小 `perRow`** | staging 只留 codes，out 改写到别的 Que/立即 MTE3 不长期占 half | A1+零 scratch 时 codes-only：`(16384−128)/128≈127` | 同步与流水重做；实现量大 |
 | **D4. 扩 / 改 meta 槽** | 仅当 `byUb` 已 >64 时才有意义；改 `BR_S2_SUB_MAX` 与 768B 布局 | 解除 64 天花板 | 今日未碰到；单独做无收益 |
@@ -560,14 +618,14 @@ A1 双 half 在 32KB 内的 Key 理论上限:
 
 建议顺序：
 
-1. **先 D1（fp16）**：便宜，主例 maxSub 23→~31，每 128 行 run 数 6→约 5；顺带 L3 列拍减半。  
+1. **D1（fp16）已落地**：主例 Key maxSub 28→~36，每 128 行 run 数 5→约 4；顺带 L3 列拍减半。下一步可把省下的字节分给 tile（见 §5）。  
 2. 若 profile 仍显示 PA run / DMA 次数是热点，再评估 **D2 或 D3**（架构级），不要指望「再削一点 dtype」到 64。  
 3. **D4** 放在 staging 已经 ≥64 之后。
 
 ```text
 扩 maxSub 决策树（Key）:
 
-  只想 23→30+ ──────────────► D1 fp16 / 瘦 scratch
+  默认 28 想到 36+ ──────────► D1 fp16（已实现）/ 瘦 scratch
   想接近 64 且保双缓冲 ──────► 32KB 几何不够 → 必须 D3 或加 UB
   想 ≥64 且可接受单 staging ► D2（+可选 D1）→ byUb~47..85，再 min(meta,…)
   想 >64 ───────────────────► D2/D3 之后再 D4 扩 meta
@@ -576,7 +634,7 @@ A1 双 half 在 32KB 内的 Key 理论上限:
 ---
 
 
-## 1.4 L2：Decode tile（主例 `n=23`）
+## 1.4 L2：Decode tile（主例示例 `n=23`，即 Scheme C 口径）
 
 ```cpp
 hoistTile = 8;   // Key: TILE_MAX=8；Val TILE_MAX=13 也对齐成步长 8
@@ -601,7 +659,7 @@ j0=16 → nb=7   行 16..22
 尾块单 AIV ~11 run ×（多数 3 tile）略少
 ```
 
-加大 `TILE_MAX` 会多吃 scratch → staging↓ → 主例的 `maxSub=23` 可能再降（L1/L2 零和）。
+加大 `TILE_MAX` 会多吃 scratch → staging↓ → 主例的 `maxSub`（A默认28/C23/half36）可能再降（L1/L2 零和）。
 
 ---
 
@@ -614,7 +672,7 @@ j0=16 → nb=7   行 16..22
             → fp16 每拍 128 元 → columnLoops=1
 ```
 
-### 主例（fp32，现网）
+### 主例（fp32，Scheme C 示例口径）
 
 ```text
 BrApplyRowAffine 每个 tile 的每一行:
@@ -628,14 +686,14 @@ BrApplyRowAffine 每个 tile 的每一行:
 
 ## 1.6 主例：整体流水 vs Dequant 内部流水（图示）
 
-主例不变：`Prefill Q=240, B=16, kvSeq=2000, s2Base=512, BS=128, Key maxSub≈23`。
+主例不变：`Prefill Q=240, B=16, kvSeq=2000, s2Base=512, BS=128, Key maxSub=示例23(Scheme C)/默认28(A)/36(half)`。
 
 先分清两级「流水单元」：
 
 | 层级 | 单元 | 主例大小 | 含义 |
 |------|------|----------|------|
 | **整体（与 Cube 同步）** | 一个 S2 任务 / FD chunk | **512**（尾块 **464**） | 这段 K（或 V）全部写入 dequant WS 后，才 `CrossCoreSetFlag`，Cube 才做 MM1/MM2 |
-| **Dequant 内部** | 一个 PA run | **~23**（Key） | 一次 MTE2→VEC→MTE3；A1/P18 ping-pong 按此转 |
+| **Dequant 内部** | 一个 PA run | **示例23(C)/默认28(A)/36(half)**（Key） | 一次 MTE2→VEC→MTE3；A1/P18 ping-pong 按此转 |
 | PA block | 物理页 | **128** | 只限制连续 DMA，**不是**与 QK 的同步单元 |
 
 ---
@@ -658,7 +716,7 @@ s2Count:  512       512       512       464
 时间 →
 
 AIV:  [======== DequantK：扫完 512 token ========] SetFlag(K)
-      │  内部：多次 PA run(~23) × 双 AIV 对半     │
+      │  内部：多次 PA run(示例23/默认28/half36) × 双 AIV 对半 │
 AIC:  WaitFlag(K) [======== MM1 QK，N=512 ========] SetFlag(C1)
 
 AIV:  …（预取槽上另一任务）…  [==== DequantV 整段 s2Count ====]→Vec1
@@ -780,10 +838,10 @@ flowchart TB
 ```
 
 ```text
-层次口诀（主例数字）:
+层次口诀（主例数字，示例按 Scheme C）:
   512  — 与 Cube 同步的「大拍」（尾块 464）
   128  — PA 物理块，只卡连续寻址
-   23  — Dequant 小流水拍（Value≈24）
+   23  — Dequant 小流水拍（Scheme C；默认 A=28，half=36；Value≈24）
     8  — Decode tile
 ```
 
@@ -792,7 +850,7 @@ flowchart TB
 ```text
 ① FD: 3×512 + 尾块464
 ② L0: 512→256+256（尾块 232+232）
-③ L1: maxSub≈23，pos0=globalS2%128
+③ L1: maxSub≈示例23(C)/默认28(A)/36(half)，pos0=globalS2%128
 ④ L2: n=23 → 8+8+7
 ⑤ L3: 每行 affine 2 列拍 @fp32
 Q=240/B=16: 只影响任务数与 Cube M 维，不改 ②–⑤ 批大小公式
@@ -800,9 +858,9 @@ Q=240/B=16: 只影响任务数与 Cube M 维，不改 ②–⑤ 批大小公式
 
 | 想提高… | 主例绑点 | 手段 |
 |---------|----------|------|
-| 单次 DMA 行数 | `maxSub≈23` | 减 scratch / 改 staging |
-| 单次 Decode 行数 | tile=8 | 减 scratch 或 fp16 |
-| 一行更少拍 | 列拍=2 | fp16 affine |
+| 单次 DMA 行数 | `maxSub≈示例23(C)/默认28(A)/36(half)` | 减 scratch / 改 staging（half 已落地到 36） |
+| 单次 Decode 行数 | tile=8 | 减 scratch 或 fp16（tile 上调待办） |
+| 一行更少拍 | 列拍=2(fp32)/1(half) | fp16 affine（已落地） |
 | Dequant∥Cube 更深 | 整段 512 才 flag | 架构级（如按更小 S2 握手，文档 P19 类） |
 
 ---
@@ -829,17 +887,214 @@ Pack 写新 token ≠ FIA dequant 读历史（分层只描述读侧）
 
 ### 1.7.3 fp16 落在主例上的体感
 
-对 **满 chunk、单 AIV、Key、256 行**：
+对 **满 chunk、单 AIV、Key、256 行**（下表以 Scheme C fp32 为"改前"口径对照；默认 Scheme A 把 23/6 换成 28/5）：
 
-| 改动 | 现 | fp16 后可能 |
+| 改动 | fp32（改前） | half-affine（已落地） |
 |------|-----|-------------|
-| L3 列拍 | 256×2 | **256×1**（必得） |
-| L2 tile 8→16 | 每 run 3 Decode | 每 run **2**（run 次数不变） |
-| L1 maxSub 23→~31 | 每 128 行 **6** run | 约 **5** run；12→~10 run/AIV |
+| L3 列拍 | 256×2 | **256×1**（已得） |
+| L2 tile 8→16 | 每 run 3 Decode | tile 暂未上调，仍 3 Decode（待办） |
+| L1 maxSub 23→~36 | 每 128 行 **6** run（C）/ 5 run（A） | 约 **4** run/AIV（A 口径 28→36） |
 | meta 64 | 未碰 | 仍未碰 |
 
 尾块 464：同样比例削减，绝对 run 数比满块少一截。  
-`tmpBuff1` 上加大 tile 与加大 `maxSub` **零和**，不能两头都按上限叠满。
+`tmpBuff1` 上加大 tile 与加大 `maxSub` **零和**，不能两头都按上限叠满；当前实现把 half 省下的字节主要给了 staging（maxSub↑），tile 未上调。
+
+---
+
+## 1.8 Host 侧 SplitCore：核间负载均衡（cube 分核）
+
+上面 §0–§1.7 都讲 **单核内部**（Dual-AIV、PA run、tile、列拍）。本节切到 **host 侧**：进 device 之前，`BitResidualFiaPagedK8v4TilingFunc`（`bit_residual_fia_paged_k8v4_tiling.cpp:426`）先调用 **`SplitCore`**（`op_host/vendored/split_core.cpp`），把整个 `(B, N2, G, S1, S2)` 任务空间切成「每个 cube 核负责哪一段」——输出的右开区间三元组 `(bN2End[i], gS1End[i], s2End[i])` 就是 device 侧每个核的数据起止。FD chunk（§0 的 `s2Base=512` 切分）只是这套分核的一个内部维度。
+
+> 源码：`op_host/vendored/split_core.h`（结构体 + `IsWithinTolerance`）、`split_core.cpp`（实现）、`bit_residual_fia_paged_k8v4_tiling.cpp:402-437`（调用与校验）。`FA_TOLERANCE_RATIO=2`、`FD_TOLERANCE_RATIO=2`、`gS1BaseSizeOfFd=8`（host 常量 `kFdGS1BaseSize`）。
+
+### 1.8.1 任务空间与游标
+
+整个任务空间是 4 维 `(b, n2, s1g, s2)`，被压成 **3 层游标**（外→中→内）：
+
+| 游标 | 轴 | 含义 | 基本块（host 常量） |
+|------|----|------|---------------------|
+| `BN2` | `b × n2`（展平） | batch × KV-head 复合外层 | — |
+| `S1G` | `s1 × g`（= M 轴，GQA 把 G 个 Q head 摊进 M） | 一个 batch 内的 M 行 | `mBase = kMBaseSize = 512` |
+| `S2` | kv seq | KV 序列方向 | `s2Base = kS2BaseSize = 512`（向 BS=128 对齐） |
+
+分核 = 把这个 3 层游标顺序区间切成 `usedCoreNum` 段。每个核拿到一个 **右开区间三元组** `(bN2End[i], gS1End[i], s2End[i])`：核 i 在 BN2 轴做到 `bN2End[i]`、S1G 轴做到 `gS1End[i]`、S2 轴做到 `s2End[i]`，下一个核从该点续接。`UpdateCursor`（`split_core.cpp:339`）负责块满→行满→batch 满的级联推进。
+
+### 1.8.2 Cost 模型：`CalcCost` 与 `CalcCostTable`
+
+**单块开销**（`split_core.cpp:86`）：
+
+```cpp
+alignBasicM  = ceil(basicM  / 16);   // M 轴按 16 对齐
+alignBasicS2 = ceil(basicS2 / 64);   // S2 轴按 64 对齐
+cost = 6 * alignBasicM + 10 * alignBasicS2;
+```
+
+这是 cube MMAD（`C[M,N]=A[M,K]×B[K,N]`，M=S1G、N=S2、K=headDim=128）的 **线性开销代理**：
+
+- **16** = cube M 轴天然块（Mmad 的 `m0=16` 行一块）；**64** = N 轴 fp16/bf16 的 L0 块。对齐粒度匹配硬件块，使「块数 ≈ 真实 MMAD 拍数」。
+- **6 / 10** 是经验标定系数，**10 > 6** 反映 S2（N）轴每块更重 —— softmax、mask、KV 的 L1 重载都沿 S2 走，M 轴相对「干净」。
+- `ceil` 对齐 → 一块 M=1 与 M=16 同价；S2=1 与 S2=64 同价。
+
+**`CalcCostTable`**（`split_core.cpp:95`）：每 batch 有 M 尾（`s1GTailSize`，只在最后一个 S1G 块）和 S2 尾（`s2TailSize`，只在最后一个 S2 块）。组合出 2×2 cost 表 `BlockCost[2][2]`：`[NORMAL|TAIL][NORMAL|TAIL]`，尾块尺寸为 0 时该格 cost=0。这让分核能区分「满块」与「便宜的尾块」，避免把尾块当满块高估。
+
+**主例 cost**（`mBase=s2Base=512`）：
+
+| 块类型 | (M, S2) | cost | 计算 |
+|---|---|---|---|
+| 满块 | (512, 512) | **272** | 6·32 + 10·8 |
+| S2 尾块（kv=2000→464，§0 chunk3） | (512, 464) | **272** | 6·32 + 10·ceil(464/64)=10·8 → ⚠️ 464 与 512 同价 |
+| M 尾块（s1G=120） | (120, 512) | **128** | 6·ceil(120/16)=6·8 + 80 |
+| 小块 | (16, 64) | **16** | 6·1 + 10·1 |
+
+**评估**：
+
+- ✅ 闭式、host 侧 O(1) 可算，无 profiling。
+- ✅ `CalcS2Range`（`split_core.cpp:106`）按稀疏 mask 算每行的 **有效** S2 block 区间 `[s2Start, s2End)`，全无效行 → `s1GBlock=0`、cost=0，分核时被跳过。cost 反映有效计算量，不是盲目 `ceil(S2/s2Base)`。
+- ✅ 区分尾块，避免尾块高估。
+- ⚠️ 纯 cube MMAD 代理，**忽略 softmax、dequant（AIV）、L2/带宽、流水重叠**。两个等 cost 的方案实际墙钟可能不同（cache 局部性、bank conflict）。
+- ⚠️ 系数 6:10 是标定常数，非推导；跨硬件/shape 泛化性存疑。
+- ⚠️ `ceil` 对齐 **高估小尾块**（S2=464 与 512 同价；M=1 与 16 同价），使贪心对尾块容忍度偏松。
+- ⚠️ 不感知跨核 KV 复用 / L2 局部性。
+
+### 1.8.3 `CalcSplitPlan`：三级贪心 + 强制兜底（核心）
+
+`SplitCore`（`split_core.cpp:655`）对候选核数范围 `[minCore, maxCore]` 扫描，每个候选跑一次 `CalcSplitPlan`（`split_core.cpp:545`），保留 **慢核 maxCost 最小** 的方案。这是经典的 **multiprocessor scheduling / makespan 最小化** 贪心。
+
+**核数范围**（`split_core.cpp:673-676`）：
+
+```cpp
+maxCore = min(coreNum, totalBlockNum);                    // 不能超过块数（ForceAssign 保证每核 ≥1 块）
+minCore = round(sqrt(totalBlockNum));                     // 启发下限
+```
+
+`minCore = sqrt(N)`：块数 N 一定时，核数太少→每核过载；太多→调度/同步开销大。`sqrt(N)` 是经验折中，且作为下限避免试小核数（必然过载）。host 侧 `aicNum = TQ_FIA_MAX_AIC_CORE_NUM = 26`。
+
+**每个核的预算（动态重算）**（`split_core.cpp:577`）：
+
+```cpp
+assignContext.coreCache.costLimit = assignContext.unassignedCost / (coreNum - curCoreIdx);
+```
+
+每核预算 = 剩余总负载 / 剩余核数。**动态重算**保证末核恰好兜底（剩余负载用完），不会越分越松。`result.maxCost` 作为 prune 上限：`if (maxCost > costLimit) return`（`split_core.cpp:566`）提前剪枝。
+
+**四级贪心**（`split_core.cpp:580-588`）：每核按粒度从粗到细分四级填，判据统一为 **容忍度判据**：
+
+```cpp
+// split_core.h:62
+inline bool IsWithinTolerance(T limit, T tolerance, T value) {
+    return limit + tolerance >= value;   // 允许超额 ≤ tolerance
+}
+```
+
+| 级别 | 函数 | 单元 | 超额容忍 `tolerance` |
+|---|---|---|---|
+| 1 整 batch | `AssignByBatch`(`:388`) | 整个 batch×N2 | `bN2LastBlockCost / FA_TOLERANCE_RATIO` |
+| 2 整行 | `AssignByRow`(`:426`) | 一个 S1G 行（全部有效 S2 块） | `s1GLastBlockCost / FA_TOLERANCE_RATIO` |
+| 3 单块 | `AssignByBlock`(`:452`) | 单个 S2 块 | `curCost / FA_TOLERANCE_RATIO` |
+| 4 强制 | `ForceAssign`(`:477`) | 1 块（无视预算） | — |
+
+判据统一为 `costLimit + 单元代价/2 >= 累计+单元代价`，即 **允许超额不超过所加单元代价的一半**（`FA_TOLERANCE_RATIO=2`）。容忍度随粒度收紧：batch 级容忍最大（整批搬，超半块无所谓），块级最严（单块精确）。
+
+**关键控制流**：`AssignByBatch` 之后若 batch 没塞满预算才进 `AssignByRow`；行没塞满才进 `AssignByBlock`；若一块都没分到（`coreCache.block == 0`）→ `ForceAssign` 兜底 1 块，保证进度（防空核、防死循环）。`ForceAssign` 后调 `UpdateCursor` 级联推进游标。
+
+每核结束记录三元组（`split_core.cpp:590-592`，右开）：
+
+```cpp
+result.bN2End[i] = assignContext.curBN2Idx;
+result.gS1End[i] = assignContext.curS1GIdx;
+result.s2End[i]   = assignContext.curS2Idx;
+result.maxCost = std::max(result.maxCost, assignContext.coreCache.cost);
+assignContext.unassignedCost -= assignContext.coreCache.cost;
+```
+
+### 1.8.4 FD（跨核行归约）的记录
+
+当一个 S1G 行的 S2 被 **跨核切分**（核 i 停在行中 `curS2Idx ∈ (s2Start, s2End]`），该行就成了一个 **FD head**，需在 vector 核做归约（cube 核各算一段 partial，vec 归约）。记录分两步：
+
+**① 切分计数**（`split_core.cpp:604-607`）：
+
+```cpp
+if (assignContext.curS2Idx > assignContext.s1GCache.s2Start &&
+    assignContext.curS2Idx <= assignContext.s1GCache.s2End) {
+    assignContext.curKvSplitPart++;   // 本行又被多切一份
+}
+```
+
+`curKvSplitPart` 初始 = 1（`split_core.h:225`），每跨核切一次 +1，记录该行 S2 被切成几份。`s2SplitStartIdxOfCore[i] = curKvSplitPart - 1`（`split_core.cpp:574`）记录核 i 从第几 split 起（归约 workspace 索引用）。
+
+**② 滞后记录**（`IsNeedRecordFDInfo` `:500` + `RecordFDInfo` `:519`）：FD head **不在切分当下记录，而在下一个核处理到新切分点时滞后记录上一个**。注释（`split_core.cpp:502`）：「切分点大概率不在行尾，故滞后」。判据：
+
+```cpp
+// IsNeedRecordFDInfo: 核0不处理；curKvSplitPart<=1 无跨核行；上一个切分行还没处理完则不记
+if (curCoreIdx == 0) return false;
+if (curKvSplitPart <= 1) return false;
+if (curBN2Idx == bN2End[curCoreIdx-1] && curS1GIdx == gS1End[curCoreIdx-1]) return false;  // 还在同一行
+return true;
+```
+
+`RecordFDInfo` 记录上一个核切分点所在行的 FD 信息：行的 `(bN2Idx, gS1Idx)`、`s2SplitNumOfFdHead = curKvSplitPart`、M 轴 FD 切分 `curFdS1gSplitPart = ceil(curFdS1gSize / gS1BaseSizeOfFd=8)`（`split_core.cpp:532`）与尾块大小。记录后 `curKvSplitPart = 1` 重置。
+
+> ⚠️ **末核终末切分的边界行为**：滞后语义下，若跨核切分发生在最后一个核的末行（之后没有「下一个切分点」触发记录），该 FD head 在此路径下不被记录。vendored CANN 代码的已知边界；真实多 batch×N2 负载里末核终末切分占比小，但单 batch 极端 shape 复现时需 device 侧核实归约路径。
+
+host 在 `bit_residual_fia_paged_k8v4_tiling.cpp:431-437` 校验 `usedCoreNum / numOfFdHead / maxS2SplitNum ≤ aicNum`，越界则 `GRAPH_FAILED`。
+
+### 1.8.5 `SplitFD`：vector 侧归约均衡（`split_core.cpp:613`）
+
+FD head 的归约不在 cube 核做，而是摊到 **vector 核**（`vecCubeRatio = aivNum/aicNum`，910B = 2）。把每个 FD head 的归约单元 `(S2-split, M-split)` 展平成一维，每单元负载 = 该行的 `s2SplitNumOfFdHead[h]`：
+
+```cpp
+totalFDLoad      = Σ_h s2SplitNumOfFdHead[h] * gS1SplitNumOfFdHead[h];  // 总单元负载
+totalFDHeadSplit = Σ_h gS1SplitNumOfFdHead[h];                          // 总 M-split 单元数
+maxVectorNum = min(totalFDHeadSplit, usedCoreNum * vecCubeRatio);       // 可用 vec 上限
+loadThrOfVector = totalFDLoad / maxVectorNum;                           // 每 vec 均摊
+```
+
+逐单元塞当前 vec，若下一单元 `fDKVSplitNum > remainSpace * FD_TOLERANCE_RATIO`（`FD_TOLERANCE_RATIO=2`，同款容忍）→ 溢到下一 vec，**重算阈值** `loadThr = totalFDLoad/(maxVectorNum-curCoreIndex)` 保证末 vec 兜底。输出 `gS1IdxEndOfFdHead[v] / gS1IdxEndOfFdHeadSplit[v]`：每个 vec 负责的（head 索引, split 索引）二级右开区间。`usedVecNumOfFd` = 实际用几个 vec。模式和 `CalcSplitPlan` 同构（等分预算 + 容忍度贪心 + 末核兜底），只是作用在 vec 维、对象是归约单元而非 MMAD 块。
+
+### 1.8.6 主例 trace
+
+**(a) 均衡，无 FD**（`B=N2=G=1, S1=2048(4 行), S2=512(1 块/行), mBase=s2Base=512, aic=4`）：
+
+4 行 × 1 块 = 4 块，cost 272/块，totalCost=1088，blocks=4。`maxCore=min(4,4)=4`，`minCore=round(sqrt(4))=2`。扫 2/3/4：
+
+| 核数 | 各核块数 | maxCost |
+|---|---|---|
+| 4 | 1/1/1/1（每核整 1 行） | **272** ✓ |
+| 3 | 2/1/1 | 544 |
+| 2 | 2/2 | 544 |
+
+选 **4 核，maxCost=272**。每核拿整行（`s2End=1=s2End`），无跨核行 → **无 FD**。完美均衡。
+
+**(b) 触发 FD**（`B=N2=G=1, S1=1024(2 行), S2=2048(4 块/行), mBase=s2Base=512, aic=3`）：
+
+2 行 × 4 块 = 8 块，cost 272/块，totalCost=2176。`maxCore=3, minCore=round(sqrt(8))=3`。只试 3 核，`limit=2176/3≈725`：
+
+| 核 | AssignByBlock 结果 | 三元组 (bN2End, gS1End, s2End) | cost |
+|---|---|---|---|
+| 0 | 行0 块0,1,2（超 725+136=861 后停） | (0,0,3) | 816 |
+| 1 | 行0 块3 + 行1 块0,1 | (0,1,2) | 816 |
+| 2 | 行1 块2,3 | (0,1,4) | 544 |
+
+**行0 被核0/核1 切分**（核0 取块0-2，核1 取块3）→ 跨核行 → FD head。核1 处理完（已进到行1，越过行0 切分点）→ 触发 `IsNeedRecordFDInfo` 记录行0 的 FD：
+
+- `bN2IdxOfFdHead=0, gS1IdxOfFdHead=0`（行0 位置）
+- `s2SplitNumOfFdHead = curKvSplitPart = 2`（行0 S2 被切 2 份）
+- `curFdS1gSize=512` → `gS1SplitNumOfFdHead = ceil(512/8) = 64`，`gS1LastPartSizeOfFdHead=8`（M 轴 FD 块 `gS1BaseSizeOfFd=8`，host 常量 `kFdGS1BaseSize`）
+- `numOfFdHead=1`
+
+随后 `SplitFD` 把这 64 个 M-split 归约单元均衡摊到 `min(64, 3*2=6) = 6` 个 vector（`usedVecNumOfFd=6`），每 vec 约 11 个 split。
+
+### 1.8.7 整体评估
+
+| 方面 | 评价 |
+|---|---|
+| **算法** | makespan 最小化，贪心 + 全核数扫描 + 三级粒度 + 强制兜底；非全局最优（NP-hard）但实践足够 |
+| **cost 模型** | 闭式代理，粒度对齐硬件，稀疏感知；但忽略 softmax/dequant/带宽/重叠，且 ceil 高估尾块 |
+| **容忍度** | 随粒度收紧（batch > 行 > 块），设计合理；`FA_TOLERANCE_RATIO=2` 固定，无自适应 |
+| **FD** | 滞后记录，跨核行 → vec 归约均衡；末核终末切分的边界行为值得 device 侧核实 |
+| **结果** | `bN2End/gS1End/s2End` 三元组 + FD 表，直接喂 device；host 在 `tiling.cpp:431` 校验 `usedCoreNum/numOfFdHead/maxS2Split ≤ aicNum` |
+
+**与单核内部（§1.2–§1.5）的关系**：SplitCore 决定「每个 cube 核面对多长的 S2」（即 §0 的 FD chunk、§1.2 的 `s2Count`、§1.3 的 `siStart/siEnd` 都来自这里给每个核分配的 S2 区间）；单核内部的 Dual-AIV 对半 / PA run / tile / 列拍则在拿到这段 S2 后再逐层细分。两级流水（§1.6）的「整段 s2Count 才与 Cube 握手」就是以 SplitCore 分给本核的 S2 区间为粒度。
 
 ---
 
@@ -935,28 +1190,30 @@ UB staging:  codes[23×128 B] + meta half[23]
         │
         └─ 每行 L3: Mul/Add [0:64)+[64:128) @fp32
   ▼
-WS: dequantKey 写出 23 × 128（本 AIV 的一段 si）
+WS: dequantKey 写出 maxSub × 128（本 AIV 的一段 si；示例按 Scheme C=23 行）
 ```
 
-（旧示意若用 `n=32`，主例里有效 `maxSub=23`，不会出现单 run 32 行。）
+（示例按 Scheme C `maxSub=23`；默认 Scheme A=28、half-affine=36，单 run 不会出现 32 行。）
 
 ---
 
-## 5. 调成 FP16 后：哪一层「能多处理」
+## 5. FP16（half-affine）：哪一层「能多处理」
 
 这里的 FP16 指：**affine（及与之绑定的 q7/s、meta broadcast）中间计算用 half**，不是改 pack 格式，也不是改 Cube 输入 dtype（WS 本就是 `Q_T`）。
 
+> **落地状态：已实现**。触发条件 `kUseHalfAffine = IsSameType<WS_T,half>::value`（Scheme C 除外），对应 `BrApplyRowAffine(half)` 重载 + `BrDecodeKeyTileHalf` / `BrDecodeValueTileHalf`。bf16 OutT 仍走 fp32 affine + Cast→bf16（910B 无 half↔bf16 直 Cast，见 [[cann-dav-c220-no-half-bf16-cast]]）。
+
 ### 5.1 对照表
 
-| 层级 | FP32 现状 | 改 FP16 affine 后 | 能否多处理数据？ |
+| 层级 | FP32（Scheme A 默认） | FP16 affine（已落地） | 能否多处理数据？ |
 |------|-----------|-------------------|------------------|
-| **L3 列拍** | 64 elem/拍，D=128 → **2** 次 Mul + **2** 次 Add | 128 elem/拍 → **1** 次 Mul + **1** 次 Add | **是（同数据更少拍）** — 与 UB 无关，必得 |
-| **L2 tile** | Key 8 / Val 13（scratch 按 **4B×元素**） | scratch 按 **2B** → 可加大 `TILE_MAX`（需 8 对齐） | **是（可选：把省下的字节给 tile）** |
-| **L1 有效 maxSub** | 今日绑在 **staging `byUb≈23`**（meta 64 仍松） | scratch↓ → `kHalfBytes`↑ → **`byUb` 可升**（例：Key tile 仍 8 时 byUb 约 23→31） | **是（可选：把省下的字节给 staging）** |
+| **L3 列拍** | 64 elem/拍，D=128 → **2** 次 Mul + **2** 次 Add | 128 elem/拍 → **1** 次 Mul + **1** 次 Add | **是（同数据更少拍）** — 与 UB 无关，已得 |
+| **L2 tile** | Key 8 / Val 13（scratch 按 **4B×元素**） | scratch 按 **2B** → 可加大 `TILE_MAX`（需 8 对齐） | **是（可选：把省下的字节给 tile；尚未上调）** |
+| **L1 有效 maxSub** | 默认绑在 **staging `byUb≈28`**（Scheme A）；Scheme C≈23 | scratch↓ → `kHalfBytes`↑ → **`byUb`≈36**（Key tile 仍 8） | **是（已得：28→36；可选再给 staging）** |
 | L1 meta `BR_S2_SUB_MAX` | 槽位仍 64 | 只改 affine **不改** 768B 槽布局 | **否**；且即便 byUb>64 也被钉在 64，除非改 meta |
 | Dual-AIV S2 | 对半 | 不变 | **否** |
 
-> **注意**：`tmpBuff1` 上 L1 staging 与 L2 scratch **零和**。fp16 省下的字节要在「更大 tile」和「更大 maxSub」之间做分配，不能两头都按理论最大值叠满。
+> **注意**：`tmpBuff1` 上 L1 staging 与 L2 scratch **零和**。fp16 省下的字节要在「更大 tile」和「更大 maxSub」之间做分配，不能两头都按理论最大值叠满。当前实现把省下的字节主要让给了 staging（maxSub 28→36），`TILE_MAX` 暂未上调。
 
 ### 5.2 图示：受益面（绿）vs 不动面（灰）
 
@@ -967,7 +1224,7 @@ WS: dequantKey 写出 23 × 128（本 AIV 的一段 si）
                                       │
                     ┌─────────────────▼───────────────────┐
   L1 PA run         │  n ≤ maxSub                         │
-  maxSub            │  现 ~23；fp16 可 →~31               │  浅绿：dtype 可小幅抬
+  maxSub            │  Scheme A fp32 ~28；half-affine ~36  │  浅绿：dtype 已小幅抬
                     │  A1 双 half 硬顶 ~42；要 64 须改布局 │  灰/红：64 要 D2/D3
                     └─────────────────┬───────────────────┘
                                       │
@@ -977,27 +1234,27 @@ WS: dequantKey 写出 23 × 128（本 AIV 的一段 si）
   L2    │ tile 0    │           │ tile 1    │    …      │ tile k    │
   tile  │ 现: 8 行  │           │           │           │           │
         │ fp16后:   │           │           │           │           │
-        │ 可 →~16 行│ ←── 绿色：同 run 内 tile 变大、次数变少
+        │ 可 →~16 行│ ←── 绿色：同 run 内 tile 变大、次数变少（可选，未上调）
         └─────┬─────┘           └───────────┘           └───────────┘
               │
               ▼
         ┌──────────────────────────────────────┐
   L3    │ 每行 affine                          │
   列拍  │  fp32: [0:64) + [64:128)  ← 2 拍     │
-        │  fp16: [0:128)            ← 1 拍     │ ← 绿色：同 tile 内更少拍
+        │  fp16: [0:128)            ← 1 拍     │ ← 绿色：同 tile 内更少拍（已得）
         └──────────────────────────────────────┘
 ```
 
 ```mermaid
 flowchart TB
-  L1["L1 maxSub<br/>现23 / fp16~31 / A1顶42"]
-  L2["L2 decode tile<br/>Key 8 → ~16？"]
-  L3["L3 列拍<br/>2 → 1"]
+  L1["L1 maxSub<br/>A.fp32 28 / half 36 / A1顶42"]
+  L2["L2 decode tile<br/>Key 8 → ~16？（未上调）"]
+  L3["L3 列拍<br/>2 → 1（已得）"]
 
-  L1 -->|"D1 fp16: 小幅涨"| OK1["23→~31"]
+  L1 -->|"D1 fp16 已落地: 小幅涨"| OK1["28→~36"]
   L1 -.->|"要≥64: D2/D3"| X["改 ping-pong 或 perRow"]
   L2 -->|"scratch 减半: 可涨"| OK2["每 tile 更多行"]
-  L3 -->|"B16 128/repeat: 可减"| OK3["同行更少 Mul/Add"]
+  L3 -->|"B16 128/repeat: 已减"| OK3["同行更少 Mul/Add"]
 
   style OK1 fill:#d4edda,stroke:#28a745
   style OK2 fill:#d4edda,stroke:#28a745
@@ -1005,20 +1262,20 @@ flowchart TB
   style X fill:#e9ecef,stroke:#6c757d
 ```
 
-### 5.3 数量级直觉（主例 Key，`n=23` 的一个 PA run）
+### 5.3 数量级直觉（主例 Key，一个 `n=maxSub` 的 PA run）
 
-| 指标 | FP32 现 | FP16 affine（估） | 变化 |
+| 指标 | Scheme A fp32（默认） | half-affine（已落地） | 变化 |
 |------|---------|-------------------|------|
-| 本 run DMA 行数 | 23 | 23（或抬 maxSub 后更大） | 默认不变 |
-| 本 run tile 次数 | 8+8+7 = **3** | tile=16 时 **2** | 循环减少 |
+| 本 run DMA 行数 | 28 | 36（maxSub 抬后） | DMA 行数↑ |
+| 本 run tile 次数 | 8+8+8+4 = **4** | tile 仍 8 时 8+8+8+8+4 = **5**（行多了） | 略增 |
 | 每行 affine 列拍 | **2** | **1** | 列方向减半 |
-| 满块单 AIV Key runs | **12** | maxSub~31 时约 **10** | 见 §1.7.3 |
+| 满块单 AIV Key runs | `ceil(128/28)=5` | `ceil(128/36)=4` | run 数↓ |
 
 ### 5.4 抬 `maxSub` 分档（与 §1.3.5 一致）
 
 | 目标 | 只改 affine/dtype？ | 做法 | Key `byUb` 量级 |
 |------|---------------------|------|-----------------|
-| ~23 → ~30+ | **够** | D1：fp16 瘦 scratch，tile 先不动 | ~**31** |
+| 28 → ~36 | **够（已落地）** | D1：fp16 瘦 scratch，tile 先不动 | **~36** |
 | 接近硬顶 ~42 | **不够** | 还要几乎清空 scratch，且仍保 A1 双 half | ≤**42** |
 | ≥**64** | **不够** | 必须 D2（取消双 half）和/或 D3（缩小 perRow）；meta 仍松 | D2+fp16 ~**63**；D2 零 scratch ~**85** |
 | >64 | 还要 D4 | staging 已 >64 后再扩 meta 槽 | — |
@@ -1033,7 +1290,7 @@ flowchart TB
 问：scratch 减半了，为什么还提 maxSub=64？
 
 答（分层 + 布局）:
-  ① 有效 maxSub 今天 =23，绑在 staging byUb —— fp16 可抬到 ~31。
+  ① 有效 maxSub 默认 Scheme A =28，绑在 staging byUb —— half-affine 已抬到 ~36。
   ② A1 双 half + perRow=384 在 32KB 内硬顶 ~42 —— dtype 再瘦也过不去。
   ③ 设计常数 BR_S2_SUB_MAX=64 是 meta 槽 —— 今日未碰到；
      真要有效 64，先改 staging 布局（D2/D3），再考虑动 meta（D4）。
@@ -1044,14 +1301,20 @@ flowchart TB
 
 ---
 
-## 7. 实施时建议动哪些文件 / 验收
+## 7. 已落地 / 待办：动哪些文件
 
-**只做 affine→fp16（推荐第一刀）**
+**affine→fp16（已落地）**
 
-1. `BrApplyRowAffine`：`half` 版 Brcb/Mul/Add（`FP16_BLOCK=16`，`REPEAT=128`）  
-2. `BrDecodeKeyTile` / `BrDecodeValueTile`：q7/s 与 affine 留在 half；按需最终 Cast 到 `OutT`  
-3. `DequantKvImpl`：scratch 按 half 重算 → 上调 `BR_*_DECODE_TILE_MAX` / `hoistTile`  
-4. **不要**在第一刀改 `BR_S2_SUB_MAX`，除非单独改 meta 布局  
+1. `BrApplyRowAffine(half)` 重载：`FP16_BLOCK=16`，`REPEAT=128`，单列拍 ✅  
+2. `BrDecodeKeyTileHalf` / `BrDecodeValueTileHalf`：q7/s 与 affine 留在 half ✅  
+3. `DequantKvImpl`：`kUseHalfAffine` 分支，scratch 按 half 重算 ✅  
+4. `BR_S2_SUB_MAX` 未改（仍 64），meta 布局未动 ✅（符合预期）  
+
+**待办 / 可选**
+
+- 上调 `BR_KEY_DECODE_TILE_MAX`（8→16）/ `BR_VALUE_DECODE_TILE_MAX`：把 half 省下的字节分给 tile（与 maxSub 零和，需 profile 决策）  
+- D2/D3 架构级扩 maxSub（仅当 PA run/DMA 仍是热点）  
+- bf16 OutT 仍走 fp32 affine（910B 无 half↔bf16 直 Cast）  
 
 **验收**
 
@@ -1067,13 +1330,13 @@ flowchart TB
 
 | 想多处理… | 真正绑点 | 改什么 |
 |-----------|----------|--------|
-| 同一行更少 VEC 拍 | L3：256B/repeat | affine dtype → **fp16** |
-| 同一次 `BrDecode*` 更多行 | L2：scratch 字节 | scratch 改 half → **加大 tile**（与 maxSub 零和） |
-| 同一次 DMA 更多行（有效） | L1：staging `byUb≈23` | D1 瘦 scratch →~31；硬顶 A1 双 half ~42 |
+| 同一行更少 VEC 拍 | L3：256B/repeat | affine dtype → **fp16（已落地）** |
+| 同一次 `BrDecode*` 更多行 | L2：scratch 字节 | scratch 改 half → **加大 tile**（与 maxSub 零和；待上调） |
+| 同一次 DMA 更多行（有效） | L1：staging `byUb≈28`（A默认）/ `≈36`（half） | D1 瘦 scratch **已到 36**；硬顶 A1 双 half ~42 |
 | 冲到 ≥64 行/run | L1：32KB 装不下 `2×64×384` | D2 取消双 half 和/或 D3 缩小 perRow；再 D4 meta |
 | 超过 64 | L1：meta 槽 | D4 扩 `BR_S2_SUB_MAX`（staging 先够） |
 | 同一次 launch 更多 S2 | L0 | Dual-AIV / 外层调度 |
 
 ---
 
-*文档状态：说明性。贯穿主例为 L6 Prefill `Q=240,B=16,kv=2000,s2Base=512,BS=128`（尾块 **464**=`s2Idx=3`）。P18 墙钟与 longquery 口径见 §1.7。affine→fp16 为建议 spike，落地后回填实测 tile / maxSub。*
+*文档状态：说明性。贯穿主例为 L6 Prefill `Q=240,B=16,kv=2000,s2Base=512,BS=128`（尾块 **464**=`s2Idx=3`）。P18 墙钟与 longquery 口径见 §1.7。**Host 侧 SplitCore 核间负载均衡**（cost 模型 `6·ceil(M/16)+10·ceil(S2/64)`、三级贪心 + 强制兜底、FD 跨核行归约）见 §1.8。**maxSub 默认值按编译 scheme 分列**：Scheme A（默认 2×fp32）Key `byUb≈28`；Scheme C（legacy 3×fp32）`≈23`；half-affine（已落地）`≈36`。affine→fp16 已实现，`TILE_MAX` 上调为可选待办。*
