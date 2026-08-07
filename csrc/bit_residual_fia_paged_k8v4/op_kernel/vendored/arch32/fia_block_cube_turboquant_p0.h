@@ -828,7 +828,7 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ApplyPiToQL1(
 {
     // BitResidual: Q_rot = Q @ rotation_key (= Q @ Π), matching attn/golden.
     // Π 暂存 kpL1（随后 CopyK 盖掉）。Q_rot：L0C float --Fixpipe--> L1 Q。
-    // F322F16/F322BF16 会污染后续 MM1 float Fixpipe，须立刻 NoQuant 复位。
+    // 后续 MM1 FixpipeCToGM 显式设 NoQuant，无需 dummy 复位。
     if (!piApplyEnabled_ || (TQ_PI_BISECT_CUBE == 0)) {
         SetFlag<HardEvent::MTE1_MTE2>(KP_EVENT0 + this->kpL1BufId);
         return;
@@ -895,23 +895,6 @@ __aicore__ inline void FiaBlockCubeTurboQuantP0<FIAT>::ApplyPiToQL1(
         }
         auto dstL1 = qL1[subMSizeAlign * 0U][GetC0Num<Q_T>() * mOff];
         Fixpipe<Q_T, T, CFG_NZ>(dstL1, cL0Tensor[piCId], fixParams);
-
-        SetFlag<HardEvent::M_FIX>(L0C_EVENT0 + piCId);
-        WaitFlag<HardEvent::M_FIX>(L0C_EVENT0 + piCId);
-
-        // 复位 Fixpipe 量化模式，避免污染后续 MM1 float Fixpipe。
-        FixpipeParamsV220 fixReset;
-        fixReset.nSize = headDim;
-        fixReset.mSize = mAct;
-        fixReset.srcStride = mAlign;
-        fixReset.dstStride = headDim;
-        fixReset.ndNum = 1;
-        fixReset.quantPre = QuantMode_t::NoQuant;
-        const uint64_t mm1Elems = static_cast<uint64_t>(constInfo.mmResUbSize);
-        const uint64_t need = static_cast<uint64_t>(mAlign) * headDim;
-        const uint64_t resetOff = (mm1Elems > need) ? (mm1Elems - need) : 0ULL;
-        Fixpipe<MM_OUT_T, T, CFG_ROW_MAJOR>(
-            this->mm1ResGm[info.loop % CFG::PRELOAD_NUM][resetOff], cL0Tensor[piCId], fixReset);
 
         SetFlag<HardEvent::FIX_M>(L0C_EVENT0 + piCId);
         SetFlag<HardEvent::M_MTE1>(L0AB_EVENT0 + piAbId);
