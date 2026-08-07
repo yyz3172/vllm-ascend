@@ -181,12 +181,17 @@ constexpr uint32_t TQ_CUBE_OUTPUT_PI_DONE_CUBE = 11U;
  *
  * @tparam FIAT FIA算子模板参数，参见FIAType
  */
+// P29: must match host kS2BaseSize. Enable via CMake/env BR_S2_BASICSIZE_IS_1024=1.
+#ifndef BR_S2_BASICSIZE_IS_1024
+#define BR_S2_BASICSIZE_IS_1024 1
+#endif
 template <typename FIAT>
 class FiaBlockCubeTurboQuantP0 {
     struct DefaultCfg {
         static constexpr bool ENABLE_UNIFLAG = false;
         static constexpr uint32_t PRELOAD_NUM = 2;    // same as fia_kernel_nonquant.h PRELOAD_NUM
-        static constexpr bool S2_BASICSIZE_IS_1024 = false;
+        // More V L1 slots + smaller M split when host s2Base=1024.
+        static constexpr bool S2_BASICSIZE_IS_1024 = (BR_S2_BASICSIZE_IS_1024 != 0);
     };
     using T = float;
     using CFG = DefaultCfg;

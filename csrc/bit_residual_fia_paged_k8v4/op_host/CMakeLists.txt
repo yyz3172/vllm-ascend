@@ -7,6 +7,15 @@ if(DEFINED ENV{BR_KEY_UNIFORM_SCHEME})
     set(_BR_KEY_UNIFORM_SCHEME "$ENV{BR_KEY_UNIFORM_SCHEME}")
 endif()
 
+# P29: s2Base=1024 + Cube L1_V_BUFCNT=4. Default on. Disable:
+#   BR_S2_BASICSIZE_IS_1024=0 bash script/.../rebuild_op.sh
+# Host tiling and Cube kernel must use the same value.
+set(_BR_S2_BASICSIZE_IS_1024 "1")
+if(DEFINED ENV{BR_S2_BASICSIZE_IS_1024})
+    set(_BR_S2_BASICSIZE_IS_1024 "$ENV{BR_S2_BASICSIZE_IS_1024}")
+endif()
+message(STATUS "BitResidualFiaPagedK8v4 BR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}")
+
 add_ops_compile_options(
         OP_NAME BitResidualFiaPagedK8v4
         OPTIONS --cce-auto-sync=on
@@ -15,6 +24,7 @@ add_ops_compile_options(
                 -Werror
                 -fpermissive
                 -DBR_KEY_UNIFORM_SCHEME=${_BR_KEY_UNIFORM_SCHEME}
+                -DBR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/vendored
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel/vendored/arch32
@@ -30,10 +40,19 @@ target_sources(optiling PRIVATE
         vendored/split_core.cpp
 )
 
+# Host kS2BaseSize must match Cube S2_BASICSIZE_IS_1024 (add_ops_compile_options
+# only covers the device kernel).
+target_compile_definitions(optiling PRIVATE
+        BR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}
+)
+
 if (NOT BUILD_OPEN_PROJECT)
     target_sources(opmaster_ct PRIVATE
         bit_residual_fia_paged_k8v4_tiling.cpp
         vendored/split_core.cpp
+    )
+    target_compile_definitions(opmaster_ct PRIVATE
+            BR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}
     )
 endif ()
 
