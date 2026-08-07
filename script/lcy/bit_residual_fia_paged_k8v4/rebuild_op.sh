@@ -4,6 +4,8 @@
 # Usage:
 #   bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh
 #   bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh --soc=ascend910b
+#   BR_S2_BASICSIZE_IS_1024=0 bash script/lcy/bit_residual_fia_paged_k8v4/rebuild_op.sh
+#     → disable P29 (s2Base=512); default is ON (1024 + Cube L1 pack)
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
@@ -14,7 +16,7 @@ for arg in "$@"; do
         --soc=*) SOC_ARG="${arg#*=}" ;;
         --op-debug-config=*) OP_DEBUG_CONFIG="${arg#*=}" ;;
         -h|--help)
-            sed -n '2,10p' "$0"
+            sed -n '2,12p' "$0"
             exit 0
             ;;
     esac
@@ -44,11 +46,14 @@ INSTALL_PATH="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
 # 1=A asymmetric uniform (default), 2=B symmetric, 3=C legacy LSB-sign+q7.
 # Pack + FIA + attn kernels all read this via CMake; golden uses same env.
 export BR_KEY_UNIFORM_SCHEME="${BR_KEY_UNIFORM_SCHEME:-1}"
+# P29: 1=s2Base 1024 + Cube L1 pack (default), 0=s2Base 512.
+export BR_S2_BASICSIZE_IS_1024="${BR_S2_BASICSIZE_IS_1024:-1}"
 
 echo "[rebuild] ROOT=${ROOT_DIR}"
 echo "[rebuild] SOC=${SOC_ARG}"
 echo "[rebuild] OPS=${CUSTOM_OPS}"
 echo "[rebuild] BR_KEY_UNIFORM_SCHEME=${BR_KEY_UNIFORM_SCHEME}"
+echo "[rebuild] BR_S2_BASICSIZE_IS_1024=${BR_S2_BASICSIZE_IS_1024}"
 echo "[rebuild] INSTALL=${INSTALL_PATH}"
 
 cd "${ROOT_DIR}/csrc"

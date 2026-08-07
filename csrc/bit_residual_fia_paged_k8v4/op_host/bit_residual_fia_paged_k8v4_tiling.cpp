@@ -21,7 +21,16 @@ namespace optiling {
 namespace {
 
 constexpr uint32_t kPreLoadNum = 2;
+// P29: BR_S2_BASICSIZE_IS_1024=1 → s2Base=1024 (FD 4→2 @ kv=2000).
+// Must match Cube CFG::S2_BASICSIZE_IS_1024 (same compile define).
+#ifndef BR_S2_BASICSIZE_IS_1024
+#define BR_S2_BASICSIZE_IS_1024 1
+#endif
+#if BR_S2_BASICSIZE_IS_1024
+constexpr uint32_t kS2BaseSize = 1024;
+#else
 constexpr uint32_t kS2BaseSize = 512;
+#endif
 // Align with FIA TND CalcMBaseSize (M_BASE_SIZE_512), not the non-TND 256 tier.
 constexpr uint32_t kMBaseSize = 512;
 constexpr uint32_t kFdGS1BaseSize = 8;
