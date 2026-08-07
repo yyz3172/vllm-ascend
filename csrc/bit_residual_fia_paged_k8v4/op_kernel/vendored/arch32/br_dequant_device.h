@@ -467,7 +467,8 @@ __aicore__ inline void BrDecodeKeyTileHalf(
     (void)headDimAlign;
     const uint32_t N = numRows * headDim;
     Cast(halfSrc, codesUb, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
+    // P2b: no PipeBarrier before Brcb — Cast→halfSrc and Brcb→broadcast are
+    // disjoint; BrApplyRowAffine barriers before Mul drain both.
     BrApplyRowAffine(
         outUb, halfSrc, bases, steps, halfBroadcast, numRows, headDim);
 }
@@ -525,7 +526,7 @@ __aicore__ inline void BrDecodeValueTileHalf(
     (void)headDimAlign;
     const uint32_t N = numRows * headDim;
     Cast(halfSrc, nibbleUb.template ReinterpretCast<int4b_t>(), RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
+    // P2b: same as Key half — Cast/Brcb disjoint; barrier inside affine.
     BrApplyRowAffine(
         outUb, halfSrc, vmins, vsteps, halfBroadcast, numRows, headDim);
 }
