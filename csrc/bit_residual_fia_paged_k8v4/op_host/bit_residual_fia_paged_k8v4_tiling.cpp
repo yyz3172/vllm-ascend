@@ -396,7 +396,11 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
         s2BaseSize = (s2BaseSize / static_cast<uint32_t>(blockSize)) *
                      static_cast<uint32_t>(blockSize);
     }
-    const uint32_t sInnerSizeAlign = AlignUp(std::min(s2Size, s2BaseSize), 16U);
+    // Must match device actualSingleProcessSInnerSizeAlign =
+    // Align(actualS2, fa_base_vector::BYTE_BLOCK) with BYTE_BLOCK=32.
+    // Aligning only to 16 under-sizes mm1/vec1 workspace whenever S2%32!=0
+    // (e.g. 144→host 144 vs device stride 160) → Fixpipe OOB → nondeterministic NaN.
+    const uint32_t sInnerSizeAlign = AlignUp(std::min(s2Size, s2BaseSize), kByteBlock);
     const uint32_t headDimAlign = AlignUp(static_cast<uint32_t>(headSize), 16U);
 
     BaseInfo baseInfo {};
