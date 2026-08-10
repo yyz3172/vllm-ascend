@@ -1393,7 +1393,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     event_t eventIdVWaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
     event_t eventIdMte3WaitV0 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
     event_t eventIdMte3WaitV1 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-    event_t eventIdMte2WaitS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE2));
     // NaN fix: drain PIPE_V before meta/codes MTE2 (same slot reuse / prefetch).
     event_t eventIdMte2WaitV =
         static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
@@ -1415,6 +1414,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         }
         // Half: pin PA run to 32 so BS=128 splits into 4 equal runs (tile=16×2).
         // Requires BR_HALF_BRCB_FOOTPRINT shrink so byUb Key ≥ 32.
+        // P0c byUb-uncap (36/43) A/B: 334.4 vs 330 µs — regress, keep pin.
         if constexpr (kUseHalfAffine) {
             if (br_dequant::BR_HALF_PA_RUN_CAP < maxSub) {
                 maxSub = br_dequant::BR_HALF_PA_RUN_CAP;
@@ -1432,13 +1432,14 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
 
     uint32_t si = siStart;
     uint32_t runId = 0U;
-    // P18 spike: next-run codes+meta DMA issued after SetFlag(V_MTE3) and
-    // before WaitFlag(V_MTE3), overlapping current-run VEC drain.
+    // P1a: next-run codes+meta DMA issued after current MTE2 Wait and before
+    // VEC decode, so MTE2 overlaps the full decode window (was P18: only
+    // overlapped V_MTE3 drain after SetFlag).
     bool nextDmaInFlight = false;
     uint32_t prefN = 0U;
     // Scheme A: reuse block_table phys + pack headBase across consecutive
     // PA runs that share the same blockInBatch (BS=128 / maxSub~29 → many
-    // runs per block). Skip GetValue + HeadBase + S_MTE2 when unchanged.
+    // runs per block). Skip GetValue + HeadBase when unchanged.
     uint32_t cachedBlockInBatch = 0xFFFFFFFFu;
     uint64_t cachedHeadBase = 0ULL;
 
@@ -1461,8 +1462,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             if (blockInBatch != cachedBlockInBatch) {
                 uint32_t btIdx =
                     info.bIdx * constInfo.maxBlockNumPerBatch + blockInBatch;
-                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
                 int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
                 cachedHeadBase =
                     GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
@@ -1518,6 +1517,80 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
         const uint32_t outOff = br_dequant::BrAlignUp32(codesBytes);
         LocalTensor<WS_T> outBatch =
             batchUb[outOff].template ReinterpretCast<WS_T>();
+
+        // P1a: issue next-run codes/meta MTE2 BEFORE current VEC decode so
+        // MTE2 overlaps the full decode window (P18 only overlapped V_MTE3 drain).
+        const uint32_t nextSiCandidate = si + n;
+        if (nextSiCandidate < siEnd) {
+            uint32_t nextGlobalS2 =
+                info.s2Idx * constInfo.s2BaseSize + nextSiCandidate;
+            uint32_t nextBlockInBatch = nextGlobalS2 / bs;
+            uint32_t nextPos0 = nextGlobalS2 % bs;
+            if (nextBlockInBatch != cachedBlockInBatch) {
+                uint32_t nextBtIdx =
+                    info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
+                int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
+                cachedHeadBase =
+                    GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
+                cachedBlockInBatch = nextBlockInBatch;
+            }
+            uint64_t nextHeadBase = cachedHeadBase;
+
+            uint32_t nextMaxInBlock = bs - nextPos0;
+            uint32_t nextRemaining = siEnd - nextSiCandidate;
+            uint32_t nextN = nextMaxInBlock;
+            if (nextRemaining < nextN) {
+                nextN = nextRemaining;
+            }
+            if (maxSub < nextN) {
+                nextN = maxSub;
+            }
+
+            const uint32_t nextBufIdx = (runId + 1U) % 2U;
+            const uint32_t nextMetaSlotOff =
+                nextBufIdx * br_dequant::BR_META_SLOT_BYTES;
+            if (runId + 1U >= 2U) {
+                event_t reuseEv =
+                    (nextBufIdx == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
+                WaitFlag<HardEvent::MTE3_V>(reuseEv);
+            }
+
+            LocalTensor<uint8_t> nextBatchUb =
+                tmpBuff1.GetWithOffset<uint8_t>(kHalfBytes, nextBufIdx * kHalfBytes);
+            LocalTensor<uint8_t> nextPackedMetaUb =
+                dequantInt8Buf_.GetWithOffset<uint8_t>(
+                    br_dequant::BR_DEQUANT_UB_BYTES, nextMetaSlotOff);
+
+            SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
+            WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
+
+            const uint32_t nextCodesBytes = nextN * codeRowBytes;
+            uint64_t nextMeta0GmOff;
+            uint64_t nextMeta1GmOff;
+            if (isKey) {
+                uint64_t nextCodeOff =
+                    br_pack::BrKeyCodeOffset(nextHeadBase, nextPos0);
+                DataCopy(nextBatchUb, srcGm[nextCodeOff], nextCodesBytes);
+                nextMeta0GmOff =
+                    br_pack::BrKeyBaseOffset(nextHeadBase, bs, nextPos0);
+                nextMeta1GmOff =
+                    br_pack::BrKeyStepOffset(nextHeadBase, bs, nextPos0);
+            } else {
+                uint64_t nextCodeOff =
+                    br_pack::BrValCodeOffset(nextHeadBase, nextPos0);
+                DataCopy(nextBatchUb, srcGm[nextCodeOff], nextCodesBytes);
+                nextMeta0GmOff =
+                    br_pack::BrValVminOffset(nextHeadBase, bs, nextPos0);
+                nextMeta1GmOff =
+                    br_pack::BrValVstepOffset(nextHeadBase, bs, nextPos0);
+            }
+            br_dequant::BrCopyPackedMetaTile(srcGm, nextPackedMetaUb,
+                nextMeta0GmOff, nextMeta1GmOff, nextN);
+            SetFlag<HardEvent::MTE2_V>(eventIdCodesWait[nextBufIdx]);
+
+            prefN = nextN;
+            nextDmaInFlight = true;
+        }
 
         if constexpr (kUseHalfAffine) {
             // Native half meta: packed SoA is already half (Q_T=half). hoistTile
@@ -1600,83 +1673,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             }
         }
 
-        // P18: Set V_MTE3, prefetch next run while VEC drains, then Wait + store.
         SetFlag<HardEvent::V_MTE3>(eventIdVWaitMte3);
-
-        const uint32_t nextSiCandidate = si + n;
-        if (nextSiCandidate < siEnd) {
-            uint32_t nextGlobalS2 =
-                info.s2Idx * constInfo.s2BaseSize + nextSiCandidate;
-            uint32_t nextBlockInBatch = nextGlobalS2 / bs;
-            uint32_t nextPos0 = nextGlobalS2 % bs;
-            if (nextBlockInBatch != cachedBlockInBatch) {
-                uint32_t nextBtIdx =
-                    info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
-                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-                int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
-                cachedHeadBase =
-                    GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
-                cachedBlockInBatch = nextBlockInBatch;
-            }
-            uint64_t nextHeadBase = cachedHeadBase;
-
-            uint32_t nextMaxInBlock = bs - nextPos0;
-            uint32_t nextRemaining = siEnd - nextSiCandidate;
-            uint32_t nextN = nextMaxInBlock;
-            if (nextRemaining < nextN) {
-                nextN = nextRemaining;
-            }
-            if (maxSub < nextN) {
-                nextN = maxSub;
-            }
-
-            const uint32_t nextBufIdx = (runId + 1U) % 2U;
-            const uint32_t nextMetaSlotOff =
-                nextBufIdx * br_dequant::BR_META_SLOT_BYTES;
-            if (runId + 1U >= 2U) {
-                event_t reuseEv =
-                    (nextBufIdx == 0U) ? eventIdMte3WaitV0 : eventIdMte3WaitV1;
-                WaitFlag<HardEvent::MTE3_V>(reuseEv);
-            }
-
-            LocalTensor<uint8_t> nextBatchUb =
-                tmpBuff1.GetWithOffset<uint8_t>(kHalfBytes, nextBufIdx * kHalfBytes);
-            LocalTensor<uint8_t> nextPackedMetaUb =
-                dequantInt8Buf_.GetWithOffset<uint8_t>(
-                    br_dequant::BR_DEQUANT_UB_BYTES, nextMetaSlotOff);
-
-            SetFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
-            WaitFlag<HardEvent::V_MTE2>(eventIdMte2WaitV);
-
-            const uint32_t nextCodesBytes = nextN * codeRowBytes;
-            uint64_t nextMeta0GmOff;
-            uint64_t nextMeta1GmOff;
-            if (isKey) {
-                uint64_t nextCodeOff =
-                    br_pack::BrKeyCodeOffset(nextHeadBase, nextPos0);
-                DataCopy(nextBatchUb, srcGm[nextCodeOff], nextCodesBytes);
-                nextMeta0GmOff =
-                    br_pack::BrKeyBaseOffset(nextHeadBase, bs, nextPos0);
-                nextMeta1GmOff =
-                    br_pack::BrKeyStepOffset(nextHeadBase, bs, nextPos0);
-            } else {
-                uint64_t nextCodeOff =
-                    br_pack::BrValCodeOffset(nextHeadBase, nextPos0);
-                DataCopy(nextBatchUb, srcGm[nextCodeOff], nextCodesBytes);
-                nextMeta0GmOff =
-                    br_pack::BrValVminOffset(nextHeadBase, bs, nextPos0);
-                nextMeta1GmOff =
-                    br_pack::BrValVstepOffset(nextHeadBase, bs, nextPos0);
-            }
-            br_dequant::BrCopyPackedMetaTile(srcGm, nextPackedMetaUb,
-                nextMeta0GmOff, nextMeta1GmOff, nextN);
-            SetFlag<HardEvent::MTE2_V>(eventIdCodesWait[nextBufIdx]);
-
-            prefN = nextN;
-            nextDmaInFlight = true;
-        }
-
         WaitFlag<HardEvent::V_MTE3>(eventIdVWaitMte3);
         uint64_t dstWsElemIdx = wsOffset + static_cast<uint64_t>(si) * headDimAlign;
         DataCopy(dstWsGm[dstWsElemIdx], outBatch, n * headDimAlign);
