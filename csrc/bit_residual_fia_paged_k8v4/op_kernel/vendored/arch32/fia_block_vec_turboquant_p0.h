@@ -1393,7 +1393,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     event_t eventIdVWaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
     event_t eventIdMte3WaitV0 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
     event_t eventIdMte3WaitV1 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-    event_t eventIdMte2WaitS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE2));
     // NaN fix: drain PIPE_V before meta/codes MTE2 (same slot reuse / prefetch).
     event_t eventIdMte2WaitV =
         static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
@@ -1440,7 +1439,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint32_t prefN = 0U;
     // Scheme A: reuse block_table phys + pack headBase across consecutive
     // PA runs that share the same blockInBatch (BS=128 / maxSub~29 → many
-    // runs per block). Skip GetValue + HeadBase + S_MTE2 when unchanged.
+    // runs per block). Skip GetValue + HeadBase when unchanged.
     uint32_t cachedBlockInBatch = 0xFFFFFFFFu;
     uint64_t cachedHeadBase = 0ULL;
 
@@ -1463,8 +1462,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             if (blockInBatch != cachedBlockInBatch) {
                 uint32_t btIdx =
                     info.bIdx * constInfo.maxBlockNumPerBatch + blockInBatch;
-                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
                 int32_t physBlockVal = blockTableGm_.GetValue(btIdx);
                 cachedHeadBase =
                     GetBrPackHeadBase(physBlockVal, info.n2Idx, isKey);
@@ -1532,8 +1529,6 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
             if (nextBlockInBatch != cachedBlockInBatch) {
                 uint32_t nextBtIdx =
                     info.bIdx * constInfo.maxBlockNumPerBatch + nextBlockInBatch;
-                SetFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
-                WaitFlag<HardEvent::S_MTE2>(eventIdMte2WaitS);
                 int32_t nextPhysBlockVal = blockTableGm_.GetValue(nextBtIdx);
                 cachedHeadBase =
                     GetBrPackHeadBase(nextPhysBlockVal, info.n2Idx, isKey);
