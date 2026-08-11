@@ -40,12 +40,29 @@
 #   SOURCE_ENV                  可选，默认仓库 infoenvs（存在则 source）
 #   PARALLEL                    多 concurrency 是否并行，默认 1（1=并行，0=串行）
 #
+# Profiler（压测段采集 torch/Ascend trace）:
+#   ENABLE_PROFILE              设为 1 开启：serve 挂 --profiler-config.*，
+#                               压测期间 POST /start_profile 与 /stop_profile
+#   PROFILE_DIR                 trace 根目录；默认 ${LOG_ROOT}/.../profiler（绝对路径）
+#   PROFILE_IGNORE_FRONTEND     1=只采 EngineCore/NPU（ignore_frontend），默认 0
+#   PROFILE_WITH_STACK          1=with_stack，默认 1
+#   PROFILE_ACTIVE_ITERATIONS   传给 --profiler-config.active_iterations；空=框架默认(5)
+#   PROFILE_DELAY_SEC           可选：bench 开始后延迟 N 秒再 start（不设则走
+#                               `vllm bench serve --profile`：warmup 后 start、结束 stop）
+#   PROFILE_DURATION_SEC        与 DELAY 联用：start 后再采 M 秒 stop；不设则 bench
+#                               结束后再 stop
+#
 # 每轮不同 IO 长度示例:
 #   ROUNDS=3 BENCH_INPUT_LEN="10 100 2000" BENCH_OUTPUT_LEN="200 200 500" \
 #     bash script/xrx/run_bench_batch_sweep.sh
 #   # 抬高 prefill budget，减弱 chunked-prefill 错峰对 TPOT 的影响:
 #   MAX_NUM_BATCHED_TOKENS=32768 ROUNDS=2 BENCH_INPUT_LEN="200 2000" \
 #     BENCH_OUTPUT_LEN="200 200" MAX_CONCURRENCIES=16 bash script/xrx/run_bench_batch_sweep.sh
+#   # 压测全程 profile（warmup 后 start，跑完 stop）:
+#   ENABLE_PROFILE=1 MAX_CONCURRENCIES=16 ROUNDS=1 bash script/xrx/run_bench_batch_sweep.sh
+#   # 压测中途采 30s（开跑 60s 后 start，再 30s stop）:
+#   ENABLE_PROFILE=1 PROFILE_DELAY_SEC=60 PROFILE_DURATION_SEC=30 \
+#     bash script/xrx/run_bench_batch_sweep.sh
 
 set -euo pipefail
 
@@ -76,6 +93,13 @@ BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-inf}"
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/completions}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 PARALLEL="${PARALLEL:-1}"
+ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
+PROFILE_DIR="${PROFILE_DIR:-}"
+PROFILE_IGNORE_FRONTEND="${PROFILE_IGNORE_FRONTEND:-0}"
+PROFILE_WITH_STACK="${PROFILE_WITH_STACK:-1}"
+PROFILE_ACTIVE_ITERATIONS="${PROFILE_ACTIVE_ITERATIONS:-}"
+PROFILE_DELAY_SEC="${PROFILE_DELAY_SEC:-}"
+PROFILE_DURATION_SEC="${PROFILE_DURATION_SEC:-}"
 
 STAMP="$(date '+%Y%m%d_%H%M%S')"
 WORK_ROOT="${WORK_ROOT:-${PWD}/output/bench_batch_sweep_${STAMP}}"
@@ -83,7 +107,7 @@ LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs}"
 
 # ---------- CLI ----------
 usage() {
-    sed -n '2,45p' "$0" | sed 's/^# \?//'
+    sed -n '2,58p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
@@ -126,6 +150,30 @@ while [[ $# -gt 0 ]]; do
             ;;
         --parallel)
             PARALLEL="$2"
+            shift 2
+            ;;
+        --profile)
+            ENABLE_PROFILE=1
+            shift
+            ;;
+        --profile-dir)
+            PROFILE_DIR="$2"
+            shift 2
+            ;;
+        --profile-delay)
+            PROFILE_DELAY_SEC="$2"
+            shift 2
+            ;;
+        --profile-duration)
+            PROFILE_DURATION_SEC="$2"
+            shift 2
+            ;;
+        --profiler-ignore-frontend)
+            PROFILE_IGNORE_FRONTEND=1
+            shift
+            ;;
+        --profiler-active-iterations)
+            PROFILE_ACTIVE_ITERATIONS="$2"
             shift 2
             ;;
         *)
@@ -229,6 +277,7 @@ start_serve() {
     local device="$2"
     local port="$3"
     local worker_dir="$4"
+    local profiler_dir="${5:-}"
     local pid_file="${worker_dir}/vllm_serve.pid"
     local serve_log="${worker_dir}/serve_${tag}.log"
     CURRENT_SERVE_LOG="${serve_log}"
@@ -254,12 +303,38 @@ start_serve() {
     if [[ "${ENFORCE_EAGER}" == "1" ]]; then
         eager_args+=(--enforce-eager)
     fi
+    local profiler_args=()
+    if [[ -n "${profiler_dir}" ]]; then
+        mkdir -p "${profiler_dir}"
+        profiler_dir="$(cd "${profiler_dir}" && pwd)"
+        profiler_args+=(
+            --profiler-config.profiler=torch
+            --profiler-config.torch_profiler_dir="${profiler_dir}"
+        )
+        if [[ "${PROFILE_WITH_STACK}" == "1" ]]; then
+            profiler_args+=(--profiler-config.torch_profiler_with_stack=true)
+        fi
+        if [[ "${PROFILE_IGNORE_FRONTEND}" == "1" ]]; then
+            profiler_args+=(--profiler-config.ignore_frontend=true)
+        fi
+        if [[ -n "${PROFILE_ACTIVE_ITERATIONS}" ]]; then
+            if ! [[ "${PROFILE_ACTIVE_ITERATIONS}" =~ ^[1-9][0-9]*$ ]]; then
+                wlog "ERROR: PROFILE_ACTIVE_ITERATIONS 须为正整数，当前=${PROFILE_ACTIVE_ITERATIONS}"
+                return 1
+            fi
+            profiler_args+=(--profiler-config.active_iterations="${PROFILE_ACTIVE_ITERATIONS}")
+        fi
+        wlog "  profiler_dir=${profiler_dir} ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>}"
+    fi
 
     (
         export ASCEND_RT_VISIBLE_DEVICES="${device}"
         export VLLM_ASCEND_BIT_RESIDUAL_FIA
         export VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA
         export VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA
+        # Optional NaN/topk probe (set by caller): inherit into EngineCore.
+        export VLLM_ASCEND_TOPK_DEBUG="${VLLM_ASCEND_TOPK_DEBUG:-0}"
+        export VLLM_ASCEND_TOPK_DEBUG_PATH="${VLLM_ASCEND_TOPK_DEBUG_PATH:-}"
         export MODEL_PATH="${SERVE_MODEL_PATH}"
         exec setsid vllm serve "${SERVE_MODEL_PATH}" \
             --kv_cache_dtype=turboquant \
@@ -270,6 +345,7 @@ start_serve() {
             --max-model-len "${MAX_MODEL_LEN}" \
             "${batched_args[@]}" \
             "${eager_args[@]}" \
+            "${profiler_args[@]}" \
             --no-enable-prefix-caching \
             --kv-cache-metrics
     ) >"${serve_log}" 2>&1 &
@@ -283,6 +359,52 @@ start_serve() {
     fi
     wlog "serve pid=${pid}"
     wait_ready "${READY_TIMEOUT}" "http://127.0.0.1:${port}/health" "${pid_file}"
+}
+
+post_profile() {
+    # POST /start_profile or /stop_profile; returns 0 on HTTP success.
+    local port="$1"
+    local action="$2" # start_profile | stop_profile
+    local url="http://127.0.0.1:${port}/${action}"
+    local tmp_out tmp_err http_code
+    tmp_out="$(mktemp)"
+    tmp_err="$(mktemp)"
+    http_code="$(curl -sS -o "${tmp_out}" -w '%{http_code}' \
+        -X POST "${url}" 2>"${tmp_err}" || true)"
+    if [[ "${http_code}" == "200" ]]; then
+        wlog "POST /${action} ok (port=${port})"
+        rm -f "${tmp_out}" "${tmp_err}"
+        return 0
+    fi
+    wlog "WARN: POST /${action} failed http=${http_code:-na} port=${port}"
+    if [[ -s "${tmp_err}" ]]; then
+        wlog "  curl err: $(head -c 200 "${tmp_err}")"
+    fi
+    if [[ -s "${tmp_out}" ]]; then
+        wlog "  body: $(head -c 200 "${tmp_out}")"
+    fi
+    rm -f "${tmp_out}" "${tmp_err}"
+    return 1
+}
+
+# Background: sleep DELAY, start_profile, optional DURATION then stop_profile.
+# Writes pid to $1; caller must wait/kill and ensure final stop if needed.
+start_timed_profile_watcher() {
+    local pid_out="$1"
+    local port="$2"
+    local delay_sec="$3"
+    local duration_sec="${4:-}"
+    (
+        if [[ -n "${delay_sec}" && "${delay_sec}" != "0" ]]; then
+            sleep "${delay_sec}"
+        fi
+        post_profile "${port}" "start_profile" || true
+        if [[ -n "${duration_sec}" ]]; then
+            sleep "${duration_sec}"
+            post_profile "${port}" "stop_profile" || true
+        fi
+    ) &
+    echo $! > "${pid_out}"
 }
 
 # Expand scalar-or-list IO lens to exactly ROUNDS entries (1-indexed via arr[r-1]).
@@ -357,6 +479,26 @@ run_bench() {
         bench_model="${SERVE_MODEL_PATH}"
     fi
 
+    local profile_args=()
+    local timed_profile=0
+    local watcher_pid_file=""
+    local watcher_pid=""
+    if [[ "${ENABLE_PROFILE}" == "1" ]]; then
+        if [[ -n "${PROFILE_DELAY_SEC}" ]]; then
+            timed_profile=1
+            watcher_pid_file="${worker_dir}/profile_watcher_${tag}.pid"
+            wlog "timed profile: delay=${PROFILE_DELAY_SEC}s duration=${PROFILE_DURATION_SEC:-until-bench-end}"
+            start_timed_profile_watcher \
+                "${watcher_pid_file}" "${port}" \
+                "${PROFILE_DELAY_SEC}" "${PROFILE_DURATION_SEC:-}"
+            watcher_pid="$(cat "${watcher_pid_file}" 2>/dev/null || true)"
+        else
+            # vllm bench serve: POST /start_profile after warmup, /stop_profile after run.
+            profile_args+=(--profile)
+            wlog "bench --profile: warmup 后 start_profile，跑完 stop_profile"
+        fi
+    fi
+
     wlog "开始 bench: max_concurrency=${max_concurrency} round=${round}/${ROUNDS}"
     wlog "  host=127.0.0.1 port=${port} endpoint=${BENCH_ENDPOINT}"
     wlog "  input_len=${input_len} output_len=${output_len}"
@@ -377,9 +519,20 @@ run_bench() {
         --max-concurrency "${max_concurrency}" \
         --request-rate "${BENCH_REQUEST_RATE}" \
         --ignore-eos \
+        "${profile_args[@]}" \
         >"${bench_log}" 2>&1
     local rc=$?
     set -e
+
+    if [[ ${timed_profile} -eq 1 ]]; then
+        if [[ -n "${watcher_pid}" ]] && process_alive "${watcher_pid}"; then
+            kill "${watcher_pid}" >/dev/null 2>&1 || true
+            wait "${watcher_pid}" 2>/dev/null || true
+        fi
+        # Ensure stop even if duration window not reached or DELAY-only mode.
+        post_profile "${port}" "stop_profile" || true
+        rm -f "${watcher_pid_file}"
+    fi
 
     if [[ ${rc} -ne 0 ]]; then
         wlog "ERROR: bench 失败 rc=${rc}，见 ${bench_log}"
@@ -400,13 +553,25 @@ run_worker() {
     local worker_dir="${LOG_ROOT}/mc${max_concurrency}_dev${device}_port${port}"
     local pid_file="${worker_dir}/vllm_serve.pid"
     local fail=0
+    local profiler_dir=""
 
     mkdir -p "${worker_dir}"
     WORKER_TAG="mc${max_concurrency}/dev${device}/port${port}"
     WORKER_LOG="${worker_dir}/worker.log"
 
+    if [[ "${ENABLE_PROFILE}" == "1" ]]; then
+        if [[ -n "${PROFILE_DIR}" ]]; then
+            profiler_dir="${PROFILE_DIR}/mc${max_concurrency}_dev${device}_port${port}"
+        else
+            profiler_dir="${worker_dir}/profiler"
+        fi
+        mkdir -p "${profiler_dir}"
+        profiler_dir="$(cd "${profiler_dir}" && pwd)"
+        wlog "ENABLE_PROFILE=1 profiler_dir=${profiler_dir}"
+    fi
+
     wlog "======== worker start max_concurrency=${max_concurrency} device=${device} port=${port} ========"
-    if ! start_serve "mc${max_concurrency}" "${device}" "${port}" "${worker_dir}"; then
+    if ! start_serve "mc${max_concurrency}" "${device}" "${port}" "${worker_dir}" "${profiler_dir}"; then
         wlog "ERROR: worker serve 启动失败"
         echo 1 > "${worker_dir}/fail_count"
         return 1
@@ -422,6 +587,9 @@ run_worker() {
 
     stop_serve_on "${pid_file}" "${port}"
     echo "${fail}" > "${worker_dir}/fail_count"
+    if [[ -n "${profiler_dir}" ]]; then
+        wlog "profiler traces: ${profiler_dir}"
+    fi
     wlog "======== worker done max_concurrency=${max_concurrency} fail=${fail} ========"
     return 0
 }
@@ -494,11 +662,39 @@ if ! [[ "${ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 expand_io_lens_for_rounds
 
+if [[ "${ENABLE_PROFILE}" == "1" ]]; then
+    if [[ -n "${PROFILE_DELAY_SEC}" ]] && ! [[ "${PROFILE_DELAY_SEC}" =~ ^[0-9]+$ ]]; then
+        log "ERROR: PROFILE_DELAY_SEC 须为非负整数，当前=${PROFILE_DELAY_SEC}"
+        exit 1
+    fi
+    if [[ -n "${PROFILE_DURATION_SEC}" ]]; then
+        if [[ -z "${PROFILE_DELAY_SEC}" ]]; then
+            log "ERROR: PROFILE_DURATION_SEC 需配合 PROFILE_DELAY_SEC 使用（否则请用 bench --profile 模式）"
+            exit 1
+        fi
+        if ! [[ "${PROFILE_DURATION_SEC}" =~ ^[1-9][0-9]*$ ]]; then
+            log "ERROR: PROFILE_DURATION_SEC 须为正整数，当前=${PROFILE_DURATION_SEC}"
+            exit 1
+        fi
+    fi
+fi
+
 log "WORK_ROOT=${WORK_ROOT}"
 log "LOG_ROOT=${LOG_ROOT}"
 log "BLOCK_SIZE=${BLOCK_SIZE} FIA=${_FIA}/${_DECODE_FIA}/${_NOCACHE_FIA} ROUNDS=${ROUNDS} PARALLEL=${PARALLEL}"
 log "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-<default>} enforce_eager=${ENFORCE_EAGER}"
 log "bench: num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE}"
+if [[ "${ENABLE_PROFILE}" == "1" ]]; then
+    if [[ -n "${PROFILE_DELAY_SEC}" ]]; then
+        log "profile: ENABLE=1 mode=timed delay=${PROFILE_DELAY_SEC}s duration=${PROFILE_DURATION_SEC:-until-bench-end}"
+    else
+        log "profile: ENABLE=1 mode=bench --profile (warmup后start / 结束后stop)"
+    fi
+    log "  ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>}"
+    log "  PROFILE_DIR=${PROFILE_DIR:-<per-worker ${LOG_ROOT}/.../profiler>}"
+else
+    log "profile: ENABLE=0"
+fi
 for ((r = 1; r <= ROUNDS; r++)); do
     log "  round[${r}]: input_len=$(round_input_len "${r}") output_len=$(round_output_len "${r}")"
 done
