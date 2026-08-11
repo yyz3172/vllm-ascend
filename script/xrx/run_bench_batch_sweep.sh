@@ -26,6 +26,10 @@
 #   MAX_NUM_BATCHED_TOKENS      传给 vllm serve --max-num-batched-tokens；空=框架默认
 #                               （常见默认 2048）。定位短/长 input TPOT 时建议 32768
 #   ENFORCE_EAGER               设为 1 时给 vllm serve 加 --enforce-eager（关 ACL graph）
+#   ENABLE_TQ                   1=turboquant k8v4（默认）；0=非 TQ（不传 kv_cache_dtype，
+#                               等价框架默认 auto / fp KV）
+#   TQ_KV_BITS                  ENABLE_TQ=1 时 additional-config turboquant_kv_bits，
+#                               默认 "[8, 4]"
 #   MAX_CONCURRENCIES           默认 "64"（空格分隔；多项时与卡/端口一一对应并行）
 #   ROUNDS                      每个 concurrency 下客户端压测轮数，默认 1（同一 serve）
 #   BENCH_INPUT_LEN             random dataset input_len；可为单值或空格分隔列表，默认 10
@@ -63,6 +67,9 @@
 #   # 压测中途采 30s（开跑 60s 后 start，再 30s stop）:
 #   ENABLE_PROFILE=1 PROFILE_DELAY_SEC=60 PROFILE_DURATION_SEC=30 \
 #     bash script/xrx/run_bench_batch_sweep.sh
+#   # 非 TQ（fp KV baseline）:
+#   ENABLE_TQ=0 bash script/xrx/run_bench_batch_sweep.sh
+#   # 或: bash script/xrx/run_bench_batch_sweep.sh --no-tq
 
 set -euo pipefail
 
@@ -84,6 +91,8 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8500}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+ENABLE_TQ="${ENABLE_TQ:-1}"
+TQ_KV_BITS="${TQ_KV_BITS:-[8, 4]}"
 MAX_CONCURRENCIES="${MAX_CONCURRENCIES:-64}"
 ROUNDS="${ROUNDS:-1}"
 BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-10}"
@@ -107,7 +116,7 @@ LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs}"
 
 # ---------- CLI ----------
 usage() {
-    sed -n '2,58p' "$0" | sed 's/^# \?//'
+    sed -n '2,62p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
@@ -174,6 +183,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --profiler-active-iterations)
             PROFILE_ACTIVE_ITERATIONS="$2"
+            shift 2
+            ;;
+        --no-tq|--disable-tq)
+            ENABLE_TQ=0
+            shift
+            ;;
+        --tq|--enable-tq)
+            ENABLE_TQ=1
+            shift
+            ;;
+        --tq-kv-bits)
+            TQ_KV_BITS="$2"
             shift 2
             ;;
         *)
@@ -293,6 +314,7 @@ start_serve() {
     wlog "  model=${SERVE_MODEL_PATH} port=${port} block_size=${BLOCK_SIZE} device=${device}"
     wlog "  util=${GPU_MEMORY_UTILIZATION} max_len=${MAX_MODEL_LEN}"
     wlog "  max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-<default>} enforce_eager=${ENFORCE_EAGER}"
+    wlog "  ENABLE_TQ=${ENABLE_TQ} TQ_KV_BITS=${TQ_KV_BITS}"
     wlog "  FIA=${VLLM_ASCEND_BIT_RESIDUAL_FIA}/${VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA}/${VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA}"
 
     local batched_args=()
@@ -326,6 +348,14 @@ start_serve() {
         fi
         wlog "  profiler_dir=${profiler_dir} ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>}"
     fi
+    # TQ: --kv_cache_dtype=turboquant + bits；非 TQ: 不传 dtype（框架默认 auto/fp KV）。
+    local tq_args=()
+    if [[ "${ENABLE_TQ}" == "1" ]]; then
+        tq_args+=(
+            --kv_cache_dtype=turboquant
+            --additional-config="{\"turboquant_kv_bits\": ${TQ_KV_BITS}}"
+        )
+    fi
 
     (
         export ASCEND_RT_VISIBLE_DEVICES="${device}"
@@ -337,8 +367,7 @@ start_serve() {
         export VLLM_ASCEND_TOPK_DEBUG_PATH="${VLLM_ASCEND_TOPK_DEBUG_PATH:-}"
         export MODEL_PATH="${SERVE_MODEL_PATH}"
         exec setsid vllm serve "${SERVE_MODEL_PATH}" \
-            --kv_cache_dtype=turboquant \
-            --additional-config='{"turboquant_kv_bits": [8, 4]}' \
+            "${tq_args[@]}" \
             --port "${port}" \
             --block-size "${BLOCK_SIZE}" \
             --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
@@ -679,9 +708,15 @@ if [[ "${ENABLE_PROFILE}" == "1" ]]; then
     fi
 fi
 
+if [[ "${ENABLE_TQ}" != "0" && "${ENABLE_TQ}" != "1" ]]; then
+    log "ERROR: ENABLE_TQ 须为 0 或 1，当前=${ENABLE_TQ}"
+    exit 1
+fi
+
 log "WORK_ROOT=${WORK_ROOT}"
 log "LOG_ROOT=${LOG_ROOT}"
 log "BLOCK_SIZE=${BLOCK_SIZE} FIA=${_FIA}/${_DECODE_FIA}/${_NOCACHE_FIA} ROUNDS=${ROUNDS} PARALLEL=${PARALLEL}"
+log "ENABLE_TQ=${ENABLE_TQ} TQ_KV_BITS=${TQ_KV_BITS}"
 log "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-<default>} enforce_eager=${ENFORCE_EAGER}"
 log "bench: num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE}"
 if [[ "${ENABLE_PROFILE}" == "1" ]]; then
