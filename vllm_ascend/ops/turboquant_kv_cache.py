@@ -69,7 +69,6 @@ _KNOWN_OPS = [
     "bit_residual_attention_paged_k8v4",
 ]
 
-_BIT_RESIDUAL_PACK_OP: object | bool | None = None
 _BIT_RESIDUAL_ATTN_OP: object | bool | None = None
 _SEQ_LEN_LIST_CACHE: dict[tuple[int, ...], list[int]] = {}
 _SEQ_LEN_LIST_CACHE_MAX = 256
@@ -110,19 +109,6 @@ def _c_ascend_turboquant_op_available(op_name: str) -> bool:
 
 # Initialize cache at module load time
 _init_custom_op_cache()
-
-
-def _get_bit_residual_pack_k8v4_op():
-    global _BIT_RESIDUAL_PACK_OP
-    if _BIT_RESIDUAL_PACK_OP is False:
-        return None
-    if _BIT_RESIDUAL_PACK_OP is not None:
-        return _BIT_RESIDUAL_PACK_OP
-    if not _c_ascend_turboquant_op_available("bit_residual_pack_k8v4"):
-        _BIT_RESIDUAL_PACK_OP = False
-        return None
-    _BIT_RESIDUAL_PACK_OP = torch.ops._C_ascend.bit_residual_pack_k8v4
-    return _BIT_RESIDUAL_PACK_OP
 
 
 def _get_bit_residual_attention_paged_k8v4_op():
@@ -1446,236 +1432,38 @@ def turboquant_pack_kv_for_cache_to_cache(
     num_reqs: int,
     bits_key: int,
     bits_value: int,
+    rotation_t: torch.Tensor,
 ) -> None:
-    if key.numel() == 0:
-        return
-    if value.dtype != key.dtype:
-        raise ValueError("Key/value dtypes must match for turboquant.")
-    if slot_mapping.dtype != torch.int32:
-        raise ValueError("TurboQuant fused pack-to-cache expects int32 slot_mapping.")
-    if query_start_loc.dtype != torch.int32:
-        raise ValueError("TurboQuant fused pack-to-cache expects int32 query_start_loc.")
-    if num_reqs <= 0:
-        raise ValueError("TurboQuant fused pack-to-cache expects num_reqs > 0.")
-    if query_start_loc.dim() != 1 or query_start_loc.numel() < num_reqs + 1:
-        raise ValueError(
-            "TurboQuant fused pack-to-cache expects query_start_loc length "
-            "at least num_reqs + 1."
-        )
-    if not query_start_loc.is_contiguous():
-        query_start_loc = query_start_loc.contiguous()
-
     head_size = key.shape[-1]
 
-    # ------------------------------------------------------------------
-    # BitResidual k8v4 path: bits_key=8, bits_value=4
-    # Sign-reversal quantization, 16-row sub-block layout.
-    # ------------------------------------------------------------------
-    if (
-        bits_key == 8
-        and bits_value == 4
-        and head_size == 128
-        and key.dtype in (torch.float16, torch.bfloat16)
-        and key.device.type in ("npu", "privateuseone")
-        and _get_bit_residual_pack_k8v4_op() is not None
-    ):
-        pack_op = _get_bit_residual_pack_k8v4_op()
-        # Infer block_size from key_cache shape.
-        # key_cache: [num_blocks, num_kv_heads, (block_size/16)*2112]
-        key_cache_last_dim = key_cache.shape[-1]
-        if key_cache_last_dim % BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE == 0:
-            sub_blocks_per_head = key_cache_last_dim // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
-            block_size_k8v4 = sub_blocks_per_head * BIT_RESIDUAL_K8V4_BLOCK_ROWS
-            rotation_t = _bit_residual_k8v4_rotation_t(key.device, key.dtype)
-            pack_op(
-                key,
-                value,
-                slot_mapping,
-                query_start_loc,
-                rotation_t,
-                _uint8_storage_view(key_cache),
-                _uint8_storage_view(value_cache),
-                int(num_reqs),
-                int(block_size_k8v4),
-            )
-            return
-        # If cache shape doesn't match k8v4 layout, fall through to other paths.
-
-    key_slab_block_size = _turboquant_slab_block_size_or_none(
-        key_cache, head_size=head_size, bits=bits_key
-    )
-    value_slab_block_size = _turboquant_slab_block_size_or_none(
-        value_cache, head_size=head_size, bits=bits_value
-    )
-    if (
-        turboquant_4bit_slab_cache_enabled(bits_key, bits_value)
-        or key_slab_block_size is not None
-        or value_slab_block_size is not None
-    ):
-        if key_slab_block_size is None:
-            raise ValueError(
-                "4-bit TurboQuant slab pack requires key_cache shape "
-                "[num_blocks, num_heads, block_size * packed_width]."
-            )
-        if value_slab_block_size is None:
-            raise ValueError(
-                "4-bit TurboQuant slab pack requires value_cache shape "
-                "[num_blocks, num_heads, block_size * packed_width]."
-            )
-        block_size = key_slab_block_size
-        if value_slab_block_size != block_size:
-            raise ValueError(
-                "Key/value slab caches must use the same block_size, got "
-                f"{block_size} and {value_slab_block_size}."
-            )
-        use_4bit_to_cache = (
-            bits_key == bits_value == 4
-            and head_size == 128
-            and key.dtype in (torch.float16, torch.bfloat16)
-            and key.device.type in ("npu", "privateuseone")
-            and _turboquant_encode_op_enabled()
-            and _turboquant_4bit_default_codebook_enabled()
-            and _turboquant_pack_4bit_to_cache_op_ready()
-        )
-        if use_4bit_to_cache:
-            cb_k, rot_t_k = _turboquant_pack_tables(
-                key.device, head_size, bits_key, key.dtype
-            )
-            torch.ops._C_ascend.turboquant_pack_kv_for_cache_4bit(
-                key,
-                value,
-                slot_mapping,
-                query_start_loc,
-                cb_k,
-                rot_t_k,
-                _uint8_storage_view(key_cache),
-                _uint8_storage_view(value_cache),
-                int(num_reqs),
-                int(block_size),
-            )
-            return
-        row_w_k = turboquant_slab_row_bytes(head_size, bits=bits_key)
-        row_w_v = turboquant_slab_row_bytes(head_size, bits=bits_value)
-        packed_k, packed_v = turboquant_pack_kv_for_cache(
-            key=key,
-            value=value,
-            bits_key=bits_key,
-            bits_value=bits_value,
-            slot_w_k=row_w_k,
-            slot_w_v=row_w_v,
-        )
-        slot = slot_mapping.to(torch.int64)
-        valid = slot >= 0
-        if not torch.any(valid):
-            return
-        tok_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-        _turboquant_scatter_row_format_to_group4_slab(
+    # BitResidual k8v4 pack (k8v4-only): sign-reversal quantization, 16-row
+    # sub-block layout, via bit_residual_pack_k8v4 directly. Caller is trusted:
+    # the early dtype/int32/shape checks were removed (metadata guarantees them).
+    if bits_key == 8 and bits_value == 4 and head_size == 128:
+        # key_cache: [num_blocks, num_kv_heads, (block_size/16)*KEY_BLOCK_STRIDE]
+        block_size_k8v4 = (
+            key_cache.shape[-1] // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
+        ) * BIT_RESIDUAL_K8V4_BLOCK_ROWS
+        torch.ops._C_ascend.bit_residual_pack_k8v4(
+            key,
+            value,
+            slot_mapping,
+            query_start_loc,
+            rotation_t,
             key_cache,
-            packed_k[tok_idx],
-            slot_mapping[valid],
-            block_size=block_size,
-        )
-        _turboquant_scatter_row_format_to_group4_slab(
             value_cache,
-            packed_v[tok_idx],
-            slot_mapping[valid],
-            block_size=block_size,
+            int(num_reqs),
+            int(block_size_k8v4),
         )
         return
 
-    slot_w_k = key_cache.shape[-1]
-    slot_w_v = value_cache.shape[-1]
-    pack_mode = _normalize_turboquant_pack_op()
-
-    can_use_registered = (
-        bits_key == bits_value == 8
-        and head_size == 128
-        and key.dtype in (torch.float16, torch.bfloat16)
-        and ensure_turboquant_pack_tables_registered(key.device, head_size, bits_key)
-    )
-
-    if pack_mode == "fused" and can_use_registered and _turboquant_pack_to_cache_op_ready():
-        torch.ops._C_ascend.turboquant_pack_kv_for_cache_to_cache(
-            key,
-            value,
-            slot_mapping,
-            key_cache.view(dtype=torch.uint8),
-            value_cache.view(dtype=torch.uint8),
-            slot_w_k,
-            slot_w_v,
-        )
-        return
-
-    if pack_mode == "v2" and can_use_registered and _turboquant_pack_v2_to_cache_op_ready():
-        torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2_to_cache(
-            key,
-            value,
-            slot_mapping,
-            key_cache.view(dtype=torch.uint8),
-            value_cache.view(dtype=torch.uint8),
-            slot_w_k,
-            slot_w_v,
-        )
-        return
-
-    if pack_mode == "v2" and can_use_registered and _turboquant_pack_v2_ops_ready():
-        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v2(
-            key,
-            value,
-            slot_w_k,
-            slot_w_v,
-        )
-        _scatter_packed_kv_to_cache(
-            packed_k=packed_k.view(dtype=torch.int8),
-            packed_v=packed_v.view(dtype=torch.int8),
-            key_cache=key_cache,
-            value_cache=value_cache,
-            slot_mapping=slot_mapping,
-        )
-        return
-
-    if pack_mode == "v3" and can_use_registered and _turboquant_pack_v3_to_cache_op_ready():
-        torch.ops._C_ascend.turboquant_pack_kv_for_cache_v3_to_cache(
-            key,
-            value,
-            slot_mapping,
-            key_cache.view(dtype=torch.uint8),
-            value_cache.view(dtype=torch.uint8),
-            slot_w_k,
-            slot_w_v,
-        )
-        return
-
-    if pack_mode == "v3" and can_use_registered and _turboquant_pack_v3_ops_ready():
-        packed_k, packed_v = torch.ops._C_ascend.turboquant_pack_kv_for_cache_v3(
-            key,
-            value,
-            slot_w_k,
-            slot_w_v,
-        )
-        _scatter_packed_kv_to_cache(
-            packed_k=packed_k.view(dtype=torch.int8),
-            packed_v=packed_v.view(dtype=torch.int8),
-            key_cache=key_cache,
-            value_cache=value_cache,
-            slot_mapping=slot_mapping,
-        )
-        return
-
-    packed_k, packed_v = turboquant_pack_kv_for_cache(
-        key=key,
-        value=value,
-        bits_key=bits_key,
-        bits_value=bits_value,
-        slot_w_k=slot_w_k,
-        slot_w_v=slot_w_v,
-    )
-    _scatter_packed_kv_to_cache(
-        packed_k=packed_k,
-        packed_v=packed_v,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        slot_mapping=slot_mapping,
+    # k8v4 is the only supported TurboQuant pack config here; the slab / fused
+    # / v2 / v3 / generic-scatter paths were removed. Fail fast for anything
+    # else instead of silently writing a wrong layout.
+    raise RuntimeError(
+        "turboquant_pack_kv_for_cache_to_cache is k8v4-only "
+        "(bits_key=8, bits_value=4, head_size=128); got "
+        f"bits_key={bits_key}, bits_value={bits_value}, head_size={head_size}."
     )
 
 
@@ -2410,12 +2198,17 @@ def bit_residual_attention_paged_k8v4(
     num_kv_heads: int,
     block_size: int,
     scale: float,
+    rotation_key: torch.Tensor | None = None,
+    rotation_value: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Call the bit_residual k8v4 paged attention op for decode/chunked-prefill.
 
     Returns ``None`` when conditions are not met, so callers can fall through
     to existing decode+FIA fallbacks.
+
+    ``rotation_key`` / ``rotation_value`` let the layer hot path pass
+    pre-resolved Haar R^T / R tensors, skipping the per-call lookup here.
     """
     if (
         head_size != 128
@@ -2454,8 +2247,11 @@ def bit_residual_attention_paged_k8v4(
     if max_actual_seq_len <= 0:
         return None
 
-    rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
-    rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
+    # Rotation dtype must match query (= pack metadata dtype). Use caller-
+    # provided tensors when given; otherwise resolve (and cache) here.
+    if rotation_key is None or rotation_value is None:
+        rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
+        rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
 
     query_work = query if query.is_contiguous() else query.contiguous()
     key_work = key_cache if key_cache.is_contiguous() else key_cache
@@ -2498,82 +2294,39 @@ def bit_residual_fia_paged_k8v4(
     num_kv_heads: int,
     block_size: int,
     scale: float,
+    rotation_key: torch.Tensor,
+    rotation_value: torch.Tensor,
     atten_mask: torch.Tensor | None = None,
     pre_tokens: int = 2147483647,
     next_tokens: int = 2147483647,
     sparse_mode: int = 3,
     out: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """Call BitResidual FIA Paged K8V4 for Prefill / long-KV (FD-capable) path.
-
-    Supports fp16 and bf16. Query / rotation dtype must match the pack metadata
-    dtype (serving pack uses the model dtype). Returns ``None`` when conditions
-    are not met so callers can fall through to vector attn / stock FIA.
-
-    When ``out`` is provided it must be contiguous and match ``query`` shape;
-    the kernel writes in-place (same contract as bit_residual_attention_paged_k8v4).
-    """
-    if head_size != 128:
-        return None
-    if block_size % BIT_RESIDUAL_K8V4_BLOCK_ROWS != 0:
-        return None
-    if query.dtype not in (torch.float16, torch.bfloat16):
-        return None
-    if block_tables.numel() == 0:
-        return None
-    if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
-        return None
-
-    actual_seq_lengths_q = [int(length) for length in actual_seq_lengths_q]
-    actual_seq_lengths_kv = [int(length) for length in actual_seq_lengths_kv]
-    if (
-        not actual_seq_lengths_q
-        or len(actual_seq_lengths_q) != len(actual_seq_lengths_kv)
-        or actual_seq_lengths_q[-1] != query.shape[0]
-    ):
-        return None
-    if any(length < 0 for length in actual_seq_lengths_kv):
-        return None
-    if max(actual_seq_lengths_kv) <= 0:
-        return None
-
-    # Prefill / causal: sparse_mode 2/3/4 need a non-empty compress mask.
-    if sparse_mode != 0 and (atten_mask is None or atten_mask.numel() == 0):
-        return None
-
-    # OpDef accepts int8 only (0=keep, 1=discard). Serving AttentionMaskBuilder
-    # may hand bool / fp16 masks used by stock FIA.
-    mask_arg: torch.Tensor | None = atten_mask
-    if mask_arg is not None and mask_arg.dtype != torch.int8:
-        if mask_arg.dtype == torch.bool:
-            mask_arg = mask_arg.to(torch.int8)
-        else:
-            mask_arg = (mask_arg != 0).to(torch.int8)
-
-    # Rotation dtype must match query (= pack metadata dtype).
-    rotation_key = _bit_residual_k8v4_rotation_t(query.device, query.dtype)  # R^T
-    rotation_value = _bit_residual_k8v4_rotation(query.device, query.dtype)  # R
-
-    out_buf = out if out is not None else None
+) -> torch.Tensor:
+    """BitResidual FIA Paged K8V4 (prefill / long-KV). Caller is trusted: k8v4
+    invariants and seq-len validity hold, so the kernel runs unconditionally.
+    Cache is uint8 (allocated natively as such); the mask is coerced to int8
+    (0=keep / 1=discard). ``rotation_*`` are the Haar R^T / R tensors; ``out``
+    (if given) must match ``query`` shape and is written in-place."""
+    mask_arg = None if atten_mask is None else (atten_mask != 0).to(torch.int8)
     result = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
         query,
-        _uint8_storage_view(key_cache),
-        _uint8_storage_view(value_cache),
+        key_cache,
+        value_cache,
         block_tables,
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
         mask_arg,
         rotation_key,
         rotation_value,
-        int(num_heads),
-        int(num_kv_heads),
-        int(head_size),
-        int(block_size),
-        float(scale),
-        int(pre_tokens),
-        int(next_tokens),
-        int(sparse_mode),
-        out_buf,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        scale,
+        pre_tokens,
+        next_tokens,
+        sparse_mode,
+        out,
     )
     if out is not None:
         return out.view(query.shape[0], num_heads, head_size)
