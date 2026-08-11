@@ -3195,7 +3195,12 @@ class NPUModelRunner(GPUModelRunner):
                             num_kv_heads,
                             v_dim,
                         )
-                    k_cache_dtype = v_cache_dtype = current_kv_cache_spec.dtype
+                    # k8v4 KV cache is uint8 (the bit_residual pack/fia op dtype),
+                    # so the layer sees a uint8 tensor and the ops pass it through
+                    # without _uint8_storage_view. Other layouts use the spec dtype.
+                    k_cache_dtype = v_cache_dtype = (
+                        torch.uint8 if turboquant_k8v4_layout else current_kv_cache_spec.dtype
+                    )
                     if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
                         k_cache_dtype, v_cache_dtype = self.vllm_config.quant_config.get_kv_quant_dtype(
                             layer_name, current_kv_cache_spec.dtype, self.model_config
