@@ -1047,20 +1047,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
 
-        # k8v4 is FIA-only: handle every attn_state here via packed FIA and
-        # return, bypassing _get_fia_params entirely (its cache-view work is
-        # unused for k8v4 -- the FIA op reads self.key_cache directly).
-        if self._bit_residual_k8v4:
+        # k8v4 packed FIA for PrefillCacheHit / ChunkedPrefill / DecodeOnly --
+        # these read the already-packed paged KV. PrefillNoCache is excluded:
+        # the first-time prefill uses the freshly-computed float K/V via the
+        # generic float-FIA path below (full precision, no quant error).
+        if (
+            self._bit_residual_k8v4
+            and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+        ):
             state = attn_metadata.attn_state
             batch_size = attn_metadata.seq_lens.shape[0]
-            # PrefillNoCache / PrefillCacheHit slice block_tables to [batch_size];
+            # PrefillCacheHit slices block_tables to [batch_size];
             # ChunkedPrefill / DecodeOnly use the full block_table.
             block_tables = (
                 attn_metadata.block_tables[:batch_size, :]
-                if state in (
-                    AscendAttentionState.PrefillNoCache,
-                    AscendAttentionState.PrefillCacheHit,
-                )
+                if state == AscendAttentionState.PrefillCacheHit
                 else attn_metadata.block_tables
             )
             is_decode = state == AscendAttentionState.DecodeOnly
