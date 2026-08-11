@@ -38,6 +38,11 @@
 #   BENCH_NUM_PROMPTS           请求数，默认 1000
 #   BENCH_REQUEST_RATE          请求速率，默认 inf
 #   BENCH_ENDPOINT              默认 /v1/completions
+#   BENCH_NUM_WARMUPS           传给 bench --num-warmups；profile 且非 timed 时默认 16
+#                               （在 start_profile 前预热 ACL graph / 真实 batch）
+#   BENCH_SAVE_DETAILED         1=--save-result --save-detailed；profile 且非 timed 时默认 1
+#   AB_COMPARE                  1=串行跑 NOTQ+TQ 对齐 A/B，结束后 summarize + TPOT 分解表
+#   AB_SKIP_ANALYSIS            1=AB_COMPARE 时跳过 post analysis
 #   WORK_ROOT                   结果根目录，默认 ./output/bench_batch_sweep_<ts>
 #   LOG_ROOT                    日志根目录，默认 ${WORK_ROOT}/logs
 #   READY_TIMEOUT               服务就绪等待秒数，默认 600
@@ -51,6 +56,7 @@
 #   PROFILE_IGNORE_FRONTEND     1=只采 EngineCore/NPU（ignore_frontend），默认 0
 #   PROFILE_WITH_STACK          1=with_stack，默认 1
 #   PROFILE_ACTIVE_ITERATIONS   传给 --profiler-config.active_iterations；空=框架默认(5)
+#   PROFILE_DELAY_ITERATIONS    传给 --profiler-config.delay_iterations；start 后跳过 N engine step
 #   PROFILE_DELAY_SEC           可选：bench 开始后延迟 N 秒再 start（不设则走
 #                               `vllm bench serve --profile`：warmup 后 start、结束 stop）
 #   PROFILE_DURATION_SEC        与 DELAY 联用：start 后再采 M 秒 stop；不设则 bench
@@ -64,6 +70,10 @@
 #     BENCH_OUTPUT_LEN="200 200" MAX_CONCURRENCIES=16 bash script/xrx/run_bench_batch_sweep.sh
 #   # 压测全程 profile（warmup 后 start，跑完 stop）:
 #   ENABLE_PROFILE=1 MAX_CONCURRENCIES=16 ROUNDS=1 bash script/xrx/run_bench_batch_sweep.sh
+#   # NOTQ/TQ 对齐 A/B + summarize + TPOT 分解表:
+#   AB_COMPARE=1 ENABLE_PROFILE=1 MAX_CONCURRENCIES=16 ROUNDS=1 \
+#     BENCH_INPUT_LEN=2000 BENCH_OUTPUT_LEN=200 BENCH_NUM_PROMPTS=256 \
+#     bash script/xrx/run_bench_batch_sweep.sh
 #   # 压测中途采 30s（开跑 60s 后 start，再 30s stop）:
 #   ENABLE_PROFILE=1 PROFILE_DELAY_SEC=60 PROFILE_DURATION_SEC=30 \
 #     bash script/xrx/run_bench_batch_sweep.sh
@@ -100,6 +110,10 @@ BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-200}"
 BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-1000}"
 BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-inf}"
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/completions}"
+BENCH_NUM_WARMUPS="${BENCH_NUM_WARMUPS:-}"
+BENCH_SAVE_DETAILED="${BENCH_SAVE_DETAILED:-}"
+AB_COMPARE="${AB_COMPARE:-0}"
+AB_SKIP_ANALYSIS="${AB_SKIP_ANALYSIS:-0}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 PARALLEL="${PARALLEL:-1}"
 ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
@@ -107,6 +121,7 @@ PROFILE_DIR="${PROFILE_DIR:-}"
 PROFILE_IGNORE_FRONTEND="${PROFILE_IGNORE_FRONTEND:-0}"
 PROFILE_WITH_STACK="${PROFILE_WITH_STACK:-1}"
 PROFILE_ACTIVE_ITERATIONS="${PROFILE_ACTIVE_ITERATIONS:-}"
+PROFILE_DELAY_ITERATIONS="${PROFILE_DELAY_ITERATIONS:-}"
 PROFILE_DELAY_SEC="${PROFILE_DELAY_SEC:-}"
 PROFILE_DURATION_SEC="${PROFILE_DURATION_SEC:-}"
 
@@ -195,6 +210,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tq-kv-bits)
             TQ_KV_BITS="$2"
+            shift 2
+            ;;
+        --num-warmups)
+            BENCH_NUM_WARMUPS="$2"
+            shift 2
+            ;;
+        --save-detailed)
+            BENCH_SAVE_DETAILED=1
+            shift
+            ;;
+        --ab-compare)
+            AB_COMPARE=1
+            shift
+            ;;
+        --profile-delay-iterations)
+            PROFILE_DELAY_ITERATIONS="$2"
             shift 2
             ;;
         *)
@@ -346,7 +377,14 @@ start_serve() {
             fi
             profiler_args+=(--profiler-config.active_iterations="${PROFILE_ACTIVE_ITERATIONS}")
         fi
-        wlog "  profiler_dir=${profiler_dir} ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>}"
+        if [[ -n "${PROFILE_DELAY_ITERATIONS}" ]]; then
+            if ! [[ "${PROFILE_DELAY_ITERATIONS}" =~ ^[0-9]+$ ]]; then
+                wlog "ERROR: PROFILE_DELAY_ITERATIONS 须为非负整数，当前=${PROFILE_DELAY_ITERATIONS}"
+                return 1
+            fi
+            profiler_args+=(--profiler-config.delay_iterations="${PROFILE_DELAY_ITERATIONS}")
+        fi
+        wlog "  profiler_dir=${profiler_dir} ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>} delay_iterations=${PROFILE_DELAY_ITERATIONS:-0}"
     fi
     # TQ: --kv_cache_dtype=turboquant + bits；非 TQ: 不传 dtype（框架默认 auto/fp KV）。
     local tq_args=()
@@ -532,7 +570,16 @@ run_bench() {
     wlog "  host=127.0.0.1 port=${port} endpoint=${BENCH_ENDPOINT}"
     wlog "  input_len=${input_len} output_len=${output_len}"
     wlog "  num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE}"
+    wlog "  num_warmups=${BENCH_NUM_WARMUPS} save_detailed=${BENCH_SAVE_DETAILED}"
     wlog "  work_dir=${work_dir} bench_log=${bench_log}"
+
+    local bench_extra_args=()
+    if [[ "${BENCH_NUM_WARMUPS}" =~ ^[0-9]+$ && "${BENCH_NUM_WARMUPS}" -gt 0 ]]; then
+        bench_extra_args+=(--num-warmups "${BENCH_NUM_WARMUPS}")
+    fi
+    if [[ "${BENCH_SAVE_DETAILED}" == "1" ]]; then
+        bench_extra_args+=(--save-result --save-detailed --result-dir "${work_dir}")
+    fi
 
     set +e
     vllm bench serve \
@@ -549,6 +596,7 @@ run_bench() {
         --request-rate "${BENCH_REQUEST_RATE}" \
         --ignore-eos \
         "${profile_args[@]}" \
+        "${bench_extra_args[@]}" \
         >"${bench_log}" 2>&1
     local rc=$?
     set -e
@@ -572,6 +620,103 @@ run_bench() {
     cp -f "${bench_log}" "${work_dir}/bench.log" 2>/dev/null || true
     wlog "bench 完成: ${tag}"
     return 0
+}
+
+apply_profile_bench_defaults() {
+    # Aligned profile: bench --profile + warmups; skip fixed wall-clock delay.
+    if [[ "${ENABLE_PROFILE}" != "1" || -n "${PROFILE_DELAY_SEC}" ]]; then
+        return 0
+    fi
+    if [[ -z "${BENCH_NUM_WARMUPS}" ]]; then
+        BENCH_NUM_WARMUPS=16
+    fi
+    if [[ -z "${BENCH_SAVE_DETAILED}" ]]; then
+        BENCH_SAVE_DETAILED=1
+    fi
+}
+
+find_latest_rank0_prof() {
+    local parent="$1"
+    local hit
+    hit="$(find "${parent}" -maxdepth 3 -type d -name 'rank0_*_ascend_pt' 2>/dev/null | sort | tail -n 1)"
+    if [[ -z "${hit}" ]]; then
+        hit="$(find "${parent}" -maxdepth 5 -type d -name 'rank0_*_ascend_pt' 2>/dev/null | sort | tail -n 1)"
+    fi
+    echo "${hit}"
+}
+
+run_ab_post_analysis() {
+    local ab_root="$1"
+    local analysis_dir="${ab_root}/analysis"
+    mkdir -p "${analysis_dir}"
+
+    local notq_prof tq_prof
+    notq_prof="$(find_latest_rank0_prof "${ab_root}/notq_prof")"
+    tq_prof="$(find_latest_rank0_prof "${ab_root}/tq_prof")"
+    if [[ -z "${notq_prof}" || -z "${tq_prof}" ]]; then
+        log "WARN: AB analysis skip — profiler dump missing (notq=${notq_prof:-none} tq=${tq_prof:-none})"
+        return 1
+    fi
+
+    log "AB analysis: notq_prof=${notq_prof}"
+    log "AB analysis: tq_prof=${tq_prof}"
+
+    local summarize_py="${REPO_ROOT}/tests/e2e/singlecard/summarize_k8v4_profiler.py"
+    local decompose_py="${REPO_ROOT}/tools/bench_ab_tpot_decompose.py"
+
+    python3 "${summarize_py}" --compare --labels=notq,tq \
+        "${notq_prof}" "${tq_prof}" \
+        >"${analysis_dir}/summarize_compare.txt" 2>&1 || true
+
+    python3 "${summarize_py}" --json --labels=notq,tq \
+        "${notq_prof}" "${tq_prof}" \
+        >"${analysis_dir}/summarize_compare.json" 2>&1 || true
+
+    python3 "${decompose_py}" --ab-root "${ab_root}" \
+        -o "${analysis_dir}/tpot_decompose.txt" 2>&1 | tee "${analysis_dir}/tpot_decompose_run.log"
+
+    log "AB analysis written: ${analysis_dir}/"
+    log "  summarize_compare.txt  tpot_decompose.txt  tpot_decompose.json"
+}
+
+run_ab_compare_suite() {
+    local ab_root="${WORK_ROOT}"
+    local ab_fail=0
+    local variant enable_tq_val saved_enable_tq
+
+    saved_enable_tq="${ENABLE_TQ}"
+    log "AB_COMPARE=1 root=${ab_root} (NOTQ then TQ, bench --profile + warmups)"
+
+    for variant in notq tq; do
+        if [[ "${variant}" == "notq" ]]; then
+            ENABLE_TQ=0
+        else
+            ENABLE_TQ=1
+        fi
+        WORK_ROOT="${ab_root}/${variant}"
+        LOG_ROOT="${WORK_ROOT}/logs"
+        PROFILE_DIR="${ab_root}/${variant}_prof"
+        mkdir -p "${LOG_ROOT}" "${WORK_ROOT}" "${PROFILE_DIR}"
+        SWEEP_LOG="${LOG_ROOT}/sweep.log"
+        log "-------- AB variant=${variant} ENABLE_TQ=${ENABLE_TQ} WORK_ROOT=${WORK_ROOT} --------"
+        for ((i = 0; i < n_mc; i++)); do
+            if ! run_worker "${MC_ARR[i]}" "${DEV_ARR[i]}" "${PORT_ARR[i]}"; then
+                ab_fail=$((ab_fail + 1))
+            fi
+        done
+    done
+
+    ENABLE_TQ="${saved_enable_tq}"
+    WORK_ROOT="${ab_root}"
+    LOG_ROOT="${ab_root}/logs"
+    mkdir -p "${LOG_ROOT}"
+
+    if [[ "${AB_SKIP_ANALYSIS}" != "1" ]]; then
+        run_ab_post_analysis "${ab_root}" || ab_fail=$((ab_fail + 1))
+    fi
+
+    log "AB_COMPARE done fail=${ab_fail} root=${ab_root}"
+    return "${ab_fail}"
 }
 
 # One max_concurrency on one device/port: start serve once, run ROUNDS benches.
@@ -713,19 +858,31 @@ if [[ "${ENABLE_TQ}" != "0" && "${ENABLE_TQ}" != "1" ]]; then
     exit 1
 fi
 
+if [[ "${AB_COMPARE}" == "1" ]]; then
+    ENABLE_PROFILE=1
+    PROFILE_DELAY_SEC=""
+    PROFILE_DURATION_SEC=""
+    apply_profile_bench_defaults
+fi
+
+apply_profile_bench_defaults
+
+if [[ "${AB_COMPARE}" == "1" ]]; then
+    log "AB_COMPARE=1 ENABLE_TQ will run 0 then 1; single ENABLE_TQ=${ENABLE_TQ} ignored for suite"
+fi
+
 log "WORK_ROOT=${WORK_ROOT}"
 log "LOG_ROOT=${LOG_ROOT}"
 log "BLOCK_SIZE=${BLOCK_SIZE} FIA=${_FIA}/${_DECODE_FIA}/${_NOCACHE_FIA} ROUNDS=${ROUNDS} PARALLEL=${PARALLEL}"
-log "ENABLE_TQ=${ENABLE_TQ} TQ_KV_BITS=${TQ_KV_BITS}"
 log "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-<default>} enforce_eager=${ENFORCE_EAGER}"
-log "bench: num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE}"
+log "bench: num_prompts=${BENCH_NUM_PROMPTS} request_rate=${BENCH_REQUEST_RATE} num_warmups=${BENCH_NUM_WARMUPS:-0} save_detailed=${BENCH_SAVE_DETAILED:-0}"
 if [[ "${ENABLE_PROFILE}" == "1" ]]; then
     if [[ -n "${PROFILE_DELAY_SEC}" ]]; then
         log "profile: ENABLE=1 mode=timed delay=${PROFILE_DELAY_SEC}s duration=${PROFILE_DURATION_SEC:-until-bench-end}"
     else
         log "profile: ENABLE=1 mode=bench --profile (warmup后start / 结束后stop)"
     fi
-    log "  ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>}"
+    log "  ignore_frontend=${PROFILE_IGNORE_FRONTEND} with_stack=${PROFILE_WITH_STACK} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>} delay_iterations=${PROFILE_DELAY_ITERATIONS:-0}"
     log "  PROFILE_DIR=${PROFILE_DIR:-<per-worker ${LOG_ROOT}/.../profiler>}"
 else
     log "profile: ENABLE=0"
@@ -736,6 +893,11 @@ done
 for ((i = 0; i < n_mc; i++)); do
     log "  slot[${i}]: max_concurrency=${MC_ARR[i]} device=${DEV_ARR[i]} port=${PORT_ARR[i]}"
 done
+
+if [[ "${AB_COMPARE}" == "1" ]]; then
+    run_ab_compare_suite
+    exit $?
+fi
 
 worker_pids=()
 if [[ "${PARALLEL}" == "1" && ${n_mc} -gt 1 ]]; then
