@@ -334,12 +334,12 @@ static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX = 13U;
 // Half-affine: Brcb needs 32B-aligned meta src (16×half). Tile starts must be
 // multiples of 16 so metaHalf[j0] feeds Brcb directly (Adds/Cast also fault on
 // unaligned half src). Do NOT reuse these for bf16 — doubles fp32 scratch.
-static constexpr uint32_t BR_KEY_DECODE_TILE_MAX_HALF = 16U;
-static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX_HALF = 16U;
+static constexpr uint32_t BR_KEY_DECODE_TILE_MAX_HALF = 32U;
+static constexpr uint32_t BR_VALUE_DECODE_TILE_MAX_HALF = 32U;
 // Brcb writes 1 FP16 block (16 half) per row. Footprint = tile_rows × 16, not
-// tile×headDim. Shrinking frees tmpBuff1 staging so PA run can reach 32.
+// tile×headDim. Scheme A output staging frees tmpBuff1; tile 32 still leaves maxSub=64.
 static constexpr uint32_t BR_HALF_BRCB_FOOTPRINT =
-    BR_KEY_DECODE_TILE_MAX_HALF * 16U;  // 256 half = 512B
+    BR_KEY_DECODE_TILE_MAX_HALF * 16U;  // 512 half = 1024B
 // Cap PA run length to BS=128 divisor (128/32=4 equal runs, no tail).
 static constexpr uint32_t BR_HALF_PA_RUN_CAP = 32U;
 
