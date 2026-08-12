@@ -42,8 +42,18 @@
 #                               （在 start_profile 前预热 ACL graph / 真实 batch）
 #   BENCH_SAVE_DETAILED         1=--save-result --save-detailed；profile 且非 timed 时默认 1
 #   AB_COMPARE                  1=串行跑 NOTQ+TQ 对齐 A/B，结束后 summarize + TPOT 分解表
+#   AB_PROFILE_MODE             AB_COMPARE 子模式（可用 --ab-profile-mode）:
+#                               mixed   = 默认，行为与旧 AB 相同（多 req 波次，易混 phase）
+#                               decode  = 一波纯 decode 长窗（归因 TPOT：host vs device）
+#                               prefill = 首波 prefill/mixed 短窗（归因 TTFT）
+#                               别名: decode_only / prefill_only
+#   AB_ONE_WAVE                 decode/prefill 模式下默认 1：BENCH_NUM_PROMPTS=首个
+#                               max_concurrency（一波填满即停，避免换人再 prefill）
 #   AB_SKIP_ANALYSIS            1=AB_COMPARE 时跳过 post analysis
+#   AB_NO_PROFILE               1=AB_COMPARE 时仍跑 NOTQ/TQ，但不挂 profiler
+#                               （用于无开销 e2e ITL 取证；默认 0=开 profile）
 #   WORK_ROOT                   结果根目录，默认 ./output/bench_batch_sweep_<ts>
+#                               AB_COMPARE=1 时默认 ./output/bench_ab_<mode>_<ts>
 #   LOG_ROOT                    日志根目录，默认 ${WORK_ROOT}/logs
 #   READY_TIMEOUT               服务就绪等待秒数，默认 600
 #   SOURCE_ENV                  可选，默认仓库 infoenvs（存在则 source）
@@ -70,9 +80,17 @@
 #     BENCH_OUTPUT_LEN="200 200" MAX_CONCURRENCIES=16 bash script/xrx/run_bench_batch_sweep.sh
 #   # 压测全程 profile（warmup 后 start，跑完 stop）:
 #   ENABLE_PROFILE=1 MAX_CONCURRENCIES=16 ROUNDS=1 bash script/xrx/run_bench_batch_sweep.sh
-#   # NOTQ/TQ 对齐 A/B + summarize + TPOT 分解表:
-#   AB_COMPARE=1 ENABLE_PROFILE=1 MAX_CONCURRENCIES=16 ROUNDS=1 \
+#   # NOTQ/TQ 对齐 A/B + summarize + TPOT 分解表（mixed，旧行为）:
+#   AB_COMPARE=1 MAX_CONCURRENCIES=16 ROUNDS=1 \
 #     BENCH_INPUT_LEN=2000 BENCH_OUTPUT_LEN=200 BENCH_NUM_PROMPTS=256 \
+#     bash script/xrx/run_bench_batch_sweep.sh
+#   # A/B decode-only 长窗（跳过首波 prefill，采 ~120 decode step）:
+#   AB_COMPARE=1 --ab-profile-mode decode MAX_CONCURRENCIES=16 ROUNDS=1 \
+#     BENCH_INPUT_LEN=2000 BENCH_OUTPUT_LEN=200 \
+#     bash script/xrx/run_bench_batch_sweep.sh
+#   # A/B prefill 短窗（只采首波 ~20 prefill/mixed step）:
+#   AB_COMPARE=1 --ab-profile-mode prefill MAX_CONCURRENCIES=16 ROUNDS=1 \
+#     BENCH_INPUT_LEN=2000 BENCH_OUTPUT_LEN=200 \
 #     bash script/xrx/run_bench_batch_sweep.sh
 #   # 压测中途采 30s（开跑 60s 后 start，再 30s stop）:
 #   ENABLE_PROFILE=1 PROFILE_DELAY_SEC=60 PROFILE_DURATION_SEC=30 \
@@ -113,7 +131,10 @@ BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/completions}"
 BENCH_NUM_WARMUPS="${BENCH_NUM_WARMUPS:-}"
 BENCH_SAVE_DETAILED="${BENCH_SAVE_DETAILED:-}"
 AB_COMPARE="${AB_COMPARE:-0}"
+AB_PROFILE_MODE="${AB_PROFILE_MODE:-mixed}"
+AB_ONE_WAVE="${AB_ONE_WAVE:-}"
 AB_SKIP_ANALYSIS="${AB_SKIP_ANALYSIS:-0}"
+AB_NO_PROFILE="${AB_NO_PROFILE:-0}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 PARALLEL="${PARALLEL:-1}"
 ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
@@ -126,12 +147,16 @@ PROFILE_DELAY_SEC="${PROFILE_DELAY_SEC:-}"
 PROFILE_DURATION_SEC="${PROFILE_DURATION_SEC:-}"
 
 STAMP="$(date '+%Y%m%d_%H%M%S')"
+_WORK_ROOT_FROM_ENV=0
+if [[ -n "${WORK_ROOT:-}" ]]; then
+    _WORK_ROOT_FROM_ENV=1
+fi
 WORK_ROOT="${WORK_ROOT:-${PWD}/output/bench_batch_sweep_${STAMP}}"
 LOG_ROOT="${LOG_ROOT:-${WORK_ROOT}/logs}"
 
 # ---------- CLI ----------
 usage() {
-    sed -n '2,62p' "$0" | sed 's/^# \?//'
+    sed -n '2,95p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
@@ -170,6 +195,7 @@ while [[ $# -gt 0 ]]; do
         --work-root)
             WORK_ROOT="$2"
             LOG_ROOT="${WORK_ROOT}/logs"
+            _WORK_ROOT_FROM_ENV=1
             shift 2
             ;;
         --parallel)
@@ -223,6 +249,10 @@ while [[ $# -gt 0 ]]; do
         --ab-compare)
             AB_COMPARE=1
             shift
+            ;;
+        --ab-profile-mode)
+            AB_PROFILE_MODE="$2"
+            shift 2
             ;;
         --profile-delay-iterations)
             PROFILE_DELAY_ITERATIONS="$2"
@@ -635,6 +665,99 @@ apply_profile_bench_defaults() {
     fi
 }
 
+normalize_ab_profile_mode() {
+    # mixed | decode | prefill （decode_only / prefill_only 为别名）
+    local mode="${1,,}"
+    case "${mode}" in
+        mixed|default|"")
+            echo "mixed"
+            ;;
+        decode|decode_only|decode-only)
+            echo "decode"
+            ;;
+        prefill|prefill_only|prefill-only)
+            echo "prefill"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+apply_ab_profile_mode() {
+    # Tune bench + profiler windows so A/B can attribute host vs device by phase.
+    # Does not override knobs the user already set (non-empty PROFILE_* / AB_ONE_WAVE).
+    local mode first_mc
+    mode="$(normalize_ab_profile_mode "${AB_PROFILE_MODE}")"
+    if [[ -z "${mode}" ]]; then
+        log "ERROR: AB_PROFILE_MODE 无效: ${AB_PROFILE_MODE}（须为 mixed|decode|prefill）"
+        exit 1
+    fi
+    AB_PROFILE_MODE="${mode}"
+
+    # shellcheck disable=SC2206
+    first_mc="$(echo "${MAX_CONCURRENCIES}" | awk '{print $1}')"
+
+    if [[ "${_WORK_ROOT_FROM_ENV}" != "1" ]]; then
+        WORK_ROOT="${PWD}/output/bench_ab_${AB_PROFILE_MODE}_${STAMP}"
+        LOG_ROOT="${WORK_ROOT}/logs"
+        mkdir -p "${LOG_ROOT}" "${WORK_ROOT}"
+        SWEEP_LOG="${LOG_ROOT}/sweep.log"
+    fi
+
+    case "${AB_PROFILE_MODE}" in
+        mixed)
+            # Keep caller bench shape; profiler active left to framework/user.
+            if [[ -z "${AB_ONE_WAVE}" ]]; then
+                AB_ONE_WAVE=0
+            fi
+            ;;
+        decode)
+            # One wave, skip chunked-prefill steps, capture long decode window.
+            if [[ -z "${AB_ONE_WAVE}" ]]; then
+                AB_ONE_WAVE=1
+            fi
+            if [[ -z "${PROFILE_DELAY_ITERATIONS}" ]]; then
+                # ~16 chunked-prefill/mixed steps for input_len=2000 / budget=2048
+                PROFILE_DELAY_ITERATIONS=20
+            fi
+            if [[ -z "${PROFILE_ACTIVE_ITERATIONS}" ]]; then
+                PROFILE_ACTIVE_ITERATIONS=120
+            fi
+            ;;
+        prefill)
+            # One wave, profile from step0, only first prefill/mixed window.
+            if [[ -z "${AB_ONE_WAVE}" ]]; then
+                AB_ONE_WAVE=1
+            fi
+            if [[ -z "${PROFILE_DELAY_ITERATIONS}" ]]; then
+                PROFILE_DELAY_ITERATIONS=0
+            fi
+            if [[ -z "${PROFILE_ACTIVE_ITERATIONS}" ]]; then
+                PROFILE_ACTIVE_ITERATIONS=20
+            fi
+            ;;
+    esac
+
+    if [[ "${AB_ONE_WAVE}" == "1" ]]; then
+        BENCH_NUM_PROMPTS="${first_mc}"
+        log "AB_PROFILE_MODE=${AB_PROFILE_MODE}: AB_ONE_WAVE=1 → BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS}"
+    fi
+
+    log "AB_PROFILE_MODE=${AB_PROFILE_MODE} delay_iterations=${PROFILE_DELAY_ITERATIONS:-0} active_iterations=${PROFILE_ACTIVE_ITERATIONS:-<default>} one_wave=${AB_ONE_WAVE}"
+    case "${AB_PROFILE_MODE}" in
+        decode)
+            log "  目标: 纯 decode 长窗 → 归因 TPOT（看 Stage/Computing/Free/Preparing + attn/pack Device）"
+            ;;
+        prefill)
+            log "  目标: 首波 prefill/mixed → 归因 TTFT（同上，按 Q≥512 step 过滤）"
+            ;;
+        mixed)
+            log "  目标: 旧行为混合波次（均值易混 phase；仅作回归对照）"
+            ;;
+    esac
+}
+
 find_latest_rank0_prof() {
     local parent="$1"
     local hit
@@ -685,7 +808,25 @@ run_ab_compare_suite() {
     local variant enable_tq_val saved_enable_tq
 
     saved_enable_tq="${ENABLE_TQ}"
-    log "AB_COMPARE=1 root=${ab_root} (NOTQ then TQ, bench --profile + warmups)"
+    mkdir -p "${ab_root}"
+    printf '%s\n' "${AB_PROFILE_MODE}" >"${ab_root}/ab_profile_mode.txt"
+    cat >"${ab_root}/ab_profile_readme.txt" <<EOF
+AB_PROFILE_MODE=${AB_PROFILE_MODE}
+BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS}
+BENCH_INPUT_LEN=${BENCH_INPUT_LEN}
+BENCH_OUTPUT_LEN=${BENCH_OUTPUT_LEN}
+PROFILE_DELAY_ITERATIONS=${PROFILE_DELAY_ITERATIONS:-0}
+PROFILE_ACTIVE_ITERATIONS=${PROFILE_ACTIVE_ITERATIONS:-<default>}
+AB_ONE_WAVE=${AB_ONE_WAVE}
+
+How to read (host vs device):
+  step_trace: Stage / Computing(=device) / Free / Preparing(~host)
+  operator_details: Device Total Duration vs Host Total Duration for attn/pack
+  decode mode: filter Q=16 (or decode steps after delay window)
+  prefill mode: filter Q>=512 / Q in {1448,2000,2048}
+EOF
+
+    log "AB_COMPARE=1 mode=${AB_PROFILE_MODE} root=${ab_root} (NOTQ then TQ, bench --profile + warmups)"
 
     for variant in notq tq; do
         if [[ "${variant}" == "notq" ]]; then
@@ -698,7 +839,7 @@ run_ab_compare_suite() {
         PROFILE_DIR="${ab_root}/${variant}_prof"
         mkdir -p "${LOG_ROOT}" "${WORK_ROOT}" "${PROFILE_DIR}"
         SWEEP_LOG="${LOG_ROOT}/sweep.log"
-        log "-------- AB variant=${variant} ENABLE_TQ=${ENABLE_TQ} WORK_ROOT=${WORK_ROOT} --------"
+        log "-------- AB variant=${variant} mode=${AB_PROFILE_MODE} ENABLE_TQ=${ENABLE_TQ} WORK_ROOT=${WORK_ROOT} --------"
         for ((i = 0; i < n_mc; i++)); do
             if ! run_worker "${MC_ARR[i]}" "${DEV_ARR[i]}" "${PORT_ARR[i]}"; then
                 ab_fail=$((ab_fail + 1))
@@ -715,7 +856,7 @@ run_ab_compare_suite() {
         run_ab_post_analysis "${ab_root}" || ab_fail=$((ab_fail + 1))
     fi
 
-    log "AB_COMPARE done fail=${ab_fail} root=${ab_root}"
+    log "AB_COMPARE done mode=${AB_PROFILE_MODE} fail=${ab_fail} root=${ab_root}"
     return "${ab_fail}"
 }
 
@@ -859,16 +1000,31 @@ if [[ "${ENABLE_TQ}" != "0" && "${ENABLE_TQ}" != "1" ]]; then
 fi
 
 if [[ "${AB_COMPARE}" == "1" ]]; then
-    ENABLE_PROFILE=1
-    PROFILE_DELAY_SEC=""
-    PROFILE_DURATION_SEC=""
-    apply_profile_bench_defaults
+    if [[ "${AB_NO_PROFILE}" == "1" ]]; then
+        ENABLE_PROFILE=0
+        AB_SKIP_ANALYSIS=1
+        # Still apply one-wave / mode defaults (prompts, etc.) without profiler knobs.
+        apply_ab_profile_mode
+        if [[ -z "${BENCH_NUM_WARMUPS}" ]]; then
+            BENCH_NUM_WARMUPS=16
+        fi
+        if [[ -z "${BENCH_SAVE_DETAILED}" ]]; then
+            BENCH_SAVE_DETAILED=1
+        fi
+        log "AB_NO_PROFILE=1: e2e-only AB (no torch/Ascend profiler)"
+    else
+        ENABLE_PROFILE=1
+        PROFILE_DELAY_SEC=""
+        PROFILE_DURATION_SEC=""
+        apply_ab_profile_mode
+        apply_profile_bench_defaults
+    fi
 fi
 
 apply_profile_bench_defaults
 
 if [[ "${AB_COMPARE}" == "1" ]]; then
-    log "AB_COMPARE=1 ENABLE_TQ will run 0 then 1; single ENABLE_TQ=${ENABLE_TQ} ignored for suite"
+    log "AB_COMPARE=1 mode=${AB_PROFILE_MODE}; ENABLE_TQ will run 0 then 1; single ENABLE_TQ=${ENABLE_TQ} ignored for suite"
 fi
 
 log "WORK_ROOT=${WORK_ROOT}"
@@ -886,6 +1042,9 @@ if [[ "${ENABLE_PROFILE}" == "1" ]]; then
     log "  PROFILE_DIR=${PROFILE_DIR:-<per-worker ${LOG_ROOT}/.../profiler>}"
 else
     log "profile: ENABLE=0"
+fi
+if [[ "${AB_COMPARE}" == "1" ]]; then
+    log "  AB_PROFILE_MODE=${AB_PROFILE_MODE} AB_ONE_WAVE=${AB_ONE_WAVE}"
 fi
 for ((r = 1; r <= ROUNDS; r++)); do
     log "  round[${r}]: input_len=$(round_input_len "${r}") output_len=$(round_output_len "${r}")"
