@@ -332,7 +332,12 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.block_len = block_len
         # TODO(jianzs): find a better way to detect MLA.
-        self.use_mla = len(block_len) == 2
+        # NOTE: len(block_len)==2 also matches BitResidual k8v4 (per-cache K/V
+        # widths after the turboquant registration fix), so exclude turboquant.
+        self.use_mla = (
+            len(block_len) == 2
+            and vllm_config.cache_config.cache_dtype != "turboquant"
+        )
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
@@ -1187,15 +1192,31 @@ class MooncakeConnectorWorker:
         first_kv_cache = first_kv_cache_tuple[0]
 
         # TODO(tms): Find a more robust way to detect and handle MLA
+        # NOTE: the "K/V last-dim differ + 2 tensors" heuristic also matches
+        # BitResidual k8v4 (asymmetric packed widths), so exclude turboquant
+        # explicitly -- k8v4 is not MLA and must not take the MLA path.
+        is_turboquant = self.vllm_config.cache_config.cache_dtype == "turboquant"
         self.use_mla = (
-            first_kv_cache_tuple[0].size(-1) != first_kv_cache_tuple[1].size(-1) and len(first_kv_cache_tuple) == 2
+            not is_turboquant
+            and first_kv_cache_tuple[0].size(-1) != first_kv_cache_tuple[1].size(-1)
+            and len(first_kv_cache_tuple) == 2
         )
         self.use_sparse = len(first_kv_cache_tuple) == 3
 
         self.num_blocks = first_kv_cache.shape[0]
         logger.info("num_blocks: %s", self.num_blocks)
         self.block_len = []
-        if self.use_mla or self.use_sparse:
+        if is_turboquant:
+            # TurboQuant (e.g. BitResidual k8v4): 3D cache
+            # [num_blocks, num_kv_heads, packed_width] with asymmetric K/V widths.
+            # block_len must be PER-CACHE (K and V differ) and exclude num_blocks
+            # (the registration loop multiplies by num_blocks itself). Handled
+            # explicitly to avoid overlapped memory regions at registration.
+            for cache in first_kv_cache_tuple:
+                block_shape = cache.shape[1:]  # drop num_blocks
+                logger.info("block_shape: %s", block_shape)
+                self.block_len.append(cache.element_size() * math.prod(block_shape))
+        elif self.use_mla or self.use_sparse:
             block_rank = 3  # [block_size, latent_dim]
             for i in range(len(first_kv_cache_tuple)):
                 block_shape = first_kv_cache_tuple[i].shape[-block_rank:]
