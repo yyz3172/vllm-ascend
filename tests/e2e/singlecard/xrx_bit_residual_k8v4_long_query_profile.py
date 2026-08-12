@@ -126,7 +126,10 @@ def main() -> None:
                 "torch_profiler_dir": PROFILE_DIR,
                 "torch_profiler_with_stack": True,
             }
-        llm = LLM(
+        # Default follows model config (often bfloat16). Set DTYPE=float16 for
+        # half-affine dequant path in BitResidual FIA.
+        dtype = os.getenv("DTYPE", os.getenv("XRX_K8V4_DTYPE", "")).strip() or None
+        llm_kwargs = dict(
             model=MODEL_PATH,
             trust_remote_code=True,
             max_model_len=max_model_len,
@@ -139,6 +142,9 @@ def main() -> None:
             disable_log_stats=True,
             profiler_config=profiler_config,
         )
+        if dtype:
+            llm_kwargs["dtype"] = dtype
+        llm = LLM(**llm_kwargs)
         if enable_profile:
             llm.start_profile()
         try:
@@ -163,6 +169,7 @@ def main() -> None:
             "prompt_tokens": prompt_tokens,
             "max_tokens": max_tokens,
             "max_model_len": max_model_len,
+            "dtype": dtype or "config",
             "enable_profile": enable_profile,
             "profile_warmup_generates": profile_warmup_generates,
             "elapsed_s": elapsed_s,
