@@ -34,6 +34,9 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
     <fia>/in<i>_out<o>_conc<c>/{bench.log,result.json}
     summary.log                                 #   跨所有组的总汇总表
   （日期=YYYYMMDD，时间=HHMMSS；后缀默认空串。例 --ts-suffix _eager → <日期>/HHMMSS_eager/）
+  --pd 时改为：
+    <fia>/{prefill,decode}/serve.log + proxy.log   # 不开 --profile 时按 fia 复用栈
+    <fia>/in.../ 下同；--profile 时整栈落在 in.../ 下，另含 profiler_prefill/、profiler_decode/
 
 【bench 输出】只回显关键字段（从 vllm 写出的 result JSON 提取，不依赖文本对齐）：
   Successful requests / Benchmark duration / Total input tokens /
@@ -72,6 +75,20 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
     # 落到大磁盘：把 --output-dir 指过去，profiler trace 作为其子目录跟过去
     python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
         --profile -O /root/yyz/perfprof/runA
+
+【PD 分离 1P1D】--pd 一键起 Prefill + Decode + proxy，bench 打 proxy（方案 A）：
+  -d 必须给两张卡，顺序 P,D（如 -d 1,2）。kv-bits/FIA/serve-extra 与单卡模式同一套。
+  -p 为 proxy 对外端口；P/D HTTP 与 KV 端口见 --prefill-port/--decode-port/--*-kv-port。
+  --profile 时 P、D 各自落 profiler 目录（proxy 不转发 /start_profile，由本脚本分别 POST）。
+
+    # 1P1D + FIA all + 长 prefill
+    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py --pd -d 1,2 -p 9878 \\
+        -f all -L 4096:128 -c 8 -n 32 \\
+        --serve-extra '--gpu-memory-utilization 0.2 --max-model-len 8192'
+
+    # 1P1D + P/D 双端 profile
+    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py --pd -d 1,2 -p 9878 \\
+        -f all -L 4096:128 -c 4 -n 16 --profile --profiler-ignore-frontend
 """
 
 from __future__ import annotations
@@ -125,6 +142,29 @@ SERVE_ENV_DEFAULTS = {
     "VLLM_ENGINE_CORE_MULTIPROC_METHOD": "spawn",
     "VLLM_ASCEND_TURBOQUANT_MSE_IMPL": "v1",
 }
+# 继承环境里若开了这两项，INFO 会刷爆 serve.log（曾见 ~1GB/次）；e2e 默认剥离。
+_ASCEND_VERBOSE_LOG_ENV_KEYS = (
+    "ASCEND_SLOG_PRINT_TO_STDOUT",
+    "ASCEND_GLOBAL_LOG_LEVEL",
+)
+
+
+def _strip_verbose_ascend_log_env(env: dict[str, str]) -> None:
+    for k in _ASCEND_VERBOSE_LOG_ENV_KEYS:
+        env.pop(k, None)
+
+# PD 1P1D：Mooncake connector + proxy（相对本文件定位仓库根）
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_PD_PROXY_SCRIPT = (
+    _REPO_ROOT / "examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py"
+)
+_PD_MOONCAKE_MODULE = (
+    "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector"
+)
+DEFAULT_PREFILL_PORT = 9000
+DEFAULT_DECODE_PORT = 9010
+DEFAULT_PREFILL_KV_PORT = 20001
+DEFAULT_DECODE_KV_PORT = 20002
 
 # tqdm 进度条会渲染成形如 "  38%|██▊  | 97/256 [00:46<01:04, 2.45it/s]" 的行。
 _TQDM_RE = re.compile(r"^\s*\d+%\|")
@@ -280,6 +320,276 @@ def _build_bench_cmd(
     if bench_extra:
         cmd += shlex.split(bench_extra)
     return cmd
+
+
+# ---------------------------------------------------------------------------
+# PD 1P1D helpers
+# ---------------------------------------------------------------------------
+def _detect_nic_and_ip() -> tuple[str, str]:
+    """探测默认网卡与本机 IP（供 HCCL / Gloo）。容器常无 ``ip``，需多层回退。"""
+    nic, ip_addr = "eth0", "127.0.0.1"
+
+    def _from_ip_cmd() -> tuple[str, str] | None:
+        try:
+            p = subprocess.run(
+                ["ip", "-json", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if p.returncode != 0 or not (p.stdout or "").strip():
+                return None
+            routes = json.loads(p.stdout)
+            if not routes:
+                return None
+            dev = routes[0].get("dev") or nic
+            prefsrc = routes[0].get("prefsrc")
+            if prefsrc and not str(prefsrc).startswith("127."):
+                return str(dev), str(prefsrc)
+            # 再查该网卡地址
+            p2 = subprocess.run(
+                ["ip", "-json", "addr", "show", "dev", dev],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if p2.returncode == 0 and (p2.stdout or "").strip():
+                data = json.loads(p2.stdout)
+                for info in (data[0].get("addr_info") or []) if data else []:
+                    if info.get("family") == "inet" and info.get("local"):
+                        loc = str(info["local"])
+                        if not loc.startswith("127."):
+                            return str(dev), loc
+            return str(dev), ip_addr
+        except (OSError, json.JSONDecodeError, IndexError, KeyError, subprocess.TimeoutExpired):
+            return None
+
+    def _default_iface_from_proc() -> str | None:
+        # /proc/net/route: Destination 00000000 = default
+        try:
+            with open("/proc/net/route", encoding="utf-8") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == "00000000":
+                        return parts[0]
+        except OSError:
+            return None
+        return None
+
+    def _ipv4_on_iface(dev: str) -> str | None:
+        # ifconfig <dev>
+        try:
+            p = subprocess.run(
+                ["ifconfig", dev],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if p.returncode == 0 and p.stdout:
+                m = re.search(r"inet(?: addr:)?\s*(\d+\.\d+\.\d+\.\d+)", p.stdout)
+                if m and not m.group(1).startswith("127."):
+                    return m.group(1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    def _hostname_i() -> str | None:
+        try:
+            p = subprocess.run(
+                ["hostname", "-I"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if p.returncode == 0 and p.stdout:
+                for tok in p.stdout.split():
+                    if re.match(r"^\d+\.\d+\.\d+\.\d+$", tok) and not tok.startswith("127."):
+                        return tok
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    got = _from_ip_cmd()
+    if got and not got[1].startswith("127."):
+        return got
+
+    iface = _default_iface_from_proc() or (got[0] if got else nic)
+    addr = _ipv4_on_iface(iface) or _hostname_i() or ip_addr
+    return iface, addr
+
+
+def _parse_pd_devices(device: str | None) -> tuple[str, str]:
+    """``-d 1,2`` → (prefill_dev, decode_dev)。"""
+    if device is None or not str(device).strip():
+        raise argparse.ArgumentTypeError(
+            "--pd requires -d/--device with two NPUs, e.g. -d 1,2 (P,D)"
+        )
+    parts = [x.strip() for x in str(device).split(",") if x.strip()]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"--pd -d expects exactly two devices (P,D), got {device!r}"
+        )
+    return parts[0], parts[1]
+
+
+def _kv_transfer_config_json(
+    *, role: str, kv_port: int, engine_id: str,
+) -> str:
+    """Mooncake 1P1D kv-transfer-config JSON（与 script/xrx/pd 对齐，模块路径用当前仓库）。"""
+    cfg = {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_buffer_device": "npu",
+        "kv_role": role,
+        "kv_parallel_size": "1",
+        "kv_port": str(kv_port),
+        "engine_id": engine_id,
+        "kv_connector_extra_config": {
+            "prefill": {"dp_size": 1, "tp_size": 1},
+            "decode": {"dp_size": 1, "tp_size": 1},
+        },
+        "kv_connector_module_path": _PD_MOONCAKE_MODULE,
+    }
+    return json.dumps(cfg)
+
+
+def _build_pd_serve_cmd(
+    *, role: str, model: str, kv_cache_dtype: str, kv_bits: str,
+    port: int, kv_port: int, engine_id: str,
+    trust_remote_code: bool, serve_extra: str,
+    profiler_dir: str | None = None, profiler_ignore_frontend: bool = False,
+    profiler_active_iterations: int | None = None,
+) -> list[str]:
+    """role: kv_producer (P) / kv_consumer (D)。监听 0.0.0.0 供 proxy 连接。"""
+    cmd: list[str] = [
+        "vllm", "serve", model,
+        f"--kv_cache_dtype={kv_cache_dtype}",
+        f"--additional-config={_kv_bits_to_config(kv_bits)}",
+        f"--port={port}",
+        "--host=0.0.0.0",
+        "--tensor-parallel-size=1",
+        f"--kv-transfer-config={_kv_transfer_config_json(role=role, kv_port=kv_port, engine_id=engine_id)}",
+    ]
+    if role == "kv_producer":
+        cmd.append("--enable-prefix-caching")
+    if trust_remote_code:
+        cmd.append("--trust-remote-code")
+    if profiler_dir is not None:
+        cmd += [
+            "--profiler-config.profiler=torch",
+            f"--profiler-config.torch_profiler_dir={profiler_dir}",
+            "--profiler-config.torch_profiler_with_stack=true",
+        ]
+        if profiler_ignore_frontend:
+            cmd.append("--profiler-config.ignore_frontend=true")
+        if profiler_active_iterations is not None:
+            cmd.append(
+                f"--profiler-config.active_iterations={profiler_active_iterations}"
+            )
+    if serve_extra:
+        cmd += shlex.split(serve_extra)
+    return cmd
+
+
+def _build_proxy_cmd(
+    *, proxy_port: int, prefill_host: str, prefill_port: int,
+    decode_host: str, decode_port: int,
+) -> list[str]:
+    if not _PD_PROXY_SCRIPT.is_file():
+        raise FileNotFoundError(f"PD proxy script missing: {_PD_PROXY_SCRIPT}")
+    return [
+        sys.executable, str(_PD_PROXY_SCRIPT),
+        "--host", "0.0.0.0",
+        "--port", str(proxy_port),
+        "--prefiller-hosts", prefill_host,
+        "--prefiller-ports", str(prefill_port),
+        "--decoder-hosts", decode_host,
+        "--decoder-ports", str(decode_port),
+    ]
+
+
+def _pd_runtime_env(
+    *, device: str, nic: str, local_ip: str, fia: str, hccl_bufsize: str,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(SERVE_ENV_DEFAULTS)
+    _strip_verbose_ascend_log_env(env)
+    # PD 现成脚本用 fork；与 Mooncake / 多进程更稳
+    env["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
+    env["VLLM_ENGINE_CORE_MULTIPROC_METHOD"] = "fork"
+    env["VLLM_ASCEND_EXTERNAL_DP_LB_ENABLED"] = "1"
+    env[NPU_VISIBLE_ENV] = device
+    env.update(_fia_env(fia))
+    env["LOCAL_IP"] = local_ip
+    env["HCCL_IF_IP"] = local_ip
+    env["GLOO_SOCKET_IFNAME"] = nic
+    env["TP_SOCKET_IFNAME"] = nic
+    env["HCCL_SOCKET_IFNAME"] = nic
+    env["HCCL_BUFFSIZE"] = hccl_bufsize
+    env["OMP_PROC_BIND"] = "false"
+    env["OMP_NUM_THREADS"] = env.get("OMP_NUM_THREADS", "10")
+    env["PYTORCH_NPU_ALLOC_CONF"] = env.get(
+        "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
+    )
+    env["TASK_QUEUE_ENABLE"] = env.get("TASK_QUEUE_ENABLE", "1")
+    # Custom ops (TopK / BitResidual FIA). Without this, Prefill dies with
+    # aclnnApplyTopKTopPCustom not in libopapi.so under PD fork workers.
+    custom_opp = _REPO_ROOT / "vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
+    if custom_opp.is_dir():
+        prev_opp = env.get("ASCEND_CUSTOM_OPP_PATH", "")
+        env["ASCEND_CUSTOM_OPP_PATH"] = (
+            f"{custom_opp}:{prev_opp}" if prev_opp else str(custom_opp)
+        )
+    # Mooncake TransferEngine 依赖 ascend_transport.so（常见于 /usr/local/lib）
+    mooncake_lib_dirs = [
+        "/usr/local/lib",
+        "/usr/lib64",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib",
+    ]
+    if custom_opp.is_dir():
+        mooncake_lib_dirs.insert(0, str(custom_opp / "op_api/lib"))
+    existing = env.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in mooncake_lib_dirs if Path(p).is_dir()]
+    if existing:
+        parts.append(existing)
+    env["LD_LIBRARY_PATH"] = ":".join(parts)
+    return env
+
+
+def _wait_for_url(
+    url: str, timeout_s: float, interval_s: float, *,
+    proc: subprocess.Popen | None = None, label: str = "service",
+) -> None:
+    deadline = time.perf_counter() + timeout_s
+    last_err: str | None = None
+    while time.perf_counter() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"{label} exited early (code {proc.returncode}) before {url} ready"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=interval_s) as resp:
+                if 200 <= resp.status < 500:
+                    return
+                last_err = f"HTTP {resp.status}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_err = repr(e)
+        except Exception as e:  # noqa: BLE001
+            last_err = repr(e)
+        time.sleep(interval_s)
+    raise RuntimeError(f"{label} not ready at {url} within {timeout_s:.0f}s (last: {last_err})")
+
+
+def _http_post(url: str, timeout_s: float = 30.0) -> None:
+    req = urllib.request.Request(url, method="POST", data=b"")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        if resp.status >= 400:
+            raise RuntimeError(f"POST {url} -> HTTP {resp.status}")
+
+
+def _pd_profile_start_stop(prefill_port: int, decode_port: int, *, start: bool) -> None:
+    """proxy 不转发 profiler API；对 P/D 本机端口分别 POST。"""
+    path = "/start_profile" if start else "/stop_profile"
+    for name, port in (("prefill", prefill_port), ("decode", decode_port)):
+        url = f"http://127.0.0.1:{port}{path}"
+        try:
+            _http_post(url)
+            print(f"    [{name}] POST {path} ok")
+        except Exception as e:  # noqa: BLE001
+            print(f"    [!] [{name}] POST {path} failed: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -495,15 +805,22 @@ def _print_summary(rows: list[dict], log_path: Path | None = None) -> None:
         lines.append(bar)
         # profiler 目录是长路径；为保持对齐表的紧凑，把各组 profiler 目录单
         # 列在表下方的独立块里（仅当某组确有值时才出现——即用 --profile 时）。
-        prof_rows = [r for r in rows if r.get("profiler_dir")]
+        prof_rows = [r for r in rows if r.get("profiler_dir") or r.get("profiler_prefill") or r.get("profiler_decode")]
         if prof_rows:
             lines.append("")
             lines.append("profiler dir per combo:")
             for r in prof_rows:
-                lines.append(
-                    f"  fia={r['fia']} in={r['in']} out={r['out']} conc={r['conc']} "
-                    f"-> {r['profiler_dir']}"
-                )
+                if r.get("profiler_prefill") or r.get("profiler_decode"):
+                    lines.append(
+                        f"  fia={r['fia']} in={r['in']} out={r['out']} conc={r['conc']} "
+                        f"-> P={r.get('profiler_prefill') or '-'} "
+                        f"D={r.get('profiler_decode') or '-'}"
+                    )
+                else:
+                    lines.append(
+                        f"  fia={r['fia']} in={r['in']} out={r['out']} conc={r['conc']} "
+                        f"-> {r['profiler_dir']}"
+                    )
         print("\n".join(lines))
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -530,8 +847,14 @@ def main() -> int:
     )
     # ---- 共用 ----
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help="model path/name.")
-    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help="serve & bench port.")
-    parser.add_argument("--host", default="127.0.0.1", help="serve & bench host.")
+    parser.add_argument(
+        "-p", "--port", type=int, default=DEFAULT_PORT,
+        help="serve & bench port (with --pd: proxy listen/bench port).",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="bench host (with --pd: proxy host used by bench; P/D listen 0.0.0.0).",
+    )
     parser.add_argument(
         "--kv-cache-dtype", default=DEFAULT_KV_CACHE_DTYPE,
         help="kv_cache_dtype passed to `vllm serve`.",
@@ -551,25 +874,60 @@ def main() -> int:
         "-d", "--device", default=None,
         help="NPU card(s) for the serve process via "
              f"{NPU_VISIBLE_ENV}; e.g. '0' or '0,1'. "
-             "Default (None) leaves the inherited env untouched.",
+             "With --pd, must be exactly two cards P,D (e.g. '1,2'). "
+             "Default (None) leaves the inherited env untouched (non-PD only).",
     )
     serve.add_argument(
         "--serve-extra", default="",
         help="extra args appended verbatim to `vllm serve` (shell-split), e.g. "
-             "'--gpu-memory-utilization 0.1'.",
+             "'--gpu-memory-utilization 0.1'. Applied to both P and D in --pd mode.",
     )
     serve.add_argument(
         "--serve-ready-timeout", type=float, default=DEFAULT_READY_TIMEOUT_S,
-        help="seconds to wait for /health before giving up.",
+        help="seconds to wait for /health (and proxy /healthcheck in --pd) before giving up.",
     )
     serve.add_argument(
         "--serve-ready-interval", type=float, default=DEFAULT_READY_INTERVAL_S,
-        help="seconds between /health polls.",
+        help="seconds between readiness polls.",
     )
     serve.add_argument(
         "-k", "--keep-server", action="store_true",
         help="leave the serve process alive after bench (single-fia mode only; "
              "ignored when -f has multiple values).",
+    )
+    serve.add_argument(
+        "--pd", action="store_true",
+        help="1P1D disaggregation: launch Prefill+Decode+proxy (Mooncake), "
+             "bench against proxy. Requires -d P,D.",
+    )
+    serve.add_argument(
+        "--prefill-port", type=int, default=DEFAULT_PREFILL_PORT,
+        help="Prefill (producer) HTTP port when --pd.",
+    )
+    serve.add_argument(
+        "--decode-port", type=int, default=DEFAULT_DECODE_PORT,
+        help="Decode (consumer) HTTP port when --pd.",
+    )
+    serve.add_argument(
+        "--prefill-kv-port", type=int, default=DEFAULT_PREFILL_KV_PORT,
+        help="Prefill Mooncake kv_port when --pd.",
+    )
+    serve.add_argument(
+        "--decode-kv-port", type=int, default=DEFAULT_DECODE_KV_PORT,
+        help="Decode Mooncake kv_port when --pd.",
+    )
+    serve.add_argument(
+        "--pd-backend-host", default=None,
+        help="host proxy uses to reach P/D HTTP (default: 127.0.0.1). "
+             "HCCL still uses auto-detected LOCAL_IP.",
+    )
+    serve.add_argument(
+        "--pd-nic", default=None,
+        help="NIC for HCCL/GLOO/TP socket (default: auto-detect).",
+    )
+    serve.add_argument(
+        "--pd-local-ip", default=None,
+        help="LOCAL_IP / HCCL_IF_IP (default: auto-detect).",
     )
 
     # ---- bench 参数组（多值，逗号分隔）----
@@ -616,12 +974,11 @@ def main() -> int:
     prof.add_argument(
         "--profile", action="store_true",
         help="enable torch profiler: inject --profiler-config.* into `vllm serve` "
-             "and --profile into `vllm bench serve`. bench POSTs /start_profile after "
-             "warmup and /stop_profile after the run, so the trace covers only the "
-             "bench segment. On NPU the trace (msprof-style) lands under --output-dir "
-             "(<output-dir>/<日期>/<时间>[<后缀>]/<fia>/in<i>_out<o>_conc<c>/profiler/). When set, serve "
-             "is restarted per combo so each combo gets an isolated profiler dir "
-             "(slower: one serve boot per combo).",
+             "and --profile into `vllm bench serve` (non-PD). On NPU the trace lands under "
+             "--output-dir (.../profiler/). With --pd, P and D each get profiler_prefill/ "
+             "and profiler_decode/; this script POSTs /start_profile|/stop_profile to P and D "
+             "directly (proxy does not forward). When set, serve (or P+D+proxy) is restarted "
+             "per combo for isolated profiler dirs.",
     )
     prof.add_argument(
         "--profiler-ignore-frontend", action="store_true",
@@ -646,6 +1003,23 @@ def main() -> int:
     conc_list = _parse_int_list(args.concurrency, "--concurrency")
     fia_list = _parse_fia_list(args.fia)
 
+    pd_prefill_dev = pd_decode_dev = None
+    pd_nic = pd_local_ip = None
+    pd_backend_host = "127.0.0.1"
+    if args.pd:
+        try:
+            pd_prefill_dev, pd_decode_dev = _parse_pd_devices(args.device)
+        except argparse.ArgumentTypeError as e:
+            print(f"[!] {e}", file=sys.stderr)
+            return 2
+        auto_nic, auto_ip = _detect_nic_and_ip()
+        pd_nic = args.pd_nic or auto_nic
+        pd_local_ip = args.pd_local_ip or auto_ip
+        pd_backend_host = args.pd_backend_host or "127.0.0.1"
+        if not _PD_PROXY_SCRIPT.is_file():
+            print(f"[!] PD proxy script missing: {_PD_PROXY_SCRIPT}", file=sys.stderr)
+            return 2
+
     base_url = f"http://{args.host}:{args.port}"
     # run 目录拆成 日期/时间 两层，时间后可拼 --ts-suffix 后缀，便于按天归档与打标签：
     #   <output-dir>/<日期>/<时间>[<后缀>]/...
@@ -660,14 +1034,327 @@ def main() -> int:
     print("=" * 80)
     print("TurboQuant K8V4 serve+bench driver (multi-config permutations)")
     print("=" * 80)
+    print(f"  mode  : {'1P1D (scheme A)' if args.pd else 'single-serve'}")
     print(f"  fia   : {fia_list}")
     print(f"  io    : {io_pairs}")
     print(f"  conc  : {conc_list}")
+    print(f"  kv    : dtype={args.kv_cache_dtype} bits={args.kv_bits}")
     print(f"  total combos: {len(fia_list) * len(io_pairs) * len(conc_list)} "
           f"({len(fia_list)} fia x {len(io_pairs)} io x {len(conc_list)} conc)")
     print(f"  output root : {run_dir}")
+    if args.pd:
+        print(f"  PD cards: P={pd_prefill_dev} D={pd_decode_dev}  "
+              f"nic={pd_nic} local_ip={pd_local_ip}")
+        print(f"  PD ports: proxy={args.port} P_http={args.prefill_port} "
+              f"D_http={args.decode_port} P_kv={args.prefill_kv_port} "
+              f"D_kv={args.decode_kv_port}")
+        print(f"  PD backend host (proxy→P/D): {pd_backend_host}")
     print("=" * 80)
 
+    # ====================================================================
+    # PD 1P1D 分支（方案 A：本脚本一键起 P + D + proxy，bench 打 proxy）
+    # ====================================================================
+    if args.pd:
+        assert pd_prefill_dev is not None and pd_decode_dev is not None
+        assert pd_nic is not None and pd_local_ip is not None
+
+        def _pd_launch(
+            fia: str,
+            log_root: Path,
+            profiler_p: str | None,
+            profiler_d: str | None,
+        ):
+            """起 P→D→proxy；返回 (p,d,proxy, streamers) 或 (None,..., busy)."""
+            log_root.mkdir(parents=True, exist_ok=True)
+            p_log = log_root / "prefill" / "serve.log"
+            d_log = log_root / "decode" / "serve.log"
+            proxy_log = log_root / "proxy.log"
+            p_log.parent.mkdir(parents=True, exist_ok=True)
+            d_log.parent.mkdir(parents=True, exist_ok=True)
+
+            ports_to_check = [
+                ("proxy", args.host, args.port),
+                ("prefill", "127.0.0.1", args.prefill_port),
+                ("decode", "127.0.0.1", args.decode_port),
+            ]
+            for name, host, port in ports_to_check:
+                if _port_in_use(host, port):
+                    print(
+                        f"  [!] 端口 {name} {host}:{port} 已被占用；请换端口或先停旧进程。",
+                        file=sys.stderr,
+                    )
+                    return None, None, None, None, None, None, True
+
+            p_env = _pd_runtime_env(
+                device=pd_prefill_dev, nic=pd_nic, local_ip=pd_local_ip,
+                fia=fia, hccl_bufsize="256",
+            )
+            d_env = _pd_runtime_env(
+                device=pd_decode_dev, nic=pd_nic, local_ip=pd_local_ip,
+                fia=fia, hccl_bufsize="256",
+            )
+            # DP 主节点：与 xrx 1P1_1D1 一致（各端独立 DP=1）
+            for env, master_port in ((p_env, "13395"), (d_env, "13396")):
+                env["VLLM_DP_SIZE"] = "1"
+                env["VLLM_DP_MASTER_IP"] = "127.0.0.1"
+                env["VLLM_DP_MASTER_PORT"] = master_port
+                env["VLLM_DP_RANK_LOCAL"] = "0"
+                env["VLLM_DP_RANK"] = "0"
+                env["VLLM_DP_SIZE_LOCAL"] = "1"
+
+            p_cmd = _build_pd_serve_cmd(
+                role="kv_producer", model=args.model,
+                kv_cache_dtype=args.kv_cache_dtype, kv_bits=args.kv_bits,
+                port=args.prefill_port, kv_port=args.prefill_kv_port, engine_id="0",
+                trust_remote_code=args.trust_remote_code, serve_extra=args.serve_extra,
+                profiler_dir=profiler_p,
+                profiler_ignore_frontend=args.profiler_ignore_frontend,
+                profiler_active_iterations=(
+                    args.profiler_active_iterations if profiler_p else None
+                ),
+            )
+            d_cmd = _build_pd_serve_cmd(
+                role="kv_consumer", model=args.model,
+                kv_cache_dtype=args.kv_cache_dtype, kv_bits=args.kv_bits,
+                port=args.decode_port, kv_port=args.decode_kv_port, engine_id="1",
+                trust_remote_code=args.trust_remote_code, serve_extra=args.serve_extra,
+                profiler_dir=profiler_d,
+                profiler_ignore_frontend=args.profiler_ignore_frontend,
+                profiler_active_iterations=(
+                    args.profiler_active_iterations if profiler_d else None
+                ),
+            )
+            proxy_cmd = _build_proxy_cmd(
+                proxy_port=args.port,
+                prefill_host=pd_backend_host, prefill_port=args.prefill_port,
+                decode_host=pd_backend_host, decode_port=args.decode_port,
+            )
+
+            print(f"  P env : {NPU_VISIBLE_ENV}={pd_prefill_dev} "
+                  f"{FIA_ENV_PREFILL}={p_env[FIA_ENV_PREFILL]} "
+                  f"{FIA_ENV_DECODE}={p_env[FIA_ENV_DECODE]}")
+            print(f"  D env : {NPU_VISIBLE_ENV}={pd_decode_dev}")
+            print(f"  P cmd : {' '.join(shlex.quote(c) for c in p_cmd)}")
+            print(f"  D cmd : {' '.join(shlex.quote(c) for c in d_cmd)}")
+            print(f"  proxy : {' '.join(shlex.quote(c) for c in proxy_cmd)}")
+            if profiler_p:
+                print(f"  profiler P : {profiler_p}")
+            if profiler_d:
+                print(f"  profiler D : {profiler_d}")
+
+            print("  [launching Prefill ...]")
+            p_proc = subprocess.Popen(
+                p_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=p_env,
+            )
+            p_streamer = _ServeLogStreamer(p_proc, p_log)
+            try:
+                _wait_for_url(
+                    f"http://127.0.0.1:{args.prefill_port}/health",
+                    args.serve_ready_timeout, args.serve_ready_interval,
+                    proc=p_proc, label="prefill",
+                )
+            except RuntimeError as e:
+                print(f"  [!] {e}", file=sys.stderr)
+                print(f"  [!] prefill serve.log tail:\n{p_streamer.tail(40)}", file=sys.stderr)
+                _terminate(p_proc)
+                p_streamer.join(timeout=5.0)
+                return None, None, None, None, None, None, False
+            print("  [Prefill ready.]")
+
+            print("  [launching Decode ...]")
+            d_proc = subprocess.Popen(
+                d_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=d_env,
+            )
+            d_streamer = _ServeLogStreamer(d_proc, d_log)
+            try:
+                _wait_for_url(
+                    f"http://127.0.0.1:{args.decode_port}/health",
+                    args.serve_ready_timeout, args.serve_ready_interval,
+                    proc=d_proc, label="decode",
+                )
+            except RuntimeError as e:
+                print(f"  [!] {e}", file=sys.stderr)
+                print(f"  [!] decode serve.log tail:\n{d_streamer.tail(40)}", file=sys.stderr)
+                _terminate(d_proc)
+                d_streamer.join(timeout=5.0)
+                _terminate(p_proc)
+                p_streamer.join(timeout=5.0)
+                return None, None, None, None, None, None, False
+            print("  [Decode ready.]")
+
+            print("  [launching proxy ...]")
+            proxy_proc = subprocess.Popen(
+                proxy_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            proxy_streamer = _ServeLogStreamer(proxy_proc, proxy_log)
+            try:
+                _wait_for_url(
+                    f"http://127.0.0.1:{args.port}/healthcheck",
+                    args.serve_ready_timeout, args.serve_ready_interval,
+                    proc=proxy_proc, label="proxy",
+                )
+            except RuntimeError as e:
+                print(f"  [!] {e}", file=sys.stderr)
+                print(f"  [!] proxy.log tail:\n{proxy_streamer.tail(40)}", file=sys.stderr)
+                _terminate(proxy_proc)
+                proxy_streamer.join(timeout=5.0)
+                _terminate(d_proc)
+                d_streamer.join(timeout=5.0)
+                _terminate(p_proc)
+                p_streamer.join(timeout=5.0)
+                return None, None, None, None, None, None, False
+            print("  [proxy ready.]")
+            return p_proc, d_proc, proxy_proc, p_streamer, d_streamer, proxy_streamer, False
+
+        def _pd_stop(p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s, keep: bool) -> None:
+            if keep:
+                print(f"  [--keep-server] leaving PD stack alive "
+                      f"(P={p_proc.pid} D={d_proc.pid} proxy={proxy_proc.pid})")
+                return
+            print("  [stopping proxy / decode / prefill ...]")
+            for proc, streamer in (
+                (proxy_proc, proxy_s), (d_proc, d_s), (p_proc, p_s),
+            ):
+                _terminate(proc)
+                streamer.join(timeout=5.0)
+            print("  [PD stack stopped.]")
+
+        def _pd_bench_combo(
+            fia: str, il: int, ol: int, c: int,
+            group_dir: Path,
+            p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s,
+            profiler_p: str | None, profiler_d: str | None,
+        ) -> int:
+            group_dir.mkdir(parents=True, exist_ok=True)
+            # 不把 --profile 交给 bench：proxy 不转发 /start_profile；由本脚本直打 P/D。
+            bench_cmd = _build_bench_cmd(
+                model=args.model, port=args.port, host=args.host,
+                input_len=il, output_len=ol,
+                num_prompts=args.num_prompts, concurrency=c,
+                request_rate=args.request_rate, bench_extra=args.bench_extra,
+                result_dir=group_dir, profile=False,
+            )
+            label = f"fia={fia} in={il} out={ol} conc={c} [pd]"
+            do_prof = bool(profiler_p or profiler_d)
+            if do_prof:
+                print("    [pd-profile] start on P+D ...")
+                _pd_profile_start_stop(
+                    args.prefill_port, args.decode_port, start=True,
+                )
+            metrics = None
+            rc = 1
+            try:
+                for name, proc in (
+                    ("prefill", p_proc), ("decode", d_proc), ("proxy", proxy_proc),
+                ):
+                    if proc.poll() is not None:
+                        print(
+                            f"[!] {name} exited early (code {proc.returncode}) "
+                            f"before bench",
+                            file=sys.stderr,
+                        )
+                rc, metrics = _run_one_combo(
+                    serve_proc=proxy_proc, serve_streamer=proxy_s,
+                    bench_cmd=bench_cmd, group_dir=group_dir, label=label,
+                )
+            finally:
+                if do_prof:
+                    print("    [pd-profile] stop on P+D ...")
+                    _pd_profile_start_stop(
+                        args.prefill_port, args.decode_port, start=False,
+                    )
+            if metrics:
+                summary_rows.append({
+                    "fia": fia, "in": il, "out": ol, "conc": c,
+                    "completed": metrics["completed"],
+                    "duration": metrics["duration"],
+                    "in_tok": metrics["total_input_tokens"],
+                    "out_tok": metrics["total_output_tokens"],
+                    "tok/s": metrics["total_token_throughput"],
+                    "ttft": metrics["mean_ttft_ms"],
+                    "tpot": metrics["mean_tpot_ms"],
+                    "profiler_prefill": profiler_p,
+                    "profiler_decode": profiler_d,
+                })
+            return rc
+
+        if args.profile:
+            print("  profiler  : enabled (PD; per-combo P+D+proxy restart)")
+            if args.profiler_ignore_frontend:
+                print("             ignore_frontend=True (NPU worker only)")
+            if args.profiler_active_iterations is not None:
+                print(f"             active_iterations={args.profiler_active_iterations}")
+            print("=" * 80)
+            combos = [(fia, il, ol, c)
+                      for fia in fia_list for (il, ol) in io_pairs for c in conc_list]
+            for idx, (fia, il, ol, c) in enumerate(combos):
+                fia_root = run_dir / fia
+                group_dir = fia_root / f"in{il}_out{ol}_conc{c}"
+                group_dir.mkdir(parents=True, exist_ok=True)
+                profiler_p = str((group_dir / "profiler_prefill").resolve())
+                profiler_d = str((group_dir / "profiler_decode").resolve())
+                Path(profiler_p).mkdir(parents=True, exist_ok=True)
+                Path(profiler_d).mkdir(parents=True, exist_ok=True)
+
+                print(f"\n[combo {idx + 1}/{len(combos)}] "
+                      f"fia={fia} in={il} out={ol} conc={c}  ->  {group_dir}")
+                launched = _pd_launch(fia, group_dir, profiler_p, profiler_d)
+                p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s, busy = launched
+                if busy:
+                    return 4
+                if p_proc is None:
+                    overall_rc = 3
+                    continue
+                is_last = (idx == len(combos) - 1)
+                keep = args.keep_server and is_last and len(combos) == 1
+                try:
+                    rc = _pd_bench_combo(
+                        fia, il, ol, c, group_dir,
+                        p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s,
+                        profiler_p, profiler_d,
+                    )
+                    if rc != 0:
+                        overall_rc = max(overall_rc, rc)
+                finally:
+                    _pd_stop(p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s, keep)
+        else:
+            for fia_idx, fia in enumerate(fia_list):
+                fia_root = run_dir / fia
+                fia_root.mkdir(parents=True, exist_ok=True)
+                print(f"\n[fia {fia_idx + 1}/{len(fia_list)}] {fia}  ->  {fia_root}")
+                launched = _pd_launch(fia, fia_root, None, None)
+                p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s, busy = launched
+                if busy:
+                    return 4
+                if p_proc is None:
+                    overall_rc = 3
+                    continue
+                is_last_fia = (fia_idx == len(fia_list) - 1)
+                keep = args.keep_server and is_last_fia and len(fia_list) == 1
+                try:
+                    for (il, ol), c in itertools.product(io_pairs, conc_list):
+                        group_dir = fia_root / f"in{il}_out{ol}_conc{c}"
+                        rc = _pd_bench_combo(
+                            fia, il, ol, c, group_dir,
+                            p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s,
+                            None, None,
+                        )
+                        if rc != 0:
+                            overall_rc = max(overall_rc, rc)
+                finally:
+                    _pd_stop(p_proc, d_proc, proxy_proc, p_s, d_s, proxy_s, keep)
+
+        summary_log = run_dir / "summary.log"
+        _print_summary(summary_rows, log_path=summary_log)
+        print(f"\n[+] summary written to: {summary_log}")
+        return overall_rc
+
+    # ====================================================================
+    # 单卡 / 非 PD（原路径，行为零回归）
+    # ====================================================================
     # ---- serve 起停辅助（下方两种模式共用）----
     # _launch 返回 (proc, streamer, busy)：busy=True 表示端口已被占用
     # （调用方中止整次运行）；proc 为 None 表示 serve 没起来（调用方跳过
@@ -675,6 +1362,7 @@ def main() -> int:
     def _launch(fia: str, serve_log: Path, profiler_dir: str | None):
         serve_env = os.environ.copy()
         serve_env.update(SERVE_ENV_DEFAULTS)
+        _strip_verbose_ascend_log_env(serve_env)
         if args.device is not None:
             serve_env[NPU_VISIBLE_ENV] = str(args.device)
         serve_env.update(_fia_env(fia))
