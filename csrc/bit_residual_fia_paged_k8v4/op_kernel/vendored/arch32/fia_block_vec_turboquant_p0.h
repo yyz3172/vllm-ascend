@@ -150,7 +150,10 @@ private:
     __aicore__ inline uint64_t GetKvCacheTokenIdx(uint32_t bIdx, uint32_t globalS2);
     __aicore__ inline uint64_t GetBrPackHeadBase(int32_t physBlock, uint32_t n2Idx, bool isKey);
     __aicore__ inline void BindKvCacheGm(uint32_t bIdx);
-    __aicore__ inline void DequantKvImpl(const RunInfo &info, bool isKey);
+    __aicore__ inline void DequantKvImpl(const RunInfo &info, bool isKey, uint32_t wsSlot);
+    __aicore__ inline uint32_t ResolveDequantWsSlot(const RunInfo &info) const;
+    __aicore__ inline bool ShouldSkipDequant(const RunInfo &info, bool isKey);
+    __aicore__ inline void MarkDequantCached(const RunInfo &info, bool isKey, uint32_t slot);
 
     OffsetCalculator<KV_FORMAT> kvOffsetCalculator_;
     __gm__ uint8_t *keyListPtr_ = nullptr;
@@ -167,6 +170,11 @@ private:
     TBuf<> dequantInt8Buf_;
     TBuf<> dequantFp32Buf_;
     TBuf<> dequantFp16Buf_;  // half scratch + Q_T out (same 2B stride)
+    // S2-cache: per-AIV local masks (both subcores see the same task stream).
+    uint32_t dequantCacheBn2Key_ = 0xFFFFFFFFU;
+    uint32_t dequantCacheBn2Val_ = 0xFFFFFFFFU;
+    uint64_t dequantValidMaskKey_ = 0ULL;
+    uint64_t dequantValidMaskVal_ = 0ULL;
 
 protected:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
@@ -1240,12 +1248,70 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::InitDequantWorkspace(__gm_
 }
 
 template <typename FIAT>
+__aicore__ inline uint32_t FiaBlockVecTurboQuantP0<FIAT>::ResolveDequantWsSlot(const RunInfo &info) const
+{
+    if (constInfo.dequantS2Cache) {
+        if (info.s2Idx < constInfo.dequantWsSlots) {
+            return info.s2Idx;
+        }
+    }
+    return static_cast<uint32_t>(info.loop % 2);
+}
+
+template <typename FIAT>
+__aicore__ inline bool FiaBlockVecTurboQuantP0<FIAT>::ShouldSkipDequant(const RunInfo &info, bool isKey)
+{
+    if (!constInfo.dequantS2Cache) {
+        return false;
+    }
+    if (info.s2Idx >= 64U || info.s2Idx >= constInfo.dequantWsSlots) {
+        return false;
+    }
+    const uint32_t bn2 =
+        static_cast<uint32_t>(info.bIdx) * static_cast<uint32_t>(constInfo.kvHeadNum) +
+        static_cast<uint32_t>(info.n2Idx);
+    if (isKey) {
+        if (bn2 != dequantCacheBn2Key_) {
+            dequantCacheBn2Key_ = bn2;
+            dequantValidMaskKey_ = 0ULL;
+            return false;
+        }
+        return (dequantValidMaskKey_ & (1ULL << info.s2Idx)) != 0ULL;
+    }
+    if (bn2 != dequantCacheBn2Val_) {
+        dequantCacheBn2Val_ = bn2;
+        dequantValidMaskVal_ = 0ULL;
+        return false;
+    }
+    return (dequantValidMaskVal_ & (1ULL << info.s2Idx)) != 0ULL;
+}
+
+template <typename FIAT>
+__aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::MarkDequantCached(const RunInfo &info, bool isKey,
+    uint32_t slot)
+{
+    if (!constInfo.dequantS2Cache || slot >= 64U || slot >= constInfo.dequantWsSlots) {
+        return;
+    }
+    if (isKey) {
+        dequantValidMaskKey_ |= (1ULL << slot);
+    } else {
+        dequantValidMaskVal_ |= (1ULL << slot);
+    }
+}
+
+template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantK(const RunInfo &info)
 {
     // Dual-AIV: both subcores dequant disjoint S2 halves (see DequantKvImpl).
     // FIA_SYNC_MODE2 Cube wait requires both flags after real work.
     // Note: AIV↔AIV MODE2 join before Cube notify deadlocks on 910B.
-    DequantKvImpl(info, true);
+    // Flag ID stays on loop%2 (pipeline handshake). Data slot may be s2Idx.
+    const uint32_t slot = ResolveDequantWsSlot(info);
+    if (!ShouldSkipDequant(info, true)) {
+        DequantKvImpl(info, true, slot);
+        MarkDequantCached(info, true, slot);
+    }
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
         TQ_VEC_DEQ_K0_READY_VEC + (info.loop % 2));
 }
@@ -1253,7 +1319,11 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantK(const RunInfo &in
 template <typename FIAT>
 __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantV(const RunInfo &info)
 {
-    DequantKvImpl(info, false);
+    const uint32_t slot = ResolveDequantWsSlot(info);
+    if (!ShouldSkipDequant(info, false)) {
+        DequantKvImpl(info, false, slot);
+        MarkDequantCached(info, false, slot);
+    }
     CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
         TQ_VEC_DEQ_V0_READY_VEC + (info.loop % 2));
 }
@@ -1296,7 +1366,8 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::BindKvCacheGm(uint32_t bId
 }
 
 template <typename FIAT>
-__aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInfo &info, bool isKey)
+__aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInfo &info, bool isKey,
+    uint32_t wsSlot)
 {
     BindKvCacheGm(info.bIdx);
 
@@ -1304,7 +1375,7 @@ __aicore__ inline void FiaBlockVecTurboQuantP0<FIAT>::DequantKvImpl(const RunInf
     uint32_t headDimAlign = constInfo.headDimAlign;
     uint32_t headDim = static_cast<uint32_t>(constInfo.headDim);
     uint64_t wsStride = static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(headDimAlign);
-    uint64_t wsOffset = static_cast<uint64_t>(info.loop % 2) * wsStride;
+    uint64_t wsOffset = static_cast<uint64_t>(wsSlot) * wsStride;
 
     // Dual-AIV element half-split at any PA position.  Both subcores own a
     // contiguous, disjoint WS range.  Do NOT block-align the cut: that only

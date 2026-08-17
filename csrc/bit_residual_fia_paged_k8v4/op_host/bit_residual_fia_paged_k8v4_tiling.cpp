@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -493,6 +494,40 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
     tiling.workspaceParams.set_mm1ResSize(mm1ResSize);
     tiling.workspaceParams.set_mm2ResSize(mm2ResSize);
 
+    // S2-indexed dequant cache: only useful when the same (b,n2,s2) is revisited
+    // across gS1 tiles (Prefill with gS1LoopTimes>=2). Decode (and short Prefill
+    // with a single gS1 tile) keeps classic 2-slot loop%2 ping-pong — no skip
+    // benefit, and no extra WS / s2Idx indexing tax.
+    const uint32_t s2LoopTimes =
+        s2BaseSize == 0U ? 1U : (s2Size + s2BaseSize - 1U) / s2BaseSize;
+    const uint64_t gS1Size =
+        static_cast<uint64_t>(s1Size) * static_cast<uint64_t>(gSize);
+    const uint32_t gS1LoopTimes = kMBaseSize == 0U
+                                      ? 1U
+                                      : static_cast<uint32_t>((gS1Size + kMBaseSize - 1U) /
+                                                             kMBaseSize);
+    uint32_t maxDeqSlots = 8U;
+    if (const char *envMax = std::getenv("TQ_FIA_DEQUANT_S2_CACHE_MAX_SLOTS")) {
+        char *end = nullptr;
+        unsigned long v = std::strtoul(envMax, &end, 10);
+        if (end != envMax && v >= 2UL && v <= 64UL) {
+            maxDeqSlots = static_cast<uint32_t>(v);
+        }
+    }
+    bool wantS2Cache = true;
+    if (const char *envCache = std::getenv("TQ_FIA_DEQUANT_S2_CACHE")) {
+        wantS2Cache = !(envCache[0] == '0' && envCache[1] == '\0');
+    }
+    uint32_t dequantWsSlots = kPreLoadNum;
+    uint32_t dequantS2Cache = 0U;
+    if (wantS2Cache && gS1LoopTimes >= 2U && s2LoopTimes >= 1U &&
+        s2LoopTimes <= maxDeqSlots) {
+        dequantWsSlots = std::max(kPreLoadNum, s2LoopTimes);
+        dequantS2Cache = 1U;
+    }
+    tiling.workspaceParams.set_dequantWsSlots(dequantWsSlots);
+    tiling.workspaceParams.set_dequantS2Cache(dequantS2Cache);
+
     tiling.innerSplitParams.set_mBaseSize(kMBaseSize);
     tiling.innerSplitParams.set_s2BaseSize(s2BaseSize);
 
@@ -542,9 +577,10 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
     // Dequant workspace stride on device uses s2BaseSize (BYTE_BLOCK-aligned), NOT
     // sInnerSizeAlign=min(s2,s2Base). Multi-core GQA indexes aiCoreIdx*perCoreDequantSize
     // with that stride; allocating only sInnerSizeAlign makes core>=1 collide/OOB.
+    // Slot count = dequantWsSlots (2 ping-pong or s2LoopTimes for S2 cache).
     const uint32_t dequantS2Align = AlignUp(s2BaseSize, kByteBlock);
     const uint64_t tqWs =
-        static_cast<uint64_t>(kPreLoadNum) * usedCoreNum * 2ULL *
+        static_cast<uint64_t>(dequantWsSlots) * usedCoreNum * 2ULL *
         static_cast<uint64_t>(dequantS2Align) * headDimAlign * 2ULL;
 
     size_t* workspaces = context->GetWorkspaceSizes(1);
@@ -560,11 +596,13 @@ static ge::graphStatus BitResidualFiaPagedK8v4TilingFunc(gert::TilingContext* co
     context->SetTilingKey(enableFd ? kTilingKeyFd : kTilingKeyNoFd);
 
     OPS_LOG_I(nodeName,
-              "BR-FIA tiling: B=%ld N2=%ld G=%u S1=%u S2=%u cores=%u fd=%d fdHeads=%u "
-              "maxS2Split=%u mask=%d sparse=%d pre=%ld next=%ld ws=%zu key=%lu",
-              batchSize, numKvHeads, gSize, s1Size, s2Size, usedCoreNum, enableFd ? 1 : 0,
-              splitRes.numOfFdHead, splitRes.maxS2SplitNum, attenMaskFlag ? 1 : 0, sparseMode,
-              preToken, nextToken, workspaces[0],
+              "BR-FIA tiling: B=%ld N2=%ld G=%u S1=%u S2=%u gS1Loops=%u cores=%u fd=%d "
+              "fdHeads=%u maxS2Split=%u mask=%d sparse=%d pre=%ld next=%ld "
+              "deqSlots=%u s2Cache=%u ws=%zu key=%lu",
+              batchSize, numKvHeads, gSize, s1Size, s2Size, gS1LoopTimes, usedCoreNum,
+              enableFd ? 1 : 0, splitRes.numOfFdHead, splitRes.maxS2SplitNum,
+              attenMaskFlag ? 1 : 0, sparseMode, preToken, nextToken, dequantWsSlots,
+              dequantS2Cache, workspaces[0],
               static_cast<unsigned long>(enableFd ? kTilingKeyFd : kTilingKeyNoFd));
     return ge::GRAPH_SUCCESS;
 }

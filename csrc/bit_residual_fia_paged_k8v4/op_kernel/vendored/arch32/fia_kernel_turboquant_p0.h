@@ -251,6 +251,11 @@ __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, 
     constInfo.outputLayout = static_cast<FIA_LAYOUT>(tilingData->baseParams.outputLayout);
     constInfo.mBaseSize = tilingData->innerSplitParams.mBaseSize;
     constInfo.s2BaseSize = tilingData->innerSplitParams.s2BaseSize;
+    constInfo.dequantWsSlots = tilingData->workspaceParams.dequantWsSlots;
+    if (constInfo.dequantWsSlots < 2U) {
+        constInfo.dequantWsSlots = 2U;
+    }
+    constInfo.dequantS2Cache = (tilingData->workspaceParams.dequantS2Cache != 0U);
     constInfo.batchContinuous = tilingData->baseParams.batchContinuous;
     constInfo.l2CacheOffFlag = tilingData->baseParams.l2CacheOffFlag;
 
@@ -975,14 +980,17 @@ __aicore__ inline uint64_t FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockTy
 template <typename FIAT, typename CubeBlockType, typename VecBlockType, typename FdBlockType>
 __aicore__ inline void FiaKernelTurboQuantP0<FIAT, CubeBlockType, VecBlockType, FdBlockType>::BindDequantWorkspace()
 {
-    static constexpr uint32_t TQ_PRELOAD = 2;
     static constexpr uint32_t FP16_ELEM_SIZE = 2;
     static constexpr uint32_t BYTE_BLOCK = 32;
     uint64_t layoutCoreNum = static_cast<uint64_t>(usedCoreNum);
     uint64_t stdWsSize = CalcStdWorkspaceSize();
     uint64_t sInnerSizeAlign = (static_cast<uint64_t>(constInfo.s2BaseSize) + BYTE_BLOCK - 1) /
                                BYTE_BLOCK * BYTE_BLOCK;
-    uint64_t perCoreDequantSize = TQ_PRELOAD * sInnerSizeAlign *
+    uint64_t deqSlots = static_cast<uint64_t>(constInfo.dequantWsSlots);
+    if (deqSlots < 2ULL) {
+        deqSlots = 2ULL;
+    }
+    uint64_t perCoreDequantSize = deqSlots * sInnerSizeAlign *
                                 static_cast<uint64_t>(constInfo.headDimAlign) * FP16_ELEM_SIZE;
 
     __gm__ uint8_t *wsBase = workspaceBase_;

@@ -200,6 +200,9 @@ struct ConstInfo {
 
     uint32_t mBaseSize = 1ULL;
     uint32_t s2BaseSize = 1ULL;
+    // Dequant workspace: slots per core; s2-cache indexes by s2Idx and skips re-dequant.
+    uint32_t dequantWsSlots = 2U;
+    bool dequantS2Cache = false;
     bool batchContinuous = true;
     bool ropeSplitMode = false;
 
