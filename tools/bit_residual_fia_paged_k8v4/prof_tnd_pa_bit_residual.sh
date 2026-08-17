@@ -165,7 +165,7 @@ EOF
     if [[ -n "${Q_TOKENS_PER_BATCH}" ]]; then
         printf 'export Q_TOKENS_PER_BATCH=%q\n' "${Q_TOKENS_PER_BATCH}" >> "${run_wrapper}"
     fi
-    for v in Q_PATH PI_PATH GOLDEN_OUT_PATH WS_DUMP_PATH; do
+    for v in Q_PATH PI_PATH GOLDEN_OUT_PATH WS_DUMP_PATH TQ_FIA_DEQUANT_S2_CACHE TQ_FIA_DEQUANT_S2_CACHE_MAX_SLOTS TQ_FIA_DISABLE_S2_COLUMN; do
         if [[ -n "${!v:-}" ]]; then
             printf 'export %s=%q\n' "${v}" "${!v}" >> "${run_wrapper}"
         fi

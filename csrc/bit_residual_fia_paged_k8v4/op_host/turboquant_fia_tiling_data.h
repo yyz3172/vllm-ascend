@@ -59,6 +59,10 @@ TILING_DATA_FIELD_DEF(uint32_t, mm1ResSize)
 TILING_DATA_FIELD_DEF(uint32_t, mm2ResSize)
 TILING_DATA_FIELD_DEF(uint32_t, fdAccumOutSize)
 TILING_DATA_FIELD_DEF(uint32_t, fdLogSumExpSize)
+// Dequant GM slots per AIC (K and V each). 2 = classic loop%2 ping-pong.
+// When == s2LoopTimes and dequantS2Cache!=0, device indexes by s2Idx and may skip.
+TILING_DATA_FIELD_DEF(uint32_t, dequantWsSlots)
+TILING_DATA_FIELD_DEF(uint32_t, dequantS2Cache)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(TqFiaWorkspaceParamsOp, TqFiaWorkspaceParams)
 

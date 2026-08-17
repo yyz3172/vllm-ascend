@@ -57,6 +57,8 @@ struct TqFiaWorkspaceParams {
     uint32_t mm2ResSize;
     uint32_t fdAccumOutSize;
     uint32_t fdLogSumExpSize;
+    uint32_t dequantWsSlots;
+    uint32_t dequantS2Cache;
 };
 
 struct TqFiaInnerSplitParams {

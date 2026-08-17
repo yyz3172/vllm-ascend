@@ -439,10 +439,15 @@ public:
 
     __aicore__ inline void SetDequantWsTaskOffset(const RunInfo &info)
     {
-        uint64_t pingpongStride =
+        uint64_t stride =
             static_cast<uint64_t>(constInfo.s2BaseSize) * static_cast<uint64_t>(constInfo.headDimAlign);
-        dequantKeyWsOffset_ = static_cast<uint64_t>(info.loop % 2) * pingpongStride;
-        dequantValueWsOffset_ = static_cast<uint64_t>(info.loop % 2) * pingpongStride;
+        uint64_t slot = constInfo.dequantS2Cache ? static_cast<uint64_t>(info.s2Idx)
+                                                : static_cast<uint64_t>(info.loop % 2);
+        if (constInfo.dequantS2Cache && slot >= static_cast<uint64_t>(constInfo.dequantWsSlots)) {
+            slot = static_cast<uint64_t>(info.loop % 2);
+        }
+        dequantKeyWsOffset_ = slot * stride;
+        dequantValueWsOffset_ = slot * stride;
     }
 
 public:
