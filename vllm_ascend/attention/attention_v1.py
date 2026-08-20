@@ -1401,6 +1401,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):
         def _cache_view_for_fia(cache: torch.Tensor) -> tuple[int, torch.Tensor]:
             if self.kv_cache_dtype == "turboquant":
+                # BitResidual k8v4 is 3D [num_blocks, num_kv_heads, packed_width].
+                # Stock FIA expects 4D; k8v4 must use `_br_fia_paged_k8v4` instead.
+                # Keep a shape-safe view here only as a defensive fallback.
+                if getattr(self, "_bit_residual_k8v4", False) and cache.ndim == 3:
+                    block_size = int(getattr(self, "_block_size", 0) or 0)
+                    if block_size <= 0:
+                        raise ValueError(
+                            "k8v4 cache is 3D but _block_size is unset; "
+                            "use _br_fia_paged_k8v4 instead of stock FIA."
+                        )
+                    return block_size, cache.view(cache.shape[0], block_size, -1)
                 slab_block_size = turboquant_slab_block_size_or_none(
                     cache,
                     head_size=self.head_size,
@@ -1412,6 +1423,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     return slab_block_size, cache.view(
                         cache.shape[0], slab_block_size, -1
                     )
+            if cache.ndim == 3:
+                raise ValueError(
+                    f"stock FIA cache view expects 4D [blocks, block_size, "
+                    f"heads, dim], got 3D {tuple(cache.shape)}; k8v4/slab "
+                    f"layouts must use their dedicated attention path."
+                )
             num_block, block_size, _, _ = cache.shape
             return block_size, cache.view(num_block, block_size, -1)
 
@@ -1526,6 +1543,42 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output[:batch_size] = attn_output[:batch_size]
         return output
 
+    def _forward_bit_residual_k8v4_paged(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        *,
+        num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Paged k8v4 FIA for PrefillCacheHit / ChunkedPrefill / DecodeOnly.
+
+        Must run for both eager and ACL-graph capture: stock ``full_graph_fia``
+        assumes 4D KV cache, while k8v4 is 3D packed uint8.
+        """
+        if num_tokens is None:
+            num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        state = attn_metadata.attn_state
+        batch_size = attn_metadata.seq_lens.shape[0]
+        block_tables = (
+            attn_metadata.block_tables[:batch_size, :]
+            if state == AscendAttentionState.PrefillCacheHit
+            else attn_metadata.block_tables
+        )
+        is_decode = state == AscendAttentionState.DecodeOnly
+        self._br_fia_paged_k8v4(
+            query=query,
+            block_tables=block_tables,
+            actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+            block_size=self._block_size,
+            atten_mask=None if is_decode else attn_metadata.attn_mask,
+            sparse_mode=0 if is_decode else 3,
+            out=output[:num_tokens],
+        )
+        return output
+
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -1535,6 +1588,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         kv_cache=None,
     ):
+        # k8v4 packed FIA for PrefillCacheHit / ChunkedPrefill / DecodeOnly --
+        # these read the already-packed paged KV. PrefillNoCache is excluded:
+        # the first-time prefill uses the freshly-computed float K/V via the
+        # generic float-FIA path below (full precision, no quant error).
+        # IMPORTANT: handle before ACL-graph ``full_graph_fia`` — that path
+        # unpacks 4D cache and crashes on 3D k8v4 slabs during capture.
+        if (
+            self._bit_residual_k8v4
+            and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+        ):
+            return self._forward_bit_residual_k8v4_paged(query, attn_metadata, output)
+
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
@@ -1556,36 +1621,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return self._forward_fia_slidingwindow(query, attn_metadata, output)
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
-
-        # k8v4 packed FIA for PrefillCacheHit / ChunkedPrefill / DecodeOnly --
-        # these read the already-packed paged KV. PrefillNoCache is excluded:
-        # the first-time prefill uses the freshly-computed float K/V via the
-        # generic float-FIA path below (full precision, no quant error).
-        if (
-            self._bit_residual_k8v4
-            and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
-        ):
-            state = attn_metadata.attn_state
-            batch_size = attn_metadata.seq_lens.shape[0]
-            # PrefillCacheHit slices block_tables to [batch_size];
-            # ChunkedPrefill / DecodeOnly use the full block_table.
-            block_tables = (
-                attn_metadata.block_tables[:batch_size, :]
-                if state == AscendAttentionState.PrefillCacheHit
-                else attn_metadata.block_tables
-            )
-            is_decode = state == AscendAttentionState.DecodeOnly
-            self._br_fia_paged_k8v4(
-                query=query,
-                block_tables=block_tables,
-                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
-                actual_seq_lengths_kv=attn_metadata.seq_lens_list,
-                block_size=self._block_size,
-                atten_mask=None if is_decode else attn_metadata.attn_mask,
-                sparse_mode=0 if is_decode else 3,
-                out=output[:num_tokens],
-            )
-            return output
 
         passed_key = key
         passed_value = value
@@ -1818,6 +1853,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # BitResidual k8v4 Decode: FIA-only. Must run before ACL-graph PA
+        # capture (stock paged-attn expects a different cache layout).
+        if self.kv_cache_dtype == "turboquant" and self._bit_residual_k8v4:
+            assert self.key_cache is not None and self.value_cache is not None
+            self._br_fia_paged_k8v4(
+                query=query,
+                block_tables=attn_metadata.block_tables,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                block_size=self._block_size,
+                atten_mask=None,
+                sparse_mode=0,
+                out=output,
+            )
+            return output
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
         block_table = attn_metadata.block_tables
@@ -1825,19 +1875,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value_cache = self.value_cache
         if self.kv_cache_dtype == "turboquant":
             assert key_cache is not None and value_cache is not None
-            # BitResidual k8v4 Decode: FIA-only.
-            if self._bit_residual_k8v4:
-                self._br_fia_paged_k8v4(
-                    query=query,
-                    block_tables=block_table,
-                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=attn_metadata.seq_lens_list,
-                    block_size=self._block_size,
-                    atten_mask=None,
-                    sparse_mode=0,
-                    out=output,
-                )
-                return output
             key_cache, value_cache, block_table = turboquant_decode_kv_cache_compact(
                 key_cache=key_cache,
                 value_cache=value_cache,

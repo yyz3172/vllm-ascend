@@ -45,14 +45,14 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
 
 典型用法：
     # 默认单组：fia=off, io=200:200, conc=16
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py -p 31720 -d 5
 
     # 多组全排列：2 个 fia × 2 组 io × 2 个并发 = 8 组
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
         -f off,all -L 200:200,1024:200 -c 16,32
 
     # 保留 serve 不关（便于挂 profiler），仅单组时常用
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -k
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py -k
 
 【profiler】--profile 开启 torch profiler（NPU 上落盘 Ascend msprof trace）：
   serve 带 --profiler-config.*（profiler=torch + torch_profiler_dir + with_stack），
@@ -65,15 +65,15 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
   worker、跳过前端 CPU trace 以降开销。
 
     # 单组 + profiler：trace 落 <output-dir>/<日期>/<时间>/off/in200_out200_conc16/profiler/
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
         --profile
 
     # 多组 + profiler：每个 combo 各重启 serve、各一份 trace
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
         --profile -f off,all -L 200:200,1024:200 -c 16,32
 
     # 落到大磁盘：把 --output-dir 指过去，profiler trace 作为其子目录跟过去
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py -p 31720 -d 5 \\
         --profile -O /root/yyz/perfprof/runA
 
 【PD 分离 1P1D】--pd 一键起 Prefill + Decode + proxy，bench 打 proxy（方案 A）：
@@ -82,12 +82,12 @@ serve」全流程，并支持对 FIA / 输入输出长度 / 并发数做多组�
   --profile 时 P、D 各自落 profiler 目录（proxy 不转发 /start_profile，由本脚本分别 POST）。
 
     # 1P1D + FIA all + 长 prefill
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py --pd -d 1,2 -p 9878 \\
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py --pd -d 1,2 -p 9878 \\
         -f all -L 4096:128 -c 8 -n 32 \\
         --serve-extra '--gpu-memory-utilization 0.2 --max-model-len 8192'
 
     # 1P1D + P/D 双端 profile
-    python tests/e2e/singlecard/turboquant_k8v4_serve_bench.py --pd -d 1,2 -p 9878 \\
+    python tests/e2e/pull_request/one_card/turboquant_k8v4_serve_bench.py --pd -d 1,2 -p 9878 \\
         -f all -L 4096:128 -c 4 -n 16 --profile --profiler-ignore-frontend
 """
 
@@ -154,7 +154,7 @@ def _strip_verbose_ascend_log_env(env: dict[str, str]) -> None:
         env.pop(k, None)
 
 # PD 1P1D：Mooncake connector + proxy（相对本文件定位仓库根）
-# singlecard → parents[3]；pull_request/one_card → parents[4]
+# singlecard → parents[2]；pull_request/one_card → parents[3]（按目录深度探测）
 def _find_repo_root() -> Path:
     here = Path(__file__).resolve().parent
     for depth in (3, 4, 2, 5):

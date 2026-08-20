@@ -470,14 +470,6 @@ class KVCacheRecvingThread(threading.Thread):
             defaultdict(dict)
         )
         self.pending_reformat_lock = threading.Lock()
-        self.block_len = block_len
-        # TODO(jianzs): find a better way to detect MLA.
-        # NOTE: len(block_len)==2 also matches BitResidual k8v4 (per-cache K/V
-        # widths after the turboquant registration fix), so exclude turboquant.
-        self.use_mla = (
-            len(block_len) == 2
-            and vllm_config.cache_config.cache_dtype != "turboquant"
-        )
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()), None)
