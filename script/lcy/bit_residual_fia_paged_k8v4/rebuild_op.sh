@@ -57,20 +57,78 @@ echo "[rebuild] BR_S2_BASICSIZE_IS_1024=${BR_S2_BASICSIZE_IS_1024}"
 echo "[rebuild] INSTALL=${INSTALL_PATH}"
 
 cd "${ROOT_DIR}/csrc"
-rm -rf build output
+rm -rf build output build_out
 BUILD_ARGS=(-n "${CUSTOM_OPS}" -c "${SOC_ARG}")
 if [[ -n "${OP_DEBUG_CONFIG}" ]]; then
     BUILD_ARGS+=(--op-debug-config "${OP_DEBUG_CONFIG}")
 fi
 bash build.sh "${BUILD_ARGS[@]}"
 
-RUN_PKG=$(ls -1 output/CANN-custom_ops*.run 2>/dev/null | head -1)
+# v0.18: output/CANN-custom_ops*.run
+# v0.23: build/cann-ops-transformer-custom_linux-*.run (or build_out/)
+RUN_PKG=""
+for cand in \
+    output/CANN-custom_ops*.run \
+    build/cann-ops-transformer*.run \
+    build_out/cann-ops-transformer*.run \
+    build/CANN-custom_ops*.run
+do
+    # shellcheck disable=SC2086
+    for f in ${cand}; do
+        if [[ -f "${f}" ]]; then
+            RUN_PKG="${f}"
+            break 2
+        fi
+    done
+done
 if [[ -z "${RUN_PKG}" ]]; then
-    echo "[rebuild] ERROR: no CANN-custom_ops*.run under csrc/output"
+    echo "[rebuild] ERROR: no installable .run under csrc/{output,build,build_out}"
+    echo "[rebuild] Hint: ENABLE_BUILD_PKG must be ON for makeself packaging."
+    ls -la output build build_out 2>/dev/null || true
     exit 1
 fi
+echo "[rebuild] RUN_PKG=${RUN_PKG}"
 mkdir -p "${INSTALL_PATH}"
-bash "${RUN_PKG}" --install-path="${INSTALL_PATH}"
+bash "${RUN_PKG}" --quiet --install-path="${INSTALL_PATH}"
+
+# v0.23 runtime vendor dir is custom_transformer; cherry-picked smoke scripts
+# still look for vendors/vllm-ascend — keep a compat symlink.
+VENDOR_DIR="${INSTALL_PATH}/vendors/custom_transformer"
+COMPAT_DIR="${INSTALL_PATH}/vendors/vllm-ascend"
+if [[ -d "${VENDOR_DIR}" ]]; then
+    mkdir -p "${INSTALL_PATH}/vendors"
+    if [[ ! -e "${COMPAT_DIR}" ]]; then
+        ln -s custom_transformer "${COMPAT_DIR}"
+        echo "[rebuild] symlink vendors/vllm-ascend -> custom_transformer"
+    elif [[ -L "${COMPAT_DIR}" ]]; then
+        ln -sfn custom_transformer "${COMPAT_DIR}"
+    fi
+fi
+
 echo "[rebuild] Installed. Header check:"
-ls -la "${INSTALL_PATH}/vendors/vllm-ascend/op_api/include/aclnn_bit_residual_fia_paged_k8v4.h"
+HDR=""
+for h in \
+    "${VENDOR_DIR}/op_api/include/aclnnop/aclnn_bit_residual_fia_paged_k8v4.h" \
+    "${VENDOR_DIR}/op_api/include/aclnn_bit_residual_fia_paged_k8v4.h" \
+    "${COMPAT_DIR}/op_api/include/aclnn_bit_residual_fia_paged_k8v4.h"
+do
+    if [[ -f "${h}" ]]; then
+        HDR="${h}"
+        break
+    fi
+done
+if [[ -z "${HDR}" ]]; then
+    echo "[rebuild] ERROR: aclnn_bit_residual_fia_paged_k8v4.h not found after install"
+    find "${INSTALL_PATH}/vendors" -name '*bit_residual*' 2>/dev/null | head -40 || true
+    exit 1
+fi
+ls -la "${HDR}"
+LIB="${VENDOR_DIR}/op_api/lib/libcust_opapi.so"
+if [[ -f "${LIB}" ]] && nm -D "${LIB}" | grep -q 'aclnnBitResidualFiaPagedK8v4'; then
+    echo "[rebuild] libcust_opapi.so exports aclnnBitResidualFiaPagedK8v4 OK"
+else
+    echo "[rebuild] ERROR: libcust_opapi.so missing aclnnBitResidualFiaPagedK8v4"
+    nm -D "${LIB}" 2>/dev/null | grep -i bitresidual | head || true
+    exit 1
+fi
 echo "[rebuild] Done."

@@ -101,22 +101,44 @@ def _patch_turboquant_page_size_bytes() -> None:
 
 
 def register_turboquant_kv_spec_managers() -> None:
-    """Wire TQ-full spec classes into vLLM's ``spec_manager_map`` (same as TurboQuant)."""
-    from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: PLC0415
-        FullAttentionManager,
-        spec_manager_map,
-    )
+    """Wire TQ-full spec classes into the KV manager lookup used by this vLLM.
 
-    spec_manager_map.setdefault(AscendTQFullAttentionSpecFallback,
-                                FullAttentionManager)
+    v0.18 uses ``spec_manager_map``; v0.23 uses ``KVCacheSpecRegistry``.
+    Upstream v0.23 already registers ``TQFullAttentionSpec`` /
+    ``TurboQuantAttentionSpec``; we still register the Ascend fallback spec
+    and patch k8v4 ``page_size_bytes``.
+    """
     try:
-        from vllm.v1.kv_cache_interface import (  # noqa: PLC0415
-            TQFullAttentionSpec as _TQF,
+        from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: PLC0415
+            FullAttentionManager,
+            spec_manager_map,
         )
     except ImportError:
-        pass
+        spec_manager_map = None
     else:
-        spec_manager_map.setdefault(_TQF, FullAttentionManager)
+        spec_manager_map.setdefault(AscendTQFullAttentionSpecFallback,
+                                    FullAttentionManager)
+        try:
+            from vllm.v1.kv_cache_interface import (  # noqa: PLC0415
+                TQFullAttentionSpec as _TQF,
+            )
+        except ImportError:
+            pass
+        else:
+            spec_manager_map.setdefault(_TQF, FullAttentionManager)
+
+    if spec_manager_map is None:
+        from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: PLC0415
+            FullAttentionManager,
+        )
+        from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: PLC0415
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry  # noqa: PLC0415
+
+        KVCacheSpecRegistry.register(
+            AscendTQFullAttentionSpecFallback,
+            FullAttentionManager,
+            uniform_type_base_spec=FullAttentionSpec,
+        )
 
     # Patch page_size_bytes for k8v4 so the scheduler sees the correct
     # (smaller) per-block size and allocates more blocks from the same

@@ -1,3 +1,5 @@
+add_op_to_compiled_list()
+
 # Vendored/arch32 is on -I for FIA headers, but do NOT name any vendored file
 # the same as AscendC headers (e.g. former kernel_common.h) — that shadows
 # AscendC includes mid-kernel_operator.h and breaks matmul (FixpipeConfig/TPipe).
@@ -16,6 +18,12 @@ if(DEFINED ENV{BR_S2_BASICSIZE_IS_1024})
 endif()
 message(STATUS "BitResidualFiaPagedK8v4 BR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}")
 
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnn PRIVATE
+        bit_residual_fia_paged_k8v4_def.cpp
+    )
+endif()
+
 add_ops_compile_options(
         OP_NAME BitResidualFiaPagedK8v4
         OPTIONS --cce-auto-sync=on
@@ -31,36 +39,23 @@ add_ops_compile_options(
                 -I${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_sources(op_host_aclnn PRIVATE
-        bit_residual_fia_paged_k8v4_def.cpp
-)
-
-target_sources(optiling PRIVATE
-        bit_residual_fia_paged_k8v4_tiling.cpp
+if (NOT BUILD_OPS_RTY_KERNEL)
+    add_modules_sources(OPTYPE bit_residual_fia_paged_k8v4 ACLNNTYPE aclnn)
+    # vendored/split_core.cpp is not matched by *_tiling*.cpp GLOB.
+    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
         vendored/split_core.cpp
-)
-
-# Host kS2BaseSize must match Cube S2_BASICSIZE_IS_1024 (add_ops_compile_options
-# only covers the device kernel).
-target_compile_definitions(optiling PRIVATE
+    )
+    # Host kS2BaseSize must match Cube S2_BASICSIZE_IS_1024 (add_ops_compile_options
+    # only covers the device kernel).
+    target_compile_definitions(${OPHOST_NAME}_tiling_obj PRIVATE
         BR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}
-)
-
-if (NOT BUILD_OPEN_PROJECT)
-    target_sources(opmaster_ct PRIVATE
-        bit_residual_fia_paged_k8v4_tiling.cpp
-        vendored/split_core.cpp
     )
-    target_compile_definitions(opmaster_ct PRIVATE
-            BR_S2_BASICSIZE_IS_1024=${_BR_S2_BASICSIZE_IS_1024}
-    )
-endif ()
-
-target_include_directories(optiling PRIVATE
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
         ${CMAKE_CURRENT_SOURCE_DIR}/vendored
-)
+    )
+endif()
 
 file(GLOB _BR_FIA_PAGED_K8V4_Aclnn_header
         "${CMAKE_CURRENT_SOURCE_DIR}/aclnn_bit_residual_fia_paged_k8v4.h")

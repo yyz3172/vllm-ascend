@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
 
 _CANN_OPP = REPO_ROOT / "vllm_ascend" / "_cann_ops_custom" / "vendors" / "vllm-ascend"
@@ -36,7 +36,7 @@ import torch
 
 from vllm_ascend.utils import enable_custom_op
 
-from tests.e2e.singlecard.xrx_bit_residual_k8v4_golden import (
+from tests.e2e.pull_request.one_card.xrx_bit_residual_k8v4_golden import (
     BLOCK_SIZE,
     HEAD_SIZE,
     KEY_BLOCK_STRIDE,

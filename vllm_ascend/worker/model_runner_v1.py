@@ -4730,6 +4730,7 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.block_size,
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
+                            cache_dtype_str=self.cache_config.cache_dtype,
                         )
                     turboquant_asym = False
                     turboquant_slab_layout = False
@@ -4761,13 +4762,25 @@ class NPUModelRunner(GPUModelRunner):
                         # slab layout (16-row sub-block, asymmetric K/V widths).
                         if (self.ascend_config.turboquant_kv_bits_key == 8
                                 and self.ascend_config.turboquant_kv_bits_value == 4
-                                and kv_cache_spec.head_size == 128):
+                                and current_kv_cache_spec.head_size == 128):
                             turboquant_k8v4_layout = True
                     if turboquant_k8v4_layout:
-                        block_size = kv_cache_spec.block_size
-                        base = kv_cache_shape[1:-1]
-                        k_shape = (*base, bit_residual_k8v4_key_packed_width(block_size))
-                        v_shape = (*base, bit_residual_k8v4_value_packed_width(block_size))
+                        # 3D slab: [num_blocks, num_kv_heads, packed_width].
+                        # Do not reuse kv_cache_shape[1:-1]: v0.23 get_kv_cache_shape
+                        # is often called without cache_dtype_str and returns 5D
+                        # (2, blocks, block_size, heads, head_size).
+                        k_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.num_kv_heads,
+                            bit_residual_k8v4_key_packed_width(
+                                current_kv_cache_spec.block_size),
+                        )
+                        v_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.num_kv_heads,
+                            bit_residual_k8v4_value_packed_width(
+                                current_kv_cache_spec.block_size),
+                        )
                     elif (turboquant_slab_layout and pk_tq is not None
                             and pv_tq is not None):
                         if pk_tq != pv_tq:

@@ -1,10 +1,4 @@
-set(_TQ_PACK_COMPILE_OPTIONS
-        --cce-auto-sync=on
-        -DASCENDC_DUMP=0
-        -I${CMAKE_SOURCE_DIR}/third_party/catlass/include
-        -Wno-deprecated-declarations
-        -Werror
-)
+add_op_to_compiled_list()
 
 # Key encode scheme: 1=A asymmetric, 2=B symmetric, 3=C legacy LSB-sign+q7.
 # Must match FIA / attention BR_KEY_UNIFORM_SCHEME (env or default 1).
@@ -12,7 +6,15 @@ set(_BR_KEY_UNIFORM_SCHEME "1")
 if(DEFINED ENV{BR_KEY_UNIFORM_SCHEME})
     set(_BR_KEY_UNIFORM_SCHEME "$ENV{BR_KEY_UNIFORM_SCHEME}")
 endif()
-list(APPEND _TQ_PACK_COMPILE_OPTIONS -DBR_KEY_UNIFORM_SCHEME=${_BR_KEY_UNIFORM_SCHEME})
+
+set(_TQ_PACK_COMPILE_OPTIONS
+        --cce-auto-sync=on
+        -DASCENDC_DUMP=0
+        -I${CMAKE_SOURCE_DIR}/third_party/catlass/include
+        -Wno-deprecated-declarations
+        -Werror
+        -DBR_KEY_UNIFORM_SCHEME=${_BR_KEY_UNIFORM_SCHEME}
+)
 
 set(BIT_RESIDUAL_PACK_K8V4_DEBUG_LINE "OFF" CACHE STRING
         "Enable -g for BitResidualPackK8v4 AscendC kernel compile.")
@@ -27,25 +29,24 @@ if(_TQ_PACK_DEBUG_LINE STREQUAL "ON" OR _TQ_PACK_DEBUG_LINE STREQUAL "1" OR
     list(APPEND _TQ_PACK_COMPILE_OPTIONS -g)
 endif()
 
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnn PRIVATE
+        bit_residual_pack_k8v4_def.cpp
+    )
+endif()
+
 add_ops_compile_options(
         OP_NAME BitResidualPackK8v4
         OPTIONS ${_TQ_PACK_COMPILE_OPTIONS}
 )
 
-target_sources(op_host_aclnn PRIVATE
-        bit_residual_pack_k8v4_def.cpp
-)
-
-target_sources(optiling PRIVATE
-        bit_residual_pack_k8v4_tiling.cpp
-)
-
-target_include_directories(optiling PRIVATE
+if (NOT BUILD_OPS_RTY_KERNEL)
+    add_modules_sources(OPTYPE bit_residual_pack_k8v4 ACLNNTYPE aclnn)
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
-)
-
-target_sources(opsproto PRIVATE)
+    )
+endif()
 
 file(GLOB _TQ_PACK_TO_CACHE_Aclnn_header
         "${CMAKE_CURRENT_SOURCE_DIR}/aclnn_bit_residual_pack_k8v4.h")

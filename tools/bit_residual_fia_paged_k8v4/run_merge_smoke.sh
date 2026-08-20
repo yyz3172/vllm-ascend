@@ -32,10 +32,14 @@ set -euo pipefail
 
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${TOOLS}/../.." && pwd)"
-TEST_DIR="${ROOT_DIR}/tests/e2e/singlecard"
+# v0.23+: e2e one-card tests live under pull_request/one_card (was singlecard).
+TEST_DIR="${ROOT_DIR}/tests/e2e/pull_request/one_card"
+if [[ ! -d "${TEST_DIR}" && -d "${ROOT_DIR}/tests/e2e/singlecard" ]]; then
+    TEST_DIR="${ROOT_DIR}/tests/e2e/singlecard"
+fi
 
-MODEL_PATH="${XRX_K8V4_MODEL_PATH:-/root/cyl/model/Qwen3-0.6B}"
-PROFILE_ROOT="${XRX_K8V4_PROFILE_DIR:-/root/cyl/perflog2/merge_smoke}"
+MODEL_PATH="${XRX_K8V4_MODEL_PATH:-/root/yyz/models/Qwen3-0.6B}"
+PROFILE_ROOT="${XRX_K8V4_PROFILE_DIR:-/root/yyz/perflog/k8v4_merge_smoke}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 CONTINUE_ON_FAIL="${CONTINUE_ON_FAIL:-0}"
 WITH_FIA_SERVING="${WITH_FIA_SERVING:-0}"
@@ -65,6 +69,8 @@ mkdir -p "${LOG_DIR}"
 source_env() {
     local cann_candidates=(
         "${ASCEND_HOME_PATH:-}"
+        /usr/local/Ascend/cann
+        /usr/local/Ascend/cann-9.1.0
         /usr/local/Ascend/cann/8.5.1
         /usr/local/Ascend/cann-8.5.1
         /usr/local/Ascend/ascend-toolkit/latest
@@ -83,16 +89,33 @@ source_env() {
         fi
     done
 
-    if [[ -f /root/cyl/venv/vllmdev/.venv/bin/activate ]]; then
-        # shellcheck disable=SC1091
-        source /root/cyl/venv/vllmdev/.venv/bin/activate
-    elif [[ -f /root/l00856060/venv/lcyvllm/.venv/bin/activate ]]; then
+    if [[ -f /root/l00856060/venv/lcyvllm/.venv/bin/activate ]]; then
         # shellcheck disable=SC1091
         source /root/l00856060/venv/lcyvllm/.venv/bin/activate
+    elif [[ -f /root/cyl/venv/vllmdev/.venv/bin/activate ]]; then
+        # shellcheck disable=SC1091
+        source /root/cyl/venv/vllmdev/.venv/bin/activate
     fi
-    if [[ -f "${ROOT_DIR}/infoenvs" ]]; then
+
+    # v0.23 stack: this repo + /vllm-workspace/vllm.
+    # Do not source repo infoenvs: it pins VLLM_VERSION=0.18.0 and PYTHONPATH
+    # at the v0.18 trees.
+    export PYTHONPATH="${ROOT_DIR}:/vllm-workspace/vllm:${PYTHONPATH:-}"
+    # Dev/local vLLM may report 0.23.0+empty; pin so vllm_version_is("0.23.0")
+    # matches and skips v0.24-only patches (patch_dp_device_ids, etc.).
+    export VLLM_VERSION="${VLLM_VERSION:-0.23.0}"
+    export VLLM_ASCEND_TURBOQUANT_ENCODE_OP="${VLLM_ASCEND_TURBOQUANT_ENCODE_OP:-1}"
+    export VLLM_ASCEND_TURBOQUANT_DECODE_OP="${VLLM_ASCEND_TURBOQUANT_DECODE_OP:-1}"
+    export VLLM_ASCEND_TURBOQUANT_PACK_OP="${VLLM_ASCEND_TURBOQUANT_PACK_OP:-v2}"
+    export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
+
+    local cust_env="${ROOT_DIR}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
+    if [[ -f "${cust_env}" ]]; then
+        # vendor set_env.bash expands unset ASCEND_CUSTOM_OPP_PATH / LD_LIBRARY_PATH.
+        set +u
         # shellcheck disable=SC1090
-        source "${ROOT_DIR}/infoenvs"
+        source "${cust_env}"
+        set -u
     fi
 
     if [[ -n "${ASCEND_HOME_PATH:-}" && -d "${ASCEND_HOME_PATH}/opp" ]]; then
@@ -101,9 +124,19 @@ source_env() {
 }
 
 check_cust_ops() {
-    local lib="${ROOT_DIR}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/op_api/lib/libcust_opapi.so"
-    if [[ ! -f "${lib}" ]]; then
-        echo "[ERROR] missing ${lib}; run without --skip-build" >&2
+    local lib=""
+    local cand
+    for cand in \
+        "${ROOT_DIR}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/op_api/lib/libcust_opapi.so" \
+        "${ROOT_DIR}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/op_api/lib/libcust_opapi.so"
+    do
+        if [[ -f "${cand}" ]]; then
+            lib="${cand}"
+            break
+        fi
+    done
+    if [[ -z "${lib}" ]]; then
+        echo "[ERROR] missing libcust_opapi.so under _cann_ops_custom/vendors/{custom_transformer,vllm-ascend}; run without --skip-build" >&2
         exit 1
     fi
     if ! nm -D "${lib}" | grep -q 'aclnnBitResidualFiaPagedK8v4'; then
@@ -120,6 +153,7 @@ check_cust_ops() {
             "slim rebuild stripped serving ops. Run without --skip-build." >&2
         exit 1
     fi
+    echo "[ok] custom ops lib: ${lib}"
 }
 
 declare -a CASE_NAMES=()

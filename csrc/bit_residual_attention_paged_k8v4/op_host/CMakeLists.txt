@@ -1,3 +1,5 @@
+add_op_to_compiled_list()
+
 set(_TQ_BR_ATTN_COMPILE_OPTIONS
         --cce-auto-sync=on
         -DASCENDC_DUMP=0
@@ -25,25 +27,24 @@ if(_TQ_BR_ATTN_DEBUG_LINE STREQUAL "ON" OR _TQ_BR_ATTN_DEBUG_LINE STREQUAL "1" O
     list(APPEND _TQ_BR_ATTN_COMPILE_OPTIONS -g)
 endif()
 
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnn PRIVATE
+        bit_residual_attention_paged_k8v4_def.cpp
+    )
+endif()
+
 add_ops_compile_options(
         OP_NAME BitResidualAttentionPagedK8v4
         OPTIONS ${_TQ_BR_ATTN_COMPILE_OPTIONS}
 )
 
-target_sources(op_host_aclnn PRIVATE
-        bit_residual_attention_paged_k8v4_def.cpp
-)
-
-target_sources(optiling PRIVATE
-        bit_residual_attention_paged_k8v4_tiling.cpp
-)
-
-target_include_directories(optiling PRIVATE
+if (NOT BUILD_OPS_RTY_KERNEL)
+    add_modules_sources(OPTYPE bit_residual_attention_paged_k8v4 ACLNNTYPE aclnn)
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
-)
-
-target_sources(opsproto PRIVATE)
+    )
+endif()
 
 file(GLOB _TQ_BR_ATTN_Aclnn_header
         "${CMAKE_CURRENT_SOURCE_DIR}/aclnn_bit_residual_attention_paged_k8v4.h")
