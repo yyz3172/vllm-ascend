@@ -16,6 +16,9 @@ find_package(pybind11 REQUIRED)
 
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 set(VLLM_ASCEND_INSTALL_PATH "${CMAKE_INSTALL_PREFIX}")
+option(VLLM_ASCEND_USE_PREBUILT_KERNELS
+  "Link vllm_ascend_C against an existing libvllm_ascend_kernels.so instead of rebuilding AscendC kernels."
+  OFF)
 
 find_package(Torch REQUIRED)
 
@@ -74,9 +77,26 @@ endif()
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
     message(STATUS "Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels compile")
 else()
-    ascendc_library(vllm_ascend_kernels SHARED
-        ${VLLM_ASCEND_CUSTOM_OP}
-    )
+    if(VLLM_ASCEND_USE_PREBUILT_KERNELS)
+        find_library(VLLM_ASCEND_PREBUILT_KERNELS
+            NAMES vllm_ascend_kernels
+            PATHS
+                ${CMAKE_CURRENT_SOURCE_DIR}/vllm_ascend
+                ${CMAKE_CURRENT_SOURCE_DIR}/build/temp.linux-aarch64-cpython-311/lib
+                ${CMAKE_CURRENT_SOURCE_DIR}/build/lib.linux-aarch64-cpython-311/vllm_ascend
+            NO_DEFAULT_PATH)
+        if(NOT VLLM_ASCEND_PREBUILT_KERNELS)
+            message(FATAL_ERROR "VLLM_ASCEND_USE_PREBUILT_KERNELS is ON, but libvllm_ascend_kernels.so was not found.")
+        endif()
+        add_library(vllm_ascend_kernels SHARED IMPORTED GLOBAL)
+        set_target_properties(vllm_ascend_kernels PROPERTIES
+            IMPORTED_LOCATION "${VLLM_ASCEND_PREBUILT_KERNELS}")
+        message(STATUS "Using prebuilt vLLM Ascend kernels: ${VLLM_ASCEND_PREBUILT_KERNELS}")
+    else()
+        ascendc_library(vllm_ascend_kernels SHARED
+            ${VLLM_ASCEND_CUSTOM_OP}
+        )
+    endif()
 endif()
 
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
@@ -98,6 +118,7 @@ include_directories(
   ${TORCH_INCLUDE_DIRS}
   ${TORCH_NPU_PATH}/include
   ${ASCEND_HOME_PATH}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host
 )
 
@@ -200,5 +221,8 @@ target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGI
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
-  install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  if(NOT VLLM_ASCEND_USE_PREBUILT_KERNELS)
+    install(TARGETS vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  endif()
 endif()

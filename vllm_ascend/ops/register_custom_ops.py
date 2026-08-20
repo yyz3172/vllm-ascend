@@ -1,3 +1,5 @@
+from typing import List, Optional
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -215,6 +217,8 @@ def _muls_add_impl_fake(
     scale: float,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
 
 
 direct_register_custom_op(

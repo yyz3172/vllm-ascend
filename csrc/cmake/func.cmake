@@ -90,6 +90,10 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
                 "${CMAKE_CURRENT_SOURCE_DIR}/moe/**/framework/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/ffn/**/framework/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/mc2/**/framework/CMakeLists.txt"
+                # Cherry-picked turboquant / bit_residual ops live at csrc/ top-level
+                # (v0.18 layout). v0.23 category GLOB would otherwise skip them.
+                "${CMAKE_CURRENT_SOURCE_DIR}/bit_residual_*/op_host/CMakeLists.txt"
+                "${CMAKE_CURRENT_SOURCE_DIR}/turboquant_*/op_host/CMakeLists.txt"
             )
             List(APPEND OP_HOST_CMAKE_FILES ${CANNDEV_OPS_HOST_CMAKE_FILES})
         endif()

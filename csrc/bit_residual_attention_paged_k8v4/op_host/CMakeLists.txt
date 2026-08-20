@@ -1,0 +1,54 @@
+add_op_to_compiled_list()
+
+set(_TQ_BR_ATTN_COMPILE_OPTIONS
+        --cce-auto-sync=on
+        -DASCENDC_DUMP=0
+        -Wno-deprecated-declarations
+        -Werror
+)
+
+# Must match pack / FIA BR_KEY_UNIFORM_SCHEME (1=A, 2=B, 3=C).
+set(_BR_KEY_UNIFORM_SCHEME "1")
+if(DEFINED ENV{BR_KEY_UNIFORM_SCHEME})
+    set(_BR_KEY_UNIFORM_SCHEME "$ENV{BR_KEY_UNIFORM_SCHEME}")
+endif()
+list(APPEND _TQ_BR_ATTN_COMPILE_OPTIONS -DBR_KEY_UNIFORM_SCHEME=${_BR_KEY_UNIFORM_SCHEME})
+
+set(BIT_RESIDUAL_ATTENTION_PAGED_K8V4_DEBUG_LINE "OFF" CACHE STRING
+        "Enable -g for BitResidualAttentionPagedK8v4 AscendC kernel compile.")
+
+set(_TQ_BR_ATTN_DEBUG_LINE "${BIT_RESIDUAL_ATTENTION_PAGED_K8V4_DEBUG_LINE}")
+if(DEFINED ENV{BIT_RESIDUAL_ATTENTION_PAGED_K8V4_DEBUG_LINE})
+    set(_TQ_BR_ATTN_DEBUG_LINE "$ENV{BIT_RESIDUAL_ATTENTION_PAGED_K8V4_DEBUG_LINE}")
+endif()
+string(TOUPPER "${_TQ_BR_ATTN_DEBUG_LINE}" _TQ_BR_ATTN_DEBUG_LINE)
+if(_TQ_BR_ATTN_DEBUG_LINE STREQUAL "ON" OR _TQ_BR_ATTN_DEBUG_LINE STREQUAL "1" OR
+        _TQ_BR_ATTN_DEBUG_LINE STREQUAL "TRUE")
+    list(APPEND _TQ_BR_ATTN_COMPILE_OPTIONS -g)
+endif()
+
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnn PRIVATE
+        bit_residual_attention_paged_k8v4_def.cpp
+    )
+endif()
+
+add_ops_compile_options(
+        OP_NAME BitResidualAttentionPagedK8v4
+        OPTIONS ${_TQ_BR_ATTN_COMPILE_OPTIONS}
+)
+
+if (NOT BUILD_OPS_RTY_KERNEL)
+    add_modules_sources(OPTYPE bit_residual_attention_paged_k8v4 ACLNNTYPE aclnn)
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../op_kernel
+    )
+endif()
+
+file(GLOB _TQ_BR_ATTN_Aclnn_header
+        "${CMAKE_CURRENT_SOURCE_DIR}/aclnn_bit_residual_attention_paged_k8v4.h")
+
+install(FILES ${_TQ_BR_ATTN_Aclnn_header}
+        DESTINATION ${ACLNN_INC_INSTALL_DIR} OPTIONAL
+)

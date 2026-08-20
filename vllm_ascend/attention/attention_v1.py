@@ -15,8 +15,9 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
 import torch_npu
@@ -68,10 +69,99 @@ from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+from vllm_ascend.ops.turboquant_kv_cache import (
+    _try_8bit_decode_paged,
+    bit_residual_fia_paged_k8v4,
+    bit_residual_k8v4_key_packed_width,
+    turboquant_4bit_slab_cache_enabled,
+    turboquant_attention_paged4bit,
+    turboquant_attention_paged8bit,
+    ensure_turboquant_pack_tables_registered,
+    turboquant_decode_kv_cache_compact,
+    turboquant_fused_infer_attention_score_8bit,
+    turboquant_pack_kv_for_cache,
+    turboquant_pack_kv_for_cache_to_cache,
+    turboquant_packed_bytes_per_vector,
+    turboquant_slab_block_size_or_none,
+    warm_up_turboquant_4bit_pack_op,
+    warm_up_turboquant_4bit_tables,
+)
+from vllm_ascend.ascend_config import get_ascend_config
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_TURBOQUANT_FIA_WARMED: set[tuple[int, torch.dtype, int, int, int]] = set()
+
+
+def _normalize_npu_device(device: torch.device) -> torch.device:
+    if device.type not in ("npu", "privateuseone") or device.index is not None:
+        return device
+    try:
+        return torch.device(device.type, torch.npu.current_device())
+    except Exception:
+        return torch.device(device.type, 0)
+
+
+def _sync_npu(device: torch.device) -> None:
+    if device.type not in ("npu", "privateuseone"):
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+
+
+def _warm_up_turboquant_fia_op(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+) -> None:
+    """Pre-launch FIA once so smoke profile does not include ACL cold start."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        return
+    device = _normalize_npu_device(device)
+    device_index = device.index if device.index is not None else 0
+    warm_key = (device_index, dtype, head_size, num_heads, num_kv_heads)
+    if warm_key in _TURBOQUANT_FIA_WARMED:
+        return
+
+    query = torch.zeros((1, num_heads, head_size), device=device, dtype=dtype)
+    key = torch.zeros((1, num_kv_heads, head_size), device=device, dtype=dtype)
+    value = torch.zeros_like(key)
+    torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key,
+        value=value,
+        input_layout="TND",
+        actual_seq_lengths=[1],
+        actual_seq_lengths_kv=[1],
+        num_key_value_heads=num_kv_heads,
+        num_heads=num_heads,
+        scale=scale,
+        sparse_mode=3,
+    )
+    _sync_npu(device)
+    _TURBOQUANT_FIA_WARMED.add(warm_key)
+
+
+def _turboquant_kv_packed_slot_width(head_size: int) -> int:
+    """Per-vector packed byte width for K/V cache rows (``max(P_k, P_v)``)."""
+    try:
+        cfg = get_ascend_config()
+        pk = turboquant_packed_bytes_per_vector(
+            head_size, bits=cfg.turboquant_kv_bits_key
+        )
+        pv = turboquant_packed_bytes_per_vector(
+            head_size, bits=cfg.turboquant_kv_bits_value
+        )
+        return max(pk, pv)
+    except Exception:
+        return turboquant_packed_bytes_per_vector(head_size, bits=4)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -109,6 +199,24 @@ class AscendAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "turboquant":
+            try:
+                cfg = get_ascend_config()
+                bits_key = cfg.turboquant_kv_bits_key
+                bits_value = cfg.turboquant_kv_bits_value
+            except Exception:
+                bits_key = bits_value = None
+            # BitResidual k8v4: asymmetric 3D slab layout.
+            if bits_key == 8 and bits_value == 4 and head_size == 128:
+                key_width = bit_residual_k8v4_key_packed_width(block_size)
+                return (2, num_blocks, num_kv_heads, key_width)
+            if turboquant_4bit_slab_cache_enabled(
+                bits_key, bits_value
+            ):
+                packed = turboquant_packed_bytes_per_vector(head_size, bits=4)
+                return (2, num_blocks, num_kv_heads, block_size * packed)
+            packed = _turboquant_kv_packed_slot_width(head_size)
+            return (2, num_blocks, block_size, num_kv_heads, packed)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -172,6 +280,8 @@ class AscendMetadata:
     num_decode_tokens: int = 0
     num_prefills: int = 0
     num_decodes: int = 0
+    num_decodes_flatten: int = 0
+    num_reqs: int = 0
 
     # The sequence length per sequence. Sequence length means the computed
     # tokens + new tokens (is None if it is a decoding).
@@ -212,7 +322,6 @@ class AscendMetadata:
     reshape_cache_event: torch.npu.Event = None
 
     kvcomp_metadata: KVCompMetaData | None = None
-
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -282,6 +391,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        pack_num_reqs = 0
+        while (
+            pack_num_reqs < num_reqs
+            and query_start_loc_cpu[pack_num_reqs].item() < num_actual_tokens
+        ):
+            pack_num_reqs += 1
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.decode_threshold
@@ -302,9 +417,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
         if isinstance(self.kv_cache_spec, CrossAttentionSpec):
             seq_lens = common_attn_metadata.seq_lens
-            slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)
+            slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)[
+                :num_actual_tokens
+            ]
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
+
+        # Pack-to-cache / _npu_reshape_and_cache expect dense int32 slot indices.
+        # Normalize once here so hot paths do not call .to() / .contiguous() per layer.
+        if slot_mapping.dtype != torch.int32:
+            slot_mapping = slot_mapping.to(torch.int32)
+        if not slot_mapping.is_contiguous():
+            slot_mapping = slot_mapping.contiguous()
 
         attn_state = common_attn_metadata.attn_state
 
@@ -353,6 +477,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
+            num_reqs=pack_num_reqs,
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -417,6 +542,106 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.hidden_size = self.num_heads * self.head_size
         self.kv_cache_dtype = kv_cache_dtype
+        if kv_cache_dtype == "turboquant":
+            try:
+                cfg = get_ascend_config()
+                self.turboquant_kv_bits_key = cfg.turboquant_kv_bits_key
+                self.turboquant_kv_bits_value = cfg.turboquant_kv_bits_value
+            except Exception:
+                self.turboquant_kv_bits_key = 4
+                self.turboquant_kv_bits_value = 4
+            # Eager-register pack v2 tables (codebook + R^T) on the default NPU device.
+            # Only for TurboQuant [8,8] registered-pack; BitResidual K8V4 does not use them.
+            try:
+                if (
+                    self.turboquant_kv_bits_key == 8
+                    and self.turboquant_kv_bits_value == 8
+                ):
+                    ensure_turboquant_pack_tables_registered(
+                        torch.device("npu"),
+                        head_size,
+                        self.turboquant_kv_bits_key,
+                    )
+                warm_up_turboquant_4bit_tables(
+                    torch.device("npu"),
+                    head_size,
+                    self.turboquant_kv_bits_key,
+                    self.turboquant_kv_bits_value,
+                    self.vllm_config.model_config.dtype,
+                )
+                block_size = self.vllm_config.cache_config.block_size
+                warm_up_turboquant_4bit_pack_op(
+                    device=torch.device("npu"),
+                    dtype=self.vllm_config.model_config.dtype,
+                    head_size=head_size,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                if (
+                    self.turboquant_kv_bits_key == 4
+                    and self.turboquant_kv_bits_value == 4
+                ):
+                    _warm_up_turboquant_fia_op(
+                        device=torch.device("npu"),
+                        dtype=self.vllm_config.model_config.dtype,
+                        head_size=head_size,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        scale=self.scale,
+                    )
+                # Warm up BitResidual k8v4 rotation tensors (lazy-init quantizer).
+                if (
+                    self.turboquant_kv_bits_key == 8
+                    and self.turboquant_kv_bits_value == 4
+                    and head_size == 128
+                ):
+                    from vllm_ascend.ops.turboquant_kv_cache import (
+                        _bit_residual_k8v4_rotation_t,
+                        _bit_residual_k8v4_rotation,
+                    )
+                    _bit_residual_k8v4_rotation_t(
+                        torch.device("npu"), self.vllm_config.model_config.dtype
+                    )
+                    _bit_residual_k8v4_rotation(
+                        torch.device("npu"), self.vllm_config.model_config.dtype
+                    )
+            except Exception:
+                pass
+        else:
+            self.turboquant_kv_bits_key = 4
+            self.turboquant_kv_bits_value = 4
+        # BitResidual k8v4 is an immutable per-layer invariant; cache it once
+        # instead of recomputing ``bits==[8,4] and head_size==128`` on every
+        # forward at each dispatch site.
+        self._bit_residual_k8v4 = (
+            self.kv_cache_dtype == "turboquant"
+            and self.turboquant_kv_bits_key == 8
+            and self.turboquant_kv_bits_value == 4
+            and self.head_size == 128
+        )
+        # cache_config.block_size is read on every k8v4 forward (site A/C);
+        # snapshot it once to skip the attribute-chain lookup in the hot path.
+        self._block_size = self.vllm_config.cache_config.block_size
+        if self._bit_residual_k8v4:
+            # k8v4 is FIA-only: bit_residual_fia_paged_k8v4 handles every
+            # attn_state unconditionally (no env-gated A/B, no vector fallback),
+            # so there are no per-call dispatch flags left to snapshot.
+            # Pre-resolve the Haar rotation tensors (R^T / R). The k8v4 ops
+            # otherwise look them up per call (device-normalize + str(device) +
+            # str(dtype) + dict probe, twice per forward). device/dtype are
+            # immutable per layer, and the warm-up above already populated the
+            # getter cache, so this is a dict hit. Passing these to the ops
+            # lets them skip the per-call getter entirely.
+            from vllm_ascend.ops.turboquant_kv_cache import (  # noqa: PLC0415
+                _bit_residual_k8v4_rotation,
+                _bit_residual_k8v4_rotation_t,
+            )
+            _br_dev = torch.device("npu")
+            _br_dtype = self.vllm_config.model_config.dtype
+            self._br_rotation_key = _bit_residual_k8v4_rotation_t(_br_dev, _br_dtype)
+            self._br_rotation_value = _bit_residual_k8v4_rotation(_br_dev, _br_dtype)
         self.sliding_window = sliding_window
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
@@ -428,6 +653,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.key_cache = None
         self.value_cache = None
+        self._decoded_key_cache = None
+        self._decoded_value_cache = None
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
@@ -1172,6 +1399,39 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return output
 
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):
+        def _cache_view_for_fia(cache: torch.Tensor) -> tuple[int, torch.Tensor]:
+            if self.kv_cache_dtype == "turboquant":
+                # BitResidual k8v4 is 3D [num_blocks, num_kv_heads, packed_width].
+                # Stock FIA expects 4D; k8v4 must use `_br_fia_paged_k8v4` instead.
+                # Keep a shape-safe view here only as a defensive fallback.
+                if getattr(self, "_bit_residual_k8v4", False) and cache.ndim == 3:
+                    block_size = int(getattr(self, "_block_size", 0) or 0)
+                    if block_size <= 0:
+                        raise ValueError(
+                            "k8v4 cache is 3D but _block_size is unset; "
+                            "use _br_fia_paged_k8v4 instead of stock FIA."
+                        )
+                    return block_size, cache.view(cache.shape[0], block_size, -1)
+                slab_block_size = turboquant_slab_block_size_or_none(
+                    cache,
+                    head_size=self.head_size,
+                    bits=self.turboquant_kv_bits_key,
+                )
+                if slab_block_size is not None:
+                    # Slab cache must be decoded before FIA; this view is only a
+                    # shape-safe placeholder for paths that immediately decode.
+                    return slab_block_size, cache.view(
+                        cache.shape[0], slab_block_size, -1
+                    )
+            if cache.ndim == 3:
+                raise ValueError(
+                    f"stock FIA cache view expects 4D [blocks, block_size, "
+                    f"heads, dim], got 3D {tuple(cache.shape)}; k8v4/slab "
+                    f"layouts must use their dedicated attention path."
+                )
+            num_block, block_size, _, _ = cache.shape
+            return block_size, cache.view(num_block, block_size, -1)
+
         # PrefillNoCache doesn't need key_cache, but other modes do
         # Only initialize/require cache for modes that actually use it
         if attn_metadata.attn_state != AscendAttentionState.PrefillNoCache:
@@ -1191,45 +1451,133 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     f"key_cache is None in _get_fia_params for mode {attn_metadata.attn_state}. kv_cache={kv_cache}"
                 )
 
+        # k8v4 bypasses this entirely (handled by the FIA-only fast path in
+        # forward_fused_infer_attention), so only non-k8v4 layouts reach here.
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             block_size = 128
             block_table = None
             actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
             if self.attn_type == AttentionType.ENCODER_DECODER:
                 actual_seq_lengths_kv = torch.cumsum(attn_metadata.seq_lens, dim=0).tolist()
-        elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
-            batch_size = attn_metadata.seq_lens.shape[0]
-            block_table = attn_metadata.block_tables[:batch_size, :]
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
-        elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
-        # chunked prefill.
         else:
-            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1
-            )
+            # PrefillCacheHit / ChunkedPrefill / DecodeOnly: read paged KV cache.
+            block_size, key = _cache_view_for_fia(self.key_cache)  # type: ignore[arg-type]
+            _, value = _cache_view_for_fia(self.value_cache)  # type: ignore[arg-type]
             block_table = attn_metadata.block_tables
+            if attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+                block_table = block_table[: attn_metadata.seq_lens.shape[0], :]
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
+
+    def _br_fia_paged_k8v4(
+        self,
+        *,
+        query: torch.Tensor,
+        block_tables: torch.Tensor,
+        actual_seq_lengths_q,
+        actual_seq_lengths_kv,
+        block_size: int,
+        atten_mask: torch.Tensor | None,
+        sparse_mode: int,
+        out: torch.Tensor,
+    ):
+        """Call ``bit_residual_fia_paged_k8v4`` with this layer's cached params
+        (key/value_cache, head/num_heads, scale, rotation). Each dispatch site
+        passes only what differs (``block_tables``, kv-length source,
+        ``block_size``, ``atten_mask``, ``sparse_mode``, ``out``); the kernel
+        writes ``out`` in place."""
+        return bit_residual_fia_paged_k8v4(
+            query=query,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            block_tables=block_tables,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            head_size=self.head_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            block_size=block_size,
+            scale=self.scale,
+            atten_mask=atten_mask,
+            pre_tokens=SWA_INT_MAX,
+            next_tokens=SWA_INT_MAX,
+            sparse_mode=sparse_mode,
+            rotation_key=self._br_rotation_key,
+            rotation_value=self._br_rotation_value,
+            out=out,
+        )
+
+    def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
+        batch_size = attn_metadata.seq_lens.shape[0]
+        block_size = 128
+        query = query.view(batch_size, 1, self.num_heads * self.head_size)
+        key = self.key_cache
+        value = self.value_cache
+        if self.key_cache is not None and self.value_cache is not None:
+            block_size = self.key_cache.shape[1]
+            if self.kv_cache_dtype == "turboquant":
+                assert self._decoded_key_cache is not None
+                assert self._decoded_value_cache is not None
+                key = self._decoded_key_cache.flatten(2, 3).contiguous()
+                value = self._decoded_value_cache.flatten(2, 3).contiguous()
+            else:
+                key = self.key_cache.flatten(2, 3).contiguous()
+                value = self.value_cache.flatten(2, 3).contiguous()
+
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BSH",
+            block_size=block_size,
+            pre_tokens=self.sliding_window,
+            scale=self.scale,
+            block_table=attn_metadata.block_tables,
+            actual_seq_lengths=[1] * len(attn_metadata.seq_lens),
+            actual_seq_lengths_kv=attn_metadata.seq_lens,
+        )
+
+        attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
+        output[:batch_size] = attn_output[:batch_size]
+        return output
+
+    def _forward_bit_residual_k8v4_paged(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        *,
+        num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Paged k8v4 FIA for PrefillCacheHit / ChunkedPrefill / DecodeOnly.
+
+        Must run for both eager and ACL-graph capture: stock ``full_graph_fia``
+        assumes 4D KV cache, while k8v4 is 3D packed uint8.
+        """
+        if num_tokens is None:
+            num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        state = attn_metadata.attn_state
+        batch_size = attn_metadata.seq_lens.shape[0]
+        block_tables = (
+            attn_metadata.block_tables[:batch_size, :]
+            if state == AscendAttentionState.PrefillCacheHit
+            else attn_metadata.block_tables
+        )
+        is_decode = state == AscendAttentionState.DecodeOnly
+        self._br_fia_paged_k8v4(
+            query=query,
+            block_tables=block_tables,
+            actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+            block_size=self._block_size,
+            atten_mask=None if is_decode else attn_metadata.attn_mask,
+            sparse_mode=0 if is_decode else 3,
+            out=output[:num_tokens],
+        )
+        return output
 
     def forward_fused_infer_attention(
         self,
@@ -1240,6 +1588,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         kv_cache=None,
     ):
+        # k8v4 packed FIA for PrefillCacheHit / ChunkedPrefill / DecodeOnly --
+        # these read the already-packed paged KV. PrefillNoCache is excluded:
+        # the first-time prefill uses the freshly-computed float K/V via the
+        # generic float-FIA path below (full precision, no quant error).
+        # IMPORTANT: handle before ACL-graph ``full_graph_fia`` — that path
+        # unpacks 4D cache and crashes on 3D k8v4 slabs during capture.
+        if (
+            self._bit_residual_k8v4
+            and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+        ):
+            return self._forward_bit_residual_k8v4_paged(query, attn_metadata, output)
+
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
@@ -1252,6 +1612,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+        if (
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and self.sliding_window is not None
+            and attn_metadata.seq_lens.shape[0] == query.size(0)
+            and self.sinks is None
+        ):
+            return self._forward_fia_slidingwindow(query, attn_metadata, output)
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+
         passed_key = key
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
@@ -1263,8 +1633,125 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table, actual_seq_lengths_kv = get_kvcomp_decode_params(
                 self.layerIndex, attn_metadata.kvcomp_metadata, query, passed_key, block_table, actual_seq_lengths_kv
             )
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        query = query[:num_tokens]
+
+        if self.kv_cache_dtype == "turboquant" and block_table is not None:
+            assert self.key_cache is not None and self.value_cache is not None
+
+            slab_block_size = turboquant_slab_block_size_or_none(
+                self.key_cache,
+                head_size=self.head_size,
+                bits=self.turboquant_kv_bits_key,
+            )
+            use_slab_cache = slab_block_size is not None
+            # Scheme B kernel supports DecodeOnly and ChunkedPrefill (mixed
+            # prefill/decode) with per-token causal KV bounds.
+            if not use_slab_cache and attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.ChunkedPrefill,
+            ):
+                attn_output = turboquant_attention_paged8bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                if attn_output is not None:
+                    output[:num_tokens] = attn_output[:num_tokens]
+                    return output
+            if use_slab_cache and attn_metadata.attn_state in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.ChunkedPrefill,
+            ):
+                attn_output = turboquant_attention_paged4bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                if attn_output is not None:
+                    output[:num_tokens] = attn_output[:num_tokens]
+                    return output
+            # Phase 1 / scheme A: decode packed 8-bit KV -> compact fp16 via the
+            # fused paged decode op (opt-in), then fall through to the standard
+            # FIA below. Returns None (and we keep the old paths) when disabled or
+            # the op/conditions are not met.
+            fast = None
+            if not use_slab_cache:
+                fast = _try_8bit_decode_paged(
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_table=block_table,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    dtype=query.dtype,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+            if fast is not None:
+                key_ws, value_ws, block_table = fast
+                key = key_ws.flatten(2, 3).contiguous()
+                value = value_ws.flatten(2, 3).contiguous()
+            elif (
+                self.sinks is None
+                and self.turboquant_kv_bits_key == 8
+                and self.turboquant_kv_bits_value == 8
+                and self.head_size == 128
+                and query.dtype == torch.float16
+            ):
+                attn_output = turboquant_fused_infer_attention_score_8bit(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    atten_mask=attn_metadata.attn_mask,
+                    actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    scale=self.scale,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                )
+                output[:num_tokens] = attn_output[:num_tokens]
+                return output
+            else:
+                key_dec, value_dec, block_table = turboquant_decode_kv_cache_compact(
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    block_tables=block_table,
+                    head_size=self.head_size,
+                    dtype=query.dtype,
+                    bits_key=self.turboquant_kv_bits_key,
+                    bits_value=self.turboquant_kv_bits_value,
+                    decode_only_arange_fast_path=(
+                        attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                    ),
+                )
+                # FIA expects key/value shaped like [num_blocks, block_size, hidden]
+                # in TND layout flattening; keep consistent with existing path.
+                key = key_dec.flatten(2, 3).contiguous()
+                value = value_dec.flatten(2, 3).contiguous()
+
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
@@ -1366,19 +1853,46 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # BitResidual k8v4 Decode: FIA-only. Must run before ACL-graph PA
+        # capture (stock paged-attn expects a different cache layout).
+        if self.kv_cache_dtype == "turboquant" and self._bit_residual_k8v4:
+            assert self.key_cache is not None and self.value_cache is not None
+            self._br_fia_paged_k8v4(
+                query=query,
+                block_tables=attn_metadata.block_tables,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                block_size=self._block_size,
+                atten_mask=None,
+                sparse_mode=0,
+                out=output,
+            )
+            return output
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
-        torch_npu._npu_paged_attention(
-            query=query,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            num_kv_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
-            scale_value=self.scale,
-            block_table=attn_metadata.block_tables,
-            context_lens=attn_metadata.seq_lens,
-            out=output,
-        )
+        block_table = attn_metadata.block_tables
+        key_cache = self.key_cache
+        value_cache = self.value_cache
+        if self.kv_cache_dtype == "turboquant":
+            assert key_cache is not None and value_cache is not None
+            key_cache, value_cache, block_table = turboquant_decode_kv_cache_compact(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_tables=block_table,
+                head_size=self.head_size,
+                dtype=query.dtype,
+                bits_key=self.turboquant_kv_bits_key,
+                bits_value=self.turboquant_kv_bits_value,
+            )
+        torch_npu._npu_paged_attention(query=query,
+                                       key_cache=key_cache,
+                                       value_cache=value_cache,
+                                       num_kv_heads=self.num_kv_heads,
+                                       num_heads=self.num_heads,
+                                       scale_value=self.scale,
+                                       block_table=block_table,
+                                       context_lens=attn_metadata.seq_lens,
+                                       out=output)
         return output
 
     def _forward_encoder_attention(
@@ -1439,8 +1953,63 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if len(kv_cache) > 1:
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                if self.kv_cache_dtype == "turboquant":
+                    try:
+                        block_size = turboquant_slab_block_size_or_none(
+                            self.key_cache,
+                            head_size=self.head_size,
+                            bits=self.turboquant_kv_bits_key,
+                        )
+                        if block_size is not None:
+                            warm_up_turboquant_4bit_pack_op(
+                                device=key.device,
+                                dtype=key.dtype,
+                                head_size=self.head_size,
+                                num_kv_heads=self.num_kv_heads,
+                                block_size=block_size,
+                                bits_key=self.turboquant_kv_bits_key,
+                                bits_value=self.turboquant_kv_bits_value,
+                            )
+                    except Exception:
+                        pass
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+            
+            if self.kv_cache_dtype == "turboquant":
+                if attn_metadata.num_actual_tokens > 0:
+                    # slot_mapping is int32+contiguous from metadata build().
+                    # K/V are contiguous after Attention.forward view(-1, H, D).
+                    num_tok = attn_metadata.num_actual_tokens
+                    if not encoder_decoder:
+                        key_in = key if key.shape[0] == num_tok else key[:num_tok]
+                        value_in = (
+                            value if value.shape[0] == num_tok else value[:num_tok]
+                        )
+                        cache_slots = (
+                            slots if slots.shape[0] == num_tok else slots[:num_tok]
+                        )
+                    else:
+                        key_in = key
+                        value_in = value
+                        cache_slots = slots
+                    turboquant_pack_kv_for_cache_to_cache(
+                        key=key_in,
+                        value=value_in,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        slot_mapping=cache_slots,
+                        query_start_loc=attn_metadata.query_start_loc,
+                        num_reqs=attn_metadata.num_reqs,
+                        bits_key=self.turboquant_kv_bits_key,
+                        bits_value=self.turboquant_kv_bits_value,
+                        rotation_t=self._br_rotation_key,
+                    )
+                if self.is_kv_producer:
+                    if attn_metadata.reshape_cache_event is None:
+                        attn_metadata.reshape_cache_event = torch.npu.Event()
+                    attn_metadata.reshape_cache_event.record()
+                return query, key, value, output
+            
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
@@ -1493,8 +2062,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape =
-                [2, num_blocks, block_size, num_kv_heads, head_size]
+            kv_cache: ``(key_cache, value_cache)`` each
+                ``[num_blocks, block_size, num_kv_heads, slot_dim]``.
+                For fp16/bf16, ``slot_dim`` is ``head_size`` and both tensors match.
+                For TurboQuant uint8, ``slot_dim`` is packed bytes per vector; with
+                mixed K/V bits, ``key_cache.shape[-1]`` (``P_k``) and
+                ``value_cache.shape[-1]`` (``P_v``) may differ—quantize/pack uses each
+                tensor's own last dim (see ``turboquant_pack_kv_for_cache``).
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -1541,7 +2115,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
-        output[:num_tokens] = attn_output[:num_tokens]
+        # All eager Ascend attention paths accept and return the caller-provided
+        # output buffer. Avoid dispatching an in-place copy when that exact
+        # buffer is returned; preserve the copy for any future allocating path.
+        if attn_output is not output:
+            output[:num_tokens] = attn_output[:num_tokens]
         return output
 
 

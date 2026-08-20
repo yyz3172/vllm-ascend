@@ -365,6 +365,13 @@ class NPUModelRunner(GPUModelRunner):
 
         return self.input_batch
 
+    @torch.inference_mode()
+    def sample_tokens(
+        self,
+        grammar_output: GrammarOutput | None,
+    ):
+        return super().sample_tokens(grammar_output)
+
     def postprocess(
         self,
         input_batch,

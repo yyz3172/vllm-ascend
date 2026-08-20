@@ -243,6 +243,151 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     return {out, expert_token_nums};
 }
 
+at::Tensor turboquant_decode_packed_blocks_meta(
+    const at::Tensor &packed,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    int64_t head_size,
+    int64_t out_dtype_code) {
+    (void)codebook;
+    (void)rotation;
+    // packed: [N, P] -> output [N, D]
+    TORCH_CHECK(packed.dim() == 2, "packed must be 2D");
+    auto N = packed.sym_size(0);
+    at::ScalarType out_dtype = (out_dtype_code == 1) ? at::kBFloat16 : at::kHalf;
+    return at::empty_symint({N, head_size}, packed.options().dtype(out_dtype).device(at::kMeta));
+}
+
+at::Tensor turboquant_decode_packed_blocks_compact_meta(
+    const at::Tensor &packed,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation_batched,
+    int64_t head_size,
+    int64_t out_dtype_code) {
+    (void)codebook;
+    (void)rotation_batched;
+    TORCH_CHECK(packed.dim() == 4, "packed must be 4D");
+    at::ScalarType out_dtype = (out_dtype_code == 1) ? at::kBFloat16 : at::kHalf;
+    auto U = packed.sym_size(0);
+    auto BS = packed.sym_size(1);
+    auto H = packed.sym_size(2);
+    return at::empty_symint({U, BS, H, head_size}, packed.options().dtype(out_dtype).device(at::kMeta));
+}
+
+at::Tensor turboquant_encode_packed_blocks_meta(
+    const at::Tensor &y,
+    const at::Tensor &codebook,
+    const at::Tensor &norms_fp16,
+    int64_t head_size,
+    int64_t bits) {
+    (void)codebook;
+    (void)norms_fp16;
+    TORCH_CHECK(y.dim() == 2, "y must be 2D");
+    TORCH_CHECK(bits == 4 || bits == 8, "bits must be 4 or 8");
+    auto N = y.sym_size(0);
+    int64_t packed_bytes = bits == 8 ? head_size + 2 : head_size / 2 + 2;
+    return at::empty_symint({N, packed_bytes}, y.options().dtype(at::kByte).device(at::kMeta));
+}
+
+void turboquant_pack_register_tables_meta(
+    const at::Tensor &codebook,
+    const at::Tensor &rotation_t) {
+    (void)codebook;
+    (void)rotation_t;
+}
+
+std::tuple<at::Tensor, at::Tensor> turboquant_pack_kv_for_cache_meta(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    std::vector<c10::SymInt> shape_k(key.sym_sizes().begin(), key.sym_sizes().end());
+    std::vector<c10::SymInt> shape_v(value.sym_sizes().begin(), value.sym_sizes().end());
+    shape_k.back() = slot_w_k;
+    shape_v.back() = slot_w_v;
+    auto opts_k = key.options().dtype(at::kByte).device(at::kMeta);
+    auto opts_v = value.options().dtype(at::kByte).device(at::kMeta);
+    return std::make_tuple(
+        at::empty_symint(shape_k, opts_k),
+        at::empty_symint(shape_v, opts_v));
+}
+
+void turboquant_pack_kv_for_cache_to_cache_meta(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t slot_w_k,
+    int64_t slot_w_v) {
+    (void)key;
+    (void)value;
+    (void)slot_mapping;
+    (void)key_cache;
+    (void)value_cache;
+    (void)slot_w_k;
+    (void)slot_w_v;
+}
+
+std::tuple<at::Tensor, at::Tensor> turboquant_decode_paged_8bit_meta(
+    const at::Tensor &key_cache,
+    const at::Tensor &value_cache,
+    const at::Tensor &gather_block_ids,
+    const at::Tensor &codebook,
+    const at::Tensor &rotation,
+    int64_t head_size,
+    int64_t block_size,
+    int64_t out_dtype_code,
+    int64_t mode) {
+    (void)value_cache;
+    (void)codebook;
+    (void)rotation;
+    (void)out_dtype_code;
+    (void)mode;
+    const c10::SymInt total_blocks = gather_block_ids.sym_size(0);
+    const c10::SymInt num_kv_heads = key_cache.sym_size(2);
+    std::vector<c10::SymInt> shape{total_blocks, block_size, num_kv_heads, head_size};
+    auto opts = key_cache.options().dtype(at::kHalf).device(at::kMeta);
+    return std::make_tuple(
+        at::empty_symint(shape, opts),
+        at::empty_symint(shape, opts));
+}
+
+at::Tensor turboquant_fused_infer_attention_score_8bit_meta(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& block_table,
+    const at::Tensor& atten_mask,
+    const at::Tensor& actual_seq_len_q,
+    const at::Tensor& actual_seq_len_kv,
+    const at::Tensor& codebook,
+    const at::Tensor& rotation,
+    const at::Tensor& codebook_value,
+    const at::Tensor& rotation_value,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t block_size,
+    double scale_value) {
+    (void)key_cache;
+    (void)value_cache;
+    (void)block_table;
+    (void)atten_mask;
+    (void)actual_seq_len_q;
+    (void)actual_seq_len_kv;
+    (void)codebook;
+    (void)rotation;
+    (void)codebook_value;
+    (void)rotation_value;
+    (void)num_heads;
+    (void)num_kv_heads;
+    (void)head_size;
+    (void)block_size;
+    (void)scale_value;
+    return at::empty_symint(query.sym_sizes(), query.options().dtype(query.scalar_type()).device(at::kMeta));
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
@@ -1876,6 +2021,22 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+    // TurboQuant packed decode
+    ops.impl("turboquant_decode_packed_blocks", &vllm_ascend::meta::turboquant_decode_packed_blocks_meta);
+    // TurboQuant packed decode for compact KV blocks
+    ops.impl("turboquant_decode_packed_blocks_compact", &vllm_ascend::meta::turboquant_decode_packed_blocks_compact_meta);
+    // TurboQuant packed encode (4-bit MSE quant)
+    ops.impl("turboquant_encode_packed_blocks", &vllm_ascend::meta::turboquant_encode_packed_blocks_meta);
+    ops.impl("turboquant_pack_kv_for_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_v2", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_v3", &vllm_ascend::meta::turboquant_pack_kv_for_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_v2_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_v3_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
+    ops.impl("turboquant_pack_kv_for_cache_to_cache", &vllm_ascend::meta::turboquant_pack_kv_for_cache_to_cache_meta);
+
+    ops.impl("turboquant_pack_register_tables", &vllm_ascend::meta::turboquant_pack_register_tables_meta);
+    ops.impl("turboquant_fused_infer_attention_score_8bit", &vllm_ascend::meta::turboquant_fused_infer_attention_score_8bit_meta);
+    ops.impl("turboquant_decode_paged_8bit", &vllm_ascend::meta::turboquant_decode_paged_8bit_meta);
 }
 }
 #endif

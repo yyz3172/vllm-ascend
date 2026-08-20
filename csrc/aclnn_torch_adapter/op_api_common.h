@@ -21,8 +21,12 @@
 #include <ATen/Tensor.h>
 #include <acl/acl_base.h>
 #include <c10/util/Exception.h>
+#include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
+#include <exception>
 #include <functional>
+#include <new>
 #include <type_traits>
 #include <vector>
 
@@ -714,7 +718,7 @@ typedef void (*ReleaseHugeMem)(void *, bool);
         ConvertTypes(__VA_ARGS__, workspace_size_addr, executor_addr);        \
     static auto getWorkspaceSizeFunc =                                        \
         ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);       \
-    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);     \
+    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);        \
     TORCH_CHECK(workspace_status == 0,                                        \
                 "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
     void *workspace_addr = nullptr;                                           \

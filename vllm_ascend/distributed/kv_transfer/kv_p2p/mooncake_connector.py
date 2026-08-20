@@ -3768,3 +3768,6 @@ def get_prefill_pp_indices(
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
         return (start_layer, end_layer)
+
+# Compat alias for older PD bench / CLI configs
+MooncakeConnectorV1 = MooncakeConnector

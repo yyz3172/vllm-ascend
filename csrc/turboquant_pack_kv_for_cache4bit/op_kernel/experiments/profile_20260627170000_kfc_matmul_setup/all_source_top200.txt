@@ -1,0 +1,2041 @@
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /root/x00827378/vllm-ascend/mytmp/build_libcust_opapi_nodebug_debug_line/binary/ascend910b/src/turboquant_pack_kv_for_cache4bit/turboquant_pack_kv_for_cache4bit.cpp
+Line  Instructions Executed  Records  Range Count
+97    800                    1       35
+102   400                    1       156
+103   480                    1       52
+104   160                    1       52
+108   0                      1       96
+109   0                      1       36
+110   0                      1       32
+114   24576                  1       40
+115   16384                  1       20
+116   8192                   1       20
+120   24736                  1       82
+121   16464                  1       59
+122   8232                   1       40
+126   6144                   1       156
+127   4096                   1       104
+128   2048                   1       52
+132   6144                   1       156
+133   4096                   1       56
+134   2048                   1       52
+138   160                    1       255
+139   80                     1       88
+140   40                     1       85
+144   120                    1       255
+145   80                     1       88
+146   40                     1       85
+150   120                    1       255
+151   80                     1       135
+152   40                     1       85
+251   0                      1       96
+252   0                      1       128
+254   0                      1       73
+255   0                      1       96
+256   0                      1       160
+257   0                      1       96
+265   12288                  1       68
+266   12288                  1       80
+268   18432                  1       46
+272   280                    1       162
+273   240                    1       262
+274   240                    1       212
+284   0                      1       32
+285   0                      1       96
+286   0                      1       100
+327   960                    1       2
+344   120                    1       1
+346   40                     1       1
+347   120                    1       3
+348   160                    1       3
+349   280                    1       4
+350   80                     1       1
+351   40                     1       1
+352   80                     1       2
+353   160                    1       3
+355   80                     1       2
+357   80                     1       2
+359   80                     1       1
+361   480                    1       6
+362   160                    1       3
+363   80                     1       2
+364   40                     1       1
+365   120                    1       2
+366   3200                   1       10
+378   120                    1       2
+379   160                    1       2
+380   120                    1       1
+381   120                    1       1
+382   160                    1       2
+383   320                    1       3
+384   120                    1       1
+387   1160                   1       6
+388   800                    1       8
+389   640                    1       6
+390   800                    1       3
+391   800                    1       3
+392   800                    1       3
+393   800                    1       4
+394   840                    1       4
+396   680                    1       4
+397   440                    1       5
+398   440                    1       5
+400   600                    1       5
+401   640                    1       4
+402   440                    1       3
+403   600                    1       4
+404   600                    1       3
+406   560                    1       2
+410   120                    1       1
+416   200                    1       3
+417   200                    1       2
+420   2173274                1       3
+428   4960                   1       72
+429   4720                   1       81
+430   800                    1       66
+431   960                    1       44
+432   160                    1       20
+433   160                    1       13
+434   1120                   1       60
+436   1040                   1       60
+437   45440                  1       112
+438   16384                  1       40
+440   73728                  1       59
+441   8192                   1       20
+442   16384                  1       38
+443   188416                 1       50
+444   8192                   1       20
+445   16384                  1       40
+446   49152                  1       40
+447   24576                  1       40
+448   49152                  1       79
+450   65536                  1       21
+451   8192                   1       20
+452   32768                  1       40
+453   8192                   1       20
+454   65536                  1       60
+455   8192                   1       20
+458   3520                   1       80
+459   1920                   1       96
+468   4320                   1       100
+469   5040                   1       39
+470   800                    1       35
+471   480                    1       22
+474   160                    1       21
+475   0                      1       45
+476   0                      1       20
+478   0                      1       23
+479   0                      1       20
+482   13760                  1       53
+483   2080                   1       97
+484   8800                   1       72
+485   2080                   1       22
+486   480                    1       37
+489   21622                  1       77
+490   13280                  1       60
+492   3840                   1       80
+493   1920                   1       100
+499   0                      1       598
+500   0                      1       280
+503   0                      1       300
+508   0                      1       56
+509   0                      1       76
+510   0                      1       60
+511   0                      1       60
+512   0                      1       60
+513   0                      1       60
+514   0                      1       60
+515   0                      1       60
+516   0                      1       60
+517   0                      1       60
+518   0                      1       60
+519   0                      1       60
+520   0                      1       60
+521   0                      1       60
+522   0                      1       60
+527   0                      1       20
+530   0                      1       40
+531   0                      1       20
+537   2280                   1       22
+539   120                    1       20
+540   280                    1       22
+541   15320                  1       60
+542   35560                  1       40
+544   40                     1       20
+549   160                    1       20
+552   53600                  1       38
+553   80                     1       38
+563   0                      1       320
+569   0                      1       300
+570   0                      1       572
+573   0                      1       267
+577   0                      1       280
+585   0                      1       20
+586   0                      1       20
+587   0                      1       40
+588   0                      1       20
+589   0                      1       20
+590   0                      1       20
+591   0                      1       20
+592   0                      1       20
+593   0                      1       20
+594   0                      1       22
+595   0                      1       20
+596   0                      1       20
+597   0                      1       20
+598   0                      1       20
+599   0                      1       20
+600   0                      1       20
+601   0                      1       39
+609   81920                  1       36
+610   8192                   1       20
+615   24576                  1       22
+616   8192                   1       20
+620   8192                   1       20
+621   49152                  1       40
+627   8192                   1       20
+628   57344                  1       26
+629   8192                   1       20
+630   122880                 1       54
+637   8192                   1       20
+638   57344                  1       56
+646   8192                   1       20
+653   4320                   1       100
+654   3920                   1       62
+655   1280                   1       68
+656   960                    1       63
+657   800                    1       75
+658   800                    1       62
+659   800                    1       60
+660   640                    1       60
+661   800                    1       74
+662   800                    1       43
+664   2240                   1       115
+665   160                    1       20
+666   960                    1       67
+667   53840                  1       20
+669   52832                  1       97
+670   16384                  1       37
+673   98304                  1       54
+674   8192                   1       20
+675   450560                 1       75
+676   40960                  1       20
+681   8192                   1       20
+682   8192                   1       20
+687   8192                   1       20
+688   49152                  1       40
+689   8192                   1       20
+690   16384                  1       40
+691   16384                  1       40
+694   8192                   1       20
+697   0                      1       20
+699   0                      1       95
+700   0                      1       37
+703   0                      1       41
+704   0                      1       20
+705   0                      1       41
+706   0                      1       22
+711   0                      1       20
+712   0                      1       23
+717   0                      1       20
+718   0                      1       40
+719   0                      1       20
+720   0                      1       40
+721   0                      1       40
+724   0                      1       20
+729   41920                  1       42
+731   16384                  1       20
+732   32768                  1       20
+733   24576                  1       40
+734   8192                   1       20
+737   160                    1       20
+739   4640                   1       76
+740   2720                   1       111
+746   0                      1       24
+753   120                    1       2
+756   80                     1       1
+757   240                    1       1
+758   120                    1       2
+767   0                      1       42
+768   0                      1       84
+769   0                      1       68
+770   0                      1       42
+771   0                      1       42
+779   0                      1       32
+784   0                      1       27
+785   0                      1       44
+786   0                      1       33
+805   0                      1       30
+806   0                      1       30
+807   0                      1       44
+809   0                      1       44
+812   0                      1       32
+813   0                      1       16
+814   0                      1       16
+815   0                      1       32
+820   0                      1       62
+833   320                    1       3
+838   4080                   1       7
+839   640                    1       12
+841   960                    1       10
+843   960                    1       12
+844   160                    1       2
+847   0                      1       2
+848   0                      1       26
+849   0                      1       22
+850   0                      1       10
+851   0                      1       10
+852   0                      1       34
+854   0                      1       10
+858   0                      1       2
+859   3840                   1       14
+863   703776                 1       155
+864   78662                  1       180
+865   994112                 1       179
+876   0                      1       84
+880   0                      1       32
+890   36864                  1       441
+891   6144                   1       172
+894   0                      1       98
+896   0                      1       66
+897   0                      1       80
+898   0                      1       32
+899   0                      1       32
+900   0                      1       32
+903   45056                  1       589
+905   12288                  1       328
+906   0                      1       48
+908   6144                   1       172
+909   28672                  1       348
+910   6144                   1       172
+912   22528                  1       388
+913   0                      1       32
+914   43008                  1       417
+922   2048                   1       2
+923   16384                  1       28
+924   2048                   1       20
+925   6144                   1       58
+927   14336                  1       40
+938   0                      1       38
+943   0                      1       38
+944   0                      1       16
+947   0                      1       16
+948   0                      1       16
+951   0                      1       66
+952   0                      1       16
+954   0                      1       32
+955   0                      1       32
+956   0                      1       32
+957   0                      1       16
+960   0                      1       16
+963   0                      1       32
+967   0                      1       51
+968   0                      1       34
+972   0                      1       60
+974   0                      1       46
+976   0                      1       16
+977   0                      1       16
+978   0                      1       32
+979   0                      1       32
+981   0                      1       32
+983   0                      1       32
+984   0                      1       36
+986   0                      1       84
+989   0                      1       128
+990   0                      1       128
+993   0                      1       25
+994   0                      1       25
+995   0                      1       16
+998   0                      1       32
+999   0                      1       16
+1003  0                      1       32
+1008  80                     1       33
+1011  760                    1       100
+1012  40                     1       53
+1013  40                     1       33
+1017  2048                   1       20
+1031  0                      1       16
+1032  0                      1       32
+1036  0                      1       16
+1037  0                      1       32
+1038  0                      1       16
+1040  0                      1       69
+1041  0                      1       16
+1042  0                      1       16
+1043  0                      1       16
+1045  0                      1       32
+1049  0                      1       16
+1050  0                      1       34
+1055  0                      1       39
+1056  0                      1       16
+1057  0                      1       16
+1058  0                      1       32
+1059  0                      1       16
+1060  0                      1       16
+1066  0                      1       33
+1067  0                      1       16
+1068  0                      1       33
+1069  0                      1       50
+1071  0                      1       16
+1072  0                      1       16
+1075  0                      1       32
+1076  0                      1       16
+1079  0                      1       32
+1080  0                      1       36
+1081  0                      1       41
+1083  0                      1       73
+1084  0                      1       48
+1086  0                      1       16
+1087  0                      1       48
+1088  0                      1       81
+1089  0                      1       85
+1090  0                      1       36
+1093  0                      1       16
+1094  0                      1       16
+1095  0                      1       70
+1096  0                      1       70
+1097  0                      1       32
+1099  0                      1       16
+1102  0                      1       16
+1103  0                      1       16
+1117  0                      1       11
+1120  0                      1       6
+1122  0                      1       10
+1124  0                      1       2
+1125  0                      1       4
+1126  0                      1       2
+1129  0                      1       2
+1130  0                      1       2
+1133  0                      1       4
+1135  0                      1       8
+1137  0                      1       11
+1138  0                      1       6
+1140  0                      1       10
+1141  0                      1       2
+1161  0                      1       5
+1171  4320                   1       14
+1172  800                    1       4
+1173  480                    1       4
+1175  3104                   1       4
+1177  1024                   1       2
+1178  8192                   1       4
+1180  4096                   1       2
+1181  6264                   1       4
+1182  0                      1       2
+1185  4096                   1       2
+1186  6144                   1       2
+1190  4096                   1       4
+1191  2048                   1       2
+1192  43008                  1       8
+1194  206848                 1       18
+1196  6144                   1       6
+1198  43008                  1       6
+1199  2048                   1       2
+1203  3120                   1       2
+1212  0                      1       103
+1213  0                      1       53
+1214  0                      1       12
+1218  0                      1       16
+1221  0                      1       32
+1222  0                      1       16
+1225  0                      1       16
+1226  0                      1       13
+1238  0                      1       32
+1240  0                      1       8
+1245  0                      1       94
+1246  0                      1       50
+1258  0                      1       31
+1260  0                      1       8
+1265  0                      1       94
+1266  0                      1       49
+1284  0                      1       12
+1291  0                      1       18
+1292  0                      1       13
+1305  0                      1       3
+1306  0                      1       4
+1309  0                      1       1
+1315  0                      1       7
+1319  0                      1       7
+1322  0                      1       2
+1323  0                      1       1
+1340  11440                  1       9
+1343  800                    1       6
+1347  1776550                1       10
+1348  366408                 1       10
+1360  3076                   1       4
+1362  640                    1       1
+1363  400                    1       1
+1365  160                    1       1
+1366  0                      1       5
+1367  0                      1       3
+1370  0                      1       3
+1373  0                      1       1
+1377  400                    1       2
+1378  480                    1       1
+1381  240                    1       1
+1385  1104488                1       3
+1386  160                    1       2
+1388  400                    1       2
+1390  1050710                1       2
+1394  80                     1       1
+1395  80                     1       1
+1400  80                     1       2
+1409  120                    1       1
+1410  160                    1       1
+1421  0                      1       6
+1422  0                      1       4
+1431  280                    1       7
+1434  0                      1       50
+1435  0                      1       48
+1444  280                    1       13
+1449  0                      1       7
+1459  0                      1       4
+1462  0                      1       4
+1483  0                      1       8
+1486  0                      1       3
+1493  0                      1       5
+1495  0                      1       5
+1496  0                      1       2
+1497  0                      1       3
+1499  0                      1       9
+1500  0                      1       2
+1501  0                      1       4
+1503  0                      1       2
+1504  0                      1       6
+1505  0                      1       4
+1508  0                      1       5
+1509  0                      1       9
+1510  0                      1       4
+1511  0                      1       2
+1512  0                      1       2
+1515  0                      1       2
+1526  120                    1       2
+1528  200                    1       3
+1553  84                     1       1
+1554  588                    1       2
+1555  0                      1       2
+1556  0                      1       1
+1559  0                      1       1
+1560  0                      1       3
+1573  0                      1       1
+1574  0                      1       1
+1577  126                    1       1
+1580  378                    1       1
+1581  0                      1       3
+1583  2162606                1       4
+1588  42                     1       1
+1589  126                    1       2
+1590  168                    1       1
+1593  294                    1       2
+1596  0                      1       1
+1597  0                      1       2
+1617  200                    1       1
+1618  80                     1       2
+1619  120                    1       1
+1626  160                    1       2
+1634  2240                   1       4
+1637  600                    1       4
+1642  280                    1       1
+1646  200                    1       3
+1647  40                     1       1
+1648  40                     1       1
+1652  120                    1       2
+1653  120                    1       1
+1654  40                     1       1
+1656  40                     1       1
+1661  440                    1       2
+1665  120                    1       1
+1670  210                    1       2
+1671  210                    1       2
+1672  84                     1       2
+1675  84                     1       2
+1676  126                    1       2
+1677  84                     1       2
+1678  126                    1       3
+1679  42                     1       1
+1682  84                     1       1
+1683  42                     1       1
+1686  2165210                1       1
+1696  126                    1       2
+1699  280                    1       1
+1700  1040                   1       1
+1774  860                    1       3
+1784  180                    1       4
+1785  0                      1       4
+1788  2800                   1       6
+1789  2060                   1       7
+1790  673388                 1       13
+1791  3200                   1       10
+1796  80                     1       2
+1797  40                     1       1
+1798  80                     1       2
+1800  40                     1       1
+1801  80                     1       1
+1803  80                     1       1
+1805  80                     1       2
+1808  12760                  1       2
+1817  2174074                1       1
+1818  17220                  1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/matmul_impl.h
+Line  Instructions Executed  Records  Range Count
+39    980                    1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/matmul_impl_base.h
+Line  Instructions Executed  Records  Range Count
+84    980                    1       4
+301   160                    1       1
+320   0                      1       1
+383   40                     1       2
+384   4720                   1       6
+410   640                    1       1
+428   0                      1       1
+429   0                      1       1
+431   0                      1       1
+433   0                      1       2
+434   0                      1       1
+436   0                      1       1
+444   520                    1       2
+451   25600                  1       3
+476   1636                   1       2
+477   62                     1       2
+478   1178                   1       3
+480   960                    1       1
+481   0                      1       2
+482   0                      1       2
+484   800                    1       1
+485   0                      1       2
+486   0                      1       2
+498   2240                   1       1
+499   160                    1       1
+566   2240                   1       1
+567   160                    1       1
+649   14080                  1       8
+670   140880                 1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../param/matmul_shape_info.h
+Line  Instructions Executed  Records  Range Count
+32    200                    1       3
+37    160                    1       1
+67    360                    1       6
+69    40                     1       1
+71    360                    1       3
+121   62                     1       2
+126   0                      1       2
+131   0                      1       2
+137   40                     1       1
+143   40                     1       2
+147   120                    1       4
+153   40                     1       1
+160   480                    1       4
+166   480                    1       4
+230   40                     1       2
+243   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../param/matmul_shape_tiling.h
+Line  Instructions Executed  Records  Range Count
+32    40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../param/matmul_subblock_info.h
+Line  Instructions Executed  Records  Range Count
+33    520                    1       2
+57    40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../param/matmul_tensor_info.h
+Line  Instructions Executed  Records  Range Count
+50    320                    1       2
+53    160                    1       1
+56    160                    1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../param/matmul_usr_define_info.h
+Line  Instructions Executed  Records  Range Count
+52    160                    1       1
+57    0                      1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../resource/cube_in_buffer/../../param/../../../tiling/matmul/matmul_constant_tiling_struct.h
+Line  Instructions Executed  Records  Range Count
+28    120                    1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../resource/cube_in_buffer/cube_in_buffer_double_buffer.h
+Line  Instructions Executed  Records  Range Count
+39    80                     1       4
+45    80                     1       4
+65    1040                   1       5
+77    640                    1       4
+79    13920                  1       7
+91    6080                   1       20
+92    640                    1       8
+93    2560                   1       12
+94    320                    1       8
+102   960                    1       4
+103   4160                   1       6
+104   5440                   1       4
+105   2240                   1       4
+111   960                    1       4
+112   0                      1       4
+113   0                      1       2
+115   2560                   1       2
+116   0                      1       2
+117   0                      1       2
+134   3360                   1       3
+147   4160                   1       14
+160   5120                   1       10
+242   640                    1       4
+247   1920                   1       4
+251   0                      1       4
+253   320                    1       4
+259   1920                   1       2
+263   0                      1       8
+265   640                    1       8
+281   80                     1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../resource/cube_out_buffer/cube_out_buffer_no_unit_flag.h
+Line  Instructions Executed  Records  Range Count
+36    40                     1       2
+48    520                    1       2
+55    3840                   1       1
+61    640                    1       5
+66    2080                   1       11
+71    2560                   1       6
+76    1920                   1       3
+81    7840                   1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../resource/l0_buffer/tbuf_pool_l0_base.h
+Line  Instructions Executed  Records  Range Count
+33    80                     1       2
+48    40                     1       2
+49    640                    1       6
+50    440                    1       8
+61    320                    1       2
+107   160                    1       1
+112   160                    1       1
+117   480                    1       3
+118   480                    1       3
+124   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../resource/l0_buffer/tbuf_pool_l0_cache.h
+Line  Instructions Executed  Records  Range Count
+37    120                    1       3
+45    1120                   1       6
+46    0                      1       2
+54    1280                   1       7
+55    160                    1       3
+70    320                    1       2
+71    480                    1       1
+72    160                    1       1
+75    320                    1       1
+80    160                    1       1
+82    160                    1       1
+88    320                    1       2
+89    480                    1       1
+90    160                    1       1
+93    320                    1       1
+98    320                    1       2
+99    640                    1       3
+100   160                    1       1
+102   80                     1       1
+110   640                    1       2
+111   320                    1       2
+112   320                    1       2
+113   320                    1       2
+114   960                    1       6
+116   320                    1       2
+118   320                    1       2
+125   100                    1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../resource/local_workspace/matmul_local_workspace.h
+Line  Instructions Executed  Records  Range Count
+322   40                     1       2
+324   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/base/scheduler_base.h
+Line  Instructions Executed  Records  Range Count
+67    40                     1       2
+70    40                     1       2
+77    200                    1       4
+79    200                    1       5
+80    200                    1       2
+81    320                    1       7
+84    1120                   1       7
+96    720                    1       7
+98    560                    1       3
+99    560                    1       2
+109   520                    1       2
+136   240                    1       3
+152   7680                   1       2
+153   6880                   1       2
+155   3200                   1       2
+156   7840                   1       2
+206   14080                  1       8
+445   480                    1       2
+446   0                      1       2
+448   0                      1       2
+450   0                      1       2
+463   320                    1       4
+464   2080                   1       11
+465   2560                   1       6
+466   480                    1       3
+473   160                    1       2
+474   0                      1       2
+479   3040                   1       2
+485   160                    1       2
+486   1920                   1       3
+492   160                    1       2
+493   0                      1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/base/scheduler_mdl_base.h
+Line  Instructions Executed  Records  Range Count
+64    4720                   1       6
+88    320                    1       2
+93    1600                   1       1
+94    5600                   1       1
+98    25120                  1       1
+117   160                    1       1
+118   2080                   1       5
+119   3360                   1       4
+129   1920                   1       3
+133   2080                   1       4
+134   1280                   1       1
+135   6560                   1       2
+142   1920                   1       2
+143   2880                   1       2
+144   8160                   1       2
+199   3520                   1       4
+201   4160                   1       5
+202   160                    1       3
+229   800                    1       3
+230   160                    1       1
+231   160                    1       1
+233   1760                   1       5
+234   1120                   1       3
+235   4320                   1       3
+239   0                      1       2
+255   640                    1       3
+269   2480                   1       5
+270   1440                   1       3
+271   5280                   1       1
+276   0                      1       2
+291   480                    1       1
+296   2080                   1       6
+381   160                    1       1
+382   320                    1       2
+392   160                    1       1
+416   160                    1       1
+443   160                    1       1
+444   160                    1       1
+491   480                    1       1
+567   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/base/scheduler_mdl_common.h
+Line  Instructions Executed  Records  Range Count
+31    40                     1       2
+62    14080                  1       8
+84    59120                  1       1
+113   640                    1       3
+114   640                    1       1
+115   10080                  1       4
+119   8480                   1       1
+120   640                    1       4
+121   320                    1       2
+122   2240                   1       5
+131   160                    1       1
+134   3200                   1       2
+143   26320                  1       7
+145   0                      1       2
+146   0                      1       1
+147   1600                   1       5
+216   1280                   1       3
+217   8480                   1       5
+218   10320                  1       3
+219   320                    1       2
+220   320                    1       2
+221   3040                   1       4
+222   160                    1       1
+223   960                    1       3
+301   320                    1       2
+303   640                    1       4
+304   640                    1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/base/scheduler_mdl_fullload.h
+Line  Instructions Executed  Records  Range Count
+31    40                     1       2
+51    960                    1       2
+52    44800                  1       3
+55    160                    1       1
+56    3840                   1       1
+59    15040                  1       3
+60    160                    1       1
+63    15840                  1       4
+64    320                    1       3
+66    59120                  1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/iterator/k_loop/k_loop_mdl.h
+Line  Instructions Executed  Records  Range Count
+40    80                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/iterator/k_loop/k_loop_mdl_base.h
+Line  Instructions Executed  Records  Range Count
+39    320                    1       7
+43    320                    1       9
+48    160                    1       1
+49    9920                   1       5
+80    480                    1       2
+81    2720                   1       3
+86    800                    1       5
+87    800                    1       4
+90    0                      1       2
+97    640                    1       3
+112   320                    1       2
+117   160                    1       1
+147   0                      1       2
+157   0                      1       3
+256   40                     1       4
+274   0                      1       1
+275   40                     1       5
+278   0                      1       1
+279   40                     1       5
+283   40                     1       9
+284   40                     1       1
+289   40                     1       2
+291   0                      1       1
+292   0                      1       1
+293   0                      1       1
+296   40                     1       2
+298   40                     1       4
+356   160                    1       1
+369   320                    1       2
+370   1600                   1       4
+371   320                    1       2
+372   640                    1       3
+373   1120                   1       3
+374   1280                   1       3
+377   800                    1       3
+378   1280                   1       4
+379   640                    1       2
+380   320                    1       2
+381   320                    1       2
+382   480                    1       3
+383   320                    1       2
+384   320                    1       1
+386   0                      1       1
+397   2720                   1       5
+435   40                     1       2
+438   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/iterator/m_loop/m_loop_mdl.h
+Line  Instructions Executed  Records  Range Count
+40    120                    1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/iterator/m_loop/m_loop_mdl_base.h
+Line  Instructions Executed  Records  Range Count
+40    200                    1       5
+44    1378                   1       8
+65    160                    1       1
+67    1920                   1       5
+84    1920                   1       2
+134   160                    1       1
+135   3200                   1       3
+169   3200                   1       3
+186   1378                   1       8
+257   257                    1       7
+258   186                    1       4
+259   248                    1       4
+260   40                     1       3
+262   93                     1       1
+264   102                    1       4
+265   319                    1       5
+267   31                     1       1
+270   102                    1       4
+300   480                    1       2
+305   2720                   1       2
+327   160                    1       1
+328   640                    1       2
+335   1120                   1       2
+339   40                     1       2
+342   40                     1       2
+344   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/iterator/n_loop/n_loop_mdl.h
+Line  Instructions Executed  Records  Range Count
+38    120                    1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../scheduler/iterator/n_loop/n_loop_mdl_base.h
+Line  Instructions Executed  Records  Range Count
+38    200                    1       2
+47    200                    1       4
+89    640                    1       2
+130   320                    1       2
+131   1600                   1       4
+162   320                    1       2
+166   1280                   1       4
+196   40                     1       7
+197   0                      1       4
+198   0                      1       4
+199   40                     1       3
+201   0                      1       1
+203   40                     1       3
+204   40                     1       5
+206   0                      1       1
+209   40                     1       4
+230   40                     1       2
+233   40                     1       2
+235   40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/compute/mmad_compute.h
+Line  Instructions Executed  Records  Range Count
+65    1920                   1       6
+68    160                    1       1
+69    0                      1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_in/base/../copy_tile_to_cube/copy_tile_to_cube_common.h
+Line  Instructions Executed  Records  Range Count
+57    1280                   1       8
+65    0                      1       4
+75    0                      1       9
+79    0                      1       4
+95    320                    1       4
+96    3840                   1       9
+101   320                    1       4
+180   160                    1       2
+186   160                    1       2
+439   3840                   1       18
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_in/base/../copy_tile_to_cube/data_copy_wrapper_nd.h
+Line  Instructions Executed  Records  Range Count
+72    0                      1       4
+93    2560                   1       33
+100   1280                   1       24
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_in/base/copy_cube_in_base.h
+Line  Instructions Executed  Records  Range Count
+40    1120                   1       3
+52    640                    1       4
+53    3520                   1       4
+62    14560                  1       3
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_in/base/copy_cube_in_mdl_base.h
+Line  Instructions Executed  Records  Range Count
+95    1920                   1       3
+96    12800                  1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_in/base/copy_cube_in_mdl_fullload.h
+Line  Instructions Executed  Records  Range Count
+50    320                    1       2
+51    4160                   1       2
+60    3360                   1       13
+61    4160                   1       8
+62    320                    1       4
+63    9600                   1       12
+64    7040                   1       12
+65    4160                   1       14
+66    5120                   1       10
+67    0                      1       1
+68    3680                   1       2
+74    40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_in/base/copy_cube_in_params_base.h
+Line  Instructions Executed  Records  Range Count
+104   2080                   1       5
+105   0                      1       2
+384   3200                   1       10
+385   0                      1       3
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_out/copy_cube_out_fixpipe.h
+Line  Instructions Executed  Records  Range Count
+69    2720                   1       3
+98    2720                   1       3
+139   320                    1       2
+152   1280                   1       10
+161   1120                   1       8
+388   1120                   1       8
+396   320                    1       2
+429   320                    1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/copy_cube_out/copy_cube_out_utils.h
+Line  Instructions Executed  Records  Range Count
+43    1280                   1       10
+61    1280                   1       10
+162   1120                   1       8
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/split/load_to_l0a/load_to_l0a_loadInstr.h
+Line  Instructions Executed  Records  Range Count
+42    320                    1       2
+54    160                    1       1
+55    0                      1       1
+57    2720                   1       1
+71    320                    1       2
+102   0                      1       3
+103   0                      1       3
+105   0                      1       2
+118   800                    1       4
+119   320                    1       2
+120   1600                   1       5
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/../../../impl/adv_api/detail/matmul/policy/../stage/split/load_to_l0b/load_to_l0b_loadInstr.h
+Line  Instructions Executed  Records  Range Count
+40    640                    1       1
+53    160                    1       1
+54    0                      1       2
+56    5120                   1       1
+70    160                    1       1
+73    480                    1       1
+88    0                      1       2
+93    0                      1       1
+97    0                      1       2
+99    0                      1       1
+101   0                      1       1
+113   0                      1       1
+122   0                      1       2
+124   0                      1       5
+128   0                      1       4
+130   0                      1       1
+131   0                      1       1
+174   960                    1       1
+175   1280                   1       2
+179   2880                   1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/ascendc/include/adv_api/matmul/matmul_client.h
+Line  Instructions Executed  Records  Range Count
+47    80                     1       2
+186   13600                  1       53
+207   320                    1       21
+209   480                    1       31
+211   160                    1       20
+212   12640                  1       90
+226   1920                   1       94
+239   0                      1       43
+240   640                    1       23
+243   160                    1       20
+250   160                    1       34
+257   320                    1       41
+258   480                    1       32
+260   160                    1       20
+321   480                    1       39
+322   320                    1       38
+327   7840                   1       44
+328   160                    1       20
+504   160                    1       20
+505   480                    1       56
+506   480                    1       40
+511   160                    1       20
+512   320                    1       40
+698   640                    1       40
+699   12480                  1       20
+983   5622                   1       59
+985   160                    1       20
+986   800                    1       44
+989   12320                  1       108
+992   320                    1       40
+993   2240                   1       112
+995   160                    1       20
+1673  40                     1       1
+1682  40                     1       1
+1685  40                     1       1
+1690  40                     1       1
+1692  40                     1       1
+1703  480                    1       60
+1704  320                    1       38
+1705  160                    1       20
+1711  1280                   1       78
+1719  1920                   1       97
+1723  8822                   1       208
+1726  2240                   1       79
+1793  2240                   1       173
+1795  11680                  1       240
+1798  960                    1       120
+1801  16320                  1       147
+1804  5280                   1       131
+1807  480                    1       60
+1808  480                    1       60
+2818  1280                   1       72
+2822  480                    1       40
+2823  320                    1       40
+2824  160                    1       20
+2851  80                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/../../include/kernel_tiling/kernel_tiling.h
+Line  Instructions Executed  Records  Range Count
+305   1000                   1       8
+306   40                     1       2
+308   80                     1       4
+312   80                     1       4
+316   80                     1       2
+320   80                     1       3
+324   80                     1       3
+328   80                     1       3
+332   80                     1       3
+336   80                     1       3
+340   80                     1       3
+344   80                     1       3
+348   80                     1       3
+352   80                     1       3
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_common_impl.h
+Line  Instructions Executed  Records  Range Count
+30    80                     1       2
+42    80                     1       2
+59    120                    1       1
+61    60                     1       3
+74    180                    1       2
+75    0                      1       4
+86    60                     1       3
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_data_copy_impl.h
+Line  Instructions Executed  Records  Range Count
+77    1920                   1       133
+124   1280                   1       78
+138   23512                  1       106
+275   1280                   1       25
+304   1280                   1       25
+475   0                      1       92
+549   8192                   1       117
+672   0                      1       1
+681   0                      1       3
+682   0                      1       1
+694   0                      1       1
+705   0                      1       2
+706   0                      1       1
+707   0                      1       2
+708   0                      1       3
+710   0                      1       1
+711   0                      1       2
+712   0                      1       3
+718   0                      1       1
+719   0                      1       2
+720   0                      1       3
+1029  62344                  1       142
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_fixpipe_v2_impl.h
+Line  Instructions Executed  Records  Range Count
+265   160                    1       4
+277   160                    1       4
+279   800                    1       10
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_mm_impl.h
+Line  Instructions Executed  Records  Range Count
+54    0                      1       1
+252   1600                   1       7
+287   2400                   1       2
+328   160                    1       1
+333   1440                   1       5
+402   160                    1       1
+410   160                    1       1
+421   320                    1       1
+429   160                    1       1
+443   20                     1       1
+631   20                     1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_set_atomic_impl.h
+Line  Instructions Executed  Records  Range Count
+44    100                    1       3
+54    0                      1       2
+65    0                      1       2
+76    0                      1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_set_spr_impl.h
+Line  Instructions Executed  Records  Range Count
+28    160                    1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_sync_impl.h
+Line  Instructions Executed  Records  Range Count
+113   0                      1       2
+421   20                     1       3
+428   200                    1       21
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_binary_impl.h
+Line  Instructions Executed  Records  Range Count
+166   8192                   1       20
+369   8192                   1       74
+372   24576                  1       40
+373   16384                  1       40
+422   6144                   1       172
+425   6144                   1       152
+426   4096                   1       136
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_binary_scalar_impl.h
+Line  Instructions Executed  Records  Range Count
+82    8192                   1       20
+118   8192                   1       20
+119   8192                   1       20
+242   8192                   1       272
+277   6144                   1       203
+278   6144                   1       200
+279   8192                   1       272
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_brcb_impl.h
+Line  Instructions Executed  Records  Range Count
+33    16384                  1       40
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_cmp_impl.h
+Line  Instructions Executed  Records  Range Count
+38    40960                  1       40
+152   49152                  1       40
+188   49152                  1       40
+214   49152                  1       40
+233   0                      1       320
+298   0                      1       320
+324   0                      1       320
+340   0                      1       320
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_cmpsel_impl.h
+Line  Instructions Executed  Records  Range Count
+154   0                      1       300
+175   0                      1       396
+176   0                      1       300
+177   0                      1       300
+179   0                      1       300
+180   0                      1       300
+184   0                      1       300
+185   0                      1       300
+192   0                      1       280
+209   8192                   1       22
+210   8192                   1       22
+211   8192                   1       20
+213   8192                   1       20
+214   8192                   1       20
+218   16384                  1       20
+220   40960                  1       38
+225   24576                  1       20
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_duplicate_impl.h
+Line  Instructions Executed  Records  Range Count
+32    33088                  1       1308
+59    25056                  1       191
+60    8512                   1       289
+61    24896                  1       986
+62    480                    1       126
+63    480                    1       112
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_reduce_impl.h
+Line  Instructions Executed  Records  Range Count
+153   8192                   1       20
+154   24576                  1       20
+155   16384                  1       40
+156   8192                   1       20
+157   8192                   1       20
+158   24576                  1       30
+159   24576                  1       40
+160   16384                  1       40
+161   16384                  1       40
+162   8192                   1       20
+163   16384                  1       40
+164   8192                   1       20
+257   16384                  1       24
+258   40960                  1       38
+275   57344                  1       56
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_unary_impl.h
+Line  Instructions Executed  Records  Range Count
+345   8192                   1       20
+346   8192                   1       20
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kernel_operator_vec_vconv_impl.h
+Line  Instructions Executed  Records  Range Count
+110   16384                  1       84
+245   16384                  1       40
+284   8192                   1       42
+648   8192                   1       43
+817   73728                  1       139
+818   40960                  1       118
+824   16384                  1       84
+831   24576                  1       83
+834   8192                   1       42
+836   49152                  1       40
+837   16384                  1       20
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kfc/kfc_comm.h
+Line  Instructions Executed  Records  Range Count
+273   960                    1       1
+277   1040                   1       1
+281   15764                  1       1
+285   1440                   1       118
+289   40                     1       1
+290   40                     1       1
+371   140                    1       5
+373   60                     1       3
+374   40                     1       2
+375   40                     1       1
+376   40                     1       1
+378   340                    1       16
+379   300                    1       15
+381   20                     1       1
+382   40                     1       1
+400   160                    1       3
+401   400                    1       6
+417   200                    1       4
+436   380                    1       8
+442   520                    1       61
+448   1040                   1       61
+449   4200                   1       122
+451   0                      1       61
+457   2120                   1       176
+458   1680                   1       176
+459   0                      1       61
+460   0                      1       61
+462   1040                   1       61
+479   15764                  1       1
+481   31528                  1       1
+484   15764                  1       1
+496   124032                 1       1
+499   2080                   1       2
+500   1040                   1       2
+501   0                      1       1
+502   0                      1       1
+504   1040                   1       1
+514   520                    1       1
+516   1040                   1       1
+517   2080                   1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kfc/kfc_comm_client.h
+Line  Instructions Executed  Records  Range Count
+44    1800                   1       5
+46    40                     1       1
+55    440                    1       4
+56    40                     1       1
+58    80                     1       1
+60    80                     1       2
+61    40                     1       1
+68    40                     1       1
+70    280                    1       4
+71    120                    1       2
+79    320                    1       5
+80    240                    1       4
+81    80                     1       1
+87    1400                   1       2
+89    120                    1       1
+98    1080                   1       1
+102   40                     1       1
+103   80                     1       1
+114   80                     1       1
+121   1440                   1       120
+122   960                    1       60
+123   480                    1       60
+124   480                    1       60
+125   960                    1       123
+136   960                    1       120
+141   11240                  1       62
+142   1040                   1       122
+166   3520                   1       84
+167   3                      1       40
+170   9                      1       196
+172   0                      1       40
+175   0                      1       40
+177   3                      1       80
+178   0                      1       40
+180   2                      1       40
+183   3201                   1       242
+185   0                      1       40
+188   0                      1       120
+195   960                    1       100
+196   320                    1       40
+197   480                    1       60
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/dav_c220/kfc/kfc_comm_server.h
+Line  Instructions Executed  Records  Range Count
+40    240                    1       8
+41    100                    1       3
+43    60                     1       2
+44    40                     1       2
+45    260                    1       1
+47    40                     1       2
+52    160                    1       4
+62    3640                   1       1
+67    480                    1       5
+68    320                    1       3
+69    160                    1       3
+75    640                    1       3
+77    480                    1       6
+78    320                    1       3
+79    160                    1       3
+90    960                    1       6
+95    191768                 1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_event.h
+Line  Instructions Executed  Records  Range Count
+279   0                      1       2
+298   99112                  1       1271
+317   53356                  1       1075
+819   640                    1       8
+822   640                    1       12
+825   360                    1       4
+828   400                    1       91
+831   160                    1       1
+834   1020                   1       10
+837   1440                   1       172
+840   800                    1       80
+843   800                    1       156
+846   5216                   1       174
+858   32848                  1       99
+861   32768                  1       60
+887   0                      1       36
+893   21440                  1       204
+896   600                    1       196
+902   320                    1       4
+905   320                    1       3
+942   2880                   1       18
+945   640                    1       9
+948   960                    1       17
+951   160                    1       2
+954   1340                   1       9
+957   0                      1       1
+960   0                      1       1
+963   0                      1       1
+966   0                      1       1
+971   960                    1       137
+974   800                    1       81
+977   840                    1       166
+980   2848                   1       133
+1000  320                    1       8
+1003  320                    1       6
+1006  0                      1       2
+1009  0                      1       2
+1012  0                      1       2
+1015  0                      1       2
+1018  0                      1       2
+1021  0                      1       2
+1024  0                      1       2
+1028  200                    1       90
+1031  200                    1       6
+1034  0                      1       2
+1037  0                      1       34
+1040  10720                  1       134
+1043  560                    1       148
+1046  0                      1       2
+1049  16424                  1       62
+1052  16384                  1       42
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_operator_data_copy_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+59    1920                   1       133
+155   1280                   1       25
+265   1280                   1       78
+325   81760                  1       176
+690   320                    1       29
+692   640                    1       61
+770   81760                  1       176
+1312  0                      1       94
+1388  10240                  1       117
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_operator_mm_base_impl.h
+Line  Instructions Executed  Records  Range Count
+284   1600                   1       7
+287   2880                   1       2
+328   1760                   1       6
+329   160                    1       1
+440   40                     1       1
+507   20                     1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_operator_mm_load2d_impl.h
+Line  Instructions Executed  Records  Range Count
+52    0                      1       2
+53    0                      1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_reg.h
+Line  Instructions Executed  Records  Range Count
+60    480                    1       126
+101   154640                 1       2546
+123   320                    1       5
+145   31200                  1       694
+150   25056                  1       412
+165   0                      1       1
+167   0                      1       1
+174   0                      1       1
+176   0                      1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_tbuf_impl.h
+Line  Instructions Executed  Records  Range Count
+33    57856                  1       446
+42    16736                  1       504
+43    16896                  1       506
+47    16576                  1       484
+76    132384                 1       809
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_tensor_impl.h
+Line  Instructions Executed  Records  Range Count
+550   89688                  1       1037
+561   114104                 1       1250
+602   40960                  1       478
+675   14248                  1       499
+691   32768                  1       274
+692   81016                  1       1023
+992   560                    1       13
+1154  240                    1       3
+1260  280                    1       1
+1284  2528                   1       163
+1294  2368                   1       160
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_tpipe_base.h
+Line  Instructions Executed  Records  Range Count
+241   280                    1       11
+243   40                     1       4
+244   160                    1       9
+252   40                     1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_tpipe_impl.h
+Line  Instructions Executed  Records  Range Count
+47    2800                   1       6
+48    520                    1       4
+49    2280                   1       4
+56    15820                  1       4
+57    180                    1       3
+60    15640                  1       2
+65    1580                   1       4
+70    60                     1       1
+72    40                     1       2
+73    40                     1       1
+75    40                     1       2
+77    60                     1       2
+80    140                    1       2
+128   120                    1       2
+130   120                    1       2
+137   60                     1       2
+225   200                    1       8
+226   1160                   1       23
+231   200                    1       8
+241   480                    1       15
+251   560                    1       9
+252   480                    1       14
+253   200                    1       8
+254   440                    1       14
+260   200                    1       8
+261   520                    1       18
+292   3000                   1       38
+293   80                     1       2
+298   120                    1       5
+307   840                    1       17
+308   1160                   1       24
+310   1400                   1       23
+311   760                    1       17
+313   560                    1       14
+319   200                    1       5
+320   960                    1       22
+421   5300                   1       204
+425   5140                   1       176
+436   5920                   1       355
+443   92992                  1       867
+469   60                     1       2
+471   6800                   1       8
+472   3760                   1       2
+473   4160                   1       4
+474   320                    1       2
+480   20                     1       1
+481   80                     1       1
+482   20                     1       1
+483   100                    1       2
+485   20                     1       1
+497   240                    1       2
+538   320                    1       9
+540   280                    1       6
+546   40                     1       2
+547   40                     1       1
+549   40                     1       2
+557   80                     1       2
+558   80                     1       2
+559   40                     1       2
+887   520                    1       4
+892   60                     1       2
+893   60                     1       2
+894   60                     1       2
+895   60                     1       2
+896   120                    1       2
+899   280                    1       5
+900   520                    1       6
+902   60                     1       2
+903   60                     1       2
+904   60                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_tquebind_impl.h
+Line  Instructions Executed  Records  Range Count
+36    80                     1       4
+78    24640                  1       213
+79    2400                   1       170
+123   11600                  1       342
+132   22080                  1       337
+213   480                    1       6
+215   2880                   1       159
+217   3520                   1       181
+237   5760                   1       188
+238   2400                   1       172
+239   2400                   1       180
+247   4000                   1       185
+266   19360                  1       392
+267   1120                   1       80
+294   480                    1       6
+296   1920                   1       142
+308   3360                   1       235
+315   3360                   1       242
+316   2240                   1       136
+317   6720                   1       142
+318   1120                   1       86
+329   4320                   1       164
+424   8320                   1       175
+425   2480                   1       163
+449   1120                   1       82
+451   3520                   1       189
+470   3360                   1       170
+472   2400                   1       85
+473   2720                   1       85
+477   2240                   1       85
+478   1120                   1       85
+488   3760                   1       85
+511   640                    1       170
+512   1920                   1       178
+513   400                    1       85
+523   3680                   1       187
+544   960                    1       6
+545   11200                  1       28
+549   2880                   1       6
+550   1280                   1       12
+551   2880                   1       14
+552   480                    1       6
+586   2880                   1       250
+587   160                    1       1
+641   3520                   1       250
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/kernel_utils_base.h
+Line  Instructions Executed  Records  Range Count
+44    240                    1       2
+46    160                    1       1
+48    20                     1       1
+49    20                     1       1
+51    80                     1       2
+108   55616                  1       1271
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/impl/basic_api/utils/kernel_utils_ceil_oom_que.h
+Line  Instructions Executed  Records  Range Count
+45    480                    1       19
+50    320                    1       42
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/adv_api/../../impl/adv_api/detail/kfc/../matmul/kfc/../utils/matmul_utils.h
+Line  Instructions Executed  Records  Range Count
+215   40                     1       1
+216   40                     1       1
+217   200                    1       1
+222   80                     1       2
+383   8888                   1       40
+389   1280                   1       10
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/adv_api/../../impl/adv_api/detail/kfc/../matmul/kfc/matmul_server.h
+Line  Instructions Executed  Records  Range Count
+38    1980                   1       5
+43    40                     1       1
+46    40                     1       1
+47    80                     1       2
+50    40                     1       1
+56    40                     1       1
+75    40                     1       1
+76    4760                   1       5
+94    480                    1       1
+107   960                    1       2
+108   5116                   1       3
+114   0                      1       2
+182   160                    1       1
+183   320                    1       1
+184   320                    1       1
+194   0                      1       1
+220   960                    1       1
+221   4160                   1       2
+222   3840                   1       2
+227   6236                   1       3
+255   800                    1       1
+413   1920                   1       2
+420   202956                 1       4
+431   3360                   1       2
+432   10560                  1       2
+437   0                      1       3
+443   960                    1       1
+450   0                      1       2
+462   0                      1       1
+467   0                      1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/adv_api/../../impl/adv_api/detail/kfc/../matmul/kfc/matmul_server_aux.h
+Line  Instructions Executed  Records  Range Count
+43    1980                   1       5
+80    1980                   1       5
+502   1980                   1       5
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/adv_api/../../impl/adv_api/detail/kfc/../matmul/kfc/matmul_server_impl.h
+Line  Instructions Executed  Records  Range Count
+26    1280                   1       1
+46    160                    1       1
+47    2400                   1       1
+94    960                    1       2
+114   160                    1       1
+115   2400                   1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/adv_api/../../impl/adv_api/detail/kfc/../matmul/kfc/matmul_server_impl_c220.h
+Line  Instructions Executed  Records  Range Count
+35    480                    1       2
+40    480                    1       1
+42    0                      1       1
+75    480                    1       2
+78    1120                   1       1
+81    140880                 1       2
+83    2240                   1       1
+91    14080                  1       2
+93    320                    1       1
+95    960                    1       2
+96    0                      1       1
+97    0                      1       1
+100   320                    1       1
+114   0                      1       1
+115   0                      1       2
+122   0                      1       6
+123   0                      1       4
+127   0                      1       4
+129   0                      1       4
+153   800                    1       2
+154   160                    1       1
+176   0                      1       1
+177   0                      1       4
+181   0                      1       1
+182   0                      1       2
+185   0                      1       1
+186   0                      1       1
+187   0                      1       1
+327   15996                  1       3
+329   640                    1       2
+330   163600                 1       3
+336   800                    1       1
+337   4000                   1       2
+341   480                    1       2
+342   320                    1       3
+348   15040                  1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/adv_api/../../impl/adv_api/detail/kfc/kernel_kfc.h
+Line  Instructions Executed  Records  Range Count
+33    100                    1       1
+36    20                     1       1
+37    40                     1       1
+38    1160                   1       2
+39    20                     1       1
+48    20                     1       1
+53    20                     1       1
+54    20                     1       1
+56    1280                   1       6
+63    47332                  1       2
+173   63056                  1       1
+175   191768                 1       4
+177   1560                   1       4
+180   1040                   1       1
+181   1040                   1       1
+184   3120                   1       2
+185   223720                 1       4
+187   0                      1       1
+188   0                      1       1
+190   0                      1       2
+192   0                      1       1
+193   0                      1       1
+196   80                     1       1
+197   160                    1       1
+199   80                     1       1
+200   0                      1       1
+208   3640                   1       1
+217   78820                  1       1
+233   200                    1       4
+234   5160                   1       4
+309   3360                   1       1
+316   480                    1       1
+317   219880                 1       5
+374   5120                   1       5
+391   20                     1       1
+416   360                    1       3
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_common_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+207   120                    1       1
+223   40                     1       1
+325   20                     1       3
+332   200                    1       21
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_fixpipe_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+153   1120                   1       8
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_mm_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+43    0                      1       2
+220   4480                   1       9
+289   1920                   1       6
+381   40                     1       1
+411   20                     1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_set_atomic_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+45    0                      1       2
+50    100                    1       3
+56    0                      1       2
+62    0                      1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_binary_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+247   16384                  1       38
+660   49152                  1       112
+731   16384                  1       348
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_binary_scalar_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+241   16384                  1       20
+574   26624                  1       451
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_brcb_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+57    24576                  1       60
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_cmpsel_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+184   49152                  1       40
+317   0                      1       320
+424   0                      1       571
+425   0                      1       266
+503   122880                 1       60
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_duplicate_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+99    59424                  1       1007
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_reduce_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+470   57344                  1       56
+878   180224                 1       50
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_unary_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+733   16384                  1       40
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/../../impl/basic_api/kernel_operator_vec_vconv_intf_impl.h
+Line  Instructions Executed  Records  Range Count
+143   262144                 1       313
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/kernel_common.h
+Line  Instructions Executed  Records  Range Count
+67    2280                   1       39
+69    40224                  1       808
+105   480                    1       126
+110   31200                  1       694
+115   25056                  1       412
+120   0                      1       2
+125   0                      1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/kernel_operator_block_sync_intf.h
+Line  Instructions Executed  Records  Range Count
+41    99772                  1       1228
+61    52716                  1       1056
+67    154640                 1       2546
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/kernel_operator_cache_intf.h
+Line  Instructions Executed  Records  Range Count
+31    320                    1       5
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/kernel_operator_swap_mem_intf.h
+Line  Instructions Executed  Records  Range Count
+37    40                     1       2
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/kernel_tensor.h
+Line  Instructions Executed  Records  Range Count
+242   280                    1       1
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/aarch64-linux/asc/include/basic_api/kernel_tpipe.h
+Line  Instructions Executed  Records  Range Count
+72    880                    1       10
+106   200                    1       5
+115   600                    1       4
+
+visualize_data: /root/x00827378/vllm-ascend/mytmp/OPPROF_20260627134444_LLPYGPYEZKODALFN/visualize_data.bin
+Source: /usr/local/Ascend/cann-8.5.1/tools/bisheng_compiler/lib/clang/15.0.5/include/__clang_cce_aicore_functions.h
+Line  Instructions Executed  Records  Range Count
+2677  360                    1       2
+2701  80                     1       1
+3087  60                     1       4

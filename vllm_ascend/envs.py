@@ -66,6 +66,70 @@ env_variables: dict[str, Callable[[], Any]] = {
     # In this case, developers need to set this value to "0.9.0" to make sure
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
+    # Use the compiled NPU custom op for TurboQuant decode (packed->fp16/bf16).
+    "VLLM_ASCEND_TURBOQUANT_DECODE_OP":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP", "1"))),
+    # Use the compiled NPU custom op for TurboQuant encode (fp16 y + norms -> packed uint8),
+    # 4-bit MSE path only; 8-bit falls back to PyTorch.
+    "VLLM_ASCEND_TURBOQUANT_ENCODE_OP":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_ENCODE_OP", "1"))),
+    # Use the 8-bit paged decode custom op (design doc §2.6 / Phase 1, scheme A):
+    # folds block_table addressing into the kernel and decodes packed uint8 KV
+    # cache to compact fp16 K/V, replacing the unique/searchsorted + PyTorch
+    # decode path. Default OFF (gray rollout); a separate switch from the 4-bit
+    # ``VLLM_ASCEND_TURBOQUANT_DECODE_OP`` because the 4-bit op is unverified.
+    "VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT", "0"))),
+    # 8-bit paged decode kernel mode: 0 = KFC Cube (Gather LUT + Cube y_hat@R,
+    # performance path), 1 = AIV-only scalar reference (numeric golden / debug).
+    "VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE":
+    lambda: int(os.getenv("VLLM_ASCEND_TURBOQUANT_DECODE_OP_8BIT_MODE", "0")),
+    # TurboQuant pack-to-cache routing in turboquant_kv_cache.py (Python layer):
+    # "v2" (default) = v2_to_cache monolithic op, or pack_v2 + scatter fallback;
+    # "fused" = monolithic turboquant_pack_kv_for_cache_to_cache C++ op;
+    # "v3" = v3_to_cache monolithic op, or pack_v3 + scatter fallback;
+    # "legacy" = pack + scatter.
+    # Valid aliases: fused→"to_cache", v2→"2"/"kfc", v3→"3"/"aiv",
+    # legacy→"fused_pack"/"pack".
+    "VLLM_ASCEND_TURBOQUANT_PACK_OP":
+    lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_PACK_OP", "v2").lower().strip(),
+    # TurboQuant codebook construction method:
+    # - "fast": use a deterministic, precomputed codebook (recommended for serving)
+    # - "sample": approximate via Beta sampling + Lloyd-like iterations (very slow)
+    "VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD":
+    lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_CODEBOOK_METHOD", "fast").lower(),
+    # TurboQuant KV quantizer implementation: v1 (default), v2 (Lloyd–Max
+    # centroids), or v3 (same quantize as v2, formula-based dequant per index).
+    # ``turboquant_kv_bits``: int (same K/V), or ``[key_bits, value_bits]``, or
+    # ``{"key": 8, "value": 4}`` (each 4 or 8).
+    "VLLM_ASCEND_TURBOQUANT_MSE_IMPL":
+    lambda: os.getenv("VLLM_ASCEND_TURBOQUANT_MSE_IMPL", "v1").lower().strip(),
+    # Use the exploratory 4-bit slab KV cache layout for symmetric 4-bit
+    # TurboQuant. Default OFF: 0 keeps the legacy row-major cache
+    # [num_blocks, block_size, num_kv_heads, packed_width]. Set to 1 to use
+    # [num_blocks, num_kv_heads, block_size * packed_width], where packed_width
+    # is head_size / 2 + 2 bytes. Not sensitive.
+    "VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_4BIT_SLAB_CACHE", "0"))),
+    # BitResidual k8v4 Prefill path (default OFF). When ON, attention_v1 routes
+    # PrefillCacheHit / ChunkedPrefill to ``bit_residual_fia_paged_k8v4``.
+    # PrefillNoCache is controlled separately by
+    # ``VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA``. DecodeOnly is controlled by
+    # ``VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA``.
+    "VLLM_ASCEND_BIT_RESIDUAL_FIA":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_FIA", "0"))),
+    # BitResidual k8v4 PrefillNoCache A/B (default OFF). When ON, PrefillNoCache
+    # uses already-packed paged KV via ``bit_residual_fia_paged_k8v4`` instead of
+    # float key/value ``npu_fused_infer_attention_score``. Falls back to float
+    # FIA if the paged op returns None.
+    "VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_NOCACHE_FIA", "0"))),
+    # BitResidual k8v4 Decode A/B (default OFF). When ON, DecodeOnly uses
+    # ``bit_residual_fia_paged_k8v4`` instead of ``bit_residual_attention_paged_k8v4``
+    # so FIA vs vector paged attn latency can be compared. Falls back to vector
+    # attn if FIA returns None.
+    "VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_BIT_RESIDUAL_DECODE_FIA", "0"))),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
