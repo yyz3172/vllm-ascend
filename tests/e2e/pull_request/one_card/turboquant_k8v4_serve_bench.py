@@ -154,7 +154,19 @@ def _strip_verbose_ascend_log_env(env: dict[str, str]) -> None:
         env.pop(k, None)
 
 # PD 1P1D：Mooncake connector + proxy（相对本文件定位仓库根）
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+# singlecard → parents[3]；pull_request/one_card → parents[4]
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve().parent
+    for depth in (3, 4, 2, 5):
+        if depth >= len(here.parents):
+            continue
+        cand = here.parents[depth]
+        if (cand / "vllm_ascend").is_dir() and (cand / "examples").is_dir():
+            return cand
+    return here.parents[min(3, len(here.parents) - 1)]
+
+
+_REPO_ROOT = _find_repo_root()
 _PD_PROXY_SCRIPT = (
     _REPO_ROOT / "examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py"
 )
@@ -262,10 +274,11 @@ def _build_serve_cmd(
     cmd: list[str] = [
         "vllm", "serve", model,
         f"--kv_cache_dtype={kv_cache_dtype}",
-        f"--additional-config={_kv_bits_to_config(kv_bits)}",
         f"--port={port}",
         f"--host={host}",
     ]
+    if kv_cache_dtype == "turboquant":
+        cmd.append(f"--additional-config={_kv_bits_to_config(kv_bits)}")
     if trust_remote_code:
         cmd.append("--trust-remote-code")
     # 给了 profiler_dir 时，通过嵌套的 --profiler-config.* CLI 让 serve 进程开启
@@ -430,7 +443,7 @@ def _kv_transfer_config_json(
 ) -> str:
     """Mooncake 1P1D kv-transfer-config JSON（与 script/xrx/pd 对齐，模块路径用当前仓库）。"""
     cfg = {
-        "kv_connector": "MooncakeConnectorV1",
+        "kv_connector": "MooncakeConnector",
         "kv_buffer_device": "npu",
         "kv_role": role,
         "kv_parallel_size": "1",
@@ -456,12 +469,13 @@ def _build_pd_serve_cmd(
     cmd: list[str] = [
         "vllm", "serve", model,
         f"--kv_cache_dtype={kv_cache_dtype}",
-        f"--additional-config={_kv_bits_to_config(kv_bits)}",
         f"--port={port}",
         "--host=0.0.0.0",
         "--tensor-parallel-size=1",
         f"--kv-transfer-config={_kv_transfer_config_json(role=role, kv_port=kv_port, engine_id=engine_id)}",
     ]
+    if kv_cache_dtype == "turboquant":
+        cmd.append(f"--additional-config={_kv_bits_to_config(kv_bits)}")
     if role == "kv_producer":
         cmd.append("--enable-prefix-caching")
     if trust_remote_code:

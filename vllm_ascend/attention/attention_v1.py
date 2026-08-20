@@ -1968,6 +1968,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         rotation_t=self._br_rotation_key,
                     )
                 if self.is_kv_producer:
+                    if attn_metadata.reshape_cache_event is None:
+                        attn_metadata.reshape_cache_event = torch.npu.Event()
                     attn_metadata.reshape_cache_event.record()
                 return query, key, value, output
             
