@@ -72,6 +72,7 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 from vllm_ascend.ops.turboquant_kv_cache import (
     _try_8bit_decode_paged,
     bit_residual_fia_paged_k8v4,
+    bit_residual_fia_paged_k8v4_get_workspace,
     bit_residual_k8v4_key_packed_width,
     turboquant_4bit_slab_cache_enabled,
     turboquant_attention_paged4bit,
@@ -90,6 +91,110 @@ from vllm_ascend.ascend_config import get_ascend_config
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+# Marker stored as attn_params[0] for k8v4 FULL-graph capture/replay.
+_BR_K8V4_GRAPH_MARKER = "br_k8v4"
+# Keep strong refs to graph workspaces: acl_graph weak_ref_workspaces() would
+# otherwise drop them after capture and graph_task_update can see freed storage.
+_BR_K8V4_GRAPH_WORKSPACES: dict[int, torch.Tensor] = {}
+
+
+def _br_k8v4_skip_pack_in_full_graph() -> bool:
+    """Bisect: omit turboquant pack from FULL ACL graphs (no pack nodes baked)."""
+    import os
+
+    return os.environ.get("BR_K8V4_SKIP_PACK_IN_FULL", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _br_k8v4_force_eager() -> bool:
+    """Bisect: capture/replay k8v4 via eager op instead of graph_task_group."""
+    import os
+
+    return os.environ.get("BR_K8V4_FORCE_EAGER", "").strip() in ("1", "true", "yes")
+
+
+def _br_k8v4_graph_debug() -> bool:
+    import os
+
+    return os.environ.get("BR_K8V4_GRAPH_DEBUG", "").strip() in ("1", "true", "yes")
+
+
+def _br_k8v4_skip_update_after_first() -> bool:
+    """Bisect: only graph_task_update on the first FULL decode step."""
+    import os
+
+    return os.environ.get("BR_K8V4_SKIP_UPDATE_AFTER_FIRST", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _br_k8v4_skip_all_updates() -> bool:
+    """Bisect: never graph_task_update (only event.record)."""
+    import os
+
+    return os.environ.get("BR_K8V4_SKIP_ALL_UPDATES", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+_BR_K8V4_UPDATE_COUNT: dict[int, int] = {}
+
+
+def _br_k8v4_debug_log(tag: str, **fields) -> None:
+    if not _br_k8v4_graph_debug():
+        return
+    import json
+    import time
+
+    row = {"ts": time.time(), "tag": tag, **fields}
+    try:
+        with open("/tmp/br_k8v4_graph_debug.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _br_k8v4_record_graph_events(update_stream, events) -> None:
+    """Record captured ExternalEvents so FULL replay event.wait cannot hang."""
+    if not events:
+        return
+    with torch.npu.stream(update_stream):
+        for event in events:
+            event.record(update_stream)
+
+
+def _br_k8v4_full_max_seq_kv() -> int:
+    """Disable FULL when any request KV len exceeds this (0 = never disable)."""
+    import os
+
+    raw = os.environ.get("BR_K8V4_FULL_MAX_SEQ_KV", "1024").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 1024
+
+
+def _br_k8v4_seq_lens_for_graph(attn_metadata, batch_size: int) -> tuple[list[int], list[int]]:
+    """Host seq-lens for k8v4 FIA graph capture/update.
+
+  Read KV lengths from the live device ``seq_lens`` tensor (same source stock
+  FIA uses) so graph_task_update never sees stale ``seq_lens_list`` snapshots.
+    """
+    seq_q = list(attn_metadata.actual_seq_lengths_q[:batch_size])
+    if attn_metadata.seq_lens is not None:
+        seq_kv = attn_metadata.seq_lens[:batch_size].detach().cpu().tolist()
+    else:
+        seq_kv = list(attn_metadata.seq_lens_list[:batch_size])
+    return seq_q, seq_kv
+
+
 _ATTN_KEYS_BUFFER = None
 _TURBOQUANT_FIA_WARMED: set[tuple[int, torch.dtype, int, int, int]] = set()
 
@@ -640,8 +745,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
             _br_dev = torch.device("npu")
             _br_dtype = self.vllm_config.model_config.dtype
-            self._br_rotation_key = _bit_residual_k8v4_rotation_t(_br_dev, _br_dtype)
-            self._br_rotation_value = _bit_residual_k8v4_rotation(_br_dev, _br_dtype)
+            self._br_rotation_key = _bit_residual_k8v4_rotation_t(_br_dev, _br_dtype).contiguous()
+            self._br_rotation_value = _bit_residual_k8v4_rotation(_br_dev, _br_dtype).contiguous()
         self.sliding_window = sliding_window
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
@@ -678,6 +783,205 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return self.kv_sharing_target_layer_name or layer_name
 
     @staticmethod
+    def _is_br_k8v4_graph_params(captured_attn_params: list) -> bool:
+        return (
+            len(captured_attn_params) > 0
+            and len(captured_attn_params[0]) > 0
+            and captured_attn_params[0][0] == _BR_K8V4_GRAPH_MARKER
+        )
+
+    @staticmethod
+    def _update_br_k8v4_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens: int,
+        graph_params,
+        use_layer_aware_replay: bool,
+    ) -> None:
+        attn_metadata = forward_context.attn_metadata
+        attn_keys = list(attn_metadata.keys())
+        num_layers = len(attn_keys)
+        events = graph_params.events.get(num_tokens) or []
+        if num_layers == 0:
+            _br_k8v4_record_graph_events(update_stream, events)
+            return
+        captured_attn_params = graph_params.attn_params[num_tokens]
+        handles = graph_params.handles[num_tokens]
+        events = graph_params.events[num_tokens]
+        graph_param_count = len(captured_attn_params)
+        if graph_param_count == 0:
+            _br_k8v4_record_graph_events(update_stream, events)
+            return
+        # Always prefer the strong keepalive: acl_graph weak_ref_workspaces()
+        # replaces graph_params.workspaces after capture; using the weak view
+        # alone has caused invalid-GM faults on later FULL replays.
+        workspace = _BR_K8V4_GRAPH_WORKSPACES.get(num_tokens)
+        if workspace is None:
+            workspace = graph_params.workspaces.get(num_tokens)
+        if workspace is None or (hasattr(workspace, "numel") and workspace.numel() == 0):
+            if _br_k8v4_graph_debug():
+                _br_k8v4_debug_log(
+                    "graph_update_no_workspace",
+                    num_tokens=num_tokens,
+                    n_events=len(events),
+                )
+            _br_k8v4_record_graph_events(update_stream, events)
+            return
+        # Match capture order: do not re-sort keys relative to handles.
+        if use_layer_aware_replay:
+            attn_keys = [attn_keys[index % num_layers] for index in range(graph_param_count)]
+        step_id = _BR_K8V4_UPDATE_COUNT.get(num_tokens, 0)
+        _BR_K8V4_UPDATE_COUNT[num_tokens] = step_id + 1
+        skip_update = _br_k8v4_skip_all_updates() or (
+            _br_k8v4_skip_update_after_first() and step_id > 0
+        )
+        if skip_update:
+            if _br_k8v4_graph_debug():
+                _br_k8v4_debug_log(
+                    "graph_update_skipped",
+                    num_tokens=num_tokens,
+                    step_id=step_id,
+                    skip_all=_br_k8v4_skip_all_updates(),
+                )
+            _br_k8v4_record_graph_events(update_stream, events)
+            return
+        recorded = 0
+        try:
+            with torch.npu.stream(update_stream):
+                for upd_idx, (key, param, handle, event) in enumerate(
+                    zip(attn_keys, captured_attn_params, handles, events)
+                ):
+                    (
+                        _marker,
+                        query,
+                        key_cache,
+                        value_cache,
+                        _block_tables,
+                        _actual_seq_lengths_q,
+                        _actual_seq_lengths_kv,
+                        block_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_size,
+                        scale,
+                        rotation_key,
+                        rotation_value,
+                        sparse_mode,
+                        pre_tokens,
+                        next_tokens,
+                        _atten_mask,
+                        out,
+                        layer_name,
+                    ) = param
+                    metadata_key = (
+                        layer_name
+                        if layer_name is not None and layer_name in attn_metadata
+                        else key
+                    )
+                    meta = attn_metadata[metadata_key]
+                    batch_size = meta.seq_lens.shape[0]
+                    actual_seq_lengths_q, actual_seq_lengths_kv = (
+                        _br_k8v4_seq_lens_for_graph(meta, batch_size)
+                    )
+                    if _br_k8v4_graph_debug():
+                        bt_dbg = meta.block_tables
+                        _br_k8v4_debug_log(
+                            "graph_update_begin",
+                            layer=layer_name,
+                            upd_idx=upd_idx,
+                            num_tokens=num_tokens,
+                            seq_q=actual_seq_lengths_q,
+                            seq_kv=actual_seq_lengths_kv,
+                            block0=(
+                                bt_dbg[0, :4].detach().cpu().tolist()
+                                if bt_dbg is not None
+                                else None
+                            ),
+                            attn_state=str(meta.attn_state),
+                        )
+                    elif upd_idx == 0:
+                        bt_dbg = meta.block_tables
+                        _br_k8v4_debug_log(
+                            "graph_update",
+                            layer=layer_name,
+                            num_tokens=num_tokens,
+                            seq_q=actual_seq_lengths_q,
+                            seq_kv=actual_seq_lengths_kv,
+                            seq_kv_list=list(meta.seq_lens_list[:batch_size]),
+                            block0=(
+                                bt_dbg[0, :4].detach().cpu().tolist()
+                                if bt_dbg is not None
+                                else None
+                            ),
+                            query_ptr=(
+                                int(query.data_ptr()) if hasattr(query, "data_ptr") else None
+                            ),
+                            ws_numel=(
+                                int(workspace.numel()) if workspace is not None else None
+                            ),
+                            attn_state=str(meta.attn_state),
+                        )
+                    block_tables = meta.block_tables
+                    if meta.attn_state == AscendAttentionState.PrefillCacheHit:
+                        batch_size = meta.seq_lens.shape[0]
+                        block_tables = block_tables[:batch_size, :]
+                    is_decode = meta.attn_state == AscendAttentionState.DecodeOnly
+                    atten_mask = None if is_decode else meta.attn_mask
+                    sparse_mode_upd = 0 if is_decode else sparse_mode
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    bit_residual_fia_paged_k8v4(
+                        query=query,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        block_tables=block_tables,
+                        actual_seq_lengths_q=actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        head_size=head_size,
+                        num_heads=num_heads,
+                        num_kv_heads=num_kv_heads,
+                        block_size=block_size,
+                        scale=scale,
+                        rotation_key=rotation_key,
+                        rotation_value=rotation_value,
+                        atten_mask=atten_mask,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
+                        sparse_mode=sparse_mode_upd,
+                        out=out,
+                        workspace=workspace,
+                        graph_update=True,
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    if _br_k8v4_graph_debug():
+                        _br_k8v4_debug_log(
+                            "graph_update_end",
+                            layer=layer_name,
+                            upd_idx=upd_idx,
+                            num_tokens=num_tokens,
+                        )
+                    event.record(update_stream)
+                    recorded += 1
+        except Exception as e:
+            # Always satisfy captured ExternalEvent.wait nodes, even on failure.
+            if recorded < len(events):
+                _br_k8v4_record_graph_events(update_stream, events[recorded:])
+            if _br_k8v4_graph_debug():
+                _br_k8v4_debug_log(
+                    "graph_update_exception",
+                    num_tokens=num_tokens,
+                    recorded=recorded,
+                    n_events=len(events),
+                    err=repr(e),
+                )
+            # Do not replay with a half-updated task group: demote subsequent
+            # steps away from FULL and skip this replay by re-raising after
+            # events are recorded (avoids event-wait deadlock).
+            raise
+        # Barrier via model_runner wait_stream + acl_graph pre-replay sync.
+        # Do not event.wait(main stream) here: update runs before replay and
+        # must only record events for the upcoming captured event.wait nodes.
+
+    @staticmethod
     def update_graph_params(
         update_stream,
         forward_context,
@@ -688,6 +992,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         draft_attn_metadatas=None,
     ):
         use_layer_aware_replay = needs_layer_aware_fia_graph_replay()
+        if not _EXTRA_CTX.is_draft_model:
+            graph_params = get_graph_params()
+            captured_attn_params = graph_params.attn_params[num_tokens]
+            if AscendAttentionBackendImpl._is_br_k8v4_graph_params(captured_attn_params):
+                AscendAttentionBackendImpl._update_br_k8v4_graph_params(
+                    update_stream,
+                    forward_context,
+                    num_tokens,
+                    graph_params,
+                    use_layer_aware_replay,
+                )
+                return
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
@@ -1480,6 +1796,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         atten_mask: torch.Tensor | None,
         sparse_mode: int,
         out: torch.Tensor,
+        workspace: torch.Tensor | None = None,
+        graph_update: bool = False,
     ):
         """Call ``bit_residual_fia_paged_k8v4`` with this layer's cached params
         (key/value_cache, head/num_heads, scale, rotation). Each dispatch site
@@ -1505,6 +1823,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             rotation_key=self._br_rotation_key,
             rotation_value=self._br_rotation_value,
             out=out,
+            workspace=workspace,
+            graph_update=graph_update,
         )
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
@@ -1541,6 +1861,124 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
         output[:batch_size] = attn_output[:batch_size]
+        return output
+
+    def full_graph_br_fia_k8v4(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        *,
+        num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """FULL ACL graph capture/replay for BitResidual k8v4 paged FIA.
+
+        Without ``graph_task_group_{begin,end}`` the outer graph replays with
+        capture-time ``seq_lens`` / ``block_tables`` and decode outputs become
+        garbage (e.g. repeated tokens) even when no AI Core fault is raised.
+        """
+        if num_tokens is None:
+            num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        state = attn_metadata.attn_state
+        batch_size = attn_metadata.seq_lens.shape[0]
+        block_tables = (
+            attn_metadata.block_tables[:batch_size, :]
+            if state == AscendAttentionState.PrefillCacheHit
+            else attn_metadata.block_tables
+        )
+        is_decode = state == AscendAttentionState.DecodeOnly
+        seq_q, seq_kv = _br_k8v4_seq_lens_for_graph(attn_metadata, batch_size)
+        atten_mask = None if is_decode else attn_metadata.attn_mask
+        sparse_mode = 0 if is_decode else 3
+        out_slice = output[:num_tokens]
+
+        graph_params = get_graph_params()
+        # Oversized buffer: decode seq_kv grows after capture; GetWorkspaceSize
+        # on each update still tiles with *actual* seq, but the external
+        # workspace must cover the max need for this graph size.
+        workspace = graph_params.workspaces.get(num_tokens)
+        if workspace is None:
+            max_model_len = int(self.vllm_config.model_config.max_model_len)
+            seq_kv_ws = [max_model_len] * batch_size
+            workspace = bit_residual_fia_paged_k8v4_get_workspace(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                block_tables=block_tables,
+                actual_seq_lengths_q=seq_q,
+                actual_seq_lengths_kv=seq_kv_ws,
+                head_size=self.head_size,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                block_size=self._block_size,
+                scale=self.scale,
+                rotation_key=self._br_rotation_key,
+                rotation_value=self._br_rotation_value,
+                atten_mask=atten_mask,
+                pre_tokens=SWA_INT_MAX,
+                next_tokens=SWA_INT_MAX,
+                sparse_mode=sparse_mode,
+                out=out_slice,
+            )
+            workspace = cache_graph_workspace(
+                graph_params, num_tokens, workspace, use_max_workspace=True
+            )
+            update_graph_params_workspaces(num_tokens, workspace)
+            _BR_K8V4_GRAPH_WORKSPACES[num_tokens] = workspace
+        elif num_tokens not in _BR_K8V4_GRAPH_WORKSPACES and workspace is not None:
+            _BR_K8V4_GRAPH_WORKSPACES[num_tokens] = workspace
+
+        # Prefer keepalive strong ref (survives weak_ref_workspaces after capture).
+        workspace = _BR_K8V4_GRAPH_WORKSPACES.get(num_tokens, workspace)
+        stream = torch_npu.npu.current_stream()
+        # Same as stock FIA: per-layer ExternalEvent wait+reset in the outer
+        # FULL graph; update path must event.record() before replay so the next
+        # replay's captured event.wait does not deadlock.
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.events[num_tokens].append(event)
+        layer_name = self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None
+        graph_params.attn_params[num_tokens].append(
+            (
+                _BR_K8V4_GRAPH_MARKER,
+                weak_ref_tensors(query),
+                weak_ref_tensors(self.key_cache),
+                weak_ref_tensors(self.value_cache),
+                weak_ref_tensors(block_tables),
+                seq_q,
+                seq_kv,
+                self._block_size,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.scale,
+                weak_ref_tensors(self._br_rotation_key),
+                weak_ref_tensors(self._br_rotation_value),
+                sparse_mode,
+                SWA_INT_MAX,
+                SWA_INT_MAX,
+                weak_ref_tensors(atten_mask) if atten_mask is not None else None,
+                weak_ref_tensors(out_slice),
+                layer_name,
+            )
+        )
+
+        torch.npu.graph_task_group_begin(stream)
+        self._br_fia_paged_k8v4(
+            query=query,
+            block_tables=block_tables,
+            actual_seq_lengths_q=seq_q,
+            actual_seq_lengths_kv=seq_kv,
+            block_size=self._block_size,
+            atten_mask=atten_mask,
+            sparse_mode=sparse_mode,
+            out=out_slice,
+            workspace=workspace,
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.handles[num_tokens].append(handle)
         return output
 
     def _forward_bit_residual_k8v4_paged(
@@ -1598,6 +2036,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self._bit_residual_k8v4
             and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
         ):
+            if _EXTRA_CTX.capturing and not _br_k8v4_force_eager():
+                return self.full_graph_br_fia_k8v4(query, attn_metadata, output)
+            if getattr(self, "layerIndex", None) == 0 and _br_k8v4_graph_debug():
+                batch_size = attn_metadata.seq_lens.shape[0]
+                sq, skv = _br_k8v4_seq_lens_for_graph(attn_metadata, batch_size)
+                _br_k8v4_debug_log(
+                    "eager_forward",
+                    layer=self._layer_name,
+                    capturing=_EXTRA_CTX.capturing,
+                    seq_q=sq,
+                    seq_kv=skv,
+                    block0=attn_metadata.block_tables[0, :4].detach().cpu().tolist()
+                    if attn_metadata.block_tables is not None
+                    else None,
+                    query_ptr=int(query.data_ptr()),
+                    attn_state=str(attn_metadata.attn_state),
+                )
             return self._forward_bit_residual_k8v4_paged(query, attn_metadata, output)
 
         # we inherit ForwardContext in model runner v2, when enable model
@@ -1857,6 +2312,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # capture (stock paged-attn expects a different cache layout).
         if self.kv_cache_dtype == "turboquant" and self._bit_residual_k8v4:
             assert self.key_cache is not None and self.value_cache is not None
+            if _EXTRA_CTX.capturing and not _br_k8v4_force_eager():
+                return self.full_graph_br_fia_k8v4(query, attn_metadata, output)
             self._br_fia_paged_k8v4(
                 query=query,
                 block_tables=attn_metadata.block_tables,
@@ -1977,6 +2434,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             
             if self.kv_cache_dtype == "turboquant":
                 if attn_metadata.num_actual_tokens > 0:
+                    # Bisect FULL: skip packing while capturing so pack nodes are
+                    # not baked into the outer graph (replay would also skip pack).
+                    if _EXTRA_CTX.capturing and _br_k8v4_skip_pack_in_full_graph():
+                        if self.is_kv_producer:
+                            if attn_metadata.reshape_cache_event is None:
+                                attn_metadata.reshape_cache_event = torch.npu.Event()
+                            attn_metadata.reshape_cache_event.record()
+                        return query, key, value, output
                     # slot_mapping is int32+contiguous from metadata build().
                     # K/V are contiguous after Attention.forward view(-1, H, D).
                     num_tok = attn_metadata.num_actual_tokens
@@ -1992,17 +2457,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         key_in = key
                         value_in = value
                         cache_slots = slots
+                    # Pack C++ no longer contig/clones (would bake temps into FULL
+                    # ACL graphs). Eager callers must materialize here; during
+                    # capture the tensors must already be graph-persistent views.
+                    if not _EXTRA_CTX.capturing:
+                        if key_in.stride(-1) != 1 or key_in.stride(0) <= 0 or key_in.stride(1) <= 0:
+                            key_in = key_in.contiguous()
+                        if value_in.stride(-1) != 1 or value_in.stride(0) <= 0 or value_in.stride(1) <= 0:
+                            value_in = value_in.contiguous()
+                        if not cache_slots.is_contiguous():
+                            cache_slots = cache_slots.contiguous()
+                        qsl = attn_metadata.query_start_loc
+                        if not qsl.is_contiguous():
+                            qsl = qsl.contiguous()
+                    else:
+                        qsl = attn_metadata.query_start_loc
                     turboquant_pack_kv_for_cache_to_cache(
                         key=key_in,
                         value=value_in,
                         key_cache=self.key_cache,
                         value_cache=self.value_cache,
                         slot_mapping=cache_slots,
-                        query_start_loc=attn_metadata.query_start_loc,
+                        query_start_loc=qsl,
                         num_reqs=attn_metadata.num_reqs,
                         bits_key=self.turboquant_kv_bits_key,
                         bits_value=self.turboquant_kv_bits_value,
                         rotation_t=self._br_rotation_key,
+                        # FULL capture: pin pack workspace so its GM address
+                        # survives after capture (see EXEC_NPU_CMD temp ws).
+                        use_graph_workspace=bool(_EXTRA_CTX.capturing),
                     )
                 if self.is_kv_producer:
                     if attn_metadata.reshape_cache_event is None:

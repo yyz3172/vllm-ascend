@@ -38,6 +38,8 @@
 #include "torch_npu/csrc/framework/interface/EnvVariables.h"
 #include "torch_npu/csrc/framework/utils/CalcuOpUtil.h"
 #include "torch_npu/csrc/framework/utils/OpPreparation.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
+#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "NPUBridge.h"
 #include "NPUStorageImpl.h"
 
@@ -644,6 +646,56 @@ constexpr auto ConvertTypes(Ts &... args) {
   return std::make_tuple(ConvertType(args)...);
 }
 
+// Owned copies for deferred OpCommand / graph_task_update (stock CopyTypesV2).
+// IntArrayRef must become std::vector so host ValueDepend seq-lens survive the
+// task-queue lambda; tensors keep storage alive via at::Tensor refcount.
+inline at::Tensor GraphCopyType(const at::Tensor &t) { return t; }
+inline std::vector<int64_t> GraphCopyType(const at::IntArrayRef &a) {
+  return a.vec();
+}
+inline c10::optional<std::vector<int64_t>>
+GraphCopyType(const c10::optional<at::IntArrayRef> &opt) {
+  if (!opt.has_value()) {
+    return c10::nullopt;
+  }
+  return opt->vec();
+}
+template <typename T> T GraphCopyType(T value) { return value; }
+
+template <typename... Ts> constexpr auto GraphCopyTypes(Ts &... args) {
+  return std::make_tuple(GraphCopyType(args)...);
+}
+
+inline aclTensor *GraphConvertType(const at::Tensor &t) {
+  return ConvertType(t);
+}
+inline aclIntArray *GraphConvertType(const std::vector<int64_t> &v) {
+  return ConvertType(at::IntArrayRef(v));
+}
+inline aclIntArray *
+GraphConvertType(const c10::optional<std::vector<int64_t>> &opt) {
+  if (!opt.has_value()) {
+    return nullptr;
+  }
+  return ConvertType(at::IntArrayRef(*opt));
+}
+template <typename T> T GraphConvertType(T value) { return value; }
+
+template <typename Tuple, std::size_t... I>
+auto GraphConvertTypesImpl(const Tuple &t, std::index_sequence<I...>) {
+  return std::make_tuple(GraphConvertType(std::get<I>(t))...);
+}
+
+template <typename... Ts>
+constexpr auto GraphConvertTypes(const std::tuple<Ts...> &args,
+                                 uint64_t *workspace_size_addr,
+                                 aclOpExecutor **executor_addr) {
+  auto convert_args =
+      GraphConvertTypesImpl(args, std::make_index_sequence<sizeof...(Ts)>{});
+  return std::tuple_cat(convert_args,
+                        std::make_tuple(workspace_size_addr, executor_addr));
+}
+
 template <typename Function, typename Tuple, size_t... I>
 auto call(Function f, Tuple t, std::index_sequence<I...>) {
   return f(std::get<I>(t)...);
@@ -687,6 +739,24 @@ uint64_t CalcHashId();
 typedef int (*InitHugeMemThreadLocal)(void *, bool);
 typedef void (*UnInitHugeMemThreadLocal)(void *, bool);
 typedef void (*ReleaseHugeMem)(void *, bool);
+typedef void (*InitPTACacheThreadLocal)();
+typedef void (*SetPTAHashKey)(uint64_t);
+typedef void (*SetPTACacheHashKey)(uint8_t *, size_t);
+typedef void (*UnInitPTACacheThreadLocal)();
+
+inline void UnInitCacheThreadLocal()
+{
+    static const auto unInitPTACacheThreadLocalAddr =
+        GetOpApiFuncAddr("UnInitPTACacheThreadLocal");
+    if (unInitPTACacheThreadLocalAddr == nullptr) {
+        return;
+    }
+    UnInitPTACacheThreadLocal unInitPTACacheThreadLocalFunc =
+        reinterpret_cast<UnInitPTACacheThreadLocal>(unInitPTACacheThreadLocalAddr);
+    if (unInitPTACacheThreadLocalFunc) {
+        unInitPTACacheThreadLocalFunc();
+    }
+}
 
 #define EXEC_NPU_CMD(aclnn_api, ...)                                          \
   do {                                                                        \
@@ -746,13 +816,558 @@ typedef void (*ReleaseHugeMem)(void *, bool);
       }                                                                       \
       return api_ret;                                                         \
     };                                                                        \
-    at_npu::native::OpCommand cmd;                                            \
-    cmd.Name(#aclnn_api);                                                     \
-    cmd.SetCustomHandler(acl_call);                                           \
-    cmd.Run();                                                                \
+    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, acl_call);              \
     if (unInitMemFunc) {                                                      \
       unInitMemFunc(nullptr, false);                                          \
     }                                                                         \
   } while (false)
+
+// Query workspace size and allocate a uint8 NPU buffer; do not run the op.
+#define EXEC_GET_WORKSPACE_CMD(workspace_tensor_out, aclnn_api, ...)          \
+  do {                                                                        \
+    static const auto getWorkspaceSizeFuncAddr =                              \
+        GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");                      \
+    static const auto initMemAddr =                                           \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                           \
+    static const auto unInitMemAddr =                                         \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                         \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");    \
+    TORCH_CHECK(getWorkspaceSizeFuncAddr != nullptr,                          \
+                #aclnn_api "GetWorkspaceSize not in ", GetOpApiLibName());    \
+    uint64_t workspace_size = 0;                                              \
+    uint64_t *workspace_size_addr = &workspace_size;                          \
+    aclOpExecutor *executor = nullptr;                                        \
+    aclOpExecutor **executor_addr = &executor;                                \
+    InitHugeMemThreadLocal initMemFunc =                                      \
+        reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);                \
+    UnInitHugeMemThreadLocal unInitMemFunc =                                  \
+        reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);            \
+    if (initMemFunc) {                                                        \
+      initMemFunc(nullptr, false);                                            \
+    }                                                                         \
+    auto converted_params =                                                   \
+        ConvertTypes(__VA_ARGS__, workspace_size_addr, executor_addr);        \
+    static auto getWorkspaceSizeFunc =                                        \
+        ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);     \
+    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);     \
+    TORCH_CHECK(workspace_status == 0,                                        \
+                "call " #aclnn_api "GetWorkspaceSize failed, detail:",        \
+                aclGetRecentErrMsg());                                        \
+    at::TensorOptions options =                                               \
+        at::TensorOptions(torch_npu::utils::get_npu_device_type());           \
+    workspace_tensor_out =                                                    \
+        at::empty({static_cast<int64_t>(workspace_size)},                     \
+                  options.dtype(kByte));                                      \
+    ReleaseConvertTypes(converted_params);                                    \
+    ReleaseHugeMem releaseMemFunc =                                           \
+        reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                     \
+    if (releaseMemFunc) {                                                     \
+      releaseMemFunc(nullptr, false);                                         \
+    }                                                                         \
+    if (unInitMemFunc) {                                                      \
+      unInitMemFunc(nullptr, false);                                          \
+    }                                                                         \
+  } while (false)
+
+// ACL graph capture/update launch: external workspace + owned param copies.
+// Mirrors stock EXEC_UPDATE_* (CopyTypesV2 + ConvertTypesV2) so ValueDepend
+// host ints and tensor views remain valid across the OpCommand task queue.
+#define EXEC_GRAPH_LAUNCH_NPU_CMD_V1(aclnn_api, workspace_addr, workspace_size, \
+                                     ...)                                      \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");                       \
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(#aclnn_api);            \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto unInitMemAddr =                                          \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                          \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");     \
+    static const auto initPTACacheThreadLocalAddr =                            \
+        GetOpApiFuncAddr("InitPTACacheThreadLocal");                           \
+    static const auto setPTAHashKeyAddr = GetOpApiFuncAddr("SetPTAHashKey");   \
+    TORCH_CHECK(                                                               \
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,       \
+        #aclnn_api, " or ", #aclnn_api "GetWorkspaceSize not in ",              \
+        GetOpApiLibName());                                                    \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    aclOpExecutor *executor = nullptr;                                         \
+    aclOpExecutor **executor_addr = &executor;                                 \
+    InitHugeMemThreadLocal initMemFunc =                                       \
+        reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);                 \
+    UnInitHugeMemThreadLocal unInitMemFunc =                                   \
+        reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);             \
+    InitPTACacheThreadLocal initPTACacheThreadLocalFunc =                      \
+        reinterpret_cast<InitPTACacheThreadLocal>(                             \
+            initPTACacheThreadLocalAddr);                                      \
+    SetPTAHashKey setPTAHashKeyFunc =                                          \
+        reinterpret_cast<SetPTAHashKey>(setPTAHashKeyAddr);                    \
+    if (initPTACacheThreadLocalFunc && setPTAHashKeyFunc) {                    \
+      initPTACacheThreadLocalFunc();                                           \
+      setPTAHashKeyFunc(0);                                                    \
+    }                                                                          \
+    if (initMemFunc) {                                                         \
+      initMemFunc(nullptr, false);                                             \
+    }                                                                          \
+    auto copied_params = GraphCopyTypes(__VA_ARGS__);                          \
+    uint64_t fake_workspace_size = 0;                                          \
+    uint64_t *workspace_size_addr = &fake_workspace_size;                      \
+    auto converted_params = GraphConvertTypes(                                 \
+        copied_params, workspace_size_addr, executor_addr);                    \
+    static auto getWorkspaceSizeFunc =                                         \
+        ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);        \
+    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);      \
+    TORCH_CHECK(workspace_status == 0,                                         \
+                "call " #aclnn_api "GetWorkspaceSize failed, detail:",         \
+                aclGetRecentErrMsg());                                         \
+    TORCH_CHECK(workspace_size >= fake_workspace_size,                         \
+                #aclnn_api " graph workspace too small: have ",                \
+                workspace_size, " need ", fake_workspace_size);                \
+    auto acl_call = [converted_params, workspace_addr, workspace_size,         \
+                     acl_stream, executor, releaseMemAddr]() -> int {          \
+      typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,              \
+                               const aclrtStream);                             \
+      OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);        \
+      auto api_ret =                                                           \
+          opApiFunc(workspace_addr, workspace_size, executor, acl_stream);     \
+      TORCH_CHECK(api_ret == 0, "call " #aclnn_api " failed, detail:",         \
+                  aclGetRecentErrMsg());                                       \
+      ReleaseConvertTypes(converted_params);                                   \
+      ReleaseHugeMem releaseMemFunc =                                          \
+          reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                    \
+      if (releaseMemFunc) {                                                    \
+        releaseMemFunc(nullptr, false);                                        \
+      }                                                                        \
+      return api_ret;                                                          \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, acl_call);               \
+    if (unInitMemFunc) {                                                       \
+      unInitMemFunc(nullptr, false);                                           \
+    }                                                                          \
+    UnInitCacheThreadLocal();                                                  \
+  } while (false)
+
+// Outer ACL FULL-graph capture for ops that are NOT refreshed via
+// graph_task_update (e.g. BitResidual pack). Releasing ConvertTypes / HugeMem
+// after the capture launch frees ACL metadata still referenced by the recorded
+// graph, which then AI-Cores on the 2nd+ replay. Hold copies for process life.
+#define EXEC_GRAPH_CAPTURE_HOLD_NPU_CMD(aclnn_api, workspace_addr,             \
+                                        workspace_size, ...)                   \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");                       \
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(#aclnn_api);            \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto initPTACacheThreadLocalAddr =                            \
+        GetOpApiFuncAddr("InitPTACacheThreadLocal");                           \
+    static const auto setPTAHashKeyAddr = GetOpApiFuncAddr("SetPTAHashKey");   \
+    TORCH_CHECK(                                                               \
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,       \
+        #aclnn_api, " or ", #aclnn_api "GetWorkspaceSize not in ",              \
+        GetOpApiLibName());                                                    \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    aclOpExecutor *executor = nullptr;                                         \
+    aclOpExecutor **executor_addr = &executor;                                 \
+    InitHugeMemThreadLocal initMemFunc =                                       \
+        reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);                 \
+    InitPTACacheThreadLocal initPTACacheThreadLocalFunc =                      \
+        reinterpret_cast<InitPTACacheThreadLocal>(                             \
+            initPTACacheThreadLocalAddr);                                      \
+    SetPTAHashKey setPTAHashKeyFunc =                                          \
+        reinterpret_cast<SetPTAHashKey>(setPTAHashKeyAddr);                    \
+    if (initPTACacheThreadLocalFunc && setPTAHashKeyFunc) {                    \
+      initPTACacheThreadLocalFunc();                                           \
+      setPTAHashKeyFunc(0);                                                    \
+    }                                                                          \
+    if (initMemFunc) {                                                         \
+      initMemFunc(nullptr, false);                                             \
+    }                                                                          \
+    /* Heap-allocate so owned copies outlive this stack frame / graph life. */ \
+    auto *copied_params =                                                      \
+        new std::decay_t<decltype(GraphCopyTypes(__VA_ARGS__))>(               \
+            GraphCopyTypes(__VA_ARGS__));                                      \
+    uint64_t fake_workspace_size = 0;                                          \
+    uint64_t *workspace_size_addr = &fake_workspace_size;                      \
+    auto converted_params = GraphConvertTypes(                                 \
+        *copied_params, workspace_size_addr, executor_addr);                   \
+    auto *converted_held =                                                     \
+        new std::decay_t<decltype(converted_params)>(converted_params);        \
+    static auto getWorkspaceSizeFunc =                                         \
+        ConvertToOpApiFunc(*converted_held, getWorkspaceSizeFuncAddr);         \
+    auto workspace_status = call(getWorkspaceSizeFunc, *converted_held);       \
+    TORCH_CHECK(workspace_status == 0,                                         \
+                "call " #aclnn_api "GetWorkspaceSize failed, detail:",         \
+                aclGetRecentErrMsg());                                         \
+    TORCH_CHECK(workspace_size >= fake_workspace_size,                         \
+                #aclnn_api " graph workspace too small: have ",                \
+                workspace_size, " need ", fake_workspace_size);                \
+    auto acl_call = [converted_held, workspace_addr, workspace_size,           \
+                     acl_stream, executor]() -> int {                          \
+      typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,              \
+                               const aclrtStream);                             \
+      OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);        \
+      auto api_ret = opApiFunc(workspace_addr, workspace_size, executor,       \
+                               acl_stream);                                    \
+      TORCH_CHECK(api_ret == 0, "call " #aclnn_api " failed, detail:",         \
+                  aclGetRecentErrMsg());                                       \
+      /* Intentionally no ReleaseConvertTypes / ReleaseHugeMem. */             \
+      (void)converted_held;                                                    \
+      return api_ret;                                                          \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, acl_call);               \
+    /* Keep HugeMem / PTA cache; do not UnInit — graph still references it. */ \
+    UnInitCacheThreadLocal();                                                  \
+    (void)copied_params;                                                       \
+  } while (false)
+
+#define EXEC_GRAPH_LAUNCH_NPU_CMD_V2(aclnn_api, workspace_addr, workspace_size, \
+                                     ...)                                      \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");                       \
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(#aclnn_api);            \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto unInitMemAddr =                                          \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                          \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");     \
+    static const auto initPTACacheThreadLocalAddr =                            \
+        GetOpApiFuncAddr("InitPTACacheThreadLocal");                           \
+    static const auto setPTACacheHashKeyAddr =                                 \
+        GetOpApiFuncAddr("SetPTACacheHashKey");                                \
+    TORCH_CHECK(                                                               \
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,       \
+        #aclnn_api, " or ", #aclnn_api "GetWorkspaceSize not in ",              \
+        GetOpApiLibName());                                                    \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    auto copied_params = GraphCopyTypes(__VA_ARGS__);                          \
+    auto acl_call = [workspace_addr, workspace_size, copied_params,            \
+                     acl_stream]() -> int {                                    \
+      uint64_t fake_workspace_size = 0;                                       \
+      uint64_t *workspace_size_addr = &fake_workspace_size;                   \
+      aclOpExecutor *executor = nullptr;                                      \
+      aclOpExecutor **executor_addr = &executor;                              \
+      InitHugeMemThreadLocal initMemFunc =                                    \
+          reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);              \
+      UnInitHugeMemThreadLocal unInitMemFunc =                                \
+          reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);          \
+      InitPTACacheThreadLocal initPTACacheThreadLocalFunc =                   \
+          reinterpret_cast<InitPTACacheThreadLocal>(                          \
+              initPTACacheThreadLocalAddr);                                   \
+      SetPTACacheHashKey setPTAHashKeyFunc =                                  \
+          reinterpret_cast<SetPTACacheHashKey>(setPTACacheHashKeyAddr);       \
+      if (initPTACacheThreadLocalFunc && setPTAHashKeyFunc) {                 \
+        initPTACacheThreadLocalFunc();                                        \
+        setPTAHashKeyFunc(nullptr, 0);                                        \
+      }                                                                       \
+      if (initMemFunc) {                                                      \
+        initMemFunc(nullptr, false);                                          \
+      }                                                                       \
+      auto converted_params = GraphConvertTypes(                              \
+          copied_params, workspace_size_addr, executor_addr);                 \
+      auto getWorkspaceSizeFunc =                                             \
+          ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);     \
+      auto workspace_status = call(getWorkspaceSizeFunc, converted_params);   \
+      TORCH_CHECK(workspace_status == 0,                                      \
+                  "call " #aclnn_api "GetWorkspaceSize failed, detail:",      \
+                  aclGetRecentErrMsg());                                      \
+      TORCH_CHECK(workspace_size >= fake_workspace_size,                      \
+                  #aclnn_api " graph workspace too small: have ",             \
+                  workspace_size, " need ", fake_workspace_size);             \
+      typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,             \
+                               const aclrtStream);                            \
+      OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);       \
+      auto api_ret =                                                          \
+          opApiFunc(workspace_addr, workspace_size, executor, acl_stream);    \
+      TORCH_CHECK(api_ret == 0, "call " #aclnn_api " failed, detail:",        \
+                  aclGetRecentErrMsg());                                      \
+      ReleaseConvertTypes(converted_params);                                  \
+      ReleaseHugeMem releaseMemFunc =                                         \
+          reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                   \
+      if (releaseMemFunc) {                                                   \
+        releaseMemFunc(nullptr, false);                                       \
+      }                                                                       \
+      if (unInitMemFunc) {                                                    \
+        unInitMemFunc(nullptr, false);                                        \
+      }                                                                       \
+      UnInitCacheThreadLocal();                                               \
+      return api_ret;                                                         \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, acl_call);               \
+  } while (false)
+
+// ACL graph capture launch: V1 — GetWorkspaceSize outside OpCommand (V2
+// historically segfaulted during FULL ACL graph capture). Callers that need
+// graph_task_update refresh (host ValueDepend seq-lens) must pass
+// graph_update=True and use EXEC_GRAPH_LAUNCH_NPU_CMD_V2 explicitly.
+#define EXEC_GRAPH_LAUNCH_NPU_CMD(aclnn_api, workspace_addr, workspace_size,    \
+                                  ...)                                         \
+  EXEC_GRAPH_LAUNCH_NPU_CMD_V1(aclnn_api, workspace_addr, workspace_size,      \
+                               __VA_ARGS__)
+
+// Graph launch with separate Tensor GetWorkspaceSize API (ValueDepend host
+// tensors) + base launch API. Host-side GetWorkspaceSize (V1 style) — V2
+// in-lambda GetWorkspaceSize previously segfaulted on FULL capture.
+#define EXEC_GRAPH_LAUNCH_NPU_CMD_SPLIT_V1(getws_api, launch_api,             \
+                                           workspace_addr, workspace_size,    \
+                                           ...)                               \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#getws_api);                                          \
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(#launch_api);           \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto unInitMemAddr =                                          \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                          \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");     \
+    static const auto initPTACacheThreadLocalAddr =                            \
+        GetOpApiFuncAddr("InitPTACacheThreadLocal");                           \
+    static const auto setPTAHashKeyAddr = GetOpApiFuncAddr("SetPTAHashKey");   \
+    TORCH_CHECK(                                                               \
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,       \
+        #getws_api, " or ", #launch_api, " not in ", GetOpApiLibName());       \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    aclOpExecutor *executor = nullptr;                                         \
+    aclOpExecutor **executor_addr = &executor;                                 \
+    InitHugeMemThreadLocal initMemFunc =                                       \
+        reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);                 \
+    UnInitHugeMemThreadLocal unInitMemFunc =                                   \
+        reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);             \
+    InitPTACacheThreadLocal initPTACacheThreadLocalFunc =                      \
+        reinterpret_cast<InitPTACacheThreadLocal>(                             \
+            initPTACacheThreadLocalAddr);                                      \
+    SetPTAHashKey setPTAHashKeyFunc =                                          \
+        reinterpret_cast<SetPTAHashKey>(setPTAHashKeyAddr);                    \
+    if (initPTACacheThreadLocalFunc && setPTAHashKeyFunc) {                    \
+      initPTACacheThreadLocalFunc();                                           \
+      setPTAHashKeyFunc(0);                                                    \
+    }                                                                          \
+    if (initMemFunc) {                                                         \
+      initMemFunc(nullptr, false);                                             \
+    }                                                                          \
+    auto copied_params = GraphCopyTypes(__VA_ARGS__);                          \
+    uint64_t fake_workspace_size = 0;                                          \
+    uint64_t *workspace_size_addr = &fake_workspace_size;                      \
+    auto converted_params = GraphConvertTypes(                                 \
+        copied_params, workspace_size_addr, executor_addr);                    \
+    static auto getWorkspaceSizeFunc =                                         \
+        ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);        \
+    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);      \
+    TORCH_CHECK(workspace_status == 0,                                         \
+                "call " #getws_api " failed, detail:",                         \
+                aclGetRecentErrMsg());                                         \
+    TORCH_CHECK(workspace_size >= fake_workspace_size,                         \
+                #launch_api " graph workspace too small: have ",               \
+                workspace_size, " need ", fake_workspace_size);                \
+    auto acl_call = [converted_params, workspace_addr, workspace_size,         \
+                     acl_stream, executor, releaseMemAddr]() -> int {          \
+      typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,              \
+                               const aclrtStream);                             \
+      OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);        \
+      auto api_ret =                                                           \
+          opApiFunc(workspace_addr, workspace_size, executor, acl_stream);     \
+      TORCH_CHECK(api_ret == 0, "call " #launch_api " failed, detail:",        \
+                  aclGetRecentErrMsg());                                       \
+      ReleaseConvertTypes(converted_params);                                   \
+      ReleaseHugeMem releaseMemFunc =                                          \
+          reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                    \
+      if (releaseMemFunc) {                                                    \
+        releaseMemFunc(nullptr, false);                                        \
+      }                                                                        \
+      return api_ret;                                                          \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#launch_api, acl_call);              \
+    if (unInitMemFunc) {                                                       \
+      unInitMemFunc(nullptr, false);                                           \
+    }                                                                          \
+    UnInitCacheThreadLocal();                                                  \
+  } while (false)
+
+// ValueDepend seq-lens: GetWorkspaceSize uses the *Tensor* aclnn entry while
+// launch still uses the base op (generated CANN pattern).
+#define EXEC_NPU_CMD_SPLIT(getws_api, launch_api, ...)                         \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#getws_api);                                          \
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(#launch_api);           \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto unInitMemAddr =                                          \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                            \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");     \
+    TORCH_CHECK(                                                               \
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,       \
+        #getws_api, " or ", #launch_api, " not in ", GetOpApiLibName());       \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    uint64_t workspace_size = 0;                                               \
+    uint64_t *workspace_size_addr = &workspace_size;                           \
+    aclOpExecutor *executor = nullptr;                                         \
+    aclOpExecutor **executor_addr = &executor;                                 \
+    InitHugeMemThreadLocal initMemFunc =                                       \
+        reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);                 \
+    UnInitHugeMemThreadLocal unInitMemFunc =                                   \
+        reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);               \
+    if (initMemFunc) {                                                         \
+      initMemFunc(nullptr, false);                                             \
+    }                                                                          \
+    auto converted_params =                                                    \
+        ConvertTypes(__VA_ARGS__, workspace_size_addr, executor_addr);          \
+    static auto getWorkspaceSizeFunc =                                         \
+        ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);        \
+    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);      \
+    TORCH_CHECK(workspace_status == 0,                                         \
+                "call " #getws_api " failed, detail:", aclGetRecentErrMsg()); \
+    void *workspace_addr = nullptr;                                            \
+    if (workspace_size != 0) {                                                 \
+      at::TensorOptions options =                                              \
+          at::TensorOptions(torch_npu::utils::get_npu_device_type());          \
+      auto workspace_tensor =                                                  \
+          at::empty({static_cast<int64_t>(workspace_size)},                    \
+                    options.dtype(kByte));                                       \
+      workspace_addr = const_cast<void *>(workspace_tensor.storage().data());  \
+    }                                                                          \
+    auto acl_call = [converted_params, workspace_addr, workspace_size,          \
+                     acl_stream, executor]() -> int {                          \
+      typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,              \
+                               const aclrtStream);                             \
+      OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);        \
+      auto api_ret =                                                           \
+          opApiFunc(workspace_addr, workspace_size, executor, acl_stream);     \
+      TORCH_CHECK(api_ret == 0, "call " #launch_api " failed, detail:",        \
+                  aclGetRecentErrMsg());                                       \
+      ReleaseConvertTypes(converted_params);                                   \
+      ReleaseHugeMem releaseMemFunc =                                          \
+          reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                    \
+      if (releaseMemFunc) {                                                    \
+        releaseMemFunc(nullptr, false);                                        \
+      }                                                                        \
+      return api_ret;                                                          \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#launch_api, acl_call);              \
+    if (unInitMemFunc) {                                                       \
+      unInitMemFunc(nullptr, false);                                           \
+    }                                                                          \
+  } while (false)
+
+#define EXEC_GET_WORKSPACE_CMD_SPLIT(workspace_tensor_out, getws_api, ...)     \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#getws_api);                                          \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto unInitMemAddr =                                          \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                          \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");    \
+    TORCH_CHECK(getWorkspaceSizeFuncAddr != nullptr,                           \
+                #getws_api " not in ", GetOpApiLibName());                     \
+    uint64_t workspace_size = 0;                                               \
+    uint64_t *workspace_size_addr = &workspace_size;                           \
+    aclOpExecutor *executor = nullptr;                                         \
+    aclOpExecutor **executor_addr = &executor;                                 \
+    InitHugeMemThreadLocal initMemFunc =                                       \
+        reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);                 \
+    UnInitHugeMemThreadLocal unInitMemFunc =                                   \
+        reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);            \
+    if (initMemFunc) {                                                         \
+      initMemFunc(nullptr, false);                                             \
+    }                                                                          \
+    auto converted_params =                                                    \
+        ConvertTypes(__VA_ARGS__, workspace_size_addr, executor_addr);          \
+    static auto getWorkspaceSizeFunc =                                         \
+        ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);        \
+    auto workspace_status = call(getWorkspaceSizeFunc, converted_params);      \
+    TORCH_CHECK(workspace_status == 0,                                         \
+                "call " #getws_api " failed, detail:", aclGetRecentErrMsg()); \
+    at::TensorOptions options =                                                \
+        at::TensorOptions(torch_npu::utils::get_npu_device_type());            \
+    workspace_tensor_out =                                                     \
+        at::empty({static_cast<int64_t>(workspace_size)},                      \
+                  options.dtype(kByte));                                       \
+    ReleaseConvertTypes(converted_params);                                     \
+    ReleaseHugeMem releaseMemFunc =                                            \
+        reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                      \
+    if (releaseMemFunc) {                                                      \
+      releaseMemFunc(nullptr, false);                                          \
+    }                                                                          \
+    if (unInitMemFunc) {                                                       \
+      unInitMemFunc(nullptr, false);                                           \
+    }                                                                          \
+  } while (false)
+
+#define EXEC_GRAPH_LAUNCH_NPU_CMD_SPLIT(getws_api, launch_api, workspace_addr, \
+                                        workspace_size, ...)                   \
+  do {                                                                         \
+    static const auto getWorkspaceSizeFuncAddr =                               \
+        GetOpApiFuncAddr(#getws_api);                                          \
+    static const auto opApiFuncAddr = GetOpApiFuncAddr(#launch_api);           \
+    static const auto initMemAddr =                                            \
+        GetOpApiFuncAddr("InitHugeMemThreadLocal");                            \
+    static const auto unInitMemAddr =                                          \
+        GetOpApiFuncAddr("UnInitHugeMemThreadLocal");                          \
+    static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");   \
+    static const auto initPTACacheThreadLocalAddr =                            \
+        GetOpApiFuncAddr("InitPTACacheThreadLocal");                           \
+    static const auto setPTACacheHashKeyAddr =                                 \
+        GetOpApiFuncAddr("SetPTACacheHashKey");                                \
+    TORCH_CHECK(                                                               \
+        getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,       \
+        #getws_api, " or ", #launch_api, " not in ", GetOpApiLibName());      \
+    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);          \
+    auto copied_params = GraphCopyTypes(__VA_ARGS__);                          \
+    auto acl_call = [workspace_addr, workspace_size, copied_params,           \
+                     acl_stream]() -> int {                                    \
+      uint64_t fake_workspace_size = 0;                                        \
+      uint64_t *workspace_size_addr = &fake_workspace_size;                    \
+      aclOpExecutor *executor = nullptr;                                       \
+      aclOpExecutor **executor_addr = &executor;                                 \
+      InitHugeMemThreadLocal initMemFunc =                                     \
+          reinterpret_cast<InitHugeMemThreadLocal>(initMemAddr);               \
+      UnInitHugeMemThreadLocal unInitMemFunc =                                 \
+          reinterpret_cast<UnInitHugeMemThreadLocal>(unInitMemAddr);           \
+      InitPTACacheThreadLocal initPTACacheThreadLocalFunc =                  \
+          reinterpret_cast<InitPTACacheThreadLocal>(                           \
+              initPTACacheThreadLocalAddr);                                    \
+      SetPTACacheHashKey setPTAHashKeyFunc =                                   \
+          reinterpret_cast<SetPTACacheHashKey>(setPTACacheHashKeyAddr);        \
+      if (initPTACacheThreadLocalFunc && setPTAHashKeyFunc) {                 \
+        initPTACacheThreadLocalFunc();                                         \
+        setPTAHashKeyFunc(nullptr, 0);                                         \
+      }                                                                        \
+      if (initMemFunc) {                                                       \
+        initMemFunc(nullptr, false);                                          \
+      }                                                                        \
+      auto converted_params = GraphConvertTypes(                               \
+          copied_params, workspace_size_addr, executor_addr);                  \
+      auto getWorkspaceSizeFunc =                                              \
+          ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);      \
+      auto workspace_status = call(getWorkspaceSizeFunc, converted_params);    \
+      TORCH_CHECK(workspace_status == 0,                                       \
+                  "call " #getws_api " failed, detail:", aclGetRecentErrMsg()); \
+      TORCH_CHECK(workspace_size >= fake_workspace_size,                       \
+                  #launch_api " graph workspace too small: have ",             \
+                  workspace_size, " need ", fake_workspace_size);              \
+      typedef int (*OpApiFunc)(void *, uint64_t, aclOpExecutor *,              \
+                               const aclrtStream);                             \
+      OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);        \
+      auto api_ret =                                                           \
+          opApiFunc(workspace_addr, workspace_size, executor, acl_stream);     \
+      TORCH_CHECK(api_ret == 0, "call " #launch_api " failed, detail:",        \
+                  aclGetRecentErrMsg());                                       \
+      ReleaseConvertTypes(converted_params);                                   \
+      ReleaseHugeMem releaseMemFunc =                                          \
+          reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                    \
+      if (releaseMemFunc) {                                                    \
+        releaseMemFunc(nullptr, false);                                        \
+      }                                                                        \
+      if (unInitMemFunc) {                                                     \
+        unInitMemFunc(nullptr, false);                                         \
+      }                                                                        \
+      UnInitCacheThreadLocal();                                                \
+      return api_ret;                                                          \
+    };                                                                         \
+    at_npu::native::OpCommand::RunOpApiV2(#launch_api, acl_call);              \
+  } while (false)
+
 
 #endif

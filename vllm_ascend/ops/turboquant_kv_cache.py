@@ -74,6 +74,9 @@ _SEQ_LEN_LIST_CACHE: dict[tuple[int, ...], list[int]] = {}
 _SEQ_LEN_LIST_CACHE_MAX = 256
 _BIT_RESIDUAL_K8V4_ROTATION_CACHE: dict[tuple[str, int, int], torch.Tensor] = {}
 _BIT_RESIDUAL_K8V4_LAYOUT_CACHE: dict[tuple, bool] = {}
+# Strong refs for FULL ACL-graph capture: pack EXEC_NPU_CMD otherwise bakes a
+# temporary workspace pointer that is freed after capture.
+_PACK_K8V4_GRAPH_WORKSPACES: dict[tuple, torch.Tensor] = {}
 
 
 def _init_custom_op_cache() -> None:
@@ -855,8 +858,8 @@ def _bit_residual_k8v4_rotation_t(
         rotation = quantizer._rotation_t_fp16.to(device=device)
     else:
         rotation = quantizer.rotation_t.to(device=device, dtype=dtype)
-    _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key] = rotation
-    return rotation
+    _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key] = rotation.contiguous()
+    return _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key]
 
 
 def _bit_residual_k8v4_rotation(
@@ -886,8 +889,8 @@ def _bit_residual_k8v4_rotation(
         rotation = quantizer._rotation_fp16.to(device=device)
     else:
         rotation = quantizer.rotation.to(device=device, dtype=dtype)
-    _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key] = rotation
-    return rotation
+    _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key] = rotation.contiguous()
+    return _BIT_RESIDUAL_K8V4_ROTATION_CACHE[cache_key]
 
 
 def _bit_residual_k8v4_layout_ok(
@@ -1433,6 +1436,8 @@ def turboquant_pack_kv_for_cache_to_cache(
     bits_key: int,
     bits_value: int,
     rotation_t: torch.Tensor,
+    workspace: torch.Tensor | None = None,
+    use_graph_workspace: bool = False,
 ) -> None:
     head_size = key.shape[-1]
 
@@ -1444,6 +1449,38 @@ def turboquant_pack_kv_for_cache_to_cache(
         block_size_k8v4 = (
             key_cache.shape[-1] // BIT_RESIDUAL_K8V4_KEY_BLOCK_STRIDE
         ) * BIT_RESIDUAL_K8V4_BLOCK_ROWS
+        pack_ws = workspace
+        if use_graph_workspace and pack_ws is None:
+            # Decode FULL graphs pack sequentially per layer; one keepalive
+            # buffer per (device, shape, num_reqs) is enough.
+            ws_key = (
+                str(key.device),
+                int(key.shape[0]),
+                int(key.shape[1]),
+                int(key_cache.shape[0]),
+                int(key_cache.shape[1]),
+                int(key_cache.shape[2]),
+                int(num_reqs),
+                int(block_size_k8v4),
+            )
+            pack_ws = _PACK_K8V4_GRAPH_WORKSPACES.get(ws_key)
+            if pack_ws is None:
+                pack_ws = torch.ops._C_ascend.bit_residual_pack_k8v4_get_workspace(
+                    key,
+                    value,
+                    slot_mapping,
+                    query_start_loc,
+                    rotation_t,
+                    key_cache,
+                    value_cache,
+                    int(num_reqs),
+                    int(block_size_k8v4),
+                )
+                _PACK_K8V4_GRAPH_WORKSPACES[ws_key] = pack_ws
+            elif pack_ws.numel() == 0:
+                # Zero-sized workspace: still pass it so C++ takes the graph
+                # launch path (no temp alloc) rather than EXEC_NPU_CMD.
+                pass
         torch.ops._C_ascend.bit_residual_pack_k8v4(
             key,
             value,
@@ -1454,6 +1491,7 @@ def turboquant_pack_kv_for_cache_to_cache(
             value_cache,
             int(num_reqs),
             int(block_size_k8v4),
+            pack_ws,
         )
         return
 
@@ -1733,8 +1771,8 @@ def _turboquant_fused_infer_attention_score_8bit_impl(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     atten_mask: torch.Tensor | None,
-    actual_seq_lengths_q: list[int],
-    actual_seq_lengths_kv: list[int],
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
     head_size: int,
     num_heads: int,
     num_key_value_heads: int,
@@ -1955,8 +1993,8 @@ def turboquant_fused_infer_attention_score_8bit(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     atten_mask: torch.Tensor | None,
-    actual_seq_lengths_q: list[int],
-    actual_seq_lengths_kv: list[int],
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
     head_size: int,
     num_heads: int,
     num_key_value_heads: int,
@@ -2018,8 +2056,8 @@ def turboquant_attention_paged8bit(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    actual_seq_lengths_q: list[int],
-    actual_seq_lengths_kv: list[int],
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
     head_size: int,
     num_heads: int,
     num_key_value_heads: int,
@@ -2103,8 +2141,8 @@ def turboquant_attention_paged4bit(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    actual_seq_lengths_q: list[int],
-    actual_seq_lengths_kv: list[int],
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
     head_size: int,
     num_heads: int,
     num_key_value_heads: int,
@@ -2191,8 +2229,8 @@ def bit_residual_attention_paged_k8v4(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    actual_seq_lengths_q: list[int],
-    actual_seq_lengths_kv: list[int],
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
     head_size: int,
     num_heads: int,
     num_kv_heads: int,
@@ -2281,14 +2319,25 @@ def bit_residual_attention_paged_k8v4(
     return result.view(query.shape[0], num_heads, head_size)
 
 
-def bit_residual_fia_paged_k8v4(
+def _br_fia_seq_as_list(seq: list[int] | torch.Tensor) -> list[int]:
+    if isinstance(seq, torch.Tensor):
+        t = seq
+        if t.dtype != torch.int64:
+            t = t.to(dtype=torch.int64)
+        if not t.is_cpu:
+            t = t.cpu()
+        return t.tolist()
+    return list(seq)
+
+
+def bit_residual_fia_paged_k8v4_get_workspace(
     *,
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    actual_seq_lengths_q: list[int],
-    actual_seq_lengths_kv: list[int],
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
     head_size: int,
     num_heads: int,
     num_kv_heads: int,
@@ -2302,19 +2351,14 @@ def bit_residual_fia_paged_k8v4(
     sparse_mode: int = 3,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """BitResidual FIA Paged K8V4 (prefill / long-KV). Caller is trusted: k8v4
-    invariants and seq-len validity hold, so the kernel runs unconditionally.
-    Cache is uint8 (allocated natively as such); the mask is coerced to int8
-    (0=keep / 1=discard). ``rotation_*`` are the Haar R^T / R tensors; ``out``
-    (if given) must match ``query`` shape and is written in-place."""
     mask_arg = None if atten_mask is None else (atten_mask != 0).to(torch.int8)
-    result = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
+    return torch.ops._C_ascend.bit_residual_fia_paged_k8v4_get_workspace(
         query,
         key_cache,
         value_cache,
         block_tables,
-        actual_seq_lengths_q,
-        actual_seq_lengths_kv,
+        _br_fia_seq_as_list(actual_seq_lengths_q),
+        _br_fia_seq_as_list(actual_seq_lengths_kv),
         mask_arg,
         rotation_key,
         rotation_value,
@@ -2327,6 +2371,72 @@ def bit_residual_fia_paged_k8v4(
         next_tokens,
         sparse_mode,
         out,
+    )
+
+
+def bit_residual_fia_paged_k8v4(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    actual_seq_lengths_q: list[int] | torch.Tensor,
+    actual_seq_lengths_kv: list[int] | torch.Tensor,
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    scale: float,
+    rotation_key: torch.Tensor,
+    rotation_value: torch.Tensor,
+    atten_mask: torch.Tensor | None = None,
+    pre_tokens: int = 2147483647,
+    next_tokens: int = 2147483647,
+    sparse_mode: int = 3,
+    out: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+    graph_update: bool = False,
+) -> torch.Tensor:
+    """BitResidual FIA Paged K8V4 (prefill / long-KV). Caller is trusted: k8v4
+    invariants and seq-len validity hold, so the kernel runs unconditionally.
+    Cache is uint8 (allocated natively as such); the mask is coerced to int8
+    (0=keep / 1=discard). ``rotation_*`` are the Haar R^T / R tensors; ``out``
+    (if given) must match ``query`` shape and is written in-place."""
+    if workspace is not None:
+        # Graph path: never allocate a fresh mask tensor (executor keeps the
+        # pointer). Decode passes None; if a mask is required it must already
+        # be a stable contiguous int8 buffer.
+        if atten_mask is None:
+            mask_arg = None
+        elif atten_mask.dtype == torch.int8 and atten_mask.is_contiguous():
+            mask_arg = atten_mask
+        else:
+            mask_arg = (atten_mask != 0).to(torch.int8).contiguous()
+    else:
+        mask_arg = None if atten_mask is None else (atten_mask != 0).to(torch.int8)
+    seq_q_list = _br_fia_seq_as_list(actual_seq_lengths_q)
+    seq_kv_list = _br_fia_seq_as_list(actual_seq_lengths_kv)
+    result = torch.ops._C_ascend.bit_residual_fia_paged_k8v4(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_q_list,
+        seq_kv_list,
+        mask_arg,
+        rotation_key,
+        rotation_value,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        scale,
+        pre_tokens,
+        next_tokens,
+        sparse_mode,
+        out,
+        workspace,
+        graph_update,
     )
     if out is not None:
         return out.view(query.shape[0], num_heads, head_size)

@@ -538,6 +538,14 @@ def _pd_runtime_env(
         "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
     )
     env["TASK_QUEUE_ENABLE"] = env.get("TASK_QUEUE_ENABLE", "1")
+    # Ensure CANN Python packages (acl) survive even if caller overwrote PYTHONPATH.
+    cann_site = "/usr/local/Ascend/cann-9.1.0/python/site-packages"
+    if Path(cann_site).is_dir():
+        prev_py = env.get("PYTHONPATH", "")
+        if cann_site not in prev_py.split(":"):
+            env["PYTHONPATH"] = (
+                f"{cann_site}:{prev_py}" if prev_py else cann_site
+            )
     # Custom ops (TopK / BitResidual FIA). Without this, Prefill dies with
     # aclnnApplyTopKTopPCustom not in libopapi.so under PD fork workers.
     custom_opp = _REPO_ROOT / "vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"

@@ -20,6 +20,7 @@
 import inspect
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -2878,6 +2879,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
+            if not self.enable_enpu:
+                torch.npu.current_stream().wait_stream(self.update_stream)
 
     def _model_forward(
         self,
@@ -2912,10 +2915,57 @@ class NPUModelRunner(GPUModelRunner):
                 is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
                 if not is_draft_eagle:
                     torch.npu.current_stream().synchronize()
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
+            # BitResidual k8v4 bakes host ValueDepend seq into the executor at
+            # graph_task_update time (unlike stock FIA device seq_lens tensors).
+            # Default: update before FULL replay so decode sees current seq_kv.
+            # BR_K8V4_UPDATE_AFTER=1 bisects stock ordering (replay then update).
+            need_update_before = False
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not forward_context.capturing
+            ):
+                try:
+                    from vllm_ascend.compilation.acl_graph import get_graph_params
+
+                    gp = get_graph_params()
+                    params = gp.attn_params.get(num_tokens_padded) if gp else None
+                    need_update_before = (
+                        bool(params)
+                        and isinstance(params[0], tuple)
+                        and len(params[0]) > 0
+                        and params[0][0] == "br_k8v4"
+                    )
+                    if need_update_before and os.environ.get(
+                        "BR_K8V4_UPDATE_AFTER", ""
+                    ).strip() in ("1", "true", "yes"):
+                        need_update_before = False
+                except Exception:
+                    need_update_before = False
+            if need_update_before:
+                if os.environ.get("BR_K8V4_GRAPH_DEBUG", "").strip() in ("1", "true", "yes"):
+                    from vllm_ascend.attention.attention_v1 import _br_k8v4_debug_log
+
+                    _br_k8v4_debug_log(
+                        "full_replay_begin",
+                        num_tokens=num_tokens_padded,
+                        capturing=forward_context.capturing,
+                    )
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions
+                )
+                hidden_states = run_model()
+                if os.environ.get("BR_K8V4_GRAPH_DEBUG", "").strip() in ("1", "true", "yes"):
+                    from vllm_ascend.attention.attention_v1 import _br_k8v4_debug_log
+
+                    _br_k8v4_debug_log(
+                        "full_replay_end",
+                        num_tokens=num_tokens_padded,
+                    )
+            else:
+                hidden_states = run_model()
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions
+                )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
@@ -3017,6 +3067,38 @@ class NPUModelRunner(GPUModelRunner):
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
+        # TurboQuant k8v4: long KV FULL replay/update has hung (Running>0, tok/s=0
+        # or event-wait timeout). Debug showed failure near seq_kv==cap and on
+        # multi-req FULL updates with ~4k KV. Disable FULL when any seq_kv is
+        # at/above the cap (use >= so the boundary step demotes). Short decodes
+        # keep FULL. BR_K8V4_FULL_MAX_SEQ_KV=0 disables the guard.
+        if (
+            force_uniform_decode is None
+            and self.cache_config.cache_dtype == "turboquant"
+            and getattr(self, "ascend_config", None) is not None
+            and self.ascend_config.turboquant_kv_bits_key == 8
+            and self.ascend_config.turboquant_kv_bits_value == 4
+        ):
+            from vllm_ascend.attention.attention_v1 import _br_k8v4_full_max_seq_kv
+
+            max_allowed = _br_k8v4_full_max_seq_kv()
+            if max_allowed > 0 and num_reqs > 0:
+                seq_kv = (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    + num_scheduled_tokens_np[:num_reqs]
+                )
+                self._br_k8v4_disable_full = bool(int(np.max(seq_kv)) >= max_allowed)
+            else:
+                self._br_k8v4_disable_full = False
+        elif force_uniform_decode is None:
+            if not (
+                self.cache_config.cache_dtype == "turboquant"
+                and getattr(self, "ascend_config", None) is not None
+                and self.ascend_config.turboquant_kv_bits_key == 8
+                and self.ascend_config.turboquant_kv_bits_value == 4
+            ):
+                self._br_k8v4_disable_full = False
+
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             if force_eager:
@@ -3031,7 +3113,17 @@ class NPUModelRunner(GPUModelRunner):
                 num_active_loras=num_active_loras,
             )
 
-        cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+            num_tokens_padded,
+            use_cascade_attn
+            or has_encoder_output
+            or (
+                # Only at runtime: during FULL graph capture, force_uniform_decode
+                # is set and we must still dispatch FULL or dummy_run mismatches.
+                getattr(self, "_br_k8v4_disable_full", False)
+                and force_uniform_decode is None
+            ),
+        )
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -3861,6 +3953,8 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
+
+        self._br_k8v4_disable_full = False
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()

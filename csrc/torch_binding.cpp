@@ -23,6 +23,7 @@
 #include "acl/acl_rt.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -734,7 +735,31 @@ void turboquant_pack_kv_for_cache_v3_to_cache(
         key, value, slot_mapping, key_cache, value_cache, slot_w_k, slot_w_v);
 }
 
-void bit_residual_pack_k8v4(
+namespace {
+
+struct BitResidualPackK8v4LaunchArgs {
+    at::Tensor key_work;
+    at::Tensor value_work;
+    at::Tensor rotation_work;
+    at::Tensor slot_work;
+    at::Tensor query_start_work;
+    at::Tensor key_cache;
+    at::Tensor value_cache;
+    int64_t n_vec = 0;
+    int64_t vec_per_core = 0;
+    int64_t num_heads = 0;
+    int64_t block_size = 0;
+    int64_t num_blocks = 0;
+    int64_t num_reqs = 0;
+    int64_t key_stride_token = 0;
+    int64_t key_stride_head = 0;
+    int64_t value_stride_token = 0;
+    int64_t value_stride_head = 0;
+    int64_t key_storage_offset = 0;
+    int64_t value_storage_offset = 0;
+};
+
+BitResidualPackK8v4LaunchArgs PrepareBitResidualPackK8v4Args(
     const at::Tensor &key,
     const at::Tensor &value,
     const at::Tensor &slot_mapping,
@@ -748,8 +773,6 @@ void bit_residual_pack_k8v4(
     constexpr int64_t kBlockRows = 16;
     constexpr int64_t kKeyBlockStride = 2112;
     constexpr int64_t kValBlockStride = 1088;
-    constexpr int64_t kKeyGroupRows = 2;
-    constexpr int64_t kValueGroupRows = 4;
     TORCH_CHECK(key.is_privateuseone() && value.is_privateuseone(), "key/value must be on NPU");
     TORCH_CHECK(slot_mapping.is_privateuseone(), "slot_mapping must be on NPU");
     TORCH_CHECK(query_start_loc.is_privateuseone(), "query_start_loc must be on NPU");
@@ -810,40 +833,22 @@ void bit_residual_pack_k8v4(
     TORCH_CHECK(query_start_loc.numel() >= num_reqs + 1,
                 "query_start_loc length must be at least num_reqs + 1");
 
-    const bool key_strided_copy_supported =
-        key.stride(2) == 1 && key.stride(0) > 0 && key.stride(1) > 0;
-    const bool value_strided_copy_supported =
-        value.stride(2) == 1 && value.stride(0) > 0 && value.stride(1) > 0;
-    at::Tensor key_work = key;
-    at::Tensor value_work = value;
-    at::Tensor slot_work = slot_mapping;
-    at::Tensor query_start_work = query_start_loc;
-    at::Tensor rotation_work = rotation_t;
-    if (!key_strided_copy_supported) {
-        if (!key_work.is_contiguous()) {
-            key_work = key_work.contiguous();
-        }
-        if (key_work.storage_offset() != 0) {
-            key_work = key_work.clone(at::MemoryFormat::Contiguous);
-        }
-    }
-    if (!value_strided_copy_supported) {
-        if (!value_work.is_contiguous()) {
-            value_work = value_work.contiguous();
-        }
-        if (value_work.storage_offset() != 0) {
-            value_work = value_work.clone(at::MemoryFormat::Contiguous);
-        }
-    }
-    if (!slot_work.is_contiguous()) {
-        slot_work = slot_work.contiguous();
-    }
-    if (!query_start_work.is_contiguous()) {
-        query_start_work = query_start_work.contiguous();
-    }
-    if (!rotation_work.is_contiguous()) {
-        rotation_work = rotation_work.contiguous();
-    }
+    // Never contig/clone here: under ACL graph capture those temps would be
+    // baked into the outer FULL graph and replay would keep packing stale K/V.
+    // ConvertType already applies storage_offset; callers must pass graph-safe
+    // views (contiguous slot/query_start/rotation; key/value with stride(2)==1).
+    TORCH_CHECK(key.stride(2) == 1 && key.stride(0) > 0 && key.stride(1) > 0,
+                "BitResidual pack requires key stride(2)==1 with positive "
+                "token/head strides");
+    TORCH_CHECK(value.stride(2) == 1 && value.stride(0) > 0 && value.stride(1) > 0,
+                "BitResidual pack requires value stride(2)==1 with positive "
+                "token/head strides");
+    TORCH_CHECK(slot_mapping.is_contiguous(),
+                "BitResidual pack requires contiguous slot_mapping");
+    TORCH_CHECK(query_start_loc.is_contiguous(),
+                "BitResidual pack requires contiguous query_start_loc");
+    TORCH_CHECK(rotation_t.is_contiguous(),
+                "BitResidual pack requires contiguous rotation_t");
 
     uint32_t vec_per_core = 128;
     if (n_vec < 128) {
@@ -854,17 +859,10 @@ void bit_residual_pack_k8v4(
             vec_per_core = 16;
         }
     }
-    const int64_t vec_per_core_i64 = static_cast<int64_t>(vec_per_core);
-    const int64_t num_blocks = key_cache.size(0);
-    const int64_t key_stride_token = key_work.stride(0);
-    const int64_t key_stride_head = key_work.stride(1);
-    const int64_t value_stride_token = value_work.stride(0);
-    const int64_t value_stride_head = value_work.stride(1);
-    // ConvertType passes tensor storage_offset to ACL, and the GM_ADDR seen by
-    // the AscendC kernel is already at the logical tensor view. Keep the
-    // kernel-side offset at zero to avoid applying storage_offset twice.
-    const int64_t key_storage_offset = 0;
-    const int64_t value_storage_offset = 0;
+    const int64_t key_stride_token = key.stride(0);
+    const int64_t key_stride_head = key.stride(1);
+    const int64_t value_stride_token = value.stride(0);
+    const int64_t value_stride_head = value.stride(1);
     constexpr int64_t kMaxKernelStride = std::numeric_limits<uint32_t>::max();
     TORCH_CHECK(key_stride_token > 0 && key_stride_head > 0 &&
                     value_stride_token > 0 && value_stride_head > 0 &&
@@ -873,28 +871,149 @@ void bit_residual_pack_k8v4(
                     value_stride_token <= kMaxKernelStride &&
                     value_stride_head <= kMaxKernelStride,
                 "key/value strides must be positive and fit uint32_t");
-    const c10_npu::OptionalNPUGuard npuGuard(key_work.device());
+
+    BitResidualPackK8v4LaunchArgs args;
+    args.key_work = key;
+    args.value_work = value;
+    args.rotation_work = rotation_t;
+    args.slot_work = slot_mapping;
+    args.query_start_work = query_start_loc;
+    args.key_cache = key_cache;
+    args.value_cache = value_cache;
+    args.n_vec = n_vec;
+    args.vec_per_core = static_cast<int64_t>(vec_per_core);
+    args.num_heads = num_heads;
+    args.block_size = block_size;
+    args.num_blocks = key_cache.size(0);
+    args.num_reqs = num_reqs;
+    args.key_stride_token = key_stride_token;
+    args.key_stride_head = key_stride_head;
+    args.value_stride_token = value_stride_token;
+    args.value_stride_head = value_stride_head;
+    // ConvertType passes tensor storage_offset to ACL; keep kernel offset 0.
+    args.key_storage_offset = 0;
+    args.value_storage_offset = 0;
+    return args;
+}
+
+}  // namespace
+
+void bit_residual_pack_k8v4(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    const at::Tensor &query_start_loc,
+    const at::Tensor &rotation_t,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t num_reqs,
+    int64_t block_size,
+    c10::optional<at::Tensor> workspace_opt) {
+    auto args = PrepareBitResidualPackK8v4Args(
+        key, value, slot_mapping, query_start_loc, rotation_t, key_cache,
+        value_cache, num_reqs, block_size);
+    const c10_npu::OptionalNPUGuard npuGuard(args.key_work.device());
+    const bool graph_mode =
+        workspace_opt.has_value() && workspace_opt->defined();
+    if (graph_mode) {
+        // FULL ACL graph capture: EXEC_NPU_CMD's local at::empty workspace is
+        // freed after return while its pointer stays baked into the outer
+        // graph → dangling GM on replay (AI Core / silent wrong packs).
+        // Callers must pass a keepalive external workspace.
+        TORCH_CHECK(workspace_opt->is_privateuseone(),
+                    "pack graph workspace must be on NPU");
+        TORCH_CHECK(workspace_opt->device() == args.key_work.device(),
+                    "pack graph workspace must match key device");
+        void *workspace_addr =
+            const_cast<void *>(workspace_opt->storage().data());
+        const uint64_t workspace_size = static_cast<uint64_t>(
+            workspace_opt->numel() * workspace_opt->element_size());
+        EXEC_GRAPH_CAPTURE_HOLD_NPU_CMD(
+            aclnnBitResidualPackK8v4,
+            workspace_addr,
+            workspace_size,
+            args.key_work,
+            args.value_work,
+            args.rotation_work,
+            args.slot_work,
+            args.query_start_work,
+            args.n_vec,
+            args.vec_per_core,
+            args.num_heads,
+            args.block_size,
+            args.num_blocks,
+            args.num_reqs,
+            args.key_stride_token,
+            args.key_stride_head,
+            args.value_stride_token,
+            args.value_stride_head,
+            args.key_storage_offset,
+            args.value_storage_offset,
+            args.key_cache,
+            args.value_cache);
+        return;
+    }
     EXEC_NPU_CMD(
         aclnnBitResidualPackK8v4,
-        key_work,
-        value_work,
-        rotation_work,
-        slot_work,
-        query_start_work,
-        n_vec,
-        vec_per_core_i64,
-        num_heads,
-        block_size,
-        num_blocks,
-        num_reqs,
-        key_stride_token,
-        key_stride_head,
-        value_stride_token,
-        value_stride_head,
-        key_storage_offset,
-        value_storage_offset,
-        key_cache,
-        value_cache);
+        args.key_work,
+        args.value_work,
+        args.rotation_work,
+        args.slot_work,
+        args.query_start_work,
+        args.n_vec,
+        args.vec_per_core,
+        args.num_heads,
+        args.block_size,
+        args.num_blocks,
+        args.num_reqs,
+        args.key_stride_token,
+        args.key_stride_head,
+        args.value_stride_token,
+        args.value_stride_head,
+        args.key_storage_offset,
+        args.value_storage_offset,
+        args.key_cache,
+        args.value_cache);
+}
+
+at::Tensor bit_residual_pack_k8v4_get_workspace(
+    const at::Tensor &key,
+    const at::Tensor &value,
+    const at::Tensor &slot_mapping,
+    const at::Tensor &query_start_loc,
+    const at::Tensor &rotation_t,
+    at::Tensor &key_cache,
+    at::Tensor &value_cache,
+    int64_t num_reqs,
+    int64_t block_size) {
+    auto args = PrepareBitResidualPackK8v4Args(
+        key, value, slot_mapping, query_start_loc, rotation_t, key_cache,
+        value_cache, num_reqs, block_size);
+    const c10_npu::OptionalNPUGuard npuGuard(args.key_work.device());
+    at::Tensor workspace;
+    EXEC_GET_WORKSPACE_CMD(
+        workspace,
+        aclnnBitResidualPackK8v4,
+        args.key_work,
+        args.value_work,
+        args.rotation_work,
+        args.slot_work,
+        args.query_start_work,
+        args.n_vec,
+        args.vec_per_core,
+        args.num_heads,
+        args.block_size,
+        args.num_blocks,
+        args.num_reqs,
+        args.key_stride_token,
+        args.key_stride_head,
+        args.value_stride_token,
+        args.value_stride_head,
+        args.key_storage_offset,
+        args.value_storage_offset,
+        args.key_cache,
+        args.value_cache);
+    return workspace;
 }
 
 at::Tensor bit_residual_attention_paged_k8v4(
@@ -1016,7 +1135,9 @@ at::Tensor bit_residual_fia_paged_k8v4(
     int64_t pre_tokens,
     int64_t next_tokens,
     int64_t sparse_mode,
-    c10::optional<at::Tensor> out_opt)
+    c10::optional<at::Tensor> out_opt,
+    c10::optional<at::Tensor> workspace_opt,
+    bool graph_update = false)
 {
     constexpr int64_t kHeadSize = 128;
     constexpr int64_t kBlockRows = 16;
@@ -1058,16 +1179,75 @@ at::Tensor bit_residual_fia_paged_k8v4(
     TORCH_CHECK(actual_seq_len_q.size() > 0, "actual_seq_len_q must not be empty");
     TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(),
                 "actual_seq_len_q and actual_seq_len_kv must have the same length");
+    const bool graph_mode =
+        workspace_opt.has_value() && workspace_opt->defined();
+    // Graph path: ValueDepend seq-lens must stay alive across OpCommand.
+    // Owned CPU vectors are copied into GraphCopyTypes as std::vector.
+    std::vector<int64_t> seq_q_owned;
+    std::vector<int64_t> seq_kv_owned;
+    at::IntArrayRef seq_q_ref = actual_seq_len_q;
+    at::IntArrayRef seq_kv_ref = actual_seq_len_kv;
+    if (graph_mode) {
+        seq_q_owned.assign(actual_seq_len_q.begin(), actual_seq_len_q.end());
+        seq_kv_owned.assign(actual_seq_len_kv.begin(), actual_seq_len_kv.end());
+        seq_q_ref = at::IntArrayRef(seq_q_owned);
+        seq_kv_ref = at::IntArrayRef(seq_kv_owned);
+    }
 
-    const at::Tensor query_c = query.contiguous();
-    const at::Tensor key_cache_c = key_cache.contiguous();
-    const at::Tensor value_cache_c = value_cache.contiguous();
-    const at::Tensor block_table_c = block_table.contiguous();
-    const at::Tensor rotation_key_c = rotation_key.contiguous();
-    const at::Tensor rotation_value_c = rotation_value.contiguous();
-    at::Tensor mask = atten_mask.has_value() && atten_mask->defined()
-                          ? atten_mask->contiguous()
-                          : at::empty({0}, query.options().dtype(at::kChar));
+    // ACL graph capture/update must not create temporary contiguous copies:
+    // GetWorkspaceSize embeds tensor storage pointers into the executor; a
+    // local contiguous() clone would dangle after this function returns.
+    at::Tensor query_c;
+    at::Tensor key_cache_c;
+    at::Tensor value_cache_c;
+    at::Tensor block_table_c;
+    at::Tensor rotation_key_c;
+    at::Tensor rotation_value_c;
+    at::Tensor mask;
+    if (graph_mode) {
+        TORCH_CHECK(query.is_contiguous(),
+                    "BitResidual FIA graph path requires contiguous query");
+        TORCH_CHECK(key_cache.is_contiguous(),
+                    "BitResidual FIA graph path requires contiguous key_cache");
+        TORCH_CHECK(value_cache.is_contiguous(),
+                    "BitResidual FIA graph path requires contiguous value_cache");
+        TORCH_CHECK(block_table.is_contiguous(),
+                    "BitResidual FIA graph path requires contiguous block_table");
+        TORCH_CHECK(rotation_key.is_contiguous(),
+                    "BitResidual FIA graph path requires contiguous rotation_key");
+        TORCH_CHECK(rotation_value.is_contiguous(),
+                    "BitResidual FIA graph path requires contiguous rotation_value");
+        query_c = query;
+        key_cache_c = key_cache;
+        value_cache_c = value_cache;
+        block_table_c = block_table;
+        rotation_key_c = rotation_key;
+        rotation_value_c = rotation_value;
+        if (atten_mask.has_value() && atten_mask->defined()) {
+            TORCH_CHECK(atten_mask->is_contiguous(),
+                        "BitResidual FIA graph path requires contiguous atten_mask");
+            mask = *atten_mask;
+        } else {
+            // Stable empty mask: per-call at::empty would dangle after update.
+            static at::Tensor empty_mask;
+            if (!empty_mask.defined() || empty_mask.device() != query.device() ||
+                empty_mask.scalar_type() != at::kChar) {
+                empty_mask =
+                    at::empty({0}, query.options().dtype(at::kChar));
+            }
+            mask = empty_mask;
+        }
+    } else {
+        query_c = query.contiguous();
+        key_cache_c = key_cache.contiguous();
+        value_cache_c = value_cache.contiguous();
+        block_table_c = block_table.contiguous();
+        rotation_key_c = rotation_key.contiguous();
+        rotation_value_c = rotation_value.contiguous();
+        mask = atten_mask.has_value() && atten_mask->defined()
+                   ? atten_mask->contiguous()
+                   : at::empty({0}, query.options().dtype(at::kChar));
+    }
 
     at::Tensor out;
     if (out_opt.has_value() && out_opt->defined()) {
@@ -1078,10 +1258,138 @@ at::Tensor bit_residual_fia_paged_k8v4(
         TORCH_CHECK(out_opt->is_contiguous(), "out must be contiguous for in-place write");
         out = *out_opt;
     } else {
+        TORCH_CHECK(!graph_mode,
+                    "BitResidual FIA graph path requires an in-place out tensor");
         out = at::empty(query_c.sizes(), query_c.options());
     }
     const c10_npu::OptionalNPUGuard npuGuard(query_c.device());
-    EXEC_NPU_CMD(
+    if (graph_mode) {
+        TORCH_CHECK(workspace_opt->is_privateuseone(),
+                    "BitResidual FIA workspace must be on NPU");
+        void *workspace_addr =
+            const_cast<void *>(workspace_opt->storage().data());
+        const uint64_t workspace_size =
+            static_cast<uint64_t>(workspace_opt->numel());
+        if (graph_update) {
+            EXEC_GRAPH_LAUNCH_NPU_CMD_V2(
+                aclnnBitResidualFiaPagedK8v4,
+                workspace_addr,
+                workspace_size,
+                query_c,
+                key_cache_c,
+                value_cache_c,
+                block_table_c,
+                seq_q_ref,
+                seq_kv_ref,
+                mask,
+                rotation_key_c,
+                rotation_value_c,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                block_size,
+                scale_value,
+                pre_tokens,
+                next_tokens,
+                sparse_mode,
+                out);
+        } else {
+            EXEC_GRAPH_LAUNCH_NPU_CMD(
+                aclnnBitResidualFiaPagedK8v4,
+                workspace_addr,
+                workspace_size,
+                query_c,
+                key_cache_c,
+                value_cache_c,
+                block_table_c,
+                seq_q_ref,
+                seq_kv_ref,
+                mask,
+                rotation_key_c,
+                rotation_value_c,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                block_size,
+                scale_value,
+                pre_tokens,
+                next_tokens,
+                sparse_mode,
+                out);
+        }
+    } else {
+        EXEC_NPU_CMD(
+            aclnnBitResidualFiaPagedK8v4,
+            query_c,
+            key_cache_c,
+            value_cache_c,
+            block_table_c,
+            actual_seq_len_q,
+            actual_seq_len_kv,
+            mask,
+            rotation_key_c,
+            rotation_value_c,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            scale_value,
+            pre_tokens,
+            next_tokens,
+            sparse_mode,
+            out);
+    }
+    return out;
+}
+
+at::Tensor bit_residual_fia_paged_k8v4_get_workspace(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& block_table,
+    at::IntArrayRef actual_seq_len_q,
+    at::IntArrayRef actual_seq_len_kv,
+    const c10::optional<at::Tensor>& atten_mask,
+    const at::Tensor& rotation_key,
+    const at::Tensor& rotation_value,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t block_size,
+    double scale_value,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t sparse_mode,
+    c10::optional<at::Tensor> out_opt)
+{
+    TORCH_CHECK(query.is_privateuseone(), "query must be on NPU");
+    TORCH_CHECK(key_cache.is_privateuseone(), "key_cache must be on NPU");
+    TORCH_CHECK(value_cache.is_privateuseone(), "value_cache must be on NPU");
+    TORCH_CHECK(rotation_key.is_privateuseone(), "rotation_key must be on NPU");
+    TORCH_CHECK(rotation_value.is_privateuseone(), "rotation_value must be on NPU");
+    TORCH_CHECK(actual_seq_len_q.size() > 0, "actual_seq_len_q must not be empty");
+    TORCH_CHECK(actual_seq_len_q.size() == actual_seq_len_kv.size(),
+                "actual_seq_len_q and actual_seq_len_kv must have the same length");
+
+    const at::Tensor query_c = query.contiguous();
+    const at::Tensor key_cache_c = key_cache.contiguous();
+    const at::Tensor value_cache_c = value_cache.contiguous();
+    const at::Tensor block_table_c = block_table.contiguous();
+    const at::Tensor rotation_key_c = rotation_key.contiguous();
+    const at::Tensor rotation_value_c = rotation_value.contiguous();
+    at::Tensor mask = atten_mask.has_value() && atten_mask->defined()
+                          ? atten_mask->contiguous()
+                          : at::empty({0}, query.options().dtype(at::kChar));
+    at::Tensor out;
+    if (out_opt.has_value() && out_opt->defined()) {
+        out = *out_opt;
+    } else {
+        out = at::empty(query_c.sizes(), query_c.options());
+    }
+    const c10_npu::OptionalNPUGuard npuGuard(query_c.device());
+    at::Tensor workspace;
+    EXEC_GET_WORKSPACE_CMD(
+        workspace,
         aclnnBitResidualFiaPagedK8v4,
         query_c,
         key_cache_c,
@@ -1101,7 +1409,7 @@ at::Tensor bit_residual_fia_paged_k8v4(
         next_tokens,
         sparse_mode,
         out);
-    return out;
+    return workspace;
 }
 
 void turboquant_pack_kv_for_cache_to_cache(
@@ -4009,9 +4317,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "bit_residual_pack_k8v4(Tensor key, Tensor value, Tensor slot_mapping, "
         "Tensor query_start_loc, Tensor rotation_t, Tensor! key_cache, "
-        "Tensor! value_cache, int num_reqs, int block_size) -> ()");
+        "Tensor! value_cache, int num_reqs, int block_size, "
+        "Tensor? workspace=None) -> ()");
     ops.impl("bit_residual_pack_k8v4", torch::kPrivateUse1,
              &vllm_ascend::bit_residual_pack_k8v4);
+
+    ops.def(
+        "bit_residual_pack_k8v4_get_workspace(Tensor key, Tensor value, "
+        "Tensor slot_mapping, Tensor query_start_loc, Tensor rotation_t, "
+        "Tensor! key_cache, Tensor! value_cache, int num_reqs, int block_size) "
+        "-> Tensor");
+    ops.impl("bit_residual_pack_k8v4_get_workspace", torch::kPrivateUse1,
+             &vllm_ascend::bit_residual_pack_k8v4_get_workspace);
 
     ops.def(
         "turboquant_pack_kv_for_cache_to_cache(Tensor key, Tensor value, Tensor slot_mapping, "
@@ -4094,12 +4411,26 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor? atten_mask, Tensor rotation_key, Tensor rotation_value, "
         "int num_heads, int num_kv_heads, int head_size, int block_size, "
         "float scale_value, int pre_tokens, int next_tokens, int sparse_mode, "
-        "Tensor? out=None"
+        "Tensor? out=None, Tensor? workspace=None, bool graph_update=False"
         ") -> Tensor");
     ops.impl(
         "bit_residual_fia_paged_k8v4",
         torch::kPrivateUse1,
         &vllm_ascend::bit_residual_fia_paged_k8v4);
+
+    ops.def(
+        "bit_residual_fia_paged_k8v4_get_workspace("
+        "Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, "
+        "int[] actual_seq_len_q, int[] actual_seq_len_kv, "
+        "Tensor? atten_mask, Tensor rotation_key, Tensor rotation_value, "
+        "int num_heads, int num_kv_heads, int head_size, int block_size, "
+        "float scale_value, int pre_tokens, int next_tokens, int sparse_mode, "
+        "Tensor? out=None"
+        ") -> Tensor");
+    ops.impl(
+        "bit_residual_fia_paged_k8v4_get_workspace",
+        torch::kPrivateUse1,
+        &vllm_ascend::bit_residual_fia_paged_k8v4_get_workspace);
 
     // TurboQuant 8-bit paged decode (设计文档 §2.6 方案 X / Phase 1).
     // 算子吞掉 block_table 寻址,host 侧只需 ceil + cumsum 算 gather_block_ids。
